@@ -28,3 +28,18 @@ func SetGlobalAuthClientForTest(c *http.Client) *http.Client {
 	}
 	return old
 }
+
+// SetKiroPortalBaseURL sets the Kiro portal sign-in URL for testing.
+func SetKiroPortalBaseURL(url string) {
+	if url != "" {
+		kiroPortalSignInURL = url
+	}
+}
+
+// SetExternalIdpTokenURLFnForTest sets a custom external IdP token URL resolver for testing.
+// The function receives an issuer URL and returns the token endpoint URL.
+func SetExternalIdpTokenURLFnForTest(fn func(issuerURL string) (string, error)) {
+	if fn != nil {
+		externalIdpTokenURLFn = fn
+	}
+}

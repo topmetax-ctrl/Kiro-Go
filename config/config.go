@@ -53,6 +53,13 @@ type Account struct {
 	AuthRegion   string `json:"authRegion,omitempty"`   // Region for token refresh endpoints; falls back to region
 	ApiRegion    string `json:"apiRegion,omitempty"`    // Region for API request hosts; falls back to region
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
+
+	// External IdP authentication fields (for "Your organization" Kiro SSO flow)
+	IssuerURL   string `json:"issuerUrl,omitempty"`   // IdP OIDC issuer (e.g. https://login.microsoftonline.com/<tenant>/v2.0)
+	IdPClientID string `json:"idpClientId,omitempty"`  // Client ID registered with the external IdP (from Kiro portal)
+	Scopes      string `json:"scopes,omitempty"`       // Space-separated scopes for the IdP token endpoint
+	LoginHint   string `json:"loginHint,omitempty"`    // User email used as login_hint during IdP authorization
+
 	ExpiresAt    int64  `json:"expiresAt,omitempty"`    // Token expiration timestamp (Unix seconds)
 	MachineId    string `json:"machineId,omitempty"`    // UUID machine identifier for request tracking
 	ProfileArn   string `json:"profileArn,omitempty"`   // CodeWhisperer/Kiro profile ARN for generation requests

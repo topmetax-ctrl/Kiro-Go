@@ -1956,7 +1956,8 @@
     sso: 'fa-solid fa-shield-halved',
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
-    cookie: 'fa-solid fa-cookie-bite'
+    cookie: 'fa-solid fa-cookie-bite',
+    kiro: 'fa-solid fa-building'
   };
   function methodCard(type, title, desc) {
     var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
@@ -1982,13 +1983,16 @@
     else if (type === 'cookie') modalCookie(title, body);
     else if (type === 'apikey') modalApiKey(title, body);
     else if (type === 'apikeybatch') modalApiKeyBatch(title, body);
+    else if (type === 'kiro') modalKiro(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
   function closeModal() {
     closeDialog('addModal');
     iamSession = '';
+    kiroSsoSession = '';
     if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
+    if (kiroSsoPollTimer) { clearTimeout(kiroSsoPollTimer); kiroSsoPollTimer = null; }
     builderIdSession = '';
   }
   function modalAdd(title, body) {
@@ -1997,6 +2001,7 @@
       '<div class="method-list">' +
       methodCard('builderid', t('modal.builderIdTitle'), t('modal.builderIdDesc')) +
       methodCard('iam', t('modal.iamTitle'), t('modal.iamDesc')) +
+      methodCard('kiro', t('modal.kiroTitle'), t('modal.kiroDesc')) +
       methodCard('sso', t('modal.ssoTitle'), t('modal.ssoDesc')) +
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
@@ -2193,6 +2198,95 @@
       '<div id="apikeyBatchResults" class="mt-3"></div>';
     $('importApikeyBatchBtn').addEventListener('click', importApiKeysBatch);
   }
+  function modalKiro(title, body) {
+    title.textContent = t('modal.kiroTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.kiroDesc')) + '</p>' +
+      '<div id="kiroStep1">' +
+      '<div class="form-group"><label>' + escapeHtml(t('kiro.emailLabel')) + '</label>' +
+      '<input type="email" id="kiroEmail" placeholder="' + escapeAttr(t('kiro.emailPlaceholder')) + '" /></div>' +
+      '<p class="text-xs muted-text">' + escapeHtml(t('kiro.emailHint')) + '</p>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="startKiroBtn" type="button">' + escapeHtml(t('kiro.startLogin')) + '</button>' +
+      '</div>' +
+      '</div>' +
+      '<div id="kiroStep2" class="hidden">' +
+      '<div class="message message-info message-center">' +
+      '<p>' + escapeHtml(t('kiro.browserOpened')) + '</p>' +
+      '<p class="text-xs mt-2 muted-text">' + escapeHtml(t('kiro.browserHint')) + '</p>' +
+      '</div>' +
+      '<p id="kiroStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
+      '<div class="modal-footer"><button class="btn btn-secondary" id="kiroCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
+      '</div>';
+    $('startKiroBtn').addEventListener('click', startKiroSso);
+  }
+
+  // Kiro SSO state
+  var kiroSsoSession = '';
+  var kiroSsoPollTimer = null;
+
+  async function startKiroSso() {
+    try {
+      var email = $('kiroEmail').value.trim();
+      var res = await api('/auth/kiro-sso/start', {
+        method: 'POST',
+        body: JSON.stringify({ loginHint: email || undefined })
+      });
+      var d = await res.json();
+      if (d.sessionId) {
+        kiroSsoSession = d.sessionId;
+        $('kiroStep1').classList.add('hidden');
+        $('kiroStep2').classList.remove('hidden');
+        $('kiroCancelBtn').addEventListener('click', cancelKiroSso);
+        window.open(d.authorizeUrl, '_blank');
+        pollKiroSso(2);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch (e) {
+      toastError(t('login.connectError'));
+    }
+  }
+
+  function pollKiroSso(interval) {
+    kiroSsoPollTimer = setTimeout(async function() {
+      try {
+        var res = await api('/auth/kiro-sso/poll', {
+          method: 'POST',
+          body: JSON.stringify({ sessionId: kiroSsoSession })
+        });
+        var d = await res.json();
+        if (d.status === 'completed') {
+          closeModal(); loadAccounts(); loadStats();
+          toastPrimary(t('builderid.success') + ': ' + (d.account?.email || d.account?.id));
+          autoRefreshNewAccount(d.account?.id);
+        } else if (d.status === 'pending') {
+          $('kiroStatus').textContent = t('builderid.waiting');
+          pollKiroSso(d.interval || interval);
+        } else {
+          cancelKiroSso();
+          toastError(t('common.failed') + ': ' + (d.error || t('kiro.authFailed')));
+        }
+      } catch (e) {
+        cancelKiroSso();
+        toastError(t('login.connectError'));
+      }
+    }, interval * 1000);
+  }
+
+  function cancelKiroSso() {
+    if (kiroSsoPollTimer) { clearTimeout(kiroSsoPollTimer); kiroSsoPollTimer = null; }
+    if (kiroSsoSession) {
+      api('/auth/kiro-sso/cancel', {
+        method: 'POST',
+        body: JSON.stringify({ sessionId: kiroSsoSession })
+      }).catch(function() {});
+    }
+    kiroSsoSession = '';
+    showModal('add');
+  }
+
   function updateLocalFields() {
     const p = $('localProvider').value;
     $('localClientGroup').classList.toggle('hidden', p === 'Google' || p === 'Github');

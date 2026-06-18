@@ -196,6 +196,9 @@ func listAvailableProfiles(account *config.Account) (string, error) {
 	}
 	setKiroHeaders(req, account)
 	req.Header.Set("Content-Type", "application/json")
+	if account.AuthMethod == "external_idp" {
+		req.Header.Set("TokenType", "EXTERNAL_IDP")
+	}
 
 	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 	if err != nil {
@@ -277,6 +280,11 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 		} else if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") ||
 			strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
 			// Token 相关错误，可能需要重新认证
+			// external_idp accounts: Microsoft-issued token may fail usage API but work for chat
+			if account.AuthMethod == "external_idp" {
+				logger.Warnf("[RefreshAccountInfo] Usage API auth error for external_idp account %s (token may not have usage scope): %v", account.Email, err)
+				return nil, fmt.Errorf("GetUsageLimits: %w", err)
+			}
 			logger.Warnf("[RefreshAccountInfo] Authentication error for %s: %v", account.Email, err)
 
 			// 更新账户封禁状态为认证失败并自动禁用

@@ -2110,6 +2110,12 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiImportCredentials(w, r)
 	case path == "/auth/apikeys-batch" && r.Method == "POST":
 		h.apiImportApiKeys(w, r)
+	case path == "/auth/kiro-sso/start" && r.Method == "POST":
+		h.apiStartKiroSso(w, r)
+	case path == "/auth/kiro-sso/poll" && r.Method == "POST":
+		h.apiPollKiroSso(w, r)
+	case path == "/auth/kiro-sso/cancel" && r.Method == "POST":
+		h.apiCancelKiroSso(w, r)
 	case path == "/status" && r.Method == "GET":
 		h.apiGetStatus(w, r)
 	case path == "/settings" && r.Method == "GET":
@@ -2711,6 +2717,137 @@ func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
 			"email": account.Email,
 		},
 	})
+}
+
+func (h *Handler) apiStartKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		LoginHint string `json:"loginHint"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	sessionID, authorizeURL, loopbackPort, err := auth.StartKiroSsoLogin(req.LoginHint)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId":    sessionID,
+		"authorizeUrl": authorizeURL,
+		"loopbackPort": loopbackPort,
+	})
+}
+
+func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	if req.SessionID == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "sessionId is required"})
+		return
+	}
+
+	status, result, err := auth.PollKiroSsoLogin(req.SessionID)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	if status == "pending" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "pending",
+		})
+		return
+	}
+
+	// Flow completed — tạo account
+	if result.AccessToken == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "No access token received"})
+		return
+	}
+
+	// Lấy user info từ login hint (có thể cập nhật sau qua RefreshAccountInfo)
+	email := result.UserEmail
+	if email == "" {
+		email = result.LoginHint
+	}
+
+	account := config.Account{
+		ID:           auth.GenerateAccountID(),
+		Email:        email,
+		AccessToken:  result.AccessToken,
+		RefreshToken: result.RefreshToken,
+		AuthMethod:   "external_idp",
+		Provider:     "MicrosoftEntra",
+		IssuerURL:    result.IssuerURL,
+		IdPClientID:  result.IdPClientID,
+		Scopes:       result.Scopes,
+		LoginHint:    result.LoginHint,
+		Region:       "us-east-1",
+		ExpiresAt:    time.Now().Unix() + int64(result.ExpiresIn),
+		Enabled:      true,
+		MachineId:    config.GenerateMachineId(),
+	}
+
+	if err := config.AddAccount(account); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	h.pool.Reload()
+
+	// Resolve profile ARN + fetch account info in background.
+	// external_idp accounts: resolve profileArn via ListAvailableProfiles (with
+	// TokenType: EXTERNAL_IDP header) first — this is the correct health-check.
+	// GetUsageLimits is optional metadata; failure does NOT ban the account.
+	go func() {
+		// Step 1: Resolve profile ARN (required for runtime generate endpoint)
+		if _, err := ResolveProfileArn(&account); err != nil {
+			logger.Warnf("[apiPollKiroSso] Profile ARN resolve failed for external_idp account %s: %v", account.Email, err)
+		}
+		// Step 2: Usage/subscription info (best-effort, non-fatal)
+		if _, err := RefreshAccountInfo(&account); err != nil {
+			logger.Warnf("[apiPollKiroSso] Account info refresh failed for external_idp account %s: %v", account.Email, err)
+		}
+		h.fetchAndCacheAccountModels(&account)
+	}()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "completed",
+		"account": map[string]interface{}{
+			"id":    account.ID,
+			"email": account.Email,
+		},
+	})
+}
+
+func (h *Handler) apiCancelKiroSso(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	auth.CancelKiroSsoLogin(req.SessionID)
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
 func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
