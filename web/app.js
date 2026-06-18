@@ -2212,9 +2212,13 @@
       '</div>' +
       '</div>' +
       '<div id="kiroStep2" class="hidden">' +
-      '<div class="message message-info message-center">' +
-      '<p>' + escapeHtml(t('kiro.browserOpened')) + '</p>' +
-      '<p class="text-xs mt-2 muted-text">' + escapeHtml(t('kiro.browserHint')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
+      '<textarea id="kiroAuthUrl" readonly rows="3" class="w-full font-mono text-xs p-2"' +
+      ' style="word-break:break-all; resize:none; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface); color:var(--text);"></textarea>' +
+      '</div>' +
+      '<div class="flex gap-2 mt-2">' +
+      '<button class="btn btn-primary btn-sm" id="kiroOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
+      '<button class="btn btn-outline btn-sm" id="kiroCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
       '</div>' +
       '<p id="kiroStatus" class="text-center text-sm mt-4 muted-text">' + escapeHtml(t('builderid.waiting')) + '</p>' +
       '<div class="modal-footer"><button class="btn btn-secondary" id="kiroCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
@@ -2238,7 +2242,16 @@
         kiroSsoSession = d.sessionId;
         $('kiroStep1').classList.add('hidden');
         $('kiroStep2').classList.remove('hidden');
+        $('kiroAuthUrl').textContent = d.authorizeUrl;
+        $('kiroOpenBtn').addEventListener('click', function() {
+          window.open($('kiroAuthUrl').textContent, '_blank');
+        });
+        $('kiroCopyBtn').addEventListener('click', async function() {
+          await copyText($('kiroAuthUrl').textContent);
+          toast(t('common.copied'), 'primary');
+        });
         $('kiroCancelBtn').addEventListener('click', cancelKiroSso);
+        // Auto-open browser (popup-blocker may suppress; user can click Open button)
         window.open(d.authorizeUrl, '_blank');
         pollKiroSso(2);
       } else {

@@ -325,12 +325,10 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" {
 		if profileArn, err := ResolveProfileArn(account); err == nil {
 			payload.ProfileArn = profileArn
+		} else if isProfileArnResolutionSoftError(err) {
+			logger.Debugf("[ProfileArn] Skipped profile ARN resolution for %s: %v", accountEmailForLog(account), err)
 		} else {
-			accountEmail := "<nil>"
-			if account != nil {
-				accountEmail = account.Email
-			}
-			logger.Warnf("[ProfileArn] Failed to resolve profile ARN for %s: %v", accountEmail, err)
+			logger.Warnf("[ProfileArn] Failed to resolve profile ARN for %s: %v", accountEmailForLog(account), err)
 		}
 	}
 
@@ -342,31 +340,17 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		// Update the origin field for the selected endpoint.
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
-		// Build region-specific URL from the account's effective API region.
-		// Non-AWS hosts (e.g. test/mock servers injected via kiroEndpoints) are
-		// used verbatim so the region rewrite only applies to real AWS endpoints.
-		endpointURL := ep.URL
-		if parsed, perr := url.Parse(ep.URL); perr == nil && strings.HasSuffix(parsed.Hostname(), ".amazonaws.com") {
-			apiRegion := account.EffectiveApiRegion()
-			switch ep.Name {
-			case "CodeWhisperer":
-				endpointURL = fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", apiRegion)
-			case "AmazonQ":
-				endpointURL = fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", apiRegion)
-			default: // Kiro IDE
-				endpointURL = fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", apiRegion)
-			}
-		}
-
+		// Target the account's region; endpoint URLs are declared for us-east-1.
+		epURL := regionalizeURL(ep.URL, account)
 		reqBody, _ := json.Marshal(payload)
-		req, err := http.NewRequest("POST", endpointURL, bytes.NewReader(reqBody))
+		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
 		if err != nil {
 			lastErr = err
 			continue
 		}
 
 		host := ""
-		if parsedURL, parseErr := url.Parse(endpointURL); parseErr == nil {
+		if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
 			host = parsedURL.Host
 		}
 		headerValues := buildStreamingHeaderValues(account, host)
@@ -377,6 +361,9 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 			req.Header.Set("X-Amz-Target", ep.AmzTarget)
 		}
 		applyKiroBaseHeaders(req, account, headerValues)
+		if account.AuthMethod == "external_idp" {
+			req.Header.Set("TokenType", "EXTERNAL_IDP")
+		}
 		req.Header.Set("x-amzn-kiro-agent-mode", "vibe")
 		req.Header.Set("x-amzn-codewhisperer-optout", "true")
 		req.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
