@@ -56,6 +56,12 @@ type KiroSsoSession struct {
 	// Single-shot gate: true sau khi external IdP descriptor đã được xử lý
 	leg2Processing bool
 
+	// idpAuthorizeURL lưu Microsoft authorize URL đã tính ở Leg-1 (cùng PKCE pair).
+	// Cho phép Leg-1 idempotent: hit lặp lại với cùng state (vd: copy URL mở browser
+	// ẩn danh) sẽ re-redirect tới đúng URL này thay vì trả 204, nên browser nào hoàn
+	// tất login Microsoft cũng được.
+	idpAuthorizeURL string
+
 	// Kết quả cuối cùng
 	ResultCh chan KiroSsoResult
 
@@ -411,10 +417,20 @@ func (s *KiroSsoSession) handleLoopback(w http.ResponseWriter, r *http.Request) 
 	loginOption := query.Get("login_option")
 	issuerURL := query.Get("issuer_url")
 	if strings.EqualFold(loginOption, "external_idp") || issuerURL != "" {
-		// Single-shot protection (zsec: check leg2 != nil → 204)
+		// Idempotent Leg-1: lần đầu xử lý descriptor và tính Microsoft authorize URL.
+		// Các lần hit lại với cùng state (vd: user copy URL mở trình duyệt ẩn danh sau
+		// khi tab auto-open đã chạy) re-redirect tới đúng URL đã tính — dùng chung PKCE
+		// pair nên browser nào hoàn tất login cũng đổi được token.
 		s.loopbackMu.Lock()
 		if s.leg2Processing {
+			cachedURL := s.idpAuthorizeURL
 			s.loopbackMu.Unlock()
+			// State phải khớp Leg-1 — chặn stray hit / CSRF.
+			if cachedURL != "" && query.Get("state") == s.State {
+				w.Header().Set("Location", cachedURL)
+				w.WriteHeader(http.StatusFound)
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -530,6 +546,11 @@ func (s *KiroSsoSession) handleExternalIdpDescriptor(w http.ResponseWriter, r *h
 	}
 
 	idpAuthorizeURL := fmt.Sprintf("%s?%s", authEndpoint, idpParams.Encode())
+
+	// Cache URL để các lần hit lại Leg-1 (vd: copy URL mở ẩn danh) re-redirect được.
+	s.loopbackMu.Lock()
+	s.idpAuthorizeURL = idpAuthorizeURL
+	s.loopbackMu.Unlock()
 
 	// 302 redirect browser đến IdP
 	w.Header().Set("Location", idpAuthorizeURL)

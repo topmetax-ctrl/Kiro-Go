@@ -2251,8 +2251,6 @@
           toast(t('common.copied'), 'primary');
         });
         $('kiroCancelBtn').addEventListener('click', cancelKiroSso);
-        // Auto-open browser (popup-blocker may suppress; user can click Open button)
-        window.open(d.authorizeUrl, '_blank');
         pollKiroSso(2);
       } else {
         toastError(t('common.failed') + ': ' + (d.error || ''));
