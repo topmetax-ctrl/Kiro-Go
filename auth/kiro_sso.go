@@ -187,6 +187,13 @@ var allowedExternalIdpHosts = []string{
 // Leg-1 URL gửi đúng 5 params như zsec: state, code_challenge, code_challenge_method,
 // redirect_uri (root path), redirect_from. KHÔNG gửi client_id, response_type, scope.
 func StartKiroSsoLogin(loginHint string) (sessionID, authorizeURL string, loopbackPort int, err error) {
+	// 0. Một user chỉ có 1 flow login active tại một thời điểm. Mỗi session pending
+	// giữ 1 port loopback trong tối đa 10 phút; nếu user bấm "start" nhiều lần (login
+	// dở dang, đổi tài khoản, refresh trang) thì các session cũ leak port, và chỉ có
+	// 10 port → cạn nhanh, gây lỗi "tất cả port loopback đều bận". Hủy mọi session cũ
+	// ngay khi bắt đầu flow mới để trả port về tức thì.
+	cancelAllPendingKiroSsoSessions()
+
 	// 1. Tạo PKCE pair cho Leg-1 (Kiro portal)
 	codeVerifier := generateCodeVerifier()
 	codeChallenge := generateCodeChallenge(codeVerifier)
@@ -840,6 +847,25 @@ func escapeHTML(s string) string {
 func shutdownLoopbackServer(s *KiroSsoSession) {
 	if s.LoopbackServer != nil {
 		s.LoopbackServer.Close()
+	}
+}
+
+// cancelAllPendingKiroSsoSessions hủy TẤT CẢ session SSO đang tồn tại và giải phóng
+// loopback port của chúng ngay lập tức. Gọi khi bắt đầu một flow login mới: một user
+// chỉ có 1 flow active, nên session cũ (login dở dang, đổi tài khoản, refresh trang)
+// chỉ tổ leak port. Khác với cleanupExpiredKiroSsoSessions (chỉ dọn session đã hết hạn),
+// hàm này dọn cả session chưa hết hạn.
+func cancelAllPendingKiroSsoSessions() {
+	kiroSsoSessionsMu.Lock()
+	stale := make([]*KiroSsoSession, 0, len(kiroSsoSessions))
+	for id, s := range kiroSsoSessions {
+		stale = append(stale, s)
+		delete(kiroSsoSessions, id)
+	}
+	kiroSsoSessionsMu.Unlock()
+
+	for _, s := range stale {
+		shutdownLoopbackServer(s)
 	}
 }
 

@@ -1,5 +1,5 @@
 {
-  "version": "1.2.4",
-  "changelog": "Import: backend now auto-detects External IdP (Microsoft Entra) accounts from issuerUrl/idpClientId/provider, so a stale cached frontend or a JSON export missing authMethod no longer misclassifies them as social (which failed with 401 Bad credentials).\nExport: single-account detail export now includes issuerUrl/idpClientId/scopes/loginHint so External IdP accounts can refresh after re-import.\nImport: backend tự nhận diện tài khoản External IdP (Microsoft Entra) từ issuerUrl/idpClientId/provider, tránh bị phân loại nhầm thành social (gây lỗi 401 Bad credentials) khi frontend cũ bị cache hoặc JSON export thiếu authMethod.",
+  "version": "1.2.5",
+  "changelog": "Kiro Hosted SSO: starting a new login now cancels all pending sessions, freeing leaked loopback ports (fixes \"all loopback ports busy\" after several aborted logins).\nExport: Copy JSON buttons (bulk export + per-account) now keep External IdP metadata (issuerUrl/idpClientId/provider/scopes/loginHint/authMethod), so copied Microsoft Entra accounts no longer re-import as social and fail with 401 Bad credentials.\nKiro Hosted SSO: bắt đầu login mới sẽ hủy mọi session đang chờ, giải phóng port loopback bị leak (sửa lỗi \"tất cả port loopback đều bận\").\nExport: nút Copy JSON giờ giữ đủ metadata External IdP nên account Microsoft Entra copy ra không còn bị import nhầm thành social (lỗi 401 Bad credentials).",
   "download": "https://github.com/Quorinex/Kiro-Go"
 }

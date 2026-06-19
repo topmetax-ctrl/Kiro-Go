@@ -940,8 +940,10 @@
       const jsonPromise = api('/accounts/' + id + '/full').then(async res => {
         if (!res.ok) throw new Error('Failed');
         const a = await res.json();
-        const { clientId, clientSecret, accessToken, refreshToken } = a;
-        return JSON.stringify({ clientId, clientSecret, accessToken, refreshToken }, null, 2);
+        const { clientId, clientSecret, accessToken, refreshToken,
+          authMethod, provider, issuerUrl, idpClientId, scopes, loginHint, region, expiresAt } = a;
+        return JSON.stringify({ clientId, clientSecret, accessToken, refreshToken,
+          authMethod, provider, issuerUrl, idpClientId, scopes, loginHint, region, expiresAt }, null, 2);
       });
       await copyText(jsonPromise);
       flashCopySuccess(btn);
@@ -2727,8 +2729,11 @@
     const jsonPromise = getExportData().then(data => {
       if (!data) throw new Error('no-data');
       const filtered = (data.accounts || []).map(a => {
-        const { clientId, clientSecret, accessToken, refreshToken } = a.credentials || {};
-        return { clientId, clientSecret, accessToken, refreshToken };
+        const c = a.credentials || {};
+        const { clientId, clientSecret, accessToken, refreshToken,
+          authMethod, provider, issuerUrl, idpClientId, scopes, loginHint, region, expiresAt } = c;
+        return { clientId, clientSecret, accessToken, refreshToken,
+          authMethod, provider, issuerUrl, idpClientId, scopes, loginHint, region, expiresAt };
       });
       return JSON.stringify(filtered, null, 2);
     });
