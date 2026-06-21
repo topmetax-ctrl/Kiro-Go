@@ -62,8 +62,13 @@ func accountEmailForLog(account *config.Account) string {
 
 // ensureRestProfileArn resolves the account profile ARN before REST calls,
 // softly skipping when resolution is unsupported (e.g. Builder ID accounts).
+// api_key accounts authenticate via API_KEY tokentype and do not need a profileArn.
 func ensureRestProfileArn(account *config.Account) error {
 	if account == nil || strings.TrimSpace(account.ProfileArn) != "" {
+		return nil
+	}
+	// api_key accounts don't need profileArn — they auth with tokentype: API_KEY
+	if account.AuthMethod == "api_key" {
 		return nil
 	}
 	profileArn, err := ResolveProfileArn(account)
