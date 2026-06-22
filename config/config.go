@@ -620,6 +620,28 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	return nil
 }
 
+// UpdateAccountProfileArnWithRegion persists a resolved profile ARN and, when
+// apiRegion is non-empty, pins the account's data-plane region to it. Kiro /
+// Q Developer profiles are regional (e.g. KiroProfile-eu-central-1), and the
+// region that owns a profile can differ from the SSO/auth region. Recording the
+// API region alongside the ARN ensures subsequent data-plane calls target the
+// correct regional endpoint without re-probing. The auth region (account.Region)
+// is intentionally left untouched so OIDC token refresh keeps working.
+func UpdateAccountProfileArnWithRegion(id, profileArn, apiRegion string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].ProfileArn = profileArn
+			if apiRegion != "" {
+				cfg.Accounts[i].ApiRegion = apiRegion
+			}
+			return Save()
+		}
+	}
+	return nil
+}
+
 func DeleteAccount(id string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
