@@ -4,14 +4,11 @@ package proxy
 
 import (
 	"bytes"
-	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -22,7 +19,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	utls "github.com/refraction-networking/utls"
 )
 
 // Endpoint configuration (auto-fallback on quota exhaustion).
@@ -110,78 +106,19 @@ func ResolveAccountProxyURL(account *config.Account) string {
 }
 
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
-// Uses utls to mimic a Chrome TLS fingerprint (JA3 hash) so AWS anti-abuse
-// Chrome ALPN with HTTP/1.1 only. We build this once at init time by cloning
-// the Chrome spec and removing "h2" from ALPN. Go's HTTP transport cannot
-// detect HTTP/2 negotiated by an external TLS dialer, so we must force
-// HTTP/1.1 at the TLS layer.
-var chromeHttp1Spec utls.ClientHelloSpec
-
-func init() {
-	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
-	if err != nil {
-		return
-	}
-	chromeHttp1Spec = spec
-	for i, ext := range chromeHttp1Spec.Extensions {
-		if alp, ok := ext.(*utls.ALPNExtension); ok {
-			alp.AlpnProtocols = []string{"http/1.1"}
-			chromeHttp1Spec.Extensions[i] = alp
-			break
-		}
-	}
-}
-
-// does not flag Go's default crypto/tls ClientHello.
 func buildKiroTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
-		// utls Chrome fingerprint negotiates "h2" by default, but Go's
-		// transport cannot detect ALPN from an external TLS connection.
-		// Force HTTP/1.1 to avoid "malformed HTTP response" errors.
-		ForceAttemptHTTP2: false,
-		TLSNextProto:      make(map[string]func(string, *tls.Conn) http.RoundTripper),
-		// Use a Chrome TLS fingerprint via utls to avoid AWS anti-abuse
-		// detection that targets Go's default crypto/tls JA3 hash.
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			dialer := &net.Dialer{}
-			rawConn, err := dialer.DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-
-			serverName, _, _ := net.SplitHostPort(addr)
-			if serverName == "" {
-				serverName = addr
-			}
-
-			// Start with a dummy ID; we'll apply the Chrome spec below.
-			uconn := utls.UClient(rawConn, &utls.Config{
-				ServerName: serverName,
-			}, utls.HelloGolang)
-
-			if chromeHttp1Spec.Extensions != nil {
-				uconn.ApplyPreset(&chromeHttp1Spec)
-			}
-
-			if err := uconn.HandshakeContext(ctx); err != nil {
-				rawConn.Close()
-				return nil, err
-			}
-			return uconn, nil
-		},
+		ForceAttemptHTTP2:   true,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
 			t.Proxy = http.ProxyURL(u)
-			// When using a forward proxy, Go will CONNECT through it
-			// and the proxy handles the TLS to the target. Reset
-			// DialTLSContext so Go uses standard TLS through the tunnel.
+			// Proxied connections cannot negotiate HTTP/2.
 			t.ForceAttemptHTTP2 = false
-			t.DialTLSContext = nil
 		}
 	} else {
 		t.Proxy = http.ProxyFromEnvironment
