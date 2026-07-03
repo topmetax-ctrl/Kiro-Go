@@ -428,9 +428,10 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		}
 
 		if resp.StatusCode == 429 {
+			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
+			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), body=%s, trying next...", ep.Name, string(errBody))
+			lastErr = fmt.Errorf("quota exhausted on %s: %s", ep.Name, string(errBody))
 			continue
 		}
 

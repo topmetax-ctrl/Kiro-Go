@@ -33,6 +33,7 @@
   let customSelectUid = 0;
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
+  let injectFeatureAvailable = false;
 
   // DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -670,7 +671,7 @@
 
   // Data loaders
   async function loadData() {
-    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
+    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion(), loadInjectStatus()]);
     renderEndpointCode('claudeEndpoint', baseUrl + '/v1/messages');
     renderEndpointCode('openaiEndpoint', baseUrl + '/v1/chat/completions');
     renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
@@ -692,6 +693,15 @@
     const res = await api('/accounts');
     accountsData = await res.json();
     renderAccounts();
+  }
+  async function loadInjectStatus() {
+    try {
+      const res = await api('/inject/status', { method: 'GET' });
+      const d = await res.json();
+      injectFeatureAvailable = !!(d && d.available);
+    } catch (e) {
+      injectFeatureAvailable = false;
+    }
   }
 
   // Account list
@@ -874,6 +884,8 @@
           escapeHtml(a.enabled ? t('accounts.disable') : t('accounts.enable')) +
           '</button>') +
         '<button class="btn btn-sm btn-secondary" data-action="test" data-id="' + idAttr + '" id="test-' + idAttr + '">' + escapeHtml(t('accounts.test')) + '</button>' +
+        (injectFeatureAvailable ?
+          '<button class="btn btn-sm btn-outline" data-action="inject" data-id="' + idAttr + '" id="inject-' + idAttr + '" title="Ghi credential vào Kiro IDE để đăng nhập account này">Inject</button>' : '') +
         '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '">' + escapeHtml(t('accounts.delete')) + '</button>' +
         '</div>' +
         '</div>' +
@@ -913,6 +925,29 @@
       toastError(t('accounts.refreshFailed'));
     }
     if (card) card.classList.remove('loading');
+  }
+  async function injectAccount(id, btn) {
+    const acc = accountsData.find(a => a.id === id);
+    const email = acc ? getDisplayEmail(acc.email, acc.id) : id;
+    const ok = await confirmAction(
+      'Ghi credential của "' + email + '" vào Kiro IDE trên máy này? File đăng nhập hiện tại sẽ bị ghi đè. Sau khi xong, hãy khởi động lại Kiro IDE.',
+      { title: 'Inject vào Kiro IDE', confirmText: 'Inject' }
+    );
+    if (!ok) return;
+    if (btn) btn.setAttribute('aria-busy', 'true');
+    try {
+      const res = await api('/inject', { method: 'POST', body: JSON.stringify({ id }) });
+      const d = await res.json();
+      if (res.ok && d.success) {
+        toast(d.message || 'Đã ghi credential. Khởi động lại Kiro IDE để đăng nhập.', 'success', { duration: 8000 });
+        if (d.cliNote) toastWarning(d.cliNote, { duration: 8000 });
+      } else {
+        toastError('Inject thất bại: ' + (d.error || t('common.failed')));
+      }
+    } catch (e) {
+      toastError((e && e.message) || t('common.failed'));
+    }
+    if (btn) btn.removeAttribute('aria-busy');
   }
   async function toggleAccount(id, enabled) {
     await api('/accounts/' + id, { method: 'PUT', body: JSON.stringify({ enabled }) });
@@ -3201,6 +3236,7 @@
       const id = btn.dataset.id;
       const action = btn.dataset.action;
       if (action === 'refresh') refreshAccount(id, btn.closest('.account-card'));
+      else if (action === 'inject') injectAccount(id, btn);
       else if (action === 'detail') showDetail(id);
       else if (action === 'copyJSON') copyAccountJSON(id, btn);
       else if (action === 'toggle') toggleAccount(id, btn.dataset.enabled === 'true');

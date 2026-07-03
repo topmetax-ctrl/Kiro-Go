@@ -10,7 +10,12 @@ services:
       - "9091:9091"
     volumes:
       - ./data:/app/data
+      # Bind-mount the host's Kiro IDE SSO cache so the "Inject" button can write
+      # kiro-auth-token.json straight to the host. Required for account injection.
+      - ${HOME}/.aws/sso/cache:/host-kiro-cache
     environment:
       - CONFIG_PATH=/app/data/config.json
       - LOOPBACK_HOST=0.0.0.0
+      # Where the inject feature writes the token file (the bind-mount target above).
+      - KIRO_INJECT_CACHE_DIR=/host-kiro-cache
     restart: unless-stopped

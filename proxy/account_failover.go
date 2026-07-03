@@ -11,7 +11,19 @@ const maxAccountRetryAttempts = 3
 
 func isQuotaErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
+	// Only match genuine quota exhaustion, not anti-abuse "suspicious activity" flags.
+	if strings.Contains(msg, "suspicious activity") {
+		return false
+	}
 	return strings.Contains(msg, "429") || strings.Contains(msg, "quota")
+}
+
+// isAntiAbuseMessage reports whether the error indicates an AWS anti-abuse
+// temporary limit (429 with "suspicious activity"). These should NOT be treated
+// as quota exhaustion — the account is not out of credits, it's being throttled.
+func isAntiAbuseMessage(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "429") && strings.Contains(msg, "suspicious activity")
 }
 
 func isOverageErrorMessage(msg string) bool {
@@ -98,6 +110,12 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)
 		h.pool.RecordError(account.ID, false)
+	case isAntiAbuseMessage(errMsg):
+		// AWS anti-abuse temporary limit ("suspicious activity").
+		// Use a short cooldown (not 1h) — this is a temporary throttle, not quota exhaustion.
+		// The account may work from a different TLS fingerprint or after a short wait.
+		h.pool.RecordError(account.ID, false)
+		logger.Warnf("[AccountFailover] Anti-abuse throttle for %s: %s", account.Email, errMsg)
 	case isQuotaErrorMessage(errMsg):
 		h.pool.RecordError(account.ID, true)
 	case isSuspensionErrorMessage(errMsg):

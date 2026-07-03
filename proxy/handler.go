@@ -2162,6 +2162,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetVersion(w, r)
 	case path == "/export" && r.Method == "POST":
 		h.apiExportAccounts(w, r)
+	case path == "/inject/status" && r.Method == "GET":
+		h.apiInjectStatus(w, r)
+	case path == "/inject" && r.Method == "POST":
+		h.apiInjectAccount(w, r)
 	case path == "/api-keys" && r.Method == "GET":
 		h.apiListApiKeys(w, r)
 	case path == "/api-keys" && r.Method == "POST":
@@ -4075,6 +4079,11 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		IdPClientID  string `json:"idpClientId,omitempty"`
 		Scopes       string `json:"scopes,omitempty"`
 		LoginHint    string `json:"loginHint,omitempty"`
+		// ProfileArn / IdpTokenEndpoint are needed to reconstruct a working
+		// kiro-auth-token.json (IDE) without a fresh login. Older Kiro Account
+		// Manager exports omit them; consumers that don't need them ignore them.
+		ProfileArn       string `json:"profileArn,omitempty"`
+		IdpTokenEndpoint string `json:"idpTokenEndpoint,omitempty"`
 	}
 
 	type ExportSubscription struct {
@@ -4163,6 +4172,8 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 				IdPClientID:  a.IdPClientID,
 				Scopes:       a.Scopes,
 				LoginHint:    a.LoginHint,
+				ProfileArn:       a.ProfileArn,
+				IdpTokenEndpoint: a.IdPTokenEndpoint,
 			},
 			Subscription: ExportSubscription{
 				Type:  subType,
