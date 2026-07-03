@@ -4,11 +4,14 @@ package proxy
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -19,6 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	utls "github.com/refraction-networking/utls"
 )
 
 // Endpoint configuration (auto-fallback on quota exhaustion).
@@ -57,7 +61,36 @@ var kiroRestHttpStore atomic.Pointer[http.Client]
 // proxyClientCache caches http.Client instances keyed by proxy URL for per-account proxy support.
 var proxyClientCache sync.Map
 
+// chromeHttp1Spec is a browser TLS ClientHello spec forced to HTTP/1.1-only ALPN.
+// Initialized in init() below, before any HTTP client is created.
+var chromeHttp1Spec utls.ClientHelloSpec
+
+func initChromeSpec() {
+	// Try Safari/iOS fingerprint first — closest to macOS SecureTransport used by Kiro IDE.
+	spec, err := utls.UTLSIdToSpec(utls.HelloSafari_Auto)
+	if err != nil {
+		logger.Warnf("[TLS] HelloSafari_Auto failed: %v, trying HelloChrome_Auto", err)
+		spec, err = utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+		if err != nil {
+			logger.Warnf("[TLS] HelloChrome_Auto also failed: %v", err)
+			return
+		}
+	}
+	chromeHttp1Spec = spec
+	// Force HTTP/1.1 ALPN only — Go's HTTP transport cannot detect h2
+	// negotiated by an external TLS dialer.
+	for i, ext := range chromeHttp1Spec.Extensions {
+		if alp, ok := ext.(*utls.ALPNExtension); ok {
+			alp.AlpnProtocols = []string{"http/1.1"}
+			chromeHttp1Spec.Extensions[i] = alp
+			break
+		}
+	}
+	logger.Debugf("[TLS] utls browser fingerprint initialized successfully")
+}
+
 func init() {
+	initChromeSpec()
 	InitKiroHttpClient("")
 }
 
@@ -106,24 +139,69 @@ func ResolveAccountProxyURL(account *config.Account) string {
 }
 
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
+// Uses utls to mimic a Chrome TLS fingerprint (JA3 hash) so AWS anti-abuse
+// does not flag Go's default crypto/tls ClientHello.
+//
+// Chrome ALPN with HTTP/1.1 only. We build this once at init time by cloning
+// the Chrome spec and removing "h2" from ALPN. Go's HTTP transport cannot
+// detect HTTP/2 negotiated by an external TLS dialer, so we must force
+// HTTP/1.1 at the TLS layer.
 func buildKiroTransport(proxyURL string) *http.Transport {
+	logger.Debugf("[TLS] buildKiroTransport proxyURL=%q", proxyURL)
 	t := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		// utls browser fingerprint negotiates "h2" by default, but Go's
+		// transport cannot detect ALPN from an external TLS connection.
+		// Force HTTP/1.1 to avoid "malformed HTTP response" errors.
+		ForceAttemptHTTP2: false,
+		TLSNextProto:      make(map[string]func(string, *tls.Conn) http.RoundTripper),
+		DialTLSContext:    kiroDialTLS,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
 			t.Proxy = http.ProxyURL(u)
-			// Proxied connections cannot negotiate HTTP/2.
 			t.ForceAttemptHTTP2 = false
 		}
 	} else {
 		t.Proxy = http.ProxyFromEnvironment
 	}
 	return t
+}
+
+// kiroDialTLS performs a TLS handshake using a browser fingerprint (utls)
+// to avoid AWS anti-abuse detection of Go's default crypto/tls JA3 hash.
+func kiroDialTLS(ctx context.Context, network, addr string) (net.Conn, error) {
+	logger.Debugf("[TLS] utls browser fingerprint dialing %s", addr)
+	dialer := &net.Dialer{}
+	rawConn, err := dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	serverName, _, _ := net.SplitHostPort(addr)
+	if serverName == "" {
+		serverName = addr
+	}
+
+	uconn := utls.UClient(rawConn, &utls.Config{
+		ServerName: serverName,
+	}, utls.HelloGolang)
+
+	if chromeHttp1Spec.Extensions != nil {
+		if err := uconn.ApplyPreset(&chromeHttp1Spec); err != nil {
+			logger.Warnf("[TLS] ApplyPreset failed: %v, falling back to HelloGolang", err)
+		}
+	}
+
+	if err := uconn.HandshakeContext(ctx); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("utls handshake to %s: %w", addr, err)
+	}
+	logger.Debugf("[TLS] utls handshake complete for %s", addr)
+	return uconn, nil
 }
 
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
