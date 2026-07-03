@@ -239,7 +239,7 @@ func (p *AccountPool) RecordSuccess(id string) {
 	p.errorCounts[id] = 0
 }
 
-// RecordError 记录请求错误，设置冷却
+// RecordError logs a request error and sets cooldown.
 func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -247,12 +247,44 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.errorCounts[id]++
 
 	if isQuotaError {
-		// 配额错误，冷却 1 小时
+		// Quota exhaustion: cooldown 1 hour.
 		p.cooldowns[id] = time.Now().Add(time.Hour)
 	} else if p.errorCounts[id] >= 3 {
-		// 连续 3 次错误，冷却 1 分钟
+		// Consecutive non-quota errors: short cooldown.
 		p.cooldowns[id] = time.Now().Add(time.Minute)
 	}
+}
+
+// RecordAntiAbuse logs an AWS anti-abuse "suspicious activity" 429 response.
+// Uses exponential backoff: 5min → 10min → 20min → 40min → 80min (capped).
+// This prevents rapid retries from renewing the AWS-side investigation timer.
+func (p *AccountPool) RecordAntiAbuse(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.errorCounts[id]++
+
+	// Exponential backoff: base 5 minutes, double each consecutive anti-abuse.
+	// Cap at 80 minutes (approx 1.3 hours).
+	minutes := 5
+	for i := 1; i < p.errorCounts[id]; i++ {
+		minutes *= 2
+		if minutes > 80 {
+			minutes = 80
+			break
+		}
+	}
+	p.cooldowns[id] = time.Now().Add(time.Duration(minutes) * time.Minute)
+}
+
+// ResetAntiAbuse resets the anti-abuse error count for an account.
+// Called when an account successfully completes a streaming request,
+// indicating the AWS-side investigation period has ended.
+func (p *AccountPool) ResetAntiAbuse(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.errorCounts[id] = 0
+	delete(p.cooldowns, id)
 }
 
 // IsAuthFailure reports whether an error indicates the refresh token / credentials

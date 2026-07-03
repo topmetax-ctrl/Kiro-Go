@@ -112,9 +112,9 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		h.pool.RecordError(account.ID, false)
 	case isAntiAbuseMessage(errMsg):
 		// AWS anti-abuse temporary limit ("suspicious activity").
-		// Use a short cooldown (not 1h) — this is a temporary throttle, not quota exhaustion.
-		// The account may work from a different TLS fingerprint or after a short wait.
-		h.pool.RecordError(account.ID, false)
+		// Exponential backoff (5→10→20→40→80 min) avoids renewing
+		// the AWS-side investigation timer with rapid retries.
+		h.pool.RecordAntiAbuse(account.ID)
 		logger.Warnf("[AccountFailover] Anti-abuse throttle for %s: %s", account.Email, errMsg)
 	case isQuotaErrorMessage(errMsg):
 		h.pool.RecordError(account.ID, true)
