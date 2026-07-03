@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.kiro-go.proxy</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/macdev/Demo/Kiro-Go/kiro-go-darwin</string>
+	</array>
+
+	<key>WorkingDirectory</key>
+	<string>/Users/macdev/Demo/Kiro-Go</string>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>CONFIG_PATH</key>
+		<string>/Users/macdev/Demo/Kiro-Go/data/config.json</string>
+		<key>KIRO_INJECT_CACHE_DIR</key>
+		<string>/Users/macdev/.aws/sso/cache</string>
+		<key>LOOPBACK_HOST</key>
+		<string>0.0.0.0</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>StandardOutPath</key>
+	<string>/Users/macdev/Demo/Kiro-Go/logs/stdout.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>/Users/macdev/Demo/Kiro-Go/logs/stderr.log</string>
+
+	<key>ProcessType</key>
+	<string>Background</string>
+
+	<key>Nice</key>
+	<integer>-5</integer>
+</dict>
+</plist>

@@ -11,6 +11,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -464,8 +465,22 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	// Build endpoint list ordered by configuration.
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
 
+	// Inter-request jitter: add 200-800ms random delay before first attempt
+	// to avoid machine-like timing patterns that trigger anti-abuse detection.
+	jitterBase := 200
+	if len(endpoints) > 1 {
+		// More endpoints = more attempts = more jitter needed
+		jitterBase = 400
+	}
+	time.Sleep(time.Duration(jitterBase+randIntn(600)) * time.Millisecond)
+
 	var lastErr error
-	for _, ep := range endpoints {
+	for i, ep := range endpoints {
+		// Add jitter between endpoint fallback attempts (not before first).
+		// This avoids the burst pattern of hitting all 3 endpoints in <1 second.
+		if i > 0 {
+			time.Sleep(time.Duration(200+randIntn(500)) * time.Millisecond)
+		}
 		// Update the origin field for the selected endpoint.
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
@@ -972,4 +987,9 @@ func extractEventType(headers []byte) string {
 		}
 	}
 	return ""
+}
+
+// randIntn returns a random integer in [0, n).
+func randIntn(n int) int {
+	return rand.Intn(n)
 }
