@@ -137,6 +137,7 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 	url := fmt.Sprintf("%s/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", kiroRestAPIBase)
 	url = regionalizeURL(url, account)
 	url = withProfileArnQuery(url, account)
+	url = maybeUseTerminator(url, account)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -206,6 +207,7 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 	url := fmt.Sprintf("%s/ListAvailableModels?origin=AI_EDITOR&maxResults=50", kiroRestAPIBase)
 	url = regionalizeURL(url, account)
 	url = withProfileArnQuery(url, account)
+	url = maybeUseTerminator(url, account)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {

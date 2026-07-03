@@ -1,246 +1,209 @@
 #!/usr/bin/env python3
 """
-Kiro TLS Terminator — CONNECT proxy using curl-impersonate.
+Kiro TLS Terminator v2 — HTTP Reverse Proxy using curl-impersonate.
 
-Accepts CONNECT tunnels from Go's HTTP transport, establishes TLS to the
-target using Chrome's BoringSSL fingerprint (bit-identical to real Chrome),
-and relays raw bytes between the Go client and Kiro server.
+Receives plain HTTP requests from Go proxy, forwards to Kiro using
+curl-impersonate with REAL Chrome BoringSSL TLS (bit-identical JA3/JA4).
+
+Architecture:
+  Go (plain HTTP) → Terminator → curl_cffi (Chrome BoringSSL) → Kiro HTTPS
 
 This gives:
-  - macOS TCP/IP stack (native Darwin kernel — not Linux VM)
-  - Chrome BoringSSL TLS fingerprint (JA3/JA4 matches real Chrome)
-  - HTTP/2 support (real Chrome H2 SETTINGS frames)
+  - macOS TCP/IP stack (native Darwin kernel — no Linux VM fingerprint)
+  - Chrome BoringSSL TLS fingerprint (bit-identical to Chrome 131)
+  - Real Chrome HTTP/2 SETTINGS frames
 
-Go proxy → CONNECT → Terminator (plain TCP) → curl-impersonate TLS → Kiro
+The Go proxy sends requests with X-Target-URL header specifying the
+actual Kiro endpoint.
 
 Usage:
   source .venv/bin/activate
   python3 kiro_tls_terminator.py --port 8888
 
-Then set account proxyURL to: http://host.docker.internal:8888
+Go proxy config:
+  Set account proxyURL to: http://host.docker.internal:8888
 """
 
 import argparse
-import select
-import socket
-import ssl as _ssl_module  # only for cert verification
-import struct
+import http.server
 import sys
-import threading
 import time
+import threading
+import urllib.parse
+import io
+
+from curl_cffi import requests as curl_requests
 
 # ── constants ──────────────────────────────────────────────────
-LISTEN_HOST = "127.0.0.1"
+LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8888
-BUFFER_SIZE = 32768
-CONNECT_TIMEOUT = 10  # seconds for TCP/TLS setup
-RELAY_TIMEOUT = 300   # seconds idle before closing tunnel
+IMPERSONATE = "chrome131"  # Chrome 131 on Windows (BoringSSL bit-identical)
+TIMEOUT = 300              # per-request timeout (streaming can be long)
 
-# curl-impersonate Chrome 131 TLS fingerprint (BoringSSL bit-identical)
-IMPERSONATE = "chrome131"
+# Headers we strip from incoming requests (Go sets them, we rebuild)
+STRIP_REQ = {"host", "connection", "transfer-encoding",
+             "accept-encoding", "content-length", "content-type"}
 
-
-# ── TLS context factory ─────────────────────────────────────────
-
-def create_tls_context():
-    """Create an SSL context with curl-impersonate Chrome fingerprint."""
-    from curl_cffi.requests import Session
-    # We don't use the Session API here — we just need the TLS context.
-    # Instead, we'll use curl_cffi's low-level curl wrapper for actual requests.
-    pass  # handled per-connection below
+# Headers we strip from Kiro responses before forwarding
+STRIP_RES = {"transfer-encoding", "connection", "keep-alive"}
 
 
-# ── connection relay ────────────────────────────────────────────
+# ── handler ─────────────────────────────────────────────────────
 
-def relay(go_conn: socket.socket, kiro_conn, conn_id: int):
-    """Bidirectional relay between Go client and Kiro server."""
-    start = time.monotonic()
-    sockets = [go_conn, kiro_conn]
-    total_up = 0
-    total_down = 0
-    closed = False
+class TerminatorHandler(http.server.BaseHTTPRequestHandler):
+    """Forward HTTP requests to Kiro via curl_cffi with Chrome BoringSSL TLS."""
 
-    try:
-        while not closed:
-            readable, _, exceptional = select.select(sockets, [], sockets, RELAY_TIMEOUT)
-            if not readable and not exceptional:
-                break  # timeout
+    # Per-host session cache: host → curl_cffi.Session
+    _sessions = {}
+    _lock = threading.Lock()
 
-            for sock in readable:
+    def do_POST(self):
+        self._forward("POST")
+
+    def do_GET(self):
+        self._forward("GET")
+
+    def do_PUT(self):
+        self._forward("PUT")
+
+    # --------------------------------------------------------------
+    def _forward(self, method):
+        start = time.monotonic()
+
+        # Read body
+        cl = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(cl) if cl > 0 else b""
+
+        # Determine target URL
+        target = self.headers.get("X-Target-URL", "")
+        if not target:
+            # Go HTTP proxy sends absolute URL in request line:
+            # "POST http://q.us-east-1.amazonaws.com/path HTTP/1.1"
+            # Python's http.server parses this as self.path
+            path = self.path
+            if path.startswith("http://") or path.startswith("https://"):
+                target = path.replace("http://", "https://", 1)
+            elif path.startswith("/https://") or path.startswith("/http://"):
+                target = path[1:].replace("http://", "https://", 1)
+            else:
+                # Relative path — assume Kiro IDE
+                target = f"https://q.us-east-1.amazonaws.com{path}"
+
+        if not target.startswith("https://"):
+            target = target.replace("http://", "https://", 1)
+
+        parsed = urllib.parse.urlparse(target)
+        host = parsed.hostname or "q.us-east-1.amazonaws.com"
+
+        # Build headers
+        fwd_headers = {}
+        content_type = ""
+        for k, v in self.headers.items():
+            lk = k.lower()
+            if lk in STRIP_REQ:
+                continue
+            if lk == "content-type":
+                content_type = v
+            fwd_headers[k] = v
+
+        # Get cached session (Chrome BoringSSL TLS)
+        session = self._get_session(host)
+
+        try:
+            if method == "GET":
+                resp = session.get(target, headers=fwd_headers, timeout=TIMEOUT)
+            elif method == "PUT":
+                resp = session.put(target, headers=fwd_headers, data=body, timeout=TIMEOUT)
+            else:
+                resp = session.post(target, headers=fwd_headers, data=body,
+                                    timeout=TIMEOUT)
+
+            # Send status
+            self.send_response(resp.status_code)
+
+            # Copy response headers
+            for k, v in resp.headers.items():
+                if k.lower() in STRIP_RES:
+                    continue
                 try:
-                    data = sock.recv(BUFFER_SIZE)
+                    self.send_header(k, v)
                 except Exception:
-                    closed = True
-                    break
+                    pass
 
-                if not data:
-                    closed = True
-                    break
+            self.end_headers()
 
-                # Determine direction
-                if sock is go_conn:
-                    kiro_conn.sendall(data)
-                    total_up += len(data)
-                else:
-                    go_conn.sendall(data)
-                    total_down += len(data)
+            # Write response body
+            self.wfile.write(resp.content)
 
-            if exceptional:
-                break
-    except Exception:
-        pass
-    finally:
-        elapsed = time.monotonic() - start
-        print(f"[terminator] conn {conn_id} closed "
-              f"(↑{total_up}B ↓{total_down}B, {elapsed:.1f}s)", file=sys.stderr)
-        try:
-            go_conn.close()
-        except Exception:
-            pass
-        try:
-            kiro_conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            print(f"[terminator] ERROR {method} {host}: {exc} ({elapsed:.1f}s)",
+                  file=sys.stderr)
+            try:
+                self.send_error(502, str(exc))
+            except Exception:
+                pass
+        else:
+            elapsed = time.monotonic() - start
+            print(f"[terminator] {resp.status_code} {method} {target[:80]} "
+                  f"({len(resp.content)}B, {elapsed:.1f}s)", file=sys.stderr)
 
+    # --------------------------------------------------------------
+    def _get_session(self, host: str) -> curl_requests.Session:
+        with self._lock:
+            sess = self._sessions.get(host)
+            if sess is not None:
+                return sess
 
-# ── CONNECT handler ─────────────────────────────────────────────
+        sess = curl_requests.Session()
+        sess.impersonate = IMPERSONATE
+        sess.timeout = TIMEOUT
+        sess.max_connections = 10
+        sess.max_keepalive_connections = 5
+        sess.keepalive_expiry = 30
 
-def handle_connect(client_conn: socket.socket, target_host: str, target_port: int,
-                   conn_id: int):
-    """Establish TLS to target using curl-impersonate, then relay."""
-    try:
-        # Create a socket to the target
-        target_sock = socket.create_connection(
-            (target_host, target_port), timeout=CONNECT_TIMEOUT
-        )
+        # Set Chrome-like default headers
+        sess.headers.update({
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
 
-        # Use curl_cffi to create a TLS-wrapped socket
-        from curl_cffi.requests import Session
-        from curl_cffi.const import CurlHttpVersion
+        with self._lock:
+            self._sessions[host] = sess
+        return sess
 
-        session = Session()
-        session.impersonate = IMPERSONATE
-
-        # We need raw socket TLS wrapping. curl_cffi doesn't expose this
-        # directly, so we use Python's ssl module with curl-impersonate's
-        # curl context. Since curl_cffi uses libcurl internally, we need
-        # to use the actual curl handle.
-        #
-        # Alternative: use curl_cffi's requests API and tunnel data through it.
-        # For the CONNECT proxy use case, we'll use a pipe-based approach.
-
-        import ssl as python_ssl
-
-        # Create SSL context with Chrome-like settings
-        ctx = python_ssl.create_default_context()
-        ctx.check_hostname = True
-        ctx.verify_mode = python_ssl.CERT_REQUIRED
-
-        # Note: Python's ssl module uses OpenSSL, not BoringSSL.
-        # For true Chrome fingerprint, we should use curl_cffi's curl handle.
-        # For now, we wrap with Python SSL and note the limitation.
-        # The TCP fingerprint (macOS) is still correct.
-
-        kiro_ssl = ctx.wrap_socket(target_sock, server_hostname=target_host)
-
-        print(f"[terminator] conn {conn_id} → {target_host}:{target_port} "
-              f"({python_ssl.OPENSSL_VERSION})", file=sys.stderr)
-
-        # Send 200 to Go client
-        client_conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-
-        # Relay
-        relay(client_conn, kiro_ssl, conn_id)
-
-    except Exception as exc:
-        print(f"[terminator] conn {conn_id} FAILED: {exc}", file=sys.stderr)
-        try:
-            client_conn.sendall(
-                f"HTTP/1.1 502 Bad Gateway\r\n\r\n{exc}\r\n".encode()
-            )
-        except Exception:
-            pass
-        try:
-            client_conn.close()
-        except Exception:
-            pass
+    def log_message(self, format, *args):
+        pass  # we handle logging
 
 
-# ── main proxy server ───────────────────────────────────────────
-
-_conn_counter = 0
-_conn_counter_lock = threading.Lock()
-
+# ── main ─────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Kiro TLS Terminator — CONNECT proxy with Chrome TLS"
+        description="Kiro TLS Terminator v2 — HTTP reverse proxy (Chrome BoringSSL)"
     )
     parser.add_argument("--port", type=int, default=LISTEN_PORT)
     parser.add_argument("--host", default=LISTEN_HOST)
     parser.add_argument("--impersonate", default=IMPERSONATE,
-                        choices=["chrome131", "chrome130", "chrome120",
-                                 "firefox133", "safari18_0"])
+                        choices=["chrome131", "chrome130", "chrome124",
+                                 "firefox133", "safari18_0", "edge101"])
     args = parser.parse_args()
 
-    global IMPERSONATE
-    IMPERSONATE = args.impersonate
+    TerminatorHandler.IMPERSONATE = args.impersonate
 
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind((args.host, args.port))
-    server_sock.listen(50)
+    server = http.server.ThreadingHTTPServer(
+        (args.host, args.port), TerminatorHandler
+    )
 
-    print(f"[terminator] {IMPERSONATE} CONNECT proxy — "
-          f"listening on {args.host}:{args.port}", file=sys.stderr)
-    print(f"[terminator] TCP stack: macOS Darwin (native)", file=sys.stderr)
-    print(f"[terminator] TLS: Chrome BoringSSL (curl-impersonate)", file=sys.stderr)
-
-    global _conn_counter
+    print(f"[terminator] {args.impersonate} TLS — Chrome BoringSSL (bit-identical)")
+    print(f"[terminator] TCP: macOS Darwin (native, not Linux VM)")
+    print(f"[terminator] listening on http://{args.host}:{args.port}")
+    print(f"[terminator] Ready. Set proxyURL=http://host.docker.internal:{args.port}")
 
     try:
-        while True:
-            client_conn, client_addr = server_sock.accept()
-
-            with _conn_counter_lock:
-                _conn_counter += 1
-                conn_id = _conn_counter
-
-            # Read CONNECT request
-            try:
-                client_conn.settimeout(CONNECT_TIMEOUT)
-                data = client_conn.recv(4096)
-                client_conn.settimeout(None)
-
-                line = data.split(b"\r\n")[0].decode("utf-8", errors="replace")
-                parts = line.split()
-                if len(parts) < 2 or parts[0].upper() != "CONNECT":
-                    client_conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                    client_conn.close()
-                    continue
-
-                target = parts[1]  # e.g., "q.us-east-1.amazonaws.com:443"
-                host, _, port_str = target.partition(":")
-                port = int(port_str) if port_str else 443
-
-            except Exception as exc:
-                print(f"[terminator] conn {conn_id} read error: {exc}", file=sys.stderr)
-                try:
-                    client_conn.close()
-                except Exception:
-                    pass
-                continue
-
-            # Handle in background thread
-            t = threading.Thread(
-                target=handle_connect,
-                args=(client_conn, host, port, conn_id),
-                daemon=True,
-            )
-            t.start()
-
+        server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[terminator] shutting down", file=sys.stderr)
+        print("\n[terminator] done")
 
 
 if __name__ == "__main__":

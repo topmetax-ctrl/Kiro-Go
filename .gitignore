@@ -26,3 +26,4 @@ PR-*.md
 
 # Playwright MCP test artifacts
 .playwright-mcp/
+kiro-go-darwin

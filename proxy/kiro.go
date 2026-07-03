@@ -139,6 +139,20 @@ func ResolveAccountProxyURL(account *config.Account) string {
 	return config.GetProxyURL()
 }
 
+// maybeUseTerminator rewrites an HTTPS URL to HTTP when a TLS terminator proxy
+// is configured. The terminator handles TLS (Chrome BoringSSL) so the Go proxy
+// sends plain HTTP. Used for Kiro API calls only.
+func maybeUseTerminator(rawURL string, account *config.Account) string {
+	proxyURL := ResolveAccountProxyURL(account)
+	if proxyURL == "" {
+		return rawURL
+	}
+	if strings.HasPrefix(rawURL, "https://") {
+		return "http://" + strings.TrimPrefix(rawURL, "https://")
+	}
+	return rawURL
+}
+
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
 // Uses utls to mimic a Chrome TLS fingerprint (JA3 hash) so AWS anti-abuse
 // does not flag Go's default crypto/tls ClientHello.
@@ -163,7 +177,15 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
-			t.Proxy = http.ProxyURL(u)
+			// Only route Kiro/AWS API hosts through the terminator.
+			// Microsoft login, token refresh, etc. go direct with uTLS.
+			t.Proxy = func(req *http.Request) (*url.URL, error) {
+				host := req.URL.Hostname()
+				if strings.HasSuffix(host, ".amazonaws.com") || strings.HasSuffix(host, ".amazonaws.com.cn") {
+					return u, nil
+				}
+				return nil, nil // direct connection
+			}
 			t.ForceAttemptHTTP2 = false
 		}
 	} else {
@@ -486,11 +508,26 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 		// Target the account's region; endpoint URLs are declared for us-east-1.
 		epURL := regionalizeURL(ep.URL, account)
+
+		// If a TLS terminator is configured, rewrite HTTPS → HTTP and
+		// add X-Target-URL so the terminator knows where to forward.
+		// This gives us real Chrome BoringSSL TLS + macOS TCP stack.
+		terminatorURL := ResolveAccountProxyURL(account)
+		originalURL := epURL
+		if terminatorURL != "" && strings.HasPrefix(epURL, "https://") {
+			epURL = "http://" + strings.TrimPrefix(epURL, "https://")
+		}
+
 		reqBody, _ := json.Marshal(payload)
 		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
 		if err != nil {
 			lastErr = err
 			continue
+
+		// Tell the terminator the real HTTPS target
+		if terminatorURL != "" && originalURL != epURL {
+			req.Header.Set("X-Target-URL", originalURL)
+		}
 		}
 
 		host := ""

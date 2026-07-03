@@ -4,6 +4,7 @@ package auth
 import (
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,7 +42,9 @@ func GetAuthClientForProxy(proxyURL string) *http.Client {
 	return client
 }
 
-// buildAuthTransport 构建带可选代理的 Transport
+// buildAuthTransport 构建带可选代理的 Transport。
+// Auth transport only routes Kiro/AWS hosts through the proxy.
+// Microsoft OAuth, token refresh, etc. must go direct.
 func buildAuthTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
 		MaxIdleConns:        50,
@@ -52,7 +55,14 @@ func buildAuthTransport(proxyURL string) *http.Transport {
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
-			t.Proxy = http.ProxyURL(u)
+			t.Proxy = func(req *http.Request) (*url.URL, error) {
+				host := req.URL.Hostname()
+				if strings.HasSuffix(host, ".amazonaws.com") ||
+					strings.HasSuffix(host, ".amazonaws.com.cn") {
+					return u, nil
+				}
+				return nil, nil // direct for Microsoft, etc.
+			}
 			t.ForceAttemptHTTP2 = false
 		}
 	} else {
