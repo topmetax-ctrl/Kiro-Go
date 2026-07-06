@@ -12,10 +12,22 @@ services:
       - ./data:/app/data
       # Bind-mount the host's Kiro IDE SSO cache so the "Inject" button can write
       # kiro-auth-token.json straight to the host. Required for account injection.
-      - ${HOME}/.aws/sso/cache:/host-kiro-cache
+      # The host path defaults to the macOS/Linux location (~/.aws/sso/cache); set
+      # KIRO_HOST_CACHE_DIR in .env to override (e.g. on Windows). See .env.example.
+      - "${KIRO_HOST_CACHE_DIR:-${HOME}/.aws/sso/cache}:/host-kiro-cache"
+      # Bind-mount the IDE's globalStorage (holds profile.json, the active-profile
+      # pointer) so Inject can also pin the correct profileArn. Without this the
+      # IDE keeps a stale arn from a prior login and usage/model-list calls 403
+      # when switching to an account on a different backend. The host path defaults
+      # to the macOS location; on Linux/Windows the globalStorage dir lives
+      # elsewhere, so set KIRO_HOST_PROFILE_DIR in .env to override (the path has a
+      # space on macOS, hence the quotes). See .env.example for per-OS values.
+      - "${KIRO_HOST_PROFILE_DIR:-${HOME}/Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent}:/host-kiro-profile"
     environment:
       - CONFIG_PATH=/app/data/config.json
       - LOOPBACK_HOST=0.0.0.0
       # Where the inject feature writes the token file (the bind-mount target above).
       - KIRO_INJECT_CACHE_DIR=/host-kiro-cache
+      # Where the inject feature writes profile.json (the globalStorage bind-mount).
+      - KIRO_INJECT_PROFILE_DIR=/host-kiro-profile
     restart: unless-stopped

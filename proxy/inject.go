@@ -36,7 +36,16 @@ import (
 // In Docker this is the in-container path of the bind-mounted host cache dir.
 const injectCacheDirEnv = "KIRO_INJECT_CACHE_DIR"
 
+// injectProfileDirEnv names the env var that points at the Kiro IDE
+// globalStorage dir holding profile.json (the active-profile pointer). In Docker
+// this is the in-container path of the bind-mounted host globalStorage dir. When
+// unset, injection still writes the token file but skips profile.json (the IDE
+// self-heals the profile only when its arn is missing, not when it is stale).
+const injectProfileDirEnv = "KIRO_INJECT_PROFILE_DIR"
+
 const kiroTokenFileName = "kiro-auth-token.json"
+
+const kiroProfileFileName = "profile.json"
 
 // injectCacheDir resolves where to write the token file. The env override wins
 // (set it to the bind-mount target in Docker); otherwise the host default
@@ -50,6 +59,67 @@ func injectCacheDir() (string, error) {
 		return "", fmt.Errorf("resolve home dir: %w", err)
 	}
 	return filepath.Join(home, ".aws", "sso", "cache"), nil
+}
+
+// injectProfileDir resolves where to write profile.json. The env override wins
+// (set it to the bind-mount target in Docker). When unset it returns "" — the
+// caller then skips the profile write rather than guessing a host path it can't
+// reach from a container.
+func injectProfileDir() string {
+	return strings.TrimSpace(os.Getenv(injectProfileDirEnv))
+}
+
+// kiroProfile is the shape of profile.json.
+type kiroProfile struct {
+	Arn  string `json:"arn"`
+	Name string `json:"name"`
+}
+
+// regionFromInjectProfileArn extracts the AWS region from a CodeWhisperer profile
+// ARN ("arn:aws:codewhisperer:<region>:<account>:profile/<id>"). Returns "" when
+// the ARN is empty or malformed.
+func regionFromInjectProfileArn(profileArn string) string {
+	arn := strings.TrimSpace(profileArn)
+	if arn == "" {
+		return ""
+	}
+	parts := strings.Split(arn, ":")
+	if len(parts) < 4 || parts[0] != "arn" || parts[2] != "codewhisperer" {
+		return ""
+	}
+	return strings.TrimSpace(parts[3])
+}
+
+// writeInjectProfile writes profile.json so the IDE's active profile points at
+// the account's profileArn. This is required because the IDE reads the active
+// profileArn from profile.json in its globalStorage, NOT from the token file,
+// and its ProfileArnGuard only self-heals when the arn is MISSING — a stale arn
+// left by a previous login is never validated against the current token, so
+// switching to an account on a different backend silently 403s usage/model-list
+// calls. Returns "" (no path, no error) when profileDir is unset or the account
+// has no profileArn to pin.
+func writeInjectProfile(profileDir, profileArn string) (string, error) {
+	arn := strings.TrimSpace(profileArn)
+	if profileDir == "" || arn == "" {
+		return "", nil
+	}
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		return "", fmt.Errorf("create profile dir: %w", err)
+	}
+	region := regionFromInjectProfileArn(arn)
+	if region == "" {
+		region = "us-east-1"
+	}
+	b, err := json.MarshalIndent(kiroProfile{Arn: arn, Name: "KiroProfile-" + region}, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal profile: %w", err)
+	}
+	path := filepath.Join(profileDir, kiroProfileFileName)
+	// profile.json is not secret (holds only an ARN); the IDE writes it 0644.
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		return "", fmt.Errorf("write %s: %w", kiroProfileFileName, err)
+	}
+	return path, nil
 }
 
 // injectAvailable reports whether injection is usable on this deployment. It is
@@ -84,9 +154,14 @@ type kiroIDEToken struct {
 	ClientIDHash string `json:"clientIdHash,omitempty"`
 	StartURL     string `json:"startUrl,omitempty"`
 	IssuerURL    string `json:"issuerUrl,omitempty"`
-	IdPClientID  string `json:"idpClientId,omitempty"`
-	Scopes       string `json:"scopes,omitempty"`
-	LoginHint    string `json:"loginHint,omitempty"`
+	// Kiro IDE refresh destructures token.clientId (verified: idpClientId occurs
+	// 0 times in the 0.12.263/0.12.333 bundle). Emitting "idpClientId" here makes
+	// the IDE read clientId=undefined and fail refresh with
+	// `"clientId" must be a non-empty string`, surfacing as "Auth provider:
+	// unexpected issue". The native external-IdP login writes "clientId".
+	IdPClientID string `json:"clientId,omitempty"`
+	Scopes      string `json:"scopes,omitempty"`
+	LoginHint   string `json:"loginHint,omitempty"`
 }
 
 // clientRegistration is the {clientIdHash}.json side file for IdC accounts.
@@ -222,9 +297,12 @@ func buildInjectToken(a config.Account) (tok kiroIDEToken, regName string, reg *
 	case "external_idp":
 		tok.AuthMethod = "external_idp"
 		tok.Region = region
-		if tok.Provider == "" {
-			tok.Provider = "MicrosoftEntra"
-		}
+		// Kiro IDE maps token.provider through a fixed table where only
+		// "ExternalIdp" yields a valid label ("External Identity Provider");
+		// it is also the exact value the IDE's own external-IdP login writes.
+		// Any other value (e.g. "MicrosoftEntra") renders as "Signed in with
+		// undefined". The specific IdP is identified by issuerUrl, not this field.
+		tok.Provider = "ExternalIdp"
 		tok.IssuerURL = a.IssuerURL
 		tok.IdPClientID = a.IdPClientID
 		tok.Scopes = a.Scopes
@@ -347,6 +425,16 @@ func (h *Handler) apiInjectAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		written = append(written, regPath)
+	}
+
+	// Pin the IDE's active profile to this account's profileArn. The IDE reads
+	// the active arn from profile.json in its globalStorage (not the token file);
+	// leaving a stale arn from a prior login makes usage/model-list calls 403.
+	// Only possible when the globalStorage dir is bind-mounted (env set).
+	if pPath, pErr := writeInjectProfile(injectProfileDir(), acc.ProfileArn); pErr != nil {
+		logger.Warnf("[Inject] token written but profile.json update failed for %s: %v", acc.Email, pErr)
+	} else if pPath != "" {
+		written = append(written, pPath)
 	}
 
 	method := normalizeInjectAuthMethod(*acc)

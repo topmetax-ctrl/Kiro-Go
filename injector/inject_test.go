@@ -2,6 +2,8 @@ package injector
 
 import (
 	"database/sql"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -141,6 +143,57 @@ func TestInjectKiroCLI_MissingDB(t *testing.T) {
 	}
 	if !contains(err.Error(), "run the CLI once") {
 		t.Fatalf("error should guide the user, got: %v", err)
+	}
+}
+
+// TestWriteKiroProfile writes profile.json into a temp dir and verifies the arn
+// is pinned and the region-derived name is correct.
+func TestWriteKiroProfile(t *testing.T) {
+	dir := t.TempDir()
+	acc := ExportAccount{Credentials: ExportCredentials{
+		ProfileArn: "arn:aws:codewhisperer:eu-central-1:123456789012:profile/ABCDEF",
+	}}
+	path, err := WriteKiroProfile(acc, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path == "" {
+		t.Fatalf("expected a written path")
+	}
+	if filepath.Base(path) != kiroProfileFileName {
+		t.Fatalf("wrote %q, want %s", path, kiroProfileFileName)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p kiroProfile
+	if err := json.Unmarshal(data, &p); err != nil {
+		t.Fatalf("profile.json not valid JSON: %v", err)
+	}
+	if p.Arn != acc.Credentials.ProfileArn {
+		t.Fatalf("arn = %q, want %q", p.Arn, acc.Credentials.ProfileArn)
+	}
+	// region is parsed from the arn, so the name must reflect eu-central-1.
+	if p.Name != "KiroProfile-eu-central-1" {
+		t.Fatalf("name = %q, want KiroProfile-eu-central-1", p.Name)
+	}
+}
+
+// TestWriteKiroProfile_NoArnSkips verifies an account without a profileArn writes
+// nothing (returns "" with no error) — we must not clobber a valid profile.json
+// with an empty arn.
+func TestWriteKiroProfile_NoArnSkips(t *testing.T) {
+	dir := t.TempDir()
+	path, err := WriteKiroProfile(ExportAccount{}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "" {
+		t.Fatalf("expected no write for an account with no profileArn, got %q", path)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, kiroProfileFileName)); !os.IsNotExist(statErr) {
+		t.Fatalf("profile.json should not exist when arn is empty")
 	}
 }
 

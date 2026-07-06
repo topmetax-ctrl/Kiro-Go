@@ -140,6 +140,12 @@ func TestBuildKiroIDEToken_ExternalIdP(t *testing.T) {
 	if tok.AuthMethod != "external_idp" {
 		t.Fatalf("authMethod = %q", tok.AuthMethod)
 	}
+	// Kiro IDE only recognizes "ExternalIdp" in its provider→label table; any
+	// other value (e.g. the stored "MicrosoftEntra") renders "Signed in with
+	// undefined". The build must normalize it regardless of the input provider.
+	if tok.Provider != "ExternalIdp" {
+		t.Fatalf("provider = %q, want ExternalIdp", tok.Provider)
+	}
 	if tok.IssuerURL == "" || tok.IdPClientID == "" || tok.Scopes == "" || tok.LoginHint == "" {
 		t.Fatalf("external IdP fields missing: %+v", tok)
 	}
@@ -151,6 +157,22 @@ func TestBuildKiroIDEToken_ExternalIdP(t *testing.T) {
 	}
 	if tok.ClientIDHash != "" || regName != "" || reg != nil {
 		t.Fatalf("external IdP must not produce a registration file")
+	}
+	// The IDE refresh reads token.clientId, not idpClientId. Assert on the
+	// serialized JSON key (not the Go field) so a tag regression is caught.
+	b, err := json.Marshal(tok)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m["clientId"] != "idp-client" {
+		t.Fatalf("clientId key = %v, want idp-client (IDE reads token.clientId)", m["clientId"])
+	}
+	if _, ok := m["idpClientId"]; ok {
+		t.Fatalf("idpClientId must not be serialized; the IDE never reads it")
 	}
 }
 

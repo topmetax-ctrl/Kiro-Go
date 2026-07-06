@@ -695,6 +695,7 @@
     renderAccounts();
   }
   async function loadInjectStatus() {
+    const prev = injectFeatureAvailable;
     try {
       const res = await api('/inject/status', { method: 'GET' });
       const d = await res.json();
@@ -702,6 +703,10 @@
     } catch (e) {
       injectFeatureAvailable = false;
     }
+    // loadData() runs this in parallel with loadAccounts(); if the account list
+    // rendered before this flag resolved, the Inject buttons are missing. Re-render
+    // once the flag becomes known so the buttons appear regardless of request order.
+    if (injectFeatureAvailable !== prev && accountsData.length) renderAccounts();
   }
 
   // Account list

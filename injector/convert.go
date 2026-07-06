@@ -96,8 +96,13 @@ type KiroIDEToken struct {
 	ClientIDHash string `json:"clientIdHash,omitempty"`
 	StartURL     string `json:"startUrl,omitempty"`
 	// External IdP (Microsoft Entra etc.) fields.
-	IssuerURL   string `json:"issuerUrl,omitempty"`
-	IdPClientID string `json:"idpClientId,omitempty"`
+	IssuerURL string `json:"issuerUrl,omitempty"`
+	// Kiro IDE refresh destructures token.clientId (verified: idpClientId occurs
+	// 0 times in the 0.12.263/0.12.333 bundle). Emitting "idpClientId" here makes
+	// the IDE read clientId=undefined and fail refresh with
+	// `"clientId" must be a non-empty string`. The native external-IdP login
+	// writes "clientId".
+	IdPClientID string `json:"clientId,omitempty"`
 	Scopes      string `json:"scopes,omitempty"`
 	LoginHint   string `json:"loginHint,omitempty"`
 }
@@ -155,9 +160,12 @@ func buildKiroIDEToken(a ExportAccount) (tok KiroIDEToken, regName string, reg *
 	case "external_idp":
 		tok.AuthMethod = "external_idp"
 		tok.Region = region
-		if tok.Provider == "" {
-			tok.Provider = "MicrosoftEntra"
-		}
+		// Kiro IDE maps token.provider through a fixed table where only
+		// "ExternalIdp" yields a valid label ("External Identity Provider");
+		// it is also the exact value the IDE's own external-IdP login writes.
+		// Any other value (e.g. "MicrosoftEntra") renders as "Signed in with
+		// undefined". The specific IdP is identified by issuerUrl, not this field.
+		tok.Provider = "ExternalIdp"
 		tok.IssuerURL = c.IssuerURL
 		tok.IdPClientID = c.IdPClientID
 		tok.Scopes = c.Scopes

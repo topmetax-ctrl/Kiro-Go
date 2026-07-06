@@ -246,13 +246,14 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 
 	p.errorCounts[id]++
 
-	if isQuotaError {
-		// Quota exhaustion: cooldown 1 hour.
-		p.cooldowns[id] = time.Now().Add(time.Hour)
-	} else if p.errorCounts[id] >= 3 {
-		// Consecutive non-quota errors: short cooldown.
-		p.cooldowns[id] = time.Now().Add(time.Minute)
-	}
+	// [TEMPORARY] Cooldown disabled — anti-abuse was blocking all traffic.
+	// if isQuotaError {
+	// 	// Quota exhaustion: cooldown 1 hour.
+	// 	p.cooldowns[id] = time.Now().Add(time.Hour)
+	// } else if p.errorCounts[id] >= 3 {
+	// 	// Consecutive non-quota errors: short cooldown.
+	// 	p.cooldowns[id] = time.Now().Add(time.Minute)
+	// }
 }
 
 // RecordAntiAbuse logs an AWS anti-abuse "suspicious activity" 429 response.
@@ -264,17 +265,16 @@ func (p *AccountPool) RecordAntiAbuse(id string) {
 
 	p.errorCounts[id]++
 
-	// Exponential backoff: base 5 minutes, double each consecutive anti-abuse.
-	// Cap at 80 minutes (approx 1.3 hours).
-	minutes := 5
-	for i := 1; i < p.errorCounts[id]; i++ {
-		minutes *= 2
-		if minutes > 80 {
-			minutes = 80
-			break
-		}
-	}
-	p.cooldowns[id] = time.Now().Add(time.Duration(minutes) * time.Minute)
+	// [TEMPORARY] Anti-abuse exponential backoff disabled.
+	// minutes := 5
+	// for i := 1; i < p.errorCounts[id]; i++ {
+	// 	minutes *= 2
+	// 	if minutes > 80 {
+	// 		minutes = 80
+	// 		break
+	// 	}
+	// }
+	// p.cooldowns[id] = time.Now().Add(time.Duration(minutes) * time.Minute)
 }
 
 // ResetAntiAbuse resets the anti-abuse error count for an account.

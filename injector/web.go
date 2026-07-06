@@ -15,10 +15,11 @@ var webFS embed.FS
 
 // Server holds the loaded export and serves the local injection UI.
 type Server struct {
-	mu       sync.Mutex
-	export   *ExportData
-	cacheDir string // override for Kiro IDE cache (dry-run); "" = default
-	cliDB    string // override for CLI sqlite path (dry-run); "" = default
+	mu         sync.Mutex
+	export     *ExportData
+	cacheDir   string // override for Kiro IDE cache (dry-run); "" = default
+	cliDB      string // override for CLI sqlite path (dry-run); "" = default
+	profileDir string // override for IDE globalStorage profile dir (dry-run); "" = default
 }
 
 // NewServer creates a server. An export may be loaded later via the UI.
@@ -195,7 +196,22 @@ func (s *Server) handleInject(w http.ResponseWriter, r *http.Request) {
 				dir = filepath.Join(os.TempDir(), "kiro-inject-dryrun", "ide")
 			}
 			written, err := InjectKiroIDE(*acc, dir)
-			results["ide"] = injectOutcome(written, err, req.DryRun)
+			out := injectOutcome(written, err, req.DryRun)
+			// The IDE reads the active profileArn from profile.json in its
+			// globalStorage, NOT from the token file. Without updating it, a stale
+			// arn from a prior login makes usage/model-list calls 403 (the IDE's
+			// ProfileArnGuard only self-heals when the arn is missing, never when
+			// it is present-but-wrong). Write it so account switches take effect.
+			pDir := s.profileDir
+			if req.DryRun {
+				pDir = filepath.Join(os.TempDir(), "kiro-inject-dryrun", "profile")
+			}
+			if pPath, pErr := WriteKiroProfile(*acc, pDir); pErr != nil {
+				out["profileError"] = pErr.Error()
+			} else if pPath != "" {
+				out["profileWritten"] = pPath
+			}
+			results["ide"] = out
 			if err == nil && !req.DryRun && req.Relaunch {
 				_ = KillApp(AppKiroIDE)
 				if lerr := LaunchKiroIDE(); lerr != nil {
@@ -253,9 +269,14 @@ func injectOutcome(written []string, err error, dryRun bool) map[string]any {
 }
 
 // SetDryRunOverrides lets the entrypoint pin override paths (used by --cache-dir).
+// The profile dir tracks the cache dir under the same parent for --cache-dir
+// testing so a dry-run never touches the real IDE globalStorage.
 func (s *Server) SetDryRunOverrides(cacheDir, cliDB string) {
 	s.mu.Lock()
 	s.cacheDir, s.cliDB = cacheDir, cliDB
+	if cacheDir != "" {
+		s.profileDir = filepath.Join(cacheDir, "globalStorage-profile")
+	}
 	s.mu.Unlock()
 }
 
