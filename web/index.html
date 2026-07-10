@@ -523,6 +523,17 @@
             </div>
           </div>
           <p class="api-hint api-addr-warning hidden" id="apiAddrWarning"><i class="fa-solid fa-triangle-exclamation"></i><span></span></p>
+          <div class="api-addr-tools">
+            <div class="api-addr-tool-row">
+              <button class="btn-secondary btn-sm" type="button" id="detectPublicIpBtn" data-i18n="api.detectPublicIp"></button>
+              <span class="api-addr-public hidden" id="publicIpResult"></span>
+            </div>
+            <div class="api-addr-tool-row">
+              <input type="text" class="input" id="customAddrInput" data-i18n-placeholder="api.customAddrPlaceholder" />
+              <button class="btn-secondary btn-sm" type="button" id="applyCustomAddrBtn" data-i18n="api.applyCustomAddr"></button>
+            </div>
+            <p class="api-hint" data-i18n="api.customAddrHint"></p>
+          </div>
           <div class="api-endpoint-list">
             <section class="api-endpoint-item">
               <div class="api-endpoint-meta">
@@ -817,7 +828,8 @@
         </div>
         <div class="form-group">
           <label data-i18n="upstreams.targetModel"></label>
-          <input type="text" id="routeForm_targetModel" data-i18n-placeholder="upstreams.targetModelPlaceholder" />
+          <input type="text" id="routeForm_targetModel" list="routeTargetModelList" autocomplete="off" data-i18n-placeholder="upstreams.targetModelPlaceholder" />
+          <datalist id="routeTargetModelList"></datalist>
           <small data-i18n="upstreams.targetModelHint"></small>
         </div>
         <div class="form-group">
@@ -829,6 +841,26 @@
         <div class="modal-footer">
           <button class="btn btn-secondary" id="modelRouteModalCancelBtn" type="button" data-i18n="upstreams.cancelBtn"></button>
           <button class="btn btn-primary" id="modelRouteModalSaveBtn" type="button" data-i18n="upstreams.saveBtn"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="upstreamModelsModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span class="modal-title" id="upstreamModelsModalTitle" data-i18n="upstreams.modelsModalTitle"></span>
+        <button class="modal-close" id="upstreamModelsModalClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <input type="text" id="upstreamModelsSearch" data-i18n-placeholder="upstreams.modelsSearchPlaceholder" />
+          <small><span id="upstreamModelsCount"></span></small>
+        </div>
+        <div id="upstreamModelsList" class="upstream-models-scroll"></div>
+        <div class="modal-footer">
+          <button class="btn btn-primary" id="upstreamModelsModalCloseBtn" type="button" data-i18n="upstreams.closeBtn"></button>
         </div>
       </div>
     </div>

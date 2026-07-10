@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"kiro-go/pool"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2235,10 +2238,16 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetUpstreams(w, r)
 	case path == "/upstreams" && r.Method == "POST":
 		h.apiUpdateUpstreams(w, r)
+	case path == "/upstream-models" && r.Method == "POST":
+		h.apiUpstreamModels(w, r)
+	case path == "/upstream-test" && r.Method == "POST":
+		h.apiUpstreamTest(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/net-interfaces" && r.Method == "GET":
 		h.apiGetNetInterfaces(w, r)
+	case path == "/public-ip" && r.Method == "GET":
+		h.apiGetPublicIP(w, r)
 	case path == "/security" && r.Method == "GET":
 		h.apiGetSecurity(w, r)
 	case path == "/security" && r.Method == "POST":
@@ -3610,6 +3619,252 @@ func (h *Handler) apiUpdateUpstreams(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// resolveUpstreamCreds resolves the base URL, API key and proxy for an upstream
+// probe request. The admin panel may send a provider ID (referring to a stored
+// provider) with a masked/empty key, in which case the stored secret and proxy
+// are used. Explicit baseURL/apiKey in the request override the stored values.
+func resolveUpstreamCreds(id, baseURL, apiKey, proxyURL string) (string, string, string) {
+	if id != "" {
+		providers, _ := config.GetUpstreamConfig()
+		for _, p := range providers {
+			if p.ID != id {
+				continue
+			}
+			if baseURL == "" {
+				baseURL = p.BaseURL
+			}
+			if apiKey == "" || strings.Contains(apiKey, "****") {
+				apiKey = p.ApiKey
+			}
+			if proxyURL == "" {
+				proxyURL = p.ProxyURL
+			}
+			break
+		}
+	}
+	if proxyURL == "" {
+		proxyURL = config.GetProxyURL()
+	}
+	return baseURL, apiKey, proxyURL
+}
+
+// apiUpstreamModels fetches the model list from an upstream's /models endpoint so
+// the admin panel can browse available models (like 9router's "Import from /models").
+func (h *Handler) apiUpstreamModels(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID       string `json:"id"`
+		BaseURL  string `json:"baseUrl"`
+		ApiKey   string `json:"apiKey"`
+		ProxyURL string `json:"proxyURL"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	baseURL, apiKey, proxyURL := resolveUpstreamCreds(req.ID, req.BaseURL, req.ApiKey, req.ProxyURL)
+	if strings.TrimSpace(baseURL) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "baseUrl is required"})
+		return
+	}
+
+	url := strings.TrimRight(baseURL, "/") + "/models"
+	httpReq, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	if apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		httpReq.Header.Set("X-Api-Key", apiKey)
+		httpReq.Header.Set("anthropic-version", "2023-06-01")
+	}
+
+	client := GetClientForProxy(proxyURL)
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]string{"error": "upstream request failed: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+
+	if resp.StatusCode != 200 {
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":  "upstream returned status " + strconv.Itoa(resp.StatusCode),
+			"status": resp.StatusCode,
+			"body":   string(respBody),
+		})
+		return
+	}
+
+	// Parse both OpenAI ({"data":[{"id":...}]}) and bare-array shapes.
+	models := parseModelIDs(respBody)
+	json.NewEncoder(w).Encode(map[string]interface{}{"models": models})
+}
+
+// parseModelIDs extracts model id strings from a /models response, tolerating the
+// OpenAI {"data":[{"id"}]} shape, an Anthropic {"data":[{"id"}]} shape, a
+// {"models":[...]} shape, or a bare JSON array of objects/strings.
+func parseModelIDs(body []byte) []string {
+	ids := make([]string, 0, 16)
+	seen := make(map[string]bool)
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s != "" && !seen[s] {
+			seen[s] = true
+			ids = append(ids, s)
+		}
+	}
+	extract := func(items []json.RawMessage) {
+		for _, it := range items {
+			var obj map[string]interface{}
+			if err := json.Unmarshal(it, &obj); err == nil {
+				if id, ok := obj["id"].(string); ok {
+					add(id)
+					continue
+				}
+				if name, ok := obj["name"].(string); ok {
+					add(name)
+					continue
+				}
+			}
+			var s string
+			if err := json.Unmarshal(it, &s); err == nil {
+				add(s)
+			}
+		}
+	}
+	var wrapped struct {
+		Data   []json.RawMessage `json:"data"`
+		Models []json.RawMessage `json:"models"`
+	}
+	if err := json.Unmarshal(body, &wrapped); err == nil {
+		if len(wrapped.Data) > 0 {
+			extract(wrapped.Data)
+		}
+		if len(wrapped.Models) > 0 {
+			extract(wrapped.Models)
+		}
+	}
+	if len(ids) == 0 {
+		var arr []json.RawMessage
+		if err := json.Unmarshal(body, &arr); err == nil {
+			extract(arr)
+		}
+	}
+	return ids
+}
+
+// apiUpstreamTest sends a minimal request to an upstream model and reports whether
+// it responded, the HTTP status, and the round-trip latency — like 9router's
+// per-model test button.
+func (h *Handler) apiUpstreamTest(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID       string `json:"id"`
+		BaseURL  string `json:"baseUrl"`
+		ApiKey   string `json:"apiKey"`
+		ProxyURL string `json:"proxyURL"`
+		Model    string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if strings.TrimSpace(req.Model) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "model is required"})
+		return
+	}
+	baseURL, apiKey, proxyURL := resolveUpstreamCreds(req.ID, req.BaseURL, req.ApiKey, req.ProxyURL)
+	if strings.TrimSpace(baseURL) == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "baseUrl is required"})
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"model":      req.Model,
+		"max_tokens": 1,
+		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
+	})
+	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
+	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(payload))
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	if apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		httpReq.Header.Set("X-Api-Key", apiKey)
+	}
+
+	client := GetClientForProxy(proxyURL)
+	start := time.Now()
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":    false,
+			"error": err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+	latency := time.Since(start).Milliseconds()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+
+	result := map[string]interface{}{
+		"ok":        resp.StatusCode >= 200 && resp.StatusCode < 300,
+		"status":    resp.StatusCode,
+		"latencyMs": latency,
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		result["error"] = string(body)
+	}
+	json.NewEncoder(w).Encode(result)
+}
+
+// apiGetPublicIP probes an external service to discover the machine's public
+// (internet-facing) IP. This is best-effort: reaching an external endpoint may
+// fail behind restrictive networks, and the returned IP is only reachable from the
+// internet if the operator has set up port-forwarding or a tunnel on their router.
+func (h *Handler) apiGetPublicIP(w http.ResponseWriter, r *http.Request) {
+	client := GetClientForProxy(config.GetProxyURL())
+	req, err := http.NewRequest("GET", "https://api.ipify.org", nil)
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	resp, err := client.Do(req.WithContext(ctx))
+	if err != nil {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
+	ip := strings.TrimSpace(string(body))
+	if resp.StatusCode != 200 || net.ParseIP(ip) == nil {
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": "could not determine public IP"})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "ip": ip, "port": config.GetPort()})
 }
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {

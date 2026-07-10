@@ -16,9 +16,9 @@ import (
 // xpiki), streams or copies the response back to the client, and returns true.
 //
 // When there is no matching enabled route it returns false and the caller
-// continues with the normal Kiro dispatch path. Forwarded requests deliberately
-// bypass the account pool and usage accounting — they are pure passthroughs and
-// do not count against the client API key's quota.
+// continues with the normal Kiro dispatch path. Forwarded requests bypass the
+// account pool and per-API-key quota, but are still counted in the global
+// request/success/failure stats. Token counts are not tracked for passthroughs.
 //
 // subPath is the upstream path appended to the provider BaseURL (e.g.
 // "/messages", "/chat/completions", "/responses"). isClaudeRoute selects the
@@ -30,6 +30,7 @@ func (h *Handler) tryForwardUpstream(w http.ResponseWriter, body []byte, model s
 	}
 
 	sendErr := func(status int, message string) {
+		h.recordFailure()
 		if isClaudeRoute {
 			h.sendClaudeError(w, status, "api_error", message)
 		} else {
@@ -85,6 +86,14 @@ func (h *Handler) tryForwardUpstream(w http.ResponseWriter, body []byte, model s
 		return true
 	}
 	defer resp.Body.Close()
+
+	// Count the forward in the global stats (tokens are not tracked for
+	// passthroughs). Per-API-key quota is intentionally left untouched.
+	if resp.StatusCode == 200 {
+		h.recordSuccess(0, 0, 0)
+	} else {
+		h.recordFailure()
+	}
 
 	// A non-200 upstream response is an error body (usually JSON), not an SSE
 	// stream — copy it through verbatim regardless of the client's stream flag.

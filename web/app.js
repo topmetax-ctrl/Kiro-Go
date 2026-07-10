@@ -34,6 +34,7 @@
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
   let netInterfacesData = null;
+  let customApiAddr = localStorage.getItem('kiro_api_custom_addr') || '';
   let securityWarnings = [];
 
   // DOM helpers
@@ -728,6 +729,10 @@
       const ifaceSuffix = a.iface ? ' · ' + a.iface : '';
       options.push({ value: baseUrlForHost(a.ip), label: t('api.addrLan') + ' · ' + a.ip + ifaceSuffix });
     });
+    // Manually-entered address (public IP, domain, or tunnel URL) always offered last.
+    if (customApiAddr) {
+      options.push({ value: customApiAddr, label: t('api.addrCustom') + ' · ' + customApiAddr });
+    }
 
     // Preserve the current selection across a language-triggered rebuild.
     const saved = sel.value || localStorage.getItem('kiro_api_addr');
@@ -765,6 +770,61 @@
       localStorage.setItem('kiro_api_addr', sel.value);
       renderApiEndpoints();
     });
+
+    const detectBtn = $('detectPublicIpBtn');
+    if (detectBtn) {
+      detectBtn.addEventListener('click', async () => {
+        const out = $('publicIpResult');
+        detectBtn.disabled = true;
+        try {
+          const res = await api('/public-ip');
+          const d = await res.json();
+          if (d && d.ok && d.ip) {
+            const addr = location.protocol + '//' + d.ip + (d.port ? ':' + d.port : '');
+            if (out) {
+              out.textContent = t('api.publicIpFound', addr);
+              out.classList.remove('hidden');
+            }
+            // Prefill the manual-address box so the operator can apply it in one click.
+            const input = $('customAddrInput');
+            if (input && !input.value) input.value = addr;
+          } else {
+            if (out) {
+              out.textContent = t('api.publicIpFailed');
+              out.classList.remove('hidden');
+            }
+          }
+        } catch (e) {
+          if (out) { out.textContent = t('api.publicIpFailed'); out.classList.remove('hidden'); }
+        } finally {
+          detectBtn.disabled = false;
+        }
+      });
+    }
+
+    const applyBtn = $('applyCustomAddrBtn');
+    if (applyBtn) {
+      applyBtn.addEventListener('click', () => {
+        const input = $('customAddrInput');
+        if (!input) return;
+        let v = (input.value || '').trim();
+        if (!v) { toast(t('api.customAddrEmpty'), 'error'); return; }
+        // Accept a bare host/IP or a full URL; normalize to an origin.
+        if (!/^https?:\/\//i.test(v)) {
+          const port = location.port ? ':' + location.port : '';
+          v = location.protocol + '//' + v + (/:\d+$/.test(v) ? '' : port);
+        }
+        v = v.replace(/\/+$/, '');
+        customApiAddr = v;
+        localStorage.setItem('kiro_api_custom_addr', v);
+        localStorage.setItem('kiro_api_addr', v);
+        buildApiAddrOptions();
+        const sel2 = $('apiAddrSelect');
+        if (sel2) { sel2.value = v; refreshCustomSelects(sel2.parentElement || document); }
+        renderApiEndpoints();
+        toast(t('api.customAddrApplied'), 'success');
+      });
+    }
   }
   async function loadStats() {
     const res = await api('/status');
@@ -1522,7 +1582,7 @@
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
     $('maxPayloadBytes').value = String(d.maxPayloadBytes || 2000000);
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadUpstreams(), loadSecurityConfig()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadUpstreams(), loadSecurityConfig(), loadKiroGoModels()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -1759,6 +1819,14 @@
   let upstreamCache = { providers: [], routes: [] };
   let upstreamEditingId = '';
   let routeEditingId = '';
+  // Models fetched per provider (keyed by provider id) for the browse/copy/test UI.
+  let providerModels = {};
+  let providerModelsLoading = {};
+  let modelsModalPid = '';
+  let modelsModalSearch = '';
+  // Model names served by this kiro-go instance (from /v1/models), used to
+  // suggest Target Model values in the route modal. Still free-text + optional.
+  let kiroGoModels = [];
 
   async function loadApiKeys() {
     const list = $('apiKeysList');
@@ -2092,10 +2160,41 @@
               '<input type="checkbox" data-upstream-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
               '<span class="slider"></span>' +
             '</label>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="load" data-id="' + id + '">' + escapeHtml(t('upstreams.loadModels')) + '</button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="edit" data-id="' + id + '">' + escapeHtml(t('upstreams.actionEdit')) + '</button>' +
             '<button class="btn btn-danger btn-sm" type="button" data-upstream-action="delete" data-id="' + id + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
           '</div>' +
         '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  // Render the fetched-model list into the models modal, filtered by the search box.
+  function renderModelsModal() {
+    const list = $('upstreamModelsList');
+    if (!list) return;
+    const pid = modelsModalPid;
+    const models = providerModels[pid] || [];
+    const kw = (modelsModalSearch || '').trim().toLowerCase();
+    const filtered = kw ? models.filter(m => m.toLowerCase().includes(kw)) : models;
+    const countEl = $('upstreamModelsCount');
+    if (countEl) countEl.textContent = t('upstreams.modelsCount', String(filtered.length), String(models.length));
+    if (!filtered.length) {
+      list.innerHTML = '<div class="muted-text text-xs" style="padding:0.75rem 0;">' + escapeHtml(models.length ? t('upstreams.noModelMatch') : t('upstreams.noModels')) + '</div>';
+      return;
+    }
+    const pidAttr = escapeAttr(pid);
+    list.innerHTML = filtered.map(m => {
+      const mid = escapeHtml(m);
+      const midAttr = escapeAttr(m);
+      return '<div class="upstream-model-row">' +
+        '<span class="font-mono text-xs upstream-model-id">' + mid + '</span>' +
+        '<span class="upstream-model-test text-xs muted-text" data-model-test-for="' + pidAttr + '|' + midAttr + '"></span>' +
+        '<span class="flex items-center gap-1">' +
+          '<button class="btn btn-outline btn-xs" type="button" data-model-action="copy" data-model="' + midAttr + '">' + escapeHtml(t('upstreams.copy')) + '</button>' +
+          '<button class="btn btn-outline btn-xs" type="button" data-model-action="test" data-pid="' + pidAttr + '" data-model="' + midAttr + '">' + escapeHtml(t('upstreams.test')) + '</button>' +
+          '<button class="btn btn-outline btn-xs" type="button" data-model-action="route" data-pid="' + pidAttr + '" data-model="' + midAttr + '">' + escapeHtml(t('upstreams.makeRoute')) + '</button>' +
+        '</span>' +
       '</div>';
     }).join('');
   }
@@ -2221,6 +2320,94 @@
     }
   }
 
+  // Fetch the model list from a provider's /models endpoint (like 9router's
+  // "Import from /models"). Uses the stored provider ID so the backend supplies
+  // the saved API key even though the panel only ever sees a masked value.
+  async function loadProviderModels(pid) {
+    const p = upstreamCache.providers.find(x => x.id === pid);
+    if (!p) return;
+    const btn = document.querySelector('[data-upstream-action="load"][data-id="' + (window.CSS && CSS.escape ? CSS.escape(pid) : pid) + '"]');
+    if (btn) { btn.disabled = true; btn.textContent = t('upstreams.loadingModels'); }
+    try {
+      const res = await api('/upstream-models', {
+        method: 'POST',
+        body: JSON.stringify({ id: pid, baseUrl: p.baseUrl, proxyURL: p.proxyURL })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.error) throw new Error(d.error || t('upstreams.loadModelsFailed'));
+      providerModels[pid] = Array.isArray(d.models) ? d.models : [];
+      if (!providerModels[pid].length) { toast(t('upstreams.noModels'), 'warning'); return; }
+      openModelsModal(pid);
+    } catch (e) {
+      providerModels[pid] = [];
+      toast((e && e.message) || t('upstreams.loadModelsFailed'), 'error');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = t('upstreams.loadModels'); }
+    }
+  }
+
+  // Open the model-browser modal for a provider (list can be long, so it scrolls
+  // and is searchable).
+  function openModelsModal(pid) {
+    modelsModalPid = pid;
+    modelsModalSearch = '';
+    const p = upstreamCache.providers.find(x => x.id === pid);
+    const titleEl = $('upstreamModelsModalTitle');
+    if (titleEl) titleEl.textContent = t('upstreams.modelsModalTitle', (p && (p.name || p.baseUrl)) || '');
+    const search = $('upstreamModelsSearch');
+    if (search) search.value = '';
+    renderModelsModal();
+    openDialog('upstreamModelsModal');
+    if (search) setTimeout(() => search.focus(), 50);
+  }
+
+  function closeModelsModal() {
+    closeDialog('upstreamModelsModal');
+    modelsModalPid = '';
+    modelsModalSearch = '';
+  }
+
+  // Send a minimal probe to one model and show status + latency inline.
+  async function testModel(pid, model) {
+    const p = upstreamCache.providers.find(x => x.id === pid);
+    if (!p) return;
+    const slot = document.querySelector('[data-model-test-for="' + (window.CSS && CSS.escape ? CSS.escape(pid) : pid) + '|' + (window.CSS && CSS.escape ? CSS.escape(model) : model) + '"]');
+    if (slot) slot.textContent = t('upstreams.testing');
+    try {
+      const res = await api('/upstream-test', {
+        method: 'POST',
+        body: JSON.stringify({ id: pid, baseUrl: p.baseUrl, proxyURL: p.proxyURL, model })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!slot) {
+        toast(d.ok ? t('upstreams.testOk', String(d.latencyMs || 0)) : t('upstreams.testFail'), d.ok ? 'success' : 'error');
+        return;
+      }
+      if (d.ok) {
+        slot.textContent = '✓ ' + t('upstreams.testOk', String(d.latencyMs || 0));
+        slot.style.color = 'var(--success, #22c55e)';
+      } else {
+        slot.textContent = '✗ ' + (d.status ? ('HTTP ' + d.status) : t('upstreams.testFail'));
+        slot.style.color = 'var(--danger, #ef4444)';
+      }
+    } catch (e) {
+      if (slot) { slot.textContent = '✗ ' + t('upstreams.testFail'); slot.style.color = 'var(--danger, #ef4444)'; }
+    }
+  }
+
+  // Open the route modal prefilled from a fetched model (one-click route creation).
+  function makeRouteFromModel(pid, model) {
+    closeModelsModal();
+    routeEditingId = '';
+    $('modelRouteModalTitle').textContent = t('upstreams.routeModalCreate');
+    $('routeForm_model').value = model;
+    $('routeForm_targetModel').value = '';
+    $('routeForm_enabled').checked = true;
+    populateRouteProviderSelect(pid);
+    populateTargetModelDatalist(pid);
+    openDialog('modelRouteModal');
+  }
+
   function populateRouteProviderSelect(selectedId) {
     const sel = $('routeForm_upstreamId');
     if (!sel) return;
@@ -2230,6 +2417,29 @@
     ).join('');
   }
 
+  // Fetch the model names this kiro-go instance serves (public /v1/models, no auth).
+  async function loadKiroGoModels() {
+    try {
+      const res = await fetch('/v1/models', { headers: { 'Accept': 'application/json' } });
+      if (!res.ok) return;
+      const d = await res.json().catch(() => ({}));
+      const arr = Array.isArray(d.data) ? d.data : [];
+      kiroGoModels = arr.map(m => (m && (m.id || m.name)) || '').filter(Boolean);
+    } catch (e) { /* suggestions only; ignore failures */ }
+  }
+
+  // Fill the Target Model datalist: kiro-go models + models loaded for this provider.
+  // The field stays free-text and optional; this only adds dropdown suggestions.
+  function populateTargetModelDatalist(pid) {
+    const dl = $('routeTargetModelList');
+    if (!dl) return;
+    const seen = {};
+    const opts = [];
+    (providerModels[pid] || []).forEach(m => { if (m && !seen[m]) { seen[m] = 1; opts.push(m); } });
+    kiroGoModels.forEach(m => { if (m && !seen[m]) { seen[m] = 1; opts.push(m); } });
+    dl.innerHTML = opts.map(m => '<option value="' + escapeAttr(m) + '"></option>').join('');
+  }
+
   function openRouteModal(entry) {
     routeEditingId = entry ? (entry.id || '') : '';
     $('modelRouteModalTitle').textContent = t(routeEditingId ? 'upstreams.routeModalEdit' : 'upstreams.routeModalCreate');
@@ -2237,6 +2447,7 @@
     $('routeForm_targetModel').value = entry ? (entry.targetModel || '') : '';
     $('routeForm_enabled').checked = entry ? !!entry.enabled : true;
     populateRouteProviderSelect(entry ? entry.upstreamId : (upstreamCache.providers[0] && upstreamCache.providers[0].id));
+    populateTargetModelDatalist($('routeForm_upstreamId').value);
     openDialog('modelRouteModal');
   }
 
@@ -2313,6 +2524,7 @@
         const entry = upstreamCache.providers.find(x => x.id === id);
         if (action === 'edit') openUpstreamModal(entry);
         else if (action === 'delete') deleteProvider(id, entry ? entry.name : '');
+        else if (action === 'load') loadProviderModels(id);
       });
       provList.addEventListener('change', e => {
         const cb = e.target.closest('input[data-upstream-action="toggle"]');
@@ -2321,6 +2533,31 @@
         if (id) toggleProvider(id, cb.checked);
       });
     }
+    // Per-model actions (copy / test / make route) live inside the models modal.
+    const modelsList = $('upstreamModelsList');
+    if (modelsList) {
+      modelsList.addEventListener('click', e => {
+        const mbtn = e.target.closest('[data-model-action]');
+        if (!mbtn) return;
+        const action = mbtn.dataset.modelAction;
+        const model = mbtn.dataset.model || '';
+        const pid = mbtn.dataset.pid || '';
+        if (action === 'copy') copyText(model).then(() => toast(t('upstreams.copied'), 'success'));
+        else if (action === 'test') testModel(pid, model);
+        else if (action === 'route') makeRouteFromModel(pid, model);
+      });
+    }
+    const modelsSearch = $('upstreamModelsSearch');
+    if (modelsSearch) {
+      modelsSearch.addEventListener('input', () => {
+        modelsModalSearch = modelsSearch.value;
+        renderModelsModal();
+      });
+    }
+    const modelsClose = $('upstreamModelsModalClose');
+    if (modelsClose) modelsClose.addEventListener('click', closeModelsModal);
+    const modelsCloseBtn = $('upstreamModelsModalCloseBtn');
+    if (modelsCloseBtn) modelsCloseBtn.addEventListener('click', closeModelsModal);
     const routeList = $('modelRoutesList');
     if (routeList) {
       routeList.addEventListener('click', e => {
@@ -2359,8 +2596,11 @@
     if (rtCancel) rtCancel.addEventListener('click', closeRouteModal);
     const rtClose = $('modelRouteModalClose');
     if (rtClose) rtClose.addEventListener('click', closeRouteModal);
+    const rtProvSel = $('routeForm_upstreamId');
+    if (rtProvSel) rtProvSel.addEventListener('change', () => populateTargetModelDatalist(rtProvSel.value));
     bindDialogBackdropClose('upstreamModal', closeUpstreamModal);
     bindDialogBackdropClose('modelRouteModal', closeRouteModal);
+    bindDialogBackdropClose('upstreamModelsModal', closeModelsModal);
   }
 
   // Prompt filter rules
