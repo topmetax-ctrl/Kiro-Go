@@ -33,6 +33,8 @@
   let customSelectUid = 0;
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
+  let netInterfacesData = null;
+  let securityWarnings = [];
 
   // DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -129,6 +131,10 @@
     renderVersionBadge();
     renderAccounts();
     renderPromptRules();
+    renderUpstreams();
+    renderModelRoutes();
+    buildApiAddrOptions();
+    renderSecurityWarnings();
   }
   function updateLangButtons() {
     qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
@@ -671,12 +677,94 @@
   // Data loaders
   async function loadData() {
     await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
-    renderEndpointCode('claudeEndpoint', baseUrl + '/v1/messages');
-    renderEndpointCode('openaiEndpoint', baseUrl + '/v1/chat/completions');
-    renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
-    renderEndpointCode('modelsEndpoint', baseUrl + '/v1/models');
-    renderEndpointCode('statsEndpoint', baseUrl + '/v1/stats');
+    renderApiEndpoints();
+    loadNetInterfaces();
     setTimeout(checkUpdate, 2000);
+  }
+  // Base URL currently selected for the API endpoint display. Defaults to how
+  // the admin page itself was reached (location.origin).
+  function apiEndpointBase() {
+    const sel = $('apiAddrSelect');
+    if (sel && sel.value) return sel.value;
+    return baseUrl;
+  }
+  function renderApiEndpoints() {
+    const base = apiEndpointBase();
+    renderEndpointCode('claudeEndpoint', base + '/v1/messages');
+    renderEndpointCode('openaiEndpoint', base + '/v1/chat/completions');
+    renderEndpointCode('openaiResponsesEndpoint', base + '/v1/responses');
+    renderEndpointCode('modelsEndpoint', base + '/v1/models');
+    renderEndpointCode('statsEndpoint', base + '/v1/stats');
+  }
+  // Build a base URL for a given hostname, preserving the protocol and port the
+  // browser is currently using (robust when reached via a TLS terminator on a
+  // non-default port).
+  function baseUrlForHost(host) {
+    const port = location.port ? ':' + location.port : '';
+    return location.protocol + '//' + host + port;
+  }
+  async function loadNetInterfaces() {
+    const sel = $('apiAddrSelect');
+    if (!sel) return;
+    try {
+      const res = await api('/net-interfaces');
+      if (!res.ok) return;
+      netInterfacesData = await res.json();
+    } catch (e) { return; }
+    buildApiAddrOptions();
+  }
+  // Rebuild the address dropdown from cached interface data. Split from the fetch
+  // so it can re-run on language change to re-translate the option labels.
+  function buildApiAddrOptions() {
+    const sel = $('apiAddrSelect');
+    if (!sel || !netInterfacesData) return;
+    const data = netInterfacesData;
+    const addrs = Array.isArray(data.addrs) ? data.addrs : [];
+    const options = [];
+    // Localhost always first; value mirrors exactly how the page was reached.
+    options.push({ value: baseUrl, label: t('api.addrLocalhost') });
+    addrs.forEach(a => {
+      if (!a || !a.ip || a.isLoopback) return;
+      const ifaceSuffix = a.iface ? ' · ' + a.iface : '';
+      options.push({ value: baseUrlForHost(a.ip), label: t('api.addrLan') + ' · ' + a.ip + ifaceSuffix });
+    });
+
+    // Preserve the current selection across a language-triggered rebuild.
+    const saved = sel.value || localStorage.getItem('kiro_api_addr');
+    sel.innerHTML = '';
+    let matched = false;
+    options.forEach(opt => {
+      const o = document.createElement('option');
+      o.value = opt.value;
+      o.textContent = opt.label;
+      if (opt.value === saved) { o.selected = true; matched = true; }
+      sel.appendChild(o);
+    });
+    if (!matched) sel.value = baseUrl;
+
+    // Warn when a LAN address is offered but the server is not bound to all
+    // interfaces, so those addresses are not actually reachable.
+    const warn = $('apiAddrWarning');
+    if (warn) {
+      const hasLan = options.length > 1;
+      if (hasLan && data.listensAll === false) {
+        warn.querySelector('span').textContent = t('api.addrLanUnreachable', data.host || '127.0.0.1');
+        warn.classList.remove('hidden');
+      } else {
+        warn.classList.add('hidden');
+      }
+    }
+
+    refreshCustomSelects(sel.parentElement || document);
+    renderApiEndpoints();
+  }
+  function initApiAddrSelect() {
+    const sel = $('apiAddrSelect');
+    if (!sel) return;
+    sel.addEventListener('change', () => {
+      localStorage.setItem('kiro_api_addr', sel.value);
+      renderApiEndpoints();
+    });
   }
   async function loadStats() {
     const res = await api('/status');
@@ -1434,7 +1522,7 @@
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
     $('maxPayloadBytes').value = String(d.maxPayloadBytes || 2000000);
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadUpstreams(), loadSecurityConfig()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -1472,6 +1560,49 @@
     const d = await res.json();
     if (d.success) toast(t('settings.endpointSaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
+  async function loadSecurityConfig() {
+    const res = await api('/security');
+    const d = await res.json();
+    $('adminAllowlist').value = (d.adminAllowlist || []).join('\n');
+    $('trustProxy').checked = !!d.trustProxy;
+    $('tlsCertFile').value = d.tlsCertFile || '';
+    $('tlsKeyFile').value = d.tlsKeyFile || '';
+    $('secYourIp').textContent = d.clientIP || '';
+    renderSecurityWarnings(d.warnings || []);
+  }
+  function renderSecurityWarnings(list) {
+    if (arguments.length > 0) securityWarnings = Array.isArray(list) ? list : [];
+    const el = $('securityWarnings');
+    if (!el) return;
+    if (securityWarnings.length === 0) {
+      el.classList.add('hidden');
+      return;
+    }
+    const text = securityWarnings.map(w => t('security.warn.' + w.code)).join(' · ');
+    el.querySelector('span').textContent = text;
+    el.classList.remove('hidden');
+  }
+  async function saveSecurityConfig() {
+    const allowlist = $('adminAllowlist').value.split('\n').map(s => s.trim()).filter(Boolean);
+    const tlsCert = $('tlsCertFile').value.trim();
+    const tlsKey = $('tlsKeyFile').value.trim();
+    const res = await api('/security', {
+      method: 'POST', body: JSON.stringify({
+        adminAllowlist: allowlist,
+        trustProxy: $('trustProxy').checked,
+        tlsCertFile: tlsCert,
+        tlsKeyFile: tlsKey
+      })
+    });
+    const d = await res.json();
+    if (d.success) {
+      toast(t('settings.securitySaved'), 'success');
+      renderSecurityWarnings(d.warnings || []);
+      if (tlsCert || tlsKey) toast(t('settings.tlsRestartHint'), 'warning');
+    } else {
+      toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+    }
   }
   async function loadProxyConfig() {
     const res = await api('/proxy');
@@ -1624,6 +1755,10 @@
   let apiKeysCache = [];
   let apiKeyEditingId = '';
   let apiKeyModalSubmitting = false;
+
+  let upstreamCache = { providers: [], routes: [] };
+  let upstreamEditingId = '';
+  let routeEditingId = '';
 
   async function loadApiKeys() {
     const list = $('apiKeysList');
@@ -1898,6 +2033,334 @@
     if (copyBtn) copyBtn.addEventListener('click', copyNewApiKey);
     bindDialogBackdropClose('apiKeyModal', closeApiKeyModal);
     bindDialogBackdropClose('apiKeyShowModal', closeShowApiKeyModal);
+  }
+
+  // ==================== Upstream forwarding ====================
+  async function loadUpstreams() {
+    const provList = $('upstreamsList');
+    const routeList = $('modelRoutesList');
+    if (!provList && !routeList) return;
+    try {
+      const res = await api('/upstreams');
+      if (!res.ok) throw new Error('http ' + res.status);
+      const d = await res.json();
+      upstreamCache = {
+        providers: Array.isArray(d.providers) ? d.providers : [],
+        routes: Array.isArray(d.routes) ? d.routes : []
+      };
+      renderUpstreams();
+    } catch (e) {
+      upstreamCache = { providers: [], routes: [] };
+      if (provList) provList.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('upstreams.loadFailed')) + '</div>';
+      if (routeList) routeList.innerHTML = '';
+    }
+  }
+
+  function providerName(id) {
+    const p = upstreamCache.providers.find(x => x.id === id);
+    return p ? (p.name || p.baseUrl || id) : id;
+  }
+
+  function renderUpstreams() {
+    renderProviders();
+    renderModelRoutes();
+  }
+
+  function renderProviders() {
+    const list = $('upstreamsList');
+    if (!list) return;
+    if (!upstreamCache.providers.length) {
+      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('upstreams.providersEmpty')) + '</div>';
+      return;
+    }
+    list.innerHTML = upstreamCache.providers.map(item => {
+      const id = escapeAttr(item.id || '');
+      const name = item.name ? escapeHtml(item.name) : '<span class="muted-text">' + escapeHtml(t('upstreams.unnamed')) + '</span>';
+      const baseUrl = escapeHtml(item.baseUrl || '');
+      const disabled = !item.enabled
+        ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('upstreams.disabled')) + '</span>'
+        : '';
+      return '<div class="card" data-upstream-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
+        '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
+          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
+            '<span class="font-semibold">' + name + '</span>' +
+            disabled +
+            '<span class="text-xs muted-text font-mono">' + baseUrl + '</span>' +
+          '</div>' +
+          '<div class="flex items-center gap-2">' +
+            '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
+              '<input type="checkbox" data-upstream-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
+              '<span class="slider"></span>' +
+            '</label>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="edit" data-id="' + id + '">' + escapeHtml(t('upstreams.actionEdit')) + '</button>' +
+            '<button class="btn btn-danger btn-sm" type="button" data-upstream-action="delete" data-id="' + id + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  function renderModelRoutes() {
+    const list = $('modelRoutesList');
+    if (!list) return;
+    if (!upstreamCache.routes.length) {
+      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('upstreams.routesEmpty')) + '</div>';
+      return;
+    }
+    list.innerHTML = upstreamCache.routes.map(item => {
+      const id = escapeAttr(item.id || '');
+      const model = escapeHtml(item.model || '');
+      const target = item.targetModel
+        ? '<span class="text-xs muted-text">&rarr; ' + escapeHtml(item.targetModel) + '</span>'
+        : '';
+      const prov = '<span class="text-xs muted-text font-mono">' + escapeHtml(providerName(item.upstreamId)) + '</span>';
+      const disabled = !item.enabled
+        ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('upstreams.disabled')) + '</span>'
+        : '';
+      return '<div class="card" data-route-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
+        '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
+          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
+            '<span class="font-semibold font-mono">' + model + '</span>' +
+            target +
+            disabled +
+            prov +
+          '</div>' +
+          '<div class="flex items-center gap-2">' +
+            '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
+              '<input type="checkbox" data-route-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
+              '<span class="slider"></span>' +
+            '</label>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-route-action="edit" data-id="' + id + '">' + escapeHtml(t('upstreams.actionEdit')) + '</button>' +
+            '<button class="btn btn-danger btn-sm" type="button" data-route-action="delete" data-id="' + id + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  }
+
+  async function persistUpstreams() {
+    const res = await api('/upstreams', {
+      method: 'POST',
+      body: JSON.stringify({ providers: upstreamCache.providers, routes: upstreamCache.routes })
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+  }
+
+  function openUpstreamModal(entry) {
+    upstreamEditingId = entry ? (entry.id || '') : '';
+    $('upstreamModalTitle').textContent = t(upstreamEditingId ? 'upstreams.providerModalEdit' : 'upstreams.providerModalCreate');
+    $('upstreamForm_name').value = entry ? (entry.name || '') : '';
+    $('upstreamForm_baseUrl').value = entry ? (entry.baseUrl || '') : '';
+    $('upstreamForm_apiKey').value = entry ? (entry.apiKey || '') : '';
+    $('upstreamForm_proxyUrl').value = entry ? (entry.proxyURL || '') : '';
+    $('upstreamForm_enabled').checked = entry ? !!entry.enabled : true;
+    openDialog('upstreamModal');
+  }
+
+  function closeUpstreamModal() {
+    closeDialog('upstreamModal');
+    upstreamEditingId = '';
+  }
+
+  async function submitUpstreamModal() {
+    const name = $('upstreamForm_name').value.trim();
+    const baseUrl = $('upstreamForm_baseUrl').value.trim();
+    const apiKey = $('upstreamForm_apiKey').value.trim();
+    const proxyURL = $('upstreamForm_proxyUrl').value.trim();
+    const enabled = $('upstreamForm_enabled').checked;
+    if (!baseUrl) { toast(t('upstreams.baseUrlRequired'), 'error'); return; }
+    const prev = JSON.parse(JSON.stringify(upstreamCache));
+    try {
+      if (upstreamEditingId) {
+        const p = upstreamCache.providers.find(x => x.id === upstreamEditingId);
+        if (p) {
+          p.name = name; p.baseUrl = baseUrl; p.apiKey = apiKey; p.proxyURL = proxyURL; p.enabled = enabled;
+        }
+      } else {
+        upstreamCache.providers.push({ id: '', name, baseUrl, apiKey, proxyURL, enabled });
+      }
+      await persistUpstreams();
+      toast(t('common.saved'), 'success');
+      closeUpstreamModal();
+      await loadUpstreams();
+    } catch (e) {
+      upstreamCache = prev;
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+
+  async function toggleProvider(id, enabled) {
+    const prev = JSON.parse(JSON.stringify(upstreamCache));
+    const p = upstreamCache.providers.find(x => x.id === id);
+    if (p) p.enabled = enabled;
+    try {
+      await persistUpstreams();
+      renderUpstreams();
+    } catch (e) {
+      upstreamCache = prev;
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+      renderUpstreams();
+    }
+  }
+
+  async function deleteProvider(id, name) {
+    const ok = await confirmAction(t('upstreams.confirmDeleteProvider', name || t('upstreams.unnamed')), {
+      title: t('upstreams.actionDelete'), confirmText: t('upstreams.actionDelete'), variant: 'danger'
+    });
+    if (!ok) return;
+    const prev = JSON.parse(JSON.stringify(upstreamCache));
+    upstreamCache.providers = upstreamCache.providers.filter(x => x.id !== id);
+    try {
+      await persistUpstreams();
+      toast(t('upstreams.deleteSuccess'), 'success');
+      await loadUpstreams();
+    } catch (e) {
+      upstreamCache = prev;
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  function populateRouteProviderSelect(selectedId) {
+    const sel = $('routeForm_upstreamId');
+    if (!sel) return;
+    sel.innerHTML = upstreamCache.providers.map(p =>
+      '<option value="' + escapeAttr(p.id || '') + '"' + (p.id === selectedId ? ' selected' : '') + '>' +
+        escapeHtml(p.name || p.baseUrl || p.id || '') + '</option>'
+    ).join('');
+  }
+
+  function openRouteModal(entry) {
+    routeEditingId = entry ? (entry.id || '') : '';
+    $('modelRouteModalTitle').textContent = t(routeEditingId ? 'upstreams.routeModalEdit' : 'upstreams.routeModalCreate');
+    $('routeForm_model').value = entry ? (entry.model || '') : '';
+    $('routeForm_targetModel').value = entry ? (entry.targetModel || '') : '';
+    $('routeForm_enabled').checked = entry ? !!entry.enabled : true;
+    populateRouteProviderSelect(entry ? entry.upstreamId : (upstreamCache.providers[0] && upstreamCache.providers[0].id));
+    openDialog('modelRouteModal');
+  }
+
+  function closeRouteModal() {
+    closeDialog('modelRouteModal');
+    routeEditingId = '';
+  }
+
+  async function submitRouteModal() {
+    const model = $('routeForm_model').value.trim();
+    const upstreamId = $('routeForm_upstreamId').value;
+    const targetModel = $('routeForm_targetModel').value.trim();
+    const enabled = $('routeForm_enabled').checked;
+    if (!model) { toast(t('upstreams.routeModelRequired'), 'error'); return; }
+    if (!upstreamId) { toast(t('upstreams.providerRequired'), 'error'); return; }
+    const prev = JSON.parse(JSON.stringify(upstreamCache));
+    try {
+      if (routeEditingId) {
+        const r = upstreamCache.routes.find(x => x.id === routeEditingId);
+        if (r) { r.model = model; r.upstreamId = upstreamId; r.targetModel = targetModel; r.enabled = enabled; }
+      } else {
+        upstreamCache.routes.push({ id: '', model, upstreamId, targetModel, enabled });
+      }
+      await persistUpstreams();
+      toast(t('common.saved'), 'success');
+      closeRouteModal();
+      await loadUpstreams();
+    } catch (e) {
+      upstreamCache = prev;
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+
+  async function toggleRoute(id, enabled) {
+    const prev = JSON.parse(JSON.stringify(upstreamCache));
+    const r = upstreamCache.routes.find(x => x.id === id);
+    if (r) r.enabled = enabled;
+    try {
+      await persistUpstreams();
+      renderUpstreams();
+    } catch (e) {
+      upstreamCache = prev;
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+      renderUpstreams();
+    }
+  }
+
+  async function deleteRoute(id, model) {
+    const ok = await confirmAction(t('upstreams.confirmDeleteRoute', model || ''), {
+      title: t('upstreams.actionDelete'), confirmText: t('upstreams.actionDelete'), variant: 'danger'
+    });
+    if (!ok) return;
+    const prev = JSON.parse(JSON.stringify(upstreamCache));
+    upstreamCache.routes = upstreamCache.routes.filter(x => x.id !== id);
+    try {
+      await persistUpstreams();
+      toast(t('upstreams.deleteSuccess'), 'success');
+      await loadUpstreams();
+    } catch (e) {
+      upstreamCache = prev;
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  function bindUpstreamEvents() {
+    const provList = $('upstreamsList');
+    if (provList) {
+      provList.addEventListener('click', e => {
+        const btn = e.target.closest('[data-upstream-action]');
+        if (!btn) return;
+        const action = btn.dataset.upstreamAction;
+        const id = btn.dataset.id;
+        if (!id) return;
+        const entry = upstreamCache.providers.find(x => x.id === id);
+        if (action === 'edit') openUpstreamModal(entry);
+        else if (action === 'delete') deleteProvider(id, entry ? entry.name : '');
+      });
+      provList.addEventListener('change', e => {
+        const cb = e.target.closest('input[data-upstream-action="toggle"]');
+        if (!cb) return;
+        const id = cb.dataset.id;
+        if (id) toggleProvider(id, cb.checked);
+      });
+    }
+    const routeList = $('modelRoutesList');
+    if (routeList) {
+      routeList.addEventListener('click', e => {
+        const btn = e.target.closest('[data-route-action]');
+        if (!btn) return;
+        const action = btn.dataset.routeAction;
+        const id = btn.dataset.id;
+        if (!id) return;
+        const entry = upstreamCache.routes.find(x => x.id === id);
+        if (action === 'edit') openRouteModal(entry);
+        else if (action === 'delete') deleteRoute(id, entry ? entry.model : '');
+      });
+      routeList.addEventListener('change', e => {
+        const cb = e.target.closest('input[data-route-action="toggle"]');
+        if (!cb) return;
+        const id = cb.dataset.id;
+        if (id) toggleRoute(id, cb.checked);
+      });
+    }
+    const addProvBtn = $('addUpstreamBtn');
+    if (addProvBtn) addProvBtn.addEventListener('click', () => openUpstreamModal(null));
+    const addRouteBtn = $('addRouteBtn');
+    if (addRouteBtn) addRouteBtn.addEventListener('click', () => {
+      if (!upstreamCache.providers.length) { toast(t('upstreams.needProviderFirst'), 'warning'); return; }
+      openRouteModal(null);
+    });
+    const upSave = $('upstreamModalSaveBtn');
+    if (upSave) upSave.addEventListener('click', submitUpstreamModal);
+    const upCancel = $('upstreamModalCancelBtn');
+    if (upCancel) upCancel.addEventListener('click', closeUpstreamModal);
+    const upClose = $('upstreamModalClose');
+    if (upClose) upClose.addEventListener('click', closeUpstreamModal);
+    const rtSave = $('modelRouteModalSaveBtn');
+    if (rtSave) rtSave.addEventListener('click', submitRouteModal);
+    const rtCancel = $('modelRouteModalCancelBtn');
+    if (rtCancel) rtCancel.addEventListener('click', closeRouteModal);
+    const rtClose = $('modelRouteModalClose');
+    if (rtClose) rtClose.addEventListener('click', closeRouteModal);
+    bindDialogBackdropClose('upstreamModal', closeUpstreamModal);
+    bindDialogBackdropClose('modelRouteModal', closeRouteModal);
   }
 
   // Prompt filter rules
@@ -3215,11 +3678,13 @@
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);
+    $('saveSecurityBtn').addEventListener('click', saveSecurityConfig);
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
     $('proxyImportBtn').addEventListener('click', importProxies);
     $('resetStatsBtn').addEventListener('click', resetStats);
     bindApiKeyEvents();
+    bindUpstreamEvents();
   }
 
   function bindPromptFilterEvents() {
@@ -3323,6 +3788,7 @@
     initCustomSelectObserver();
     initPrivacyMode();
     initRememberMe();
+    initApiAddrSelect();
     const yr = $('footerYear');
     if (yr) yr.textContent = new Date().getFullYear();
     wireEvents();

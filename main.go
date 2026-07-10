@@ -51,6 +51,12 @@ func main() {
 		config.SetPassword(envPassword)
 	}
 
+	// Surface weak-configuration warnings before serving. Runs after the
+	// ADMIN_PASSWORD override so an env-set password clears that warning.
+	for _, warn := range config.EvaluateSecurityWarnings() {
+		logger.Warnf("SECURITY: %s", warn.Msg)
+	}
+
 	// 初始化账号池
 	pool.GetPool()
 
@@ -59,10 +65,14 @@ func main() {
 
 	// 启动服务器
 	addr := fmt.Sprintf("%s:%d", config.GetHost(), config.GetPort())
-	logger.Infof("Kiro-Go starting on http://%s (log level: %s)", addr, logger.LevelName(logger.GetLevel()))
-	logger.Infof("Admin panel: http://%s/admin", addr)
-	logger.Infof("Claude API: http://%s/v1/messages", addr)
-	logger.Infof("OpenAI API: http://%s/v1/chat/completions", addr)
+	scheme := "http"
+	if config.IsTLSEnabled() {
+		scheme = "https"
+	}
+	logger.Infof("Kiro-Go starting on %s://%s (log level: %s)", scheme, addr, logger.LevelName(logger.GetLevel()))
+	logger.Infof("Admin panel: %s://%s/admin", scheme, addr)
+	logger.Infof("Claude API: %s://%s/v1/messages", scheme, addr)
+	logger.Infof("OpenAI API: %s://%s/v1/chat/completions", scheme, addr)
 
 	// WriteTimeout intentionally 0: SSE streams can run for minutes while the
 	// upstream model produces tokens. ReadHeaderTimeout + ReadTimeout still
@@ -75,7 +85,22 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	if err := srv.ListenAndServe(); err != nil {
-		logger.Fatalf("Server failed: %v", err)
+	if cert, key := config.GetTLSFiles(); cert != "" && key != "" {
+		// Fail fast rather than silently downgrading to cleartext on a box the
+		// operator has marked TLS-on.
+		if _, err := os.Stat(cert); err != nil {
+			logger.Fatalf("TLS cert not readable: %v", err)
+		}
+		if _, err := os.Stat(key); err != nil {
+			logger.Fatalf("TLS key not readable: %v", err)
+		}
+		logger.Infof("TLS enabled; serving https://%s", addr)
+		if err := srv.ListenAndServeTLS(cert, key); err != nil {
+			logger.Fatalf("Server failed: %v", err)
+		}
+	} else {
+		if err := srv.ListenAndServe(); err != nil {
+			logger.Fatalf("Server failed: %v", err)
+		}
 	}
 }

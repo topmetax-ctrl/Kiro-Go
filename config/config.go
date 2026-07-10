@@ -187,6 +187,34 @@ type PromptFilterRule struct {
 	Enabled bool   `json:"enabled"`           // Whether this rule is active
 }
 
+// UpstreamProvider describes an external OpenAI/Anthropic-compatible endpoint that
+// selected models can be forwarded to (e.g. a 9router or xpiki instance). When a
+// client model matches an enabled ModelRoute, the raw request is passed through to
+// the route's provider instead of being dispatched to the Kiro account pool.
+type UpstreamProvider struct {
+	ID       string `json:"id"`                 // Unique identifier (UUID)
+	Name     string `json:"name"`               // Human-readable label
+	BaseURL  string `json:"baseUrl"`            // Base URL incl. version, e.g. https://api.xpiki.com/v1
+	ApiKey   string `json:"apiKey"`             // Bearer token sent to the upstream
+	ProxyURL string `json:"proxyURL,omitempty"` // Optional per-provider outbound proxy (falls back to global)
+	Enabled  bool   `json:"enabled"`            // Whether this provider may receive forwards
+}
+
+// ModelRoute maps a client-supplied model name to an upstream provider. Matching is
+// exact on Model. When TargetModel is non-empty the request's "model" field is
+// rewritten to it before forwarding; otherwise the original name is preserved.
+//
+// Loop-safety note: the set of routed model names MUST be disjoint from the model
+// names the upstream forwards back to this proxy. A back-referenced Kiro model with
+// no matching enabled route falls through to the default Kiro pool, breaking the loop.
+type ModelRoute struct {
+	ID          string `json:"id"`                    // Unique identifier (UUID)
+	Model       string `json:"model"`                 // Client model name to match (exact)
+	UpstreamID  string `json:"upstreamId"`            // Target UpstreamProvider.ID
+	TargetModel string `json:"targetModel,omitempty"` // Optional model name to rewrite to; empty = keep original
+	Enabled     bool   `json:"enabled"`               // Whether this route is active
+}
+
 // ApiKeyEntry represents a single API key with optional usage limits and counters.
 // Limits with value 0 are treated as "no limit". Counters are cumulative and never reset
 // automatically; operators can use the admin endpoint to manually reset them.
@@ -259,6 +287,12 @@ type Config struct {
 	// Leave empty to connect directly.
 	ProxyURL string `json:"proxyURL,omitempty"`
 
+	// Security hardening (all opt-in; zero values preserve legacy behavior).
+	AdminAllowlist []string `json:"adminAllowlist,omitempty"` // IPs/CIDRs allowed to reach /admin*. Empty = allow all.
+	TrustProxy     bool     `json:"trustProxy,omitempty"`     // Parse X-Forwarded-For / X-Real-IP for client IP when true.
+	TLSCertFile    string   `json:"tlsCertFile,omitempty"`    // PEM cert path. Both cert+key required to enable HTTPS.
+	TLSKeyFile     string   `json:"tlsKeyFile,omitempty"`     // PEM key path. Empty = plain HTTP.
+
 	// SanitizeClaudeCodePrompt is kept for backward-compatible JSON loading only.
 	// Migrated to FilterClaudeCode on first load. Do not use directly.
 	SanitizeClaudeCodePrompt bool `json:"sanitizeClaudeCodePrompt,omitempty"`
@@ -276,6 +310,11 @@ type Config struct {
 
 	// PromptFilterRules is a list of user-defined prompt sanitization rules (regex or line-filter).
 	PromptFilterRules []PromptFilterRule `json:"promptFilterRules,omitempty"`
+
+	// Upstreams and ModelRoutes configure forwarding of selected models to external
+	// OpenAI/Anthropic-compatible endpoints instead of the Kiro account pool.
+	Upstreams   []UpstreamProvider `json:"upstreams,omitempty"`
+	ModelRoutes []ModelRoute       `json:"modelRoutes,omitempty"`
 
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
@@ -708,6 +747,106 @@ func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) e
 	return Save()
 }
 
+// GetAdminAllowlist returns a defensive copy of the admin IP allowlist.
+func GetAdminAllowlist() []string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if len(cfg.AdminAllowlist) == 0 {
+		return nil
+	}
+	out := make([]string, len(cfg.AdminAllowlist))
+	copy(out, cfg.AdminAllowlist)
+	return out
+}
+
+// GetTrustProxy reports whether forwarded-IP headers should be trusted.
+func GetTrustProxy() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg.TrustProxy
+}
+
+// GetTLSFiles returns the configured TLS cert and key file paths.
+func GetTLSFiles() (cert, key string) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg.TLSCertFile, cfg.TLSKeyFile
+}
+
+// IsTLSEnabled reports whether both TLS cert and key paths are configured.
+func IsTLSEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg.TLSCertFile != "" && cfg.TLSKeyFile != ""
+}
+
+// UpdateSecuritySettings applies a partial patch of the security-related fields.
+// Only non-nil arguments are written. One lock/Save cycle.
+func UpdateSecuritySettings(allowlist *[]string, trustProxy *bool, tlsCert *string, tlsKey *string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if allowlist != nil {
+		cfg.AdminAllowlist = *allowlist
+	}
+	if trustProxy != nil {
+		cfg.TrustProxy = *trustProxy
+	}
+	if tlsCert != nil {
+		cfg.TLSCertFile = *tlsCert
+	}
+	if tlsKey != nil {
+		cfg.TLSKeyFile = *tlsKey
+	}
+	return Save()
+}
+
+// ConfigWarning describes a weak-configuration condition worth surfacing to the
+// operator, both at startup (logs) and in the admin UI (banner). The Code is a
+// stable identifier the UI re-localizes; Msg is an English fallback.
+type ConfigWarning struct {
+	Code string `json:"code"`
+	Msg  string `json:"msg"`
+}
+
+// EvaluateSecurityWarnings inspects the live config for weak settings that make
+// public exposure dangerous. Returned most-severe first.
+func EvaluateSecurityWarnings() []ConfigWarning {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+
+	defaultPassword := cfg.Password == "changeme"
+	// Auth is effectively off whenever RequireApiKey is false: authenticate()
+	// short-circuits to success before any key is consulted. Key count is
+	// irrelevant here.
+	authDisabled := !cfg.RequireApiKey
+	// Resolve host the same way the listener does: GetHost() maps an empty Host
+	// to "127.0.0.1", so an empty value is NOT a public bind. Only an explicit
+	// wildcard address exposes the server. (Resolve inline — do not call GetHost()
+	// here, it would re-acquire the same RLock.)
+	publicBind := cfg.Host == "0.0.0.0" || cfg.Host == "::"
+
+	var out []ConfigWarning
+	if defaultPassword {
+		out = append(out, ConfigWarning{
+			Code: "defaultPassword",
+			Msg:  `Admin password is still the default "changeme". Change it now.`,
+		})
+	}
+	if authDisabled {
+		out = append(out, ConfigWarning{
+			Code: "authDisabled",
+			Msg:  "API-key authentication is disabled; anyone can use the proxy.",
+		})
+	}
+	if publicBind && (defaultPassword || authDisabled) {
+		out = append(out, ConfigWarning{
+			Code: "publicBind",
+			Msg:  "Server is bound to a public address (0.0.0.0) with weak settings above.",
+		})
+	}
+	return out
+}
+
 func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -1054,4 +1193,62 @@ func defaultSystemVersion() string {
 	default:
 		return "linux#6.6.87"
 	}
+}
+
+// GetUpstreamConfig returns copies of the configured upstream providers and model
+// routes. Copies are returned so callers cannot mutate shared state without the lock.
+func GetUpstreamConfig() ([]UpstreamProvider, []ModelRoute) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return nil, nil
+	}
+	providers := make([]UpstreamProvider, len(cfg.Upstreams))
+	copy(providers, cfg.Upstreams)
+	routes := make([]ModelRoute, len(cfg.ModelRoutes))
+	copy(routes, cfg.ModelRoutes)
+	return providers, routes
+}
+
+// UpdateUpstreamConfig replaces the upstream providers and model routes atomically
+// and persists the change. Passing nil for either slice clears it.
+func UpdateUpstreamConfig(providers []UpstreamProvider, routes []ModelRoute) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.Upstreams = providers
+	cfg.ModelRoutes = routes
+	return Save()
+}
+
+// FindEnabledRoute looks up an enabled ModelRoute whose Model matches the given
+// client model name (exact match after trimming surrounding whitespace) and returns
+// it together with its enabled UpstreamProvider. Returns (nil, nil) when there is no
+// match or the target provider is missing/disabled — callers then fall through to the
+// default Kiro pool. This exact-match-only behavior is what keeps forward loops from
+// forming: a model name the upstream sends back that has no route dispatches normally.
+func FindEnabledRoute(model string) (*ModelRoute, *UpstreamProvider) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return nil, nil
+	}
+	target := strings.TrimSpace(model)
+	if target == "" {
+		return nil, nil
+	}
+	for i := range cfg.ModelRoutes {
+		r := cfg.ModelRoutes[i]
+		if !r.Enabled || strings.TrimSpace(r.Model) != target {
+			continue
+		}
+		for j := range cfg.Upstreams {
+			up := cfg.Upstreams[j]
+			if up.ID == r.UpstreamID && up.Enabled {
+				routeCopy := r
+				upCopy := up
+				return &routeCopy, &upCopy
+			}
+		}
+	}
+	return nil, nil
 }

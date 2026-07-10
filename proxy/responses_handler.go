@@ -34,6 +34,12 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		req.Model = defaultResponsesModel
 	}
 
+	// Forward to an external upstream when the client model matches an enabled
+	// route. Uses the raw client body (passthrough), bypassing the Kiro pool.
+	if h.tryForwardUpstream(w, body, req.Model, req.Stream, "/responses", false) {
+		return
+	}
+
 	storedInputCopy := append(json.RawMessage(nil), req.Input...)
 
 	storeResponse := true

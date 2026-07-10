@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"kiro-go/config"
 	"kiro-go/logger"
 	"kiro-go/pool"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -334,6 +336,58 @@ func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) 
 	return withApiKeyContext(r, entry)
 }
 
+// clientIP resolves the request's client IP. X-Forwarded-For / X-Real-IP are only
+// consulted when TrustProxy is enabled (otherwise a directly-exposed server would
+// trust attacker-supplied headers). The left-most XFF token is the origin client.
+func clientIP(r *http.Request) string {
+	if config.GetTrustProxy() {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if ip := strings.TrimSpace(strings.Split(xff, ",")[0]); ip != "" {
+				return ip
+			}
+		}
+		if xr := strings.TrimSpace(r.Header.Get("X-Real-IP")); xr != "" {
+			return xr
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// adminIPAllowed reports whether the given client IP may reach /admin*. An empty
+// allowlist allows everyone (back-compat). Loopback is always allowed so a typo'd
+// allowlist can never lock the operator out of localhost.
+func adminIPAllowed(ipStr string) bool {
+	list := config.GetAdminAllowlist()
+	if len(list) == 0 {
+		return true
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	for _, e := range list {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if strings.Contains(e, "/") {
+			if _, c, err := net.ParseCIDR(e); err == nil && c.Contains(ip) {
+				return true
+			}
+		} else if p := net.ParseIP(e); p != nil && p.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // ServeHTTP 路由分发
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -386,13 +440,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Write([]byte(`{"status":"ok"}`))
 
-	// 管理端点
-	case path == "/admin" || path == "/admin/":
-		h.serveAdminPage(w, r)
-	case strings.HasPrefix(path, "/admin/api/"):
-		h.handleAdminAPI(w, r)
-	case strings.HasPrefix(path, "/admin/"):
-		h.serveStaticFile(w, r)
+	// 管理端点 (IP 白名单在密码校验之前生效)
+	case path == "/admin" || path == "/admin/" || strings.HasPrefix(path, "/admin/"):
+		if !adminIPAllowed(clientIP(r)) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		switch {
+		case path == "/admin" || path == "/admin/":
+			h.serveAdminPage(w, r)
+		case strings.HasPrefix(path, "/admin/api/"):
+			h.handleAdminAPI(w, r)
+		default:
+			h.serveStaticFile(w, r)
+		}
 
 	// 健康检查
 	case path == "/health" || path == "/":
@@ -800,6 +861,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	}
 	if msg := validateClaudeRequestShape(&req); msg != "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
+		return
+	}
+
+	// Forward to an external upstream when the (raw, un-normalized) client model
+	// matches an enabled route. Passthrough bypasses the Kiro pool entirely.
+	if h.tryForwardUpstream(w, body, req.Model, req.Stream, "/messages", true) {
 		return
 	}
 
@@ -1494,6 +1561,12 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Forward to an external upstream when the (raw, un-normalized) client model
+	// matches an enabled route. Passthrough bypasses the Kiro pool entirely.
+	if h.tryForwardUpstream(w, body, req.Model, req.Stream, "/chat/completions", false) {
+		return
+	}
+
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
@@ -2047,7 +2120,7 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if password != config.GetPassword() {
+	if subtle.ConstantTimeCompare([]byte(password), []byte(config.GetPassword())) != 1 {
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 		return
@@ -2158,8 +2231,18 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetPromptFilter(w, r)
 	case path == "/prompt-filter" && r.Method == "POST":
 		h.apiUpdatePromptFilter(w, r)
+	case path == "/upstreams" && r.Method == "GET":
+		h.apiGetUpstreams(w, r)
+	case path == "/upstreams" && r.Method == "POST":
+		h.apiUpdateUpstreams(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
+	case path == "/net-interfaces" && r.Method == "GET":
+		h.apiGetNetInterfaces(w, r)
+	case path == "/security" && r.Method == "GET":
+		h.apiGetSecurity(w, r)
+	case path == "/security" && r.Method == "POST":
+		h.apiUpdateSecurity(w, r)
 	case path == "/export" && r.Method == "POST":
 		h.apiExportAccounts(w, r)
 	case path == "/api-keys" && r.Method == "GET":
@@ -3348,6 +3431,77 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// apiGetSecurity returns the security-hardening config plus a live evaluation of
+// weak-config warnings and the caller's resolved IP (for the "your IP" hint).
+func (h *Handler) apiGetSecurity(w http.ResponseWriter, r *http.Request) {
+	cert, key := config.GetTLSFiles()
+	al := config.GetAdminAllowlist()
+	if al == nil {
+		al = []string{} // serialize as [] not null
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"adminAllowlist": al,
+		"trustProxy":     config.GetTrustProxy(),
+		"tlsCertFile":    cert,
+		"tlsKeyFile":     key,
+		"tlsEnabled":     config.IsTLSEnabled(),
+		"host":           config.GetHost(),
+		"clientIP":       clientIP(r),
+		"warnings":       config.EvaluateSecurityWarnings(),
+	})
+}
+
+// apiUpdateSecurity applies a partial patch to the security settings. Allowlist
+// entries are validated as IP or CIDR before persisting. TLS changes require a
+// restart to take effect (the listener is bound once at boot).
+func (h *Handler) apiUpdateSecurity(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AdminAllowlist *[]string `json:"adminAllowlist,omitempty"`
+		TrustProxy     *bool     `json:"trustProxy,omitempty"`
+		TLSCertFile    *string   `json:"tlsCertFile,omitempty"`
+		TLSKeyFile     *string   `json:"tlsKeyFile,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	// Validate + normalize allowlist entries before persisting.
+	if req.AdminAllowlist != nil {
+		cleaned := make([]string, 0, len(*req.AdminAllowlist))
+		for _, e := range *req.AdminAllowlist {
+			e = strings.TrimSpace(e)
+			if e == "" {
+				continue
+			}
+			if strings.Contains(e, "/") {
+				if _, _, err := net.ParseCIDR(e); err != nil {
+					w.WriteHeader(400)
+					json.NewEncoder(w).Encode(map[string]string{"error": "Invalid CIDR: " + e})
+					return
+				}
+			} else if net.ParseIP(e) == nil {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Invalid IP: " + e})
+				return
+			}
+			cleaned = append(cleaned, e)
+		}
+		req.AdminAllowlist = &cleaned
+	}
+
+	if err := config.UpdateSecuritySettings(req.AdminAllowlist, req.TrustProxy, req.TLSCertFile, req.TLSKeyFile); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"warnings": config.EvaluateSecurityWarnings(),
+	})
+}
+
 func (h *Handler) apiGetPromptFilter(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(config.GetPromptFilterConfig())
 }
@@ -3384,6 +3538,73 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 		rules = *req.Rules
 	}
 	if err := config.UpdatePromptFilterConfig(fcc, fen, fsb, rules); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiGetUpstreams returns the configured upstream providers and model routes.
+// Provider API keys are masked so the admin panel can display entries without
+// exposing the full secret.
+func (h *Handler) apiGetUpstreams(w http.ResponseWriter, r *http.Request) {
+	providers, routes := config.GetUpstreamConfig()
+	if providers == nil {
+		providers = []config.UpstreamProvider{}
+	}
+	if routes == nil {
+		routes = []config.ModelRoute{}
+	}
+	masked := make([]config.UpstreamProvider, len(providers))
+	for i, p := range providers {
+		p.ApiKey = config.MaskApiKey(p.ApiKey)
+		masked[i] = p
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"providers": masked,
+		"routes":    routes,
+	})
+}
+
+// apiUpdateUpstreams replaces the upstream providers and model routes atomically.
+// Because GET returns masked API keys, an incoming provider key that still looks
+// masked (contains "****") is treated as "unchanged" and the previously stored
+// secret for that provider ID is preserved.
+func (h *Handler) apiUpdateUpstreams(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Providers []config.UpstreamProvider `json:"providers"`
+		Routes    []config.ModelRoute       `json:"routes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	existing, _ := config.GetUpstreamConfig()
+	existingKeyByID := make(map[string]string, len(existing))
+	for _, p := range existing {
+		existingKeyByID[p.ID] = p.ApiKey
+	}
+
+	for i := range req.Providers {
+		p := &req.Providers[i]
+		if p.ID == "" {
+			p.ID = config.GenerateMachineId()
+		}
+		// Preserve the stored key when the client sends back a masked value.
+		if strings.Contains(p.ApiKey, "****") {
+			p.ApiKey = existingKeyByID[p.ID]
+		}
+	}
+	for i := range req.Routes {
+		if req.Routes[i].ID == "" {
+			req.Routes[i].ID = config.GenerateMachineId()
+		}
+	}
+
+	if err := config.UpdateUpstreamConfig(req.Providers, req.Routes); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -4030,6 +4251,63 @@ func (h *Handler) apiUpdateProxy(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiGetVersion(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
 		"version": config.Version,
+	})
+}
+
+// netAddrInfo 描述一个可用于访问的网络地址
+type netAddrInfo struct {
+	IP         string `json:"ip"`         // IPv4 地址
+	Iface      string `json:"iface"`      // 网卡名称 (en0, eth0...)
+	IsLoopback bool   `json:"isLoopback"` // 是否为回环地址
+}
+
+// apiGetNetInterfaces 返回本机所有 IPv4 地址，供前端生成 LAN 访问 URL。
+// 仅在服务器绑定 0.0.0.0 时，LAN 地址才真正可达；bound 字段告知前端当前监听地址。
+func (h *Handler) apiGetNetInterfaces(w http.ResponseWriter, r *http.Request) {
+	host := config.GetHost()
+	// 当绑定到 0.0.0.0 或空时，服务监听所有网卡，LAN 可达
+	listensAll := host == "0.0.0.0" || host == "" || host == "::"
+
+	addrs := make([]netAddrInfo, 0, 4)
+	// 始终包含 localhost 作为默认项
+	addrs = append(addrs, netAddrInfo{IP: "127.0.0.1", Iface: "localhost", IsLoopback: true})
+
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, iface := range ifaces {
+			// 跳过未启用的网卡
+			if iface.Flags&net.FlagUp == 0 {
+				continue
+			}
+			ifAddrs, aerr := iface.Addrs()
+			if aerr != nil {
+				continue
+			}
+			for _, a := range ifAddrs {
+				var ip net.IP
+				switch v := a.(type) {
+				case *net.IPNet:
+					ip = v.IP
+				case *net.IPAddr:
+					ip = v.IP
+				}
+				if ip == nil || ip.IsLoopback() {
+					continue
+				}
+				ip4 := ip.To4()
+				if ip4 == nil {
+					continue // 仅返回 IPv4
+				}
+				addrs = append(addrs, netAddrInfo{IP: ip4.String(), Iface: iface.Name})
+			}
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"port":       config.GetPort(),
+		"listensAll": listensAll,
+		"host":       host,
+		"addrs":      addrs,
 	})
 }
 

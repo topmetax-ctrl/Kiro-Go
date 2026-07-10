@@ -235,6 +235,8 @@
 
       <!-- Settings tab -->
       <div id="tabSettings" class="tab-content hidden">
+        <p class="api-hint api-addr-warning hidden" id="securityWarnings" style="margin-bottom: 1rem;">
+          <i class="fa-solid fa-triangle-exclamation"></i><span></span></p>
         <!-- API settings -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.apiSettings"></span></div>
@@ -343,6 +345,36 @@
           <button class="btn btn-primary" id="changePasswordBtn" data-i18n="settings.changePassword"></button>
         </div>
 
+        <!-- Security -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.security"></span></div>
+          <div class="form-group">
+            <label data-i18n="settings.adminAllowlist"></label>
+            <textarea id="adminAllowlist" rows="3" data-i18n-placeholder="settings.adminAllowlistPlaceholder"></textarea>
+            <small data-i18n="settings.adminAllowlistHint"></small>
+          </div>
+          <div class="form-group">
+            <small><span data-i18n="settings.yourIp"></span> <code id="secYourIp" class="font-mono"></code></small>
+          </div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="trustProxy" /><span class="slider"></span></span>
+              <span data-i18n="settings.trustProxy"></span>
+            </label>
+            <small data-i18n="settings.trustProxyHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="settings.tlsCertFile"></label>
+            <input type="text" id="tlsCertFile" class="font-mono" data-i18n-placeholder="settings.tlsCertPlaceholder" />
+          </div>
+          <div class="form-group">
+            <label data-i18n="settings.tlsKeyFile"></label>
+            <input type="text" id="tlsKeyFile" class="font-mono" data-i18n-placeholder="settings.tlsKeyPlaceholder" />
+            <small data-i18n="settings.tlsHint"></small>
+          </div>
+          <button class="btn btn-primary" id="saveSecurityBtn" data-i18n="settings.saveSecurity"></button>
+        </div>
+
         <!-- Outbound proxy -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.proxySettings"></span></div>
@@ -443,6 +475,36 @@
           </div>
         </div>
 
+        <!-- Upstream forwarding -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.upstreamTitle"></span></div>
+          <small class="help-block" data-i18n="upstreams.intro"></small>
+
+          <div class="form-group" style="margin-top: 1rem;">
+            <div class="flex items-center gap-2" style="justify-content: space-between;">
+              <label class="font-semibold" data-i18n="upstreams.providersTitle"></label>
+              <button class="btn btn-outline btn-sm" id="addUpstreamBtn" type="button">
+                <i class="fa-solid fa-plus"></i>
+                <span data-i18n="upstreams.addProvider"></span>
+              </button>
+            </div>
+            <small data-i18n="upstreams.providersHint"></small>
+          </div>
+          <div id="upstreamsList"></div>
+
+          <div class="form-group" style="margin-top: 1rem;">
+            <div class="flex items-center gap-2" style="justify-content: space-between;">
+              <label class="font-semibold" data-i18n="upstreams.routesTitle"></label>
+              <button class="btn btn-outline btn-sm" id="addRouteBtn" type="button">
+                <i class="fa-solid fa-plus"></i>
+                <span data-i18n="upstreams.addRoute"></span>
+              </button>
+            </div>
+            <small data-i18n="upstreams.routesHint"></small>
+          </div>
+          <div id="modelRoutesList"></div>
+        </div>
+
         <!-- Statistics reset -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.statistics"></span></div>
@@ -455,8 +517,12 @@
         <section class="api-card" aria-labelledby="apiEndpointsTitle">
           <div class="card-header api-card-header">
             <span class="card-title" id="apiEndpointsTitle" data-i18n="api.endpoints"></span>
-            <span class="api-pill" data-i18n="api.protocolHttp"></span>
+            <div class="api-header-actions">
+              <select id="apiAddrSelect" class="api-addr-select" aria-label="" data-i18n-aria-label="api.addrSelectLabel"></select>
+              <span class="api-pill" data-i18n="api.protocolHttp"></span>
+            </div>
           </div>
+          <p class="api-hint api-addr-warning hidden" id="apiAddrWarning"><i class="fa-solid fa-triangle-exclamation"></i><span></span></p>
           <div class="api-endpoint-list">
             <section class="api-endpoint-item">
               <div class="api-endpoint-meta">
@@ -686,6 +752,83 @@
         <div class="modal-footer">
           <button class="btn btn-secondary" id="apiKeyModalCancelBtn" type="button" data-i18n="apiKeys.cancelBtn"></button>
           <button class="btn btn-primary" id="apiKeyModalSaveBtn" type="button" data-i18n="apiKeys.saveBtn"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="upstreamModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span class="modal-title" id="upstreamModalTitle" data-i18n="upstreams.providerModalCreate"></span>
+        <button class="modal-close" id="upstreamModalClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label data-i18n="upstreams.formName"></label>
+          <input type="text" id="upstreamForm_name" data-i18n-placeholder="upstreams.formNamePlaceholder" />
+        </div>
+        <div class="form-group">
+          <label data-i18n="upstreams.baseUrl"></label>
+          <input type="text" id="upstreamForm_baseUrl" placeholder="http://localhost:20128/v1" />
+          <small data-i18n="upstreams.baseUrlHint"></small>
+        </div>
+        <div class="form-group">
+          <label data-i18n="upstreams.apiKey"></label>
+          <input type="text" id="upstreamForm_apiKey" data-i18n-placeholder="upstreams.apiKeyPlaceholder" />
+          <small data-i18n="upstreams.apiKeyHint"></small>
+        </div>
+        <div class="form-group">
+          <label data-i18n="upstreams.proxyUrl"></label>
+          <input type="text" id="upstreamForm_proxyUrl" placeholder="socks5://host:port" />
+          <small data-i18n="upstreams.proxyUrlHint"></small>
+        </div>
+        <div class="form-group">
+          <label class="flex items-center gap-2">
+            <span class="switch"><input type="checkbox" id="upstreamForm_enabled" checked /><span class="slider"></span></span>
+            <span data-i18n="upstreams.formEnabled"></span>
+          </label>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="upstreamModalCancelBtn" type="button" data-i18n="upstreams.cancelBtn"></button>
+          <button class="btn btn-primary" id="upstreamModalSaveBtn" type="button" data-i18n="upstreams.saveBtn"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="modelRouteModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span class="modal-title" id="modelRouteModalTitle" data-i18n="upstreams.routeModalCreate"></span>
+        <button class="modal-close" id="modelRouteModalClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label data-i18n="upstreams.routeModel"></label>
+          <input type="text" id="routeForm_model" data-i18n-placeholder="upstreams.routeModelPlaceholder" />
+          <small data-i18n="upstreams.routeModelHint"></small>
+        </div>
+        <div class="form-group">
+          <label data-i18n="upstreams.provider"></label>
+          <select id="routeForm_upstreamId"></select>
+        </div>
+        <div class="form-group">
+          <label data-i18n="upstreams.targetModel"></label>
+          <input type="text" id="routeForm_targetModel" data-i18n-placeholder="upstreams.targetModelPlaceholder" />
+          <small data-i18n="upstreams.targetModelHint"></small>
+        </div>
+        <div class="form-group">
+          <label class="flex items-center gap-2">
+            <span class="switch"><input type="checkbox" id="routeForm_enabled" checked /><span class="slider"></span></span>
+            <span data-i18n="upstreams.formEnabled"></span>
+          </label>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="modelRouteModalCancelBtn" type="button" data-i18n="upstreams.cancelBtn"></button>
+          <button class="btn btn-primary" id="modelRouteModalSaveBtn" type="button" data-i18n="upstreams.saveBtn"></button>
         </div>
       </div>
     </div>
