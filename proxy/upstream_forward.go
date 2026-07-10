@@ -6,8 +6,10 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/metrics"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // tryForwardUpstream checks whether the given client model matches an enabled
@@ -29,8 +31,25 @@ func (h *Handler) tryForwardUpstream(w http.ResponseWriter, body []byte, model s
 		return false
 	}
 
+	start := time.Now()
+	recordMetric := func(status int, ok bool, errMsg string) {
+		metrics.Record(metrics.Event{
+			ClientModel:  model,
+			TargetModel:  strings.TrimSpace(route.TargetModel),
+			RouteID:      route.ID,
+			ProviderID:   up.ID,
+			ProviderName: up.Name,
+			Status:       status,
+			LatencyMs:    time.Since(start).Milliseconds(),
+			Stream:       stream,
+			Ok:           ok,
+			ErrorMsg:     errMsg,
+		})
+	}
+
 	sendErr := func(status int, message string) {
 		h.recordFailure()
+		recordMetric(status, false, message)
 		if isClaudeRoute {
 			h.sendClaudeError(w, status, "api_error", message)
 		} else {
@@ -89,11 +108,15 @@ func (h *Handler) tryForwardUpstream(w http.ResponseWriter, body []byte, model s
 
 	// Count the forward in the global stats (tokens are not tracked for
 	// passthroughs). Per-API-key quota is intentionally left untouched.
-	if resp.StatusCode == 200 {
+	// Latency is measured to the upstream's response headers, before the body
+	// (or SSE stream) is relayed.
+	ok := resp.StatusCode == 200
+	if ok {
 		h.recordSuccess(0, 0, 0)
 	} else {
 		h.recordFailure()
 	}
+	recordMetric(resp.StatusCode, ok, "")
 
 	// A non-200 upstream response is an error body (usually JSON), not an SSE
 	// stream — copy it through verbatim regardless of the client's stream flag.

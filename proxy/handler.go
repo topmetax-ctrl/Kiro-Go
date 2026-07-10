@@ -10,6 +10,7 @@ import (
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/metrics"
 	"kiro-go/pool"
 	"net"
 	"net/http"
@@ -230,6 +231,10 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+	// 恢复转发指标聚合数据 (事件日志与时序为内存态，不持久化)
+	if err := metrics.Load(forwardMetricsPath()); err != nil {
+		logger.Warnf("[Metrics] failed to load forward stats: %v", err)
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -1367,6 +1372,15 @@ func (h *Handler) saveStats() {
 		int(atomic.LoadInt64(&h.totalTokens)),
 		h.getCredits(),
 	)
+	if err := metrics.Save(forwardMetricsPath()); err != nil {
+		logger.Warnf("[Metrics] failed to save forward stats: %v", err)
+	}
+}
+
+// forwardMetricsPath returns the file holding persisted forward-metric
+// aggregates, kept alongside the config file.
+func forwardMetricsPath() string {
+	return config.GetConfigDir() + "/forward_stats.json"
 }
 
 // getCredits 线程安全获取 credits
@@ -2242,6 +2256,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpstreamModels(w, r)
 	case path == "/upstream-test" && r.Method == "POST":
 		h.apiUpstreamTest(w, r)
+	case path == "/forward-stats" && r.Method == "GET":
+		h.apiGetForwardStats(w, r)
+	case path == "/forward-stats/reset" && r.Method == "POST":
+		h.apiResetForwardStats(w, r)
+	case path == "/forward-events" && r.Method == "GET":
+		h.apiGetForwardEvents(w, r)
+	case path == "/forward-events/stream" && r.Method == "GET":
+		h.apiStreamForwardEvents(w, r)
 	case path == "/version" && r.Method == "GET":
 		h.apiGetVersion(w, r)
 	case path == "/net-interfaces" && r.Method == "GET":
@@ -3865,6 +3887,119 @@ func (h *Handler) apiGetPublicIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "ip": ip, "port": config.GetPort()})
+}
+
+// apiGetForwardStats returns aggregate forward metrics: overall totals,
+// per-provider and per-route breakdowns, the rolling time-series, and latency
+// percentiles.
+func (h *Handler) apiGetForwardStats(w http.ResponseWriter, r *http.Request) {
+	minutes := 60
+	if v := strings.TrimSpace(r.URL.Query().Get("minutes")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			minutes = n
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"overall":     metrics.Overall(),
+		"providers":   metrics.ProviderStats(),
+		"routes":      metrics.RouteStats(),
+		"timeseries":  metrics.TimeSeries(minutes),
+		"percentiles": metrics.LatencyPercentiles(),
+	})
+}
+
+// apiResetForwardStats clears all forward metrics and persists the empty state.
+func (h *Handler) apiResetForwardStats(w http.ResponseWriter, r *http.Request) {
+	metrics.Reset()
+	if err := metrics.Save(forwardMetricsPath()); err != nil {
+		logger.Warnf("[Metrics] failed to save after reset: %v", err)
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+// apiGetForwardEvents returns forward events newest-first with optional
+// provider/status/model filters and offset/limit pagination.
+func (h *Handler) apiGetForwardEvents(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	offset := 0
+	if n, err := strconv.Atoi(strings.TrimSpace(q.Get("offset"))); err == nil && n > 0 {
+		offset = n
+	}
+	limit := 50
+	if n, err := strconv.Atoi(strings.TrimSpace(q.Get("limit"))); err == nil && n > 0 {
+		limit = n
+	}
+	items, total := metrics.Events(metrics.EventFilter{
+		ProviderID: strings.TrimSpace(q.Get("provider")),
+		Status:     strings.TrimSpace(q.Get("status")),
+		Model:      strings.TrimSpace(q.Get("model")),
+		Offset:     offset,
+		Limit:      limit,
+	})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"items":  items,
+		"total":  total,
+		"offset": offset,
+		"limit":  limit,
+	})
+}
+
+// apiStreamForwardEvents streams live forward events over SSE. It mirrors
+// apiStreamLogs: backfill recent events, then push live ones, coalescing bursts
+// into a single flush and emitting periodic pings to keep the connection open.
+func (h *Handler) apiStreamForwardEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Streaming not supported"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	writeEvent := func(e metrics.Event) {
+		data, _ := json.Marshal(e)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+	}
+
+	// Backfill the most recent events (newest-first from Events), oldest first
+	// so the client can append in chronological order.
+	recent, _ := metrics.Events(metrics.EventFilter{Limit: 50})
+	for i := len(recent) - 1; i >= 0; i-- {
+		writeEvent(recent[i])
+	}
+	flusher.Flush()
+
+	ch, cancel := metrics.Subscribe()
+	defer cancel()
+
+	ctx := r.Context()
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case e := <-ch:
+			writeEvent(e)
+			for drained := true; drained; {
+				select {
+				case e2 := <-ch:
+					writeEvent(e2)
+				default:
+					drained = false
+				}
+			}
+			flusher.Flush()
+		case <-ticker.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
 }
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {

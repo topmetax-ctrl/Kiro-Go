@@ -2165,6 +2165,7 @@
             '<button class="btn btn-danger btn-sm" type="button" data-upstream-action="delete" data-id="' + id + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
           '</div>' +
         '</div>' +
+        '<div class="text-xs muted-text font-mono" data-fwd-inline-for="' + id + '" style="margin-top:0.35rem;"></div>' +
       '</div>';
     }).join('');
   }
@@ -2601,6 +2602,269 @@
     bindDialogBackdropClose('upstreamModal', closeUpstreamModal);
     bindDialogBackdropClose('modelRouteModal', closeRouteModal);
     bindDialogBackdropClose('upstreamModelsModal', closeModelsModal);
+  }
+
+  // ===== Forwarding dashboard =====
+  let forwardStats = { overall: {}, providers: [], routes: [] };
+  let fwdEventsOffset = 0;
+  const fwdEventsLimit = 50;
+  let fwdEventsTotal = 0;
+  let fwdSource = null;
+  const fwdProviderNames = {}; // providerId -> name, for labeling events
+
+  function fwdFmtLatency(ms) {
+    if (ms == null) return '-';
+    if (ms >= 1000) return (ms / 1000).toFixed(1) + 's';
+    return ms + ' ms';
+  }
+
+  function fwdFmtTime(ms) {
+    if (!ms) return '';
+    const d = new Date(ms);
+    return d.toLocaleTimeString();
+  }
+
+  // Aggregate stats: stat cards, chart, percentiles, and per-provider/route
+  // counters used by the inline card stats in Settings.
+  async function loadForwardStats() {
+    try {
+      const res = await api('/forward-stats');
+      if (!res.ok) throw new Error('http ' + res.status);
+      const d = await res.json();
+      forwardStats = {
+        overall: d.overall || {},
+        providers: Array.isArray(d.providers) ? d.providers : [],
+        routes: Array.isArray(d.routes) ? d.routes : []
+      };
+      forwardStats.providers.forEach(p => { fwdProviderNames[p.providerId] = p.providerName || p.providerId; });
+      renderForwardStatCards(d);
+      renderForwardChart(d.timeseries || [], d.percentiles || {});
+      populateForwardProviderFilter();
+      renderProviderInlineStats();
+    } catch (e) {
+      // Non-fatal: dashboard just shows zeros.
+    }
+  }
+
+  function renderForwardStatCards(d) {
+    const o = d.overall || {};
+    if ($('fwdStatRequests')) $('fwdStatRequests').textContent = o.requests || 0;
+    if ($('fwdStatSuccess')) $('fwdStatSuccess').textContent = o.success || 0;
+    if ($('fwdStatFailed')) $('fwdStatFailed').textContent = o.failed || 0;
+    if ($('fwdStatLatency')) $('fwdStatLatency').textContent = fwdFmtLatency(o.avgLatencyMs || 0);
+  }
+
+  // Hand-rolled SVG bar chart (zero external deps): one bar per minute, success
+  // stacked below failed, height scaled to the busiest minute.
+  function renderForwardChart(series, pct) {
+    const host = $('fwdChart');
+    if (host) {
+      if (!series.length) {
+        host.innerHTML = '<div class="muted-text text-xs" style="padding:1rem 0;">' + escapeHtml(t('forward.noData')) + '</div>';
+      } else {
+        const w = 100, h = 40, n = series.length;
+        const bw = w / n;
+        const max = Math.max(1, ...series.map(b => b.requests || 0));
+        let bars = '';
+        series.forEach((b, i) => {
+          const x = (i * bw).toFixed(2);
+          const total = b.requests || 0;
+          if (!total) return;
+          const th = (total / max) * h;
+          const fh = ((b.failed || 0) / max) * h;
+          const sh = th - fh;
+          const bwFill = (bw * 0.8).toFixed(2);
+          if (sh > 0) bars += '<rect x="' + x + '" y="' + (h - th).toFixed(2) + '" width="' + bwFill + '" height="' + sh.toFixed(2) + '" fill="#22c55e"></rect>';
+          if (fh > 0) bars += '<rect x="' + x + '" y="' + (h - fh).toFixed(2) + '" width="' + bwFill + '" height="' + fh.toFixed(2) + '" fill="#ef4444"></rect>';
+        });
+        host.innerHTML = '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" style="width:100%;height:60px;">' + bars + '</svg>';
+      }
+    }
+    const pctEl = $('fwdPercentiles');
+    if (pctEl) {
+      if (pct && pct.count) {
+        pctEl.textContent = 'p50 ' + fwdFmtLatency(pct.p50) + ' · p95 ' + fwdFmtLatency(pct.p95) + ' · p99 ' + fwdFmtLatency(pct.p99);
+      } else {
+        pctEl.textContent = '';
+      }
+    }
+  }
+
+  function populateForwardProviderFilter() {
+    const sel = $('fwdFilterProvider');
+    if (!sel) return;
+    const cur = sel.value;
+    const opts = ['<option value="">' + escapeHtml(t('forward.allProviders')) + '</option>'];
+    forwardStats.providers.forEach(p => {
+      opts.push('<option value="' + escapeAttr(p.providerId) + '">' + escapeHtml(p.providerName || p.providerId) + '</option>');
+    });
+    sel.innerHTML = opts.join('');
+    sel.value = cur;
+  }
+
+  // Inline mini-stat line on each provider card (Phase 0).
+  function renderProviderInlineStats() {
+    const byId = {};
+    forwardStats.providers.forEach(p => { byId[p.providerId] = p; });
+    qsa('#upstreamsList [data-fwd-inline-for]').forEach(el => {
+      const p = byId[el.dataset.fwdInlineFor];
+      if (!p || !p.requests) { el.textContent = ''; return; }
+      el.textContent = t('forward.inlineStat', String(p.requests), String(p.success), String(p.failed), fwdFmtLatency(p.avgLatencyMs));
+    });
+  }
+
+  async function loadForwardEvents() {
+    const body = $('fwdEventsBody');
+    if (!body) return;
+    const params = new URLSearchParams();
+    params.set('offset', String(fwdEventsOffset));
+    params.set('limit', String(fwdEventsLimit));
+    const prov = $('fwdFilterProvider') ? $('fwdFilterProvider').value : '';
+    const status = $('fwdFilterStatus') ? $('fwdFilterStatus').value : '';
+    const model = $('fwdFilterModel') ? $('fwdFilterModel').value.trim() : '';
+    if (prov) params.set('provider', prov);
+    if (status) params.set('status', status);
+    if (model) params.set('model', model);
+    try {
+      const res = await api('/forward-events?' + params.toString());
+      if (!res.ok) throw new Error('http ' + res.status);
+      const d = await res.json();
+      fwdEventsTotal = d.total || 0;
+      renderForwardEvents(Array.isArray(d.items) ? d.items : []);
+    } catch (e) {
+      body.innerHTML = '<tr><td colspan="5" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('common.failed')) + '</td></tr>';
+    }
+  }
+
+  function renderForwardEvents(items) {
+    const body = $('fwdEventsBody');
+    if (!body) return;
+    if (!items.length) {
+      body.innerHTML = '<tr><td colspan="5" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('forward.noEvents')) + '</td></tr>';
+    } else {
+      body.innerHTML = items.map(fwdEventRow).join('');
+    }
+    const countEl = $('fwdEventsCount');
+    if (countEl) countEl.textContent = t('forward.eventsCount', String(fwdEventsTotal));
+    updateForwardPagination();
+  }
+
+  function fwdEventRow(e) {
+    const model = e.targetModel && e.targetModel !== e.clientModel
+      ? escapeHtml(e.clientModel) + ' <span class="muted-text">&rarr;</span> ' + escapeHtml(e.targetModel)
+      : escapeHtml(e.clientModel || '');
+    const prov = escapeHtml(e.providerName || fwdProviderNames[e.providerId] || e.providerId || '');
+    const badge = e.ok
+      ? '<span class="fwd-badge fwd-badge--ok">' + (e.status || 200) + '</span>'
+      : '<span class="fwd-badge fwd-badge--err">' + (e.status || 'ERR') + '</span>';
+    return '<tr>' +
+      '<td class="font-mono text-xs">' + escapeHtml(fwdFmtTime(e.time)) + '</td>' +
+      '<td class="font-mono text-xs">' + model + '</td>' +
+      '<td class="text-xs">' + prov + '</td>' +
+      '<td>' + badge + '</td>' +
+      '<td class="font-mono text-xs">' + escapeHtml(fwdFmtLatency(e.latencyMs)) + '</td>' +
+      '</tr>';
+  }
+
+  function updateForwardPagination() {
+    const info = $('fwdPageInfo');
+    const from = fwdEventsTotal === 0 ? 0 : fwdEventsOffset + 1;
+    const to = Math.min(fwdEventsOffset + fwdEventsLimit, fwdEventsTotal);
+    if (info) info.textContent = t('forward.pageInfo', String(from), String(to), String(fwdEventsTotal));
+    const prev = $('fwdPrevBtn');
+    const next = $('fwdNextBtn');
+    if (prev) prev.disabled = fwdEventsOffset <= 0;
+    if (next) next.disabled = fwdEventsOffset + fwdEventsLimit >= fwdEventsTotal;
+  }
+
+  function openForwardStream() {
+    if (fwdSource) return;
+    // EventSource authenticates via the admin_password cookie (no headers).
+    const src = new EventSource('/admin/api/forward-events/stream');
+    fwdSource = src;
+    const dot = $('forwardLiveDot');
+    src.onopen = () => { if (dot) dot.textContent = '● ' + t('forward.live'); };
+    src.onmessage = ev => {
+      let e;
+      try { e = JSON.parse(ev.data); } catch (err) { return; }
+      // Only reflect live events on the first, unfiltered page to avoid
+      // fighting active filters/pagination.
+      if (fwdEventsOffset === 0 && !fwdFilterActive()) {
+        const bodyEl = $('fwdEventsBody');
+        if (bodyEl) {
+          const empty = bodyEl.querySelector('td[colspan]');
+          if (empty) bodyEl.innerHTML = '';
+          bodyEl.insertAdjacentHTML('afterbegin', fwdEventRow(e));
+          const rows = bodyEl.querySelectorAll('tr');
+          for (let i = rows.length - 1; i >= fwdEventsLimit; i--) rows[i].remove();
+        }
+      }
+      // Refresh aggregate cards/chart lazily.
+      loadForwardStats();
+    };
+    src.onerror = () => { if (dot) dot.textContent = ''; };
+  }
+
+  function fwdFilterActive() {
+    const prov = $('fwdFilterProvider') ? $('fwdFilterProvider').value : '';
+    const status = $('fwdFilterStatus') ? $('fwdFilterStatus').value : '';
+    const model = $('fwdFilterModel') ? $('fwdFilterModel').value.trim() : '';
+    return !!(prov || status || model);
+  }
+
+  function closeForwardStream() {
+    if (fwdSource) { fwdSource.close(); fwdSource = null; }
+    const dot = $('forwardLiveDot');
+    if (dot) dot.textContent = '';
+  }
+
+  function openForwarding() {
+    fwdEventsOffset = 0;
+    loadForwardStats();
+    loadForwardEvents();
+    openForwardStream();
+  }
+
+  function closeForwarding() {
+    closeForwardStream();
+  }
+
+  let fwdModelSearchTimer = null;
+  function bindForwardEvents() {
+    const prov = $('fwdFilterProvider');
+    if (prov) prov.addEventListener('change', () => { fwdEventsOffset = 0; loadForwardEvents(); });
+    const status = $('fwdFilterStatus');
+    if (status) status.addEventListener('change', () => { fwdEventsOffset = 0; loadForwardEvents(); });
+    const model = $('fwdFilterModel');
+    if (model) model.addEventListener('input', () => {
+      clearTimeout(fwdModelSearchTimer);
+      fwdModelSearchTimer = setTimeout(() => { fwdEventsOffset = 0; loadForwardEvents(); }, 300);
+    });
+    const prev = $('fwdPrevBtn');
+    if (prev) prev.addEventListener('click', () => {
+      if (fwdEventsOffset <= 0) return;
+      fwdEventsOffset = Math.max(0, fwdEventsOffset - fwdEventsLimit);
+      loadForwardEvents();
+    });
+    const next = $('fwdNextBtn');
+    if (next) next.addEventListener('click', () => {
+      if (fwdEventsOffset + fwdEventsLimit >= fwdEventsTotal) return;
+      fwdEventsOffset += fwdEventsLimit;
+      loadForwardEvents();
+    });
+    const reset = $('forwardResetBtn');
+    if (reset) reset.addEventListener('click', async () => {
+      const ok = await confirmAction(t('forward.confirmReset'));
+      if (!ok) return;
+      try {
+        const res = await api('/forward-stats/reset', { method: 'POST' });
+        if (!res.ok) throw new Error('http ' + res.status);
+        fwdEventsOffset = 0;
+        toast(t('forward.resetDone'), 'success');
+        loadForwardStats();
+        loadForwardEvents();
+      } catch (e) { toast(t('common.failed'), 'error'); }
+    });
   }
 
   // Prompt filter rules
@@ -3814,6 +4078,8 @@
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
     if (tab === 'console') openConsole();
     else closeConsole();
+    if (tab === 'forwarding') openForwarding();
+    else closeForwarding();
   }
 
   // Event wiring
@@ -4017,6 +4283,7 @@
     bindDetailEvents();
     bindTestEvents();
     bindConsoleEvents();
+    bindForwardEvents();
   }
 
   // Init

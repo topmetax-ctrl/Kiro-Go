@@ -107,6 +107,8 @@
                 data-i18n="tabs.settings"></span></button>
             <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
                 data-i18n="tabs.api"></span></button>
+            <button type="button" class="tab" data-tab="forwarding"><i class="fa-solid fa-diagram-project tab-icon"></i><span
+                data-i18n="tabs.forwarding"></span></button>
             <button type="button" class="tab" data-tab="console"><i class="fa-solid fa-terminal tab-icon"></i><span
                 data-i18n="tabs.console"></span></button>
           </div>
@@ -598,6 +600,98 @@
           </div>
           <p class="api-hint"><i class="fa-solid fa-key"></i><span data-i18n="api.statsHint"></span></p>
         </section>
+      </div>
+
+      <!-- Forwarding dashboard tab -->
+      <div id="tabForwarding" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="forward.title"></span>
+            <div class="card-actions">
+              <span class="text-xs muted-text" id="forwardLiveDot"></span>
+              <button class="btn btn-danger btn-sm" id="forwardResetBtn"><i class="fa-solid fa-trash-can"
+                  aria-hidden="true"></i><span class="btn-text" data-i18n="forward.reset"></span></button>
+            </div>
+          </div>
+          <p class="muted-text text-xs" data-i18n="forward.intro"></p>
+
+          <div class="fwd-stats-grid">
+            <div class="stat-card">
+              <div class="stat-card-title" data-i18n="forward.statRequests"></div>
+              <div class="stat-body">
+                <div class="stat-main"><div class="stat-value" id="fwdStatRequests">0</div></div>
+                <i class="fa-solid fa-diagram-project stat-icon" aria-hidden="true"></i>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-card-title" data-i18n="forward.statSuccess"></div>
+              <div class="stat-body">
+                <div class="stat-main"><div class="stat-value" id="fwdStatSuccess">0</div></div>
+                <i class="fa-solid fa-circle-check stat-icon" aria-hidden="true"></i>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-card-title" data-i18n="forward.statFailed"></div>
+              <div class="stat-body">
+                <div class="stat-main"><div class="stat-value stat-value--danger" id="fwdStatFailed">0</div></div>
+                <i class="fa-solid fa-circle-xmark stat-icon stat-icon--danger" aria-hidden="true"></i>
+              </div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-card-title" data-i18n="forward.statAvgLatency"></div>
+              <div class="stat-body">
+                <div class="stat-main"><div class="stat-value" id="fwdStatLatency">0</div></div>
+                <i class="fa-solid fa-gauge-high stat-icon" aria-hidden="true"></i>
+              </div>
+            </div>
+          </div>
+
+          <div class="fwd-chart-card">
+            <div class="flex items-center justify-between" style="flex-wrap:wrap;gap:0.5rem;">
+              <span class="text-xs font-semibold" data-i18n="forward.chartTitle"></span>
+              <span class="text-xs muted-text font-mono" id="fwdPercentiles"></span>
+            </div>
+            <div id="fwdChart" class="fwd-chart"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="forward.eventsTitle"></span>
+          </div>
+          <div class="toolbar">
+            <select id="fwdFilterProvider" class="w-48!" data-i18n-aria-label="forward.filterProvider">
+              <option value="" data-i18n="forward.allProviders"></option>
+            </select>
+            <select id="fwdFilterStatus" class="w-32!" data-i18n-aria-label="forward.filterStatus">
+              <option value="" data-i18n="forward.allStatus"></option>
+              <option value="success" data-i18n="forward.statusSuccess"></option>
+              <option value="error" data-i18n="forward.statusError"></option>
+            </select>
+            <input type="text" id="fwdFilterModel" class="w-48!" data-i18n-placeholder="forward.filterModel" />
+            <div class="toolbar-spacer"></div>
+            <span class="text-xs muted-text" id="fwdEventsCount"></span>
+          </div>
+          <div class="fwd-events-scroll">
+            <table class="fwd-events-table">
+              <thead>
+                <tr>
+                  <th data-i18n="forward.colTime"></th>
+                  <th data-i18n="forward.colModel"></th>
+                  <th data-i18n="forward.colProvider"></th>
+                  <th data-i18n="forward.colStatus"></th>
+                  <th data-i18n="forward.colLatency"></th>
+                </tr>
+              </thead>
+              <tbody id="fwdEventsBody"></tbody>
+            </table>
+          </div>
+          <div class="fwd-pagination">
+            <button class="btn btn-outline btn-sm" id="fwdPrevBtn" type="button" data-i18n="forward.prev"></button>
+            <span class="text-xs muted-text" id="fwdPageInfo"></span>
+            <button class="btn btn-outline btn-sm" id="fwdNextBtn" type="button" data-i18n="forward.next"></button>
+          </div>
+        </div>
       </div>
 
       <!-- Console tab -->
