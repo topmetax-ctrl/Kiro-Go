@@ -14,3 +14,50 @@ services:
       - CONFIG_PATH=/app/data/config.json
       - LOOPBACK_HOST=0.0.0.0
     restart: unless-stopped
+    networks:
+      - websearch
+    depends_on:
+      - searxng
+
+  # SearXNG is the free, primary web-search provider. It is deliberately NOT
+  # published to the host: there is no `ports:` mapping, so nothing outside the
+  # Docker network can reach it (SSRF / abuse guard). kiro-go reaches it over the
+  # shared `websearch` network at http://searxng:8080 — matches
+  # webSearch.searxng.baseUrl in config.json.
+  #
+  # The network is NOT marked `internal`, because SearXNG itself needs outbound
+  # internet to query upstream engines. "Not publicly exposed" is achieved by
+  # omitting the port mapping, not by cutting SearXNG's egress.
+  #
+  # JSON output must be enabled in searxng/settings.yml (search.formats: [html, json]);
+  # a stock instance returns 403 for format=json otherwise.
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    volumes:
+      # Read-write: the SearXNG entrypoint may write generated state into
+      # /etc/searxng on first boot. settings.yml itself is safe to edit in-repo.
+      - ./searxng:/etc/searxng
+    environment:
+      # Internal base URL; used by SearXNG for absolute links only, not exposed.
+      - SEARXNG_BASE_URL=http://searxng:8080/
+    restart: unless-stopped
+    networks:
+      - websearch
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  # Shared bridge for kiro-go <-> searxng. SearXNG has no published ports, so it
+  # is reachable only by services on this network, while still retaining the
+  # outbound internet access it needs to run searches.
+  websearch:
+    driver: bridge

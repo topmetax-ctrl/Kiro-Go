@@ -169,9 +169,30 @@ type ImageSource struct {
 }
 
 type ClaudeTool struct {
+	// Type is set for Anthropic native server tools (e.g. "web_search_20250305").
+	// Client-defined tools omit it. Recognizing web_search relies on Type or Name.
+	Type        string      `json:"type,omitempty"`
 	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	InputSchema interface{} `json:"input_schema"`
+	Description string      `json:"description,omitempty"`
+	InputSchema interface{} `json:"input_schema,omitempty"`
+
+	// Native web_search server-tool metadata. Anthropic sends these instead of an
+	// input_schema; Kiro does not understand them, so they are parsed into a
+	// WebSearchPolicy and never forwarded in the tool spec.
+	MaxUses        *int                   `json:"max_uses,omitempty"`
+	AllowedDomains []string               `json:"allowed_domains,omitempty"`
+	BlockedDomains []string               `json:"blocked_domains,omitempty"`
+	UserLocation   *WebSearchUserLocation `json:"user_location,omitempty"`
+}
+
+// WebSearchUserLocation mirrors Anthropic's web_search user_location object. It is
+// carried through into the search policy for providers that support geo-biasing.
+type WebSearchUserLocation struct {
+	Type     string `json:"type,omitempty"`
+	City     string `json:"city,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
 }
 
 type ClaudeResponse struct {
@@ -800,7 +821,14 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 		w := KiroToolWrapper{}
 		w.ToolSpecification.Name = sanitized
 		w.ToolSpecification.Description = normalizeToolDesc(desc, sanitized)
-		w.ToolSpecification.InputSchema = InputSchema{JSON: ensureObjectSchema(tool.InputSchema)}
+		// The native web_search server tool arrives without an input_schema; inject
+		// an explicit {query} schema so Kiro is told the parameter contract instead
+		// of receiving a bare {"type":"object"} and having to infer the field.
+		if isWebSearchTool(tool) {
+			w.ToolSpecification.InputSchema = InputSchema{JSON: webSearchQuerySchema()}
+		} else {
+			w.ToolSpecification.InputSchema = InputSchema{JSON: ensureObjectSchema(tool.InputSchema)}
+		}
 		result = append(result, w)
 	}
 	return result, nameMap

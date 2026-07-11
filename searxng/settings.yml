@@ -1,0 +1,43 @@
+# SearXNG settings for kiro-go's free-first web search.
+#
+# Only the keys that matter for our use are pinned here; everything else falls
+# back to SearXNG's shipped defaults (the image merges this over its default
+# settings.yml). The two things kiro-go depends on:
+#
+#   1. search.formats includes "json" — otherwise /search?format=json returns 403.
+#   2. server.limiter is off — this instance is only reachable on the private
+#      Docker network (no published port), so the bot limiter (which needs Valkey)
+#      would just get in the way of our backend calls.
+#
+# CHANGE THE SECRET before any non-local deployment.
+
+use_default_settings: true
+
+general:
+  instance_name: "kiro-go-search"
+  # Do not leak instance metrics/errors to callers.
+  debug: false
+
+server:
+  # MUST be overridden with a unique random value in real deployments.
+  secret_key: "change-this-to-a-long-random-value-before-deploying"
+  # Bot limiter off: the instance is private (no published port). Leaving it on
+  # would require Valkey and could throttle our own backend.
+  limiter: false
+  image_proxy: false
+
+search:
+  # Enable JSON so kiro-go can call /search?format=json. Without "json" here the
+  # instance returns 403 Forbidden for JSON requests.
+  formats:
+    - html
+    - json
+  # Default language; kiro-go overrides per-request when the policy sets one.
+  default_lang: "auto"
+  # Moderate safe search by default (0=off, 1=moderate, 2=strict). kiro-go passes
+  # an explicit safesearch per request, so this is only the fallback.
+  safe_search: 1
+
+# Keep the response lean: we only consume url/title/content/engine/score.
+ui:
+  static_use_hash: true

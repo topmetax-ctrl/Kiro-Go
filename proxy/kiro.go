@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -339,7 +340,16 @@ func summarizeKiroPayload(payload *KiroPayload) string {
 }
 
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
+// CallKiroAPI is the context-free entry point kept for existing callers and
+// tests. It delegates to CallKiroAPIContext with a background context.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
+	return CallKiroAPIContext(context.Background(), account, payload, callback)
+}
+
+// CallKiroAPIContext calls the Kiro streaming API, trying each configured
+// endpoint with automatic fallback. The context cancels the in-flight HTTP
+// request (and therefore the event-stream read) when the caller disconnects.
+func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	originalProfileArn := ""
 	if payload != nil {
 		originalProfileArn = payload.ProfileArn
@@ -394,7 +404,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		// Target the account's region; endpoint URLs are declared for us-east-1.
 		epURL := regionalizeURL(ep.URL, account)
 		reqBody, _ := json.Marshal(payload)
-		req, err := http.NewRequest("POST", epURL, bytes.NewReader(reqBody))
+		req, err := http.NewRequestWithContext(ctx, "POST", epURL, bytes.NewReader(reqBody))
 		if err != nil {
 			lastErr = err
 			continue

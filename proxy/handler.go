@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/auth"
@@ -44,6 +45,9 @@ type Handler struct {
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
 	tokenRefreshMu  sync.Mutex
+	// conversationRunner orchestrates multi-round Kiro calls with server-side
+	// web_search execution. Injected so tests can supply fakes.
+	conversationRunner ConversationRunner
 }
 
 type thinkingStreamSource int
@@ -221,16 +225,17 @@ func NewHandler() *Handler {
 
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
-		pool:            pool.GetPool(),
-		totalRequests:   int64(totalReq),
-		successRequests: int64(successReq),
-		failedRequests:  int64(failedReq),
-		totalTokens:     int64(totalTokens),
-		totalCredits:    totalCredits,
-		startTime:       time.Now().Unix(),
-		stopRefresh:     make(chan struct{}),
-		stopStatsSaver:  make(chan struct{}),
-		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		pool:               pool.GetPool(),
+		totalRequests:      int64(totalReq),
+		successRequests:    int64(successReq),
+		failedRequests:     int64(failedReq),
+		totalTokens:        int64(totalTokens),
+		totalCredits:       totalCredits,
+		startTime:          time.Now().Unix(),
+		stopRefresh:        make(chan struct{}),
+		stopStatsSaver:     make(chan struct{}),
+		promptCache:        newPromptCacheTracker(defaultPromptCacheTTL),
+		conversationRunner: NewKiroConversationRunner(),
 	}
 	// 恢复转发指标聚合数据 (事件日志与时序为内存态，不持久化)
 	if err := metrics.Load(forwardMetricsPath()); err != nil {
@@ -890,17 +895,42 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
 
+	// Resolve the web_search server-tool policy from the request. When a
+	// web_search tool is present, the proxy executes the search itself via the
+	// conversation runner instead of handing an unresolved tool_use to the client.
+	policy, hasWebSearch, policyErr := extractWebSearchPolicy(req.Tools)
+	if policyErr != nil {
+		h.sendClaudeError(w, 400, "invalid_request_error", policyErr.Error())
+		return
+	}
+	// Fail fast when web_search is requested and the operator turned the feature
+	// on but no provider is usable (no SearXNG base URL and no Tavily key):
+	// silently passing the tool through would stall, since the client does not
+	// execute this server tool.
+	if hasWebSearch && config.WebSearchToggledOn() && !policy.Enabled {
+		h.sendClaudeError(w, 500, "api_error", "web_search is enabled but no search provider is configured (set a SearXNG base URL or a Tavily API key)")
+		return
+	}
+	// Engage the runner only when a web_search tool is present AND the feature is
+	// fully enabled (toggle + key). Otherwise behavior is unchanged.
+	useRunner := hasWebSearch && policy.Enabled
+
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, useRunner, policy)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, useRunner, policy)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+//
+// When useRunner is set (a web_search tool is present and the feature is fully
+// enabled), the ConversationRunner drives the multi-round search loop and only
+// the final round's buffered events are streamed to the client. Otherwise the
+// stream path behaves exactly as before (a single CallKiroAPIContext round).
+func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, useRunner bool, policy WebSearchPolicy) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1206,6 +1236,50 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			}
 		}
 
+		// emitToolUse renders one tool_use content block. Shared by the live
+		// callback and the runner's final-round replay so both paths emit an
+		// identical SSE shape.
+		emitToolUse := func(tu KiroToolUse) {
+			processClaudeText("", false, true)
+			rawContentBuilder.WriteString(tu.Name)
+			if b, err := json.Marshal(tu.Input); err == nil {
+				rawContentBuilder.Write(b)
+			}
+
+			toolUses = append(toolUses, tu)
+			ensureMessageStart()
+			closeActiveBlock()
+
+			idx := nextContentIndex
+			nextContentIndex++
+
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": idx,
+				"content_block": map[string]interface{}{
+					"type":  "tool_use",
+					"id":    tu.ToolUseID,
+					"name":  tu.Name,
+					"input": map[string]interface{}{},
+				},
+			})
+
+			inputJSON, _ := json.Marshal(tu.Input)
+			h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": idx,
+				"delta": map[string]interface{}{
+					"type":         "input_json_delta",
+					"partial_json": string(inputJSON),
+				},
+			})
+
+			h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": idx,
+			})
+		}
+
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
@@ -1218,46 +1292,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				}
 				processClaudeText(text, isThinking, false)
 			},
-			OnToolUse: func(tu KiroToolUse) {
-				processClaudeText("", false, true)
-				rawContentBuilder.WriteString(tu.Name)
-				if b, err := json.Marshal(tu.Input); err == nil {
-					rawContentBuilder.Write(b)
-				}
-
-				toolUses = append(toolUses, tu)
-				ensureMessageStart()
-				closeActiveBlock()
-
-				idx := nextContentIndex
-				nextContentIndex++
-
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
-					"type":  "content_block_start",
-					"index": idx,
-					"content_block": map[string]interface{}{
-						"type":  "tool_use",
-						"id":    tu.ToolUseID,
-						"name":  tu.Name,
-						"input": map[string]interface{}{},
-					},
-				})
-
-				inputJSON, _ := json.Marshal(tu.Input)
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": idx,
-					"delta": map[string]interface{}{
-						"type":         "input_json_delta",
-						"partial_json": string(inputJSON),
-					},
-				})
-
-				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
-					"type":  "content_block_stop",
-					"index": idx,
-				})
-			},
+			OnToolUse: emitToolUse,
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
 				outputTokens = outTok
@@ -1270,29 +1305,119 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
-		if err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			if !messageStarted {
-				continue
+		// usedRunner marks the web_search path so token aggregation below does not
+		// let the final round's context-occupancy override the summed input total.
+		usedRunner := false
+		var runSources []SearchSource
+
+		if useRunner {
+			usedRunner = true
+			run, err := h.conversationRunner.Run(ctx, account, payload, policy)
+			if err != nil {
+				if classifyRunError(err) {
+					// Kiro/account error: retry from the original payload on another
+					// account, but only if we have not started streaming yet.
+					lastErr = err
+					excluded[account.ID] = true
+					h.handleAccountFailure(account, err)
+					if !messageStarted {
+						continue
+					}
+					h.recordFailure()
+					h.sendSSE(w, flusher, "error", map[string]interface{}{
+						"type":  "error",
+						"error": map[string]string{"type": "api_error", "message": err.Error()},
+					})
+					return
+				}
+				// Search/config/mixed/cancel: do not fail the account.
+				if ctx.Err() != nil {
+					return
+				}
+				lastErr = err
+				if !messageStarted {
+					h.sendClaudeErrorForWebSearch(w, err)
+					return
+				}
+				h.recordFailure()
+				h.sendSSE(w, flusher, "error", map[string]interface{}{
+					"type":  "error",
+					"error": map[string]string{"type": "api_error", "message": err.Error()},
+				})
+				return
 			}
-			h.recordFailure()
-			h.sendSSE(w, flusher, "error", map[string]interface{}{
-				"type":  "error",
-				"error": map[string]string{"type": "api_error", "message": err.Error()},
-			})
-			return
+
+			// Replay only the final round's ordered events through the same
+			// renderer the live path uses. Intermediate rounds (searches) are never
+			// streamed to the client.
+			for _, ev := range run.FinalRound.Events {
+				switch ev.Kind {
+				case RoundEventText:
+					rawContentBuilder.WriteString(ev.Text)
+					processClaudeText(ev.Text, false, false)
+				case RoundEventThinking:
+					rawThinkingBuilder.WriteString(ev.Text)
+					processClaudeText(ev.Text, true, false)
+				case RoundEventToolUse:
+					if ev.ToolUse != nil {
+						emitToolUse(*ev.ToolUse)
+					}
+				}
+			}
+
+			inputTokens = run.TotalInputTokens
+			outputTokens = run.TotalOutputTokens
+			credits = run.TotalCredits
+			if run.FinalContextPct > 0 {
+				realInputTokens = int(run.FinalContextPct * float64(getContextWindowSize(model)) / 100.0)
+			}
+			runSources = run.Sources
+		} else {
+			err := CallKiroAPIContext(ctx, account, payload, callback)
+			if err != nil {
+				lastErr = err
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, err)
+				if !messageStarted {
+					continue
+				}
+				h.recordFailure()
+				h.sendSSE(w, flusher, "error", map[string]interface{}{
+					"type":  "error",
+					"error": map[string]string{"type": "api_error", "message": err.Error()},
+				})
+				return
+			}
 		}
 
 		processClaudeText("", false, true)
 		if eventThinkingOpen {
 			sendText("", 3)
 		}
+
+		// Append the deterministic Sources list (web_search path) as a final text
+		// delta before closing the block.
+		if usedRunner && len(runSources) > 0 && config.WebSearchAppendSources() {
+			if src := formatSourcesList(runSources); src != "" {
+				rawContentBuilder.WriteString(src)
+				sendText(src, 0)
+			}
+		}
+
 		closeActiveBlock()
 
-		if realInputTokens > 0 {
+		if usedRunner {
+			// Aggregate totals already summed across rounds; do not overwrite with
+			// the final round's context occupancy (spec: client-visible usage is the
+			// whole logical request). Fall back to the estimate only if unset.
+			if inputTokens <= 0 {
+				if realInputTokens > 0 {
+					inputTokens = realInputTokens
+				} else {
+					inputTokens = estimatedInputTokens
+				}
+			}
+		} else if realInputTokens > 0 {
 			inputTokens = realInputTokens
 		} else if inputTokens <= 0 {
 			inputTokens = estimatedInputTokens
@@ -1424,7 +1549,7 @@ func (h *Handler) recordFailure() {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, useRunner bool, policy WebSearchPolicy) {
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1447,36 +1572,72 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var sources []SearchSource
 
-		callback := &KiroStreamCallback{
-			OnText: func(text string, isThinking bool) {
-				if isThinking {
-					thinkingContent += text
-				} else {
-					content += text
+		if useRunner {
+			// Server-side web_search path: the runner drives as many Kiro rounds as
+			// the model needs, executing searches in between, and returns the final
+			// round plus aggregate usage.
+			run, err := h.conversationRunner.Run(ctx, account, payload, policy)
+			if err != nil {
+				if classifyRunError(err) {
+					// A Kiro/account error: fail the account and retry from the
+					// original payload on a different account.
+					lastErr = err
+					excluded[account.ID] = true
+					h.handleAccountFailure(account, err)
+					continue
 				}
-			},
-			OnToolUse: func(tu KiroToolUse) {
-				toolUses = append(toolUses, tu)
-			},
-			OnComplete: func(inTok, outTok int) {
-				inputTokens = inTok
-				outputTokens = outTok
-			},
-			OnCredits: func(c float64) {
-				credits = c
-			},
-			OnContextUsage: func(pct float64) {
-				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
-			},
-		}
+				// Search/config/mixed/cancel error: do not fail the account.
+				if ctx.Err() != nil {
+					return
+				}
+				lastErr = err
+				h.sendClaudeErrorForWebSearch(w, err)
+				return
+			}
+			fr := run.FinalRound
+			content = fr.VisibleContent
+			thinkingContent = fr.ThinkingContent
+			toolUses = fr.ToolUses
+			inputTokens = run.TotalInputTokens
+			outputTokens = run.TotalOutputTokens
+			credits = run.TotalCredits
+			if fr.ContextUsagePct > 0 {
+				realInputTokens = int(fr.ContextUsagePct * float64(getContextWindowSize(model)) / 100.0)
+			}
+			sources = run.Sources
+		} else {
+			callback := &KiroStreamCallback{
+				OnText: func(text string, isThinking bool) {
+					if isThinking {
+						thinkingContent += text
+					} else {
+						content += text
+					}
+				},
+				OnToolUse: func(tu KiroToolUse) {
+					toolUses = append(toolUses, tu)
+				},
+				OnComplete: func(inTok, outTok int) {
+					inputTokens = inTok
+					outputTokens = outTok
+				},
+				OnCredits: func(c float64) {
+					credits = c
+				},
+				OnContextUsage: func(pct float64) {
+					realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
+				},
+			}
 
-		err := CallKiroAPI(account, payload, callback)
-		if err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
+			err := CallKiroAPIContext(ctx, account, payload, callback)
+			if err != nil {
+				lastErr = err
+				excluded[account.ID] = true
+				h.handleAccountFailure(account, err)
+				continue
+			}
 		}
 
 		thinkingFormat := thinkingOpts.Format
@@ -1495,6 +1656,12 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			inputTokens = estimatedInputTokens
 		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+
+		// Append a deterministic Sources list when the runner gathered any and the
+		// feature is configured to do so.
+		if useRunner && len(sources) > 0 && config.WebSearchAppendSources() {
+			finalContent += formatSourcesList(sources)
+		}
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
 		h.pool.RecordSuccess(account.ID)
@@ -1553,6 +1720,33 @@ func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, me
 			"message": message,
 		},
 	})
+}
+
+// sendClaudeErrorForWebSearch maps a non-account web_search runner error to a
+// Claude-compatible error response. Provider auth/config failures are 500-class
+// api_errors; a mixed server/client tool turn is a 400 invalid_request the
+// client can act on; anything else falls back to a generic 502.
+func (h *Handler) sendClaudeErrorForWebSearch(w http.ResponseWriter, err error) {
+	h.recordFailure()
+	var cfgErr *SearchConfigError
+	var provErr *SearchProviderError
+	var mixed *MixedToolUseError
+	switch {
+	case errors.As(err, &mixed):
+		h.sendClaudeError(w, 400, "invalid_request_error", mixed.Error())
+	case errors.As(err, &cfgErr):
+		h.sendClaudeError(w, 500, "api_error", cfgErr.Error())
+	case errors.As(err, &provErr):
+		// Auth against the provider is a server misconfiguration from the client's
+		// perspective; rate/timeout/5xx are upstream unavailability.
+		if provErr.Kind == SearchErrAuth {
+			h.sendClaudeError(w, 500, "api_error", "web_search provider authentication failed")
+		} else {
+			h.sendClaudeError(w, 502, "api_error", "web_search provider unavailable: "+string(provErr.Kind))
+		}
+	default:
+		h.sendClaudeError(w, 502, "api_error", "web_search failed: "+err.Error())
+	}
 }
 
 // handleOpenAIChat OpenAI API 处理

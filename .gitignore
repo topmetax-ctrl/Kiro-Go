@@ -1,6 +1,8 @@
 # Build artifacts
 /kiro-go
 /kiro-go.exe
+/kiro-go-darwin
+/bin/
 *.exe
 *.test
 *.out

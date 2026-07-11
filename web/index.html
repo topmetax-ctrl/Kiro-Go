@@ -913,7 +913,8 @@
       <div class="modal-body">
         <div class="form-group">
           <label data-i18n="upstreams.routeModel"></label>
-          <input type="text" id="routeForm_model" data-i18n-placeholder="upstreams.routeModelPlaceholder" />
+          <input type="text" id="routeForm_model" list="routeClientModelList" autocomplete="off" data-i18n-placeholder="upstreams.routeModelPlaceholder" />
+          <datalist id="routeClientModelList"></datalist>
           <small data-i18n="upstreams.routeModelHint"></small>
         </div>
         <div class="form-group">

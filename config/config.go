@@ -316,6 +316,13 @@ type Config struct {
 	Upstreams   []UpstreamProvider `json:"upstreams,omitempty"`
 	ModelRoutes []ModelRoute       `json:"modelRoutes,omitempty"`
 
+	// WebSearch configures server-side execution of the web_search tool. The Kiro
+	// backend emits a tool_use(web_search) and then waits for a tool_result it
+	// never receives on its own; when enabled, the proxy runs the search itself
+	// (free-first: SearXNG primary, Tavily optional fallback) and feeds the
+	// result back so the model can answer.
+	WebSearch WebSearchConfig `json:"webSearch,omitempty"`
+
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
 	// Can be overridden by the LOG_LEVEL environment variable.
@@ -327,6 +334,180 @@ type Config struct {
 	FailedRequests  int     `json:"failedRequests,omitempty"`  // Failed requests count
 	TotalTokens     int     `json:"totalTokens,omitempty"`     // Total tokens processed
 	TotalCredits    float64 `json:"totalCredits,omitempty"`    // Total credits consumed
+}
+
+// WebSearchConfig controls proxy-side execution of the web_search tool. It is
+// free-first: SearXNG (self-hosted, no API cost) is the primary provider and
+// Tavily is an optional, budget-capped fallback that is off unless explicitly
+// enabled. The structure is nested by concern; GetWebSearchConfig resolves
+// zero-valued fields to their defaults centrally.
+type WebSearchConfig struct {
+	// Enabled turns on the server-side search sub-loop. When false, a
+	// tool_use(web_search) is passed through to the client unchanged (legacy
+	// behavior), which stalls unless the client executes the search itself.
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Routing selects providers and the free-first policy.
+	Routing WebSearchRouting `json:"routing,omitempty"`
+
+	// Limits bounds rounds, searches, concurrency, results, and total time.
+	Limits WebSearchLimits `json:"limits,omitempty"`
+
+	// SearXNG configures the primary (free) discovery provider.
+	SearXNG SearXNGConfig `json:"searxng,omitempty"`
+
+	// Tavily configures the optional paid-tier fallback (free-only by default).
+	Tavily TavilyConfig `json:"tavily,omitempty"`
+
+	// Cache configures the process-level result cache.
+	Cache WebSearchCacheConfig `json:"cache,omitempty"`
+
+	// Reranking configures deterministic result reranking.
+	Reranking WebSearchRerankConfig `json:"reranking,omitempty"`
+
+	// AppendSources controls whether a deterministic "Sources:" list is appended
+	// to the final answer. Defaults to true when unset (see GetWebSearchConfig).
+	AppendSources *bool `json:"appendSources,omitempty"`
+}
+
+// WebSearchRouting selects providers and enforces the free-first / no-paid-usage
+// policy.
+type WebSearchRouting struct {
+	// Mode is the routing strategy. Only "free-first" is implemented: try the
+	// primary (free) provider, fall back only on failure/low quality. Empty means
+	// DefaultWebSearchRoutingMode.
+	Mode string `json:"mode,omitempty"`
+
+	// PrimaryProvider names the first provider to try. Empty means
+	// DefaultWebSearchPrimaryProvider ("searxng").
+	PrimaryProvider string `json:"primaryProvider,omitempty"`
+
+	// FallbackProviders are tried in order when the primary yields no usable
+	// result. nil means the default (["tavily"]).
+	FallbackProviders []string `json:"fallbackProviders,omitempty"`
+
+	// AllowPaidUsage is a hard gate. When false (default), a provider that would
+	// incur cost (Tavily beyond its free budget, or with a non-basic depth) is
+	// never used. This is enforced independently of per-provider enabled flags.
+	AllowPaidUsage bool `json:"allowPaidUsage,omitempty"`
+}
+
+// WebSearchLimits bounds the search loop. maxRounds and maxSearchesPerRequest are
+// distinct budgets: one round may issue several searches.
+type WebSearchLimits struct {
+	// MaxRounds bounds Kiro reasoning round-trips. 0 means DefaultWebSearchMaxRounds.
+	MaxRounds int `json:"maxRounds,omitempty"`
+
+	// MaxSearchesPerRequest bounds total provider calls for the whole logical
+	// request across all rounds. 0 means DefaultWebSearchMaxSearches.
+	MaxSearchesPerRequest int `json:"maxSearchesPerRequest,omitempty"`
+
+	// MaxConcurrentSearches bounds parallel provider calls within one round.
+	// 0 means DefaultWebSearchMaxConcurrency.
+	MaxConcurrentSearches int `json:"maxConcurrentSearches,omitempty"`
+
+	// MaxResultsPerSearch caps results fed back per query. 0 means
+	// DefaultWebSearchMaxResults.
+	MaxResultsPerSearch int `json:"maxResultsPerSearch,omitempty"`
+
+	// TotalTimeoutSeconds bounds the entire web-search logical request. 0 means
+	// DefaultWebSearchTotalTimeoutSeconds.
+	TotalTimeoutSeconds int `json:"totalTimeoutSeconds,omitempty"`
+}
+
+// SearXNGConfig configures the self-hosted SearXNG JSON search API (primary).
+type SearXNGConfig struct {
+	// Enabled turns SearXNG on as a provider. Defaults to true (free-first).
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// BaseURL is the SearXNG instance root (e.g. http://searxng:8080). Validated
+	// at startup; NEVER taken from a request (SSRF guard). Empty means
+	// DefaultSearXNGBaseURL.
+	BaseURL string `json:"baseUrl,omitempty"`
+
+	// TimeoutSeconds bounds a single SearXNG call. 0 means DefaultSearXNGTimeout.
+	TimeoutSeconds int `json:"timeoutSeconds,omitempty"`
+
+	// Language biases results ("auto" or an ISO code). Empty means "auto".
+	Language string `json:"language,omitempty"`
+
+	// SafeSearch maps to SearXNG safesearch (0=none, 1=moderate, 2=strict). Use a
+	// pointer so 0 is distinguishable from unset; nil means DefaultSearXNGSafeSearch.
+	SafeSearch *int `json:"safeSearch,omitempty"`
+
+	// Categories restricts SearXNG categories. nil means ["general"].
+	Categories []string `json:"categories,omitempty"`
+
+	// MinimumResults is the quality floor: fewer usable results than this triggers
+	// fallback. 0 means DefaultSearXNGMinResults.
+	MinimumResults int `json:"minimumResults,omitempty"`
+}
+
+// TavilyConfig configures the optional Tavily fallback. Off by default; strictly
+// free-only unless routing.allowPaidUsage is set.
+type TavilyConfig struct {
+	// Enabled turns Tavily on as a fallback. Defaults to false.
+	Enabled bool `json:"enabled,omitempty"`
+
+	// APIKey authenticates against Tavily. TAVILY_API_KEY env overrides it.
+	APIKey string `json:"apiKey,omitempty"`
+
+	// FreeOnly forbids paid features (advanced depth, auto_parameters) and stops
+	// once the monthly credit budget is spent. Defaults to true.
+	FreeOnly *bool `json:"freeOnly,omitempty"`
+
+	// MonthlyCreditLimit caps Tavily credits spent per calendar month. 0 means
+	// DefaultTavilyMonthlyCredits.
+	MonthlyCreditLimit int `json:"monthlyCreditLimit,omitempty"`
+
+	// SearchDepth maps to Tavily search_depth. Under FreeOnly it is forced to
+	// "basic". Empty means "basic".
+	SearchDepth string `json:"searchDepth,omitempty"`
+
+	// AutoParameters enables Tavily auto_parameters. Forbidden under FreeOnly.
+	AutoParameters bool `json:"autoParameters,omitempty"`
+
+	// TimeoutSeconds bounds a single Tavily call. 0 means DefaultTavilyTimeout.
+	TimeoutSeconds int `json:"timeoutSeconds,omitempty"`
+
+	// RetryMax bounds retries for transient failures (429/5xx/timeout). 0 means
+	// DefaultWebSearchRetryMax. Terminal errors (400/401/403) never retry.
+	RetryMax int `json:"retryMax,omitempty"`
+
+	// RetryBaseDelayMs is the base backoff between retries. 0 means
+	// DefaultWebSearchRetryBaseDelayMs.
+	RetryBaseDelayMs int `json:"retryBaseDelayMs,omitempty"`
+}
+
+// WebSearchCacheConfig configures the bounded process-level result cache.
+type WebSearchCacheConfig struct {
+	// Enabled turns the process cache on. Defaults to true.
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Provider is the cache backend. Only "memory" is implemented. Empty means
+	// "memory".
+	Provider string `json:"provider,omitempty"`
+
+	// TTLSeconds bounds a cache entry's lifetime. 0 means DefaultWebSearchCacheTTL.
+	TTLSeconds int `json:"ttlSeconds,omitempty"`
+
+	// MaxEntries bounds the LRU. 0 means DefaultWebSearchCacheEntries.
+	MaxEntries int `json:"maxEntries,omitempty"`
+}
+
+// WebSearchRerankConfig configures deterministic reranking of merged results.
+type WebSearchRerankConfig struct {
+	// Provider is the rerank strategy. Only "heuristic" is implemented (no paid
+	// LLM). Empty means "heuristic".
+	Provider string `json:"provider,omitempty"`
+
+	// MaxCandidates bounds results considered before reranking. 0 means
+	// DefaultWebSearchRerankCandidates.
+	MaxCandidates int `json:"maxCandidates,omitempty"`
+
+	// MaxFinalResults bounds results kept after reranking. 0 means
+	// DefaultWebSearchMaxResults.
+	MaxFinalResults int `json:"maxFinalResults,omitempty"`
 }
 
 // AccountInfo contains account metadata retrieved from Kiro API.
@@ -361,7 +542,12 @@ var (
 // Init initializes the configuration system with the specified file path.
 // If the file doesn't exist, a default configuration is created.
 func Init(path string) error {
+	// Guard the cfgPath write: every other mutation of the package globals runs
+	// under cfgLock, and Save() (called while a caller holds the lock) reads
+	// cfgPath. Load() takes the write lock itself, so release before calling it.
+	cfgLock.Lock()
 	cfgPath = path
+	cfgLock.Unlock()
 	return Load()
 }
 
@@ -1078,6 +1264,9 @@ func UpdateEndpointFallback(enabled bool) error {
 func GetProxyURL() string {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return ""
+	}
 	return cfg.ProxyURL
 }
 
@@ -1129,6 +1318,227 @@ func UpdateMaxPayloadBytes(n int) error {
 	defer cfgLock.Unlock()
 	cfg.MaxPayloadBytes = n
 	return Save()
+}
+
+// Web search sub-loop defaults, used when the corresponding config field is 0.
+const (
+	DefaultWebSearchMaxResults     = 5
+	DefaultWebSearchMaxRounds      = 4
+	DefaultWebSearchMaxSearches    = 5
+	DefaultWebSearchMaxConcurrency = 2
+	DefaultWebSearchTotalTimeout   = 90
+	DefaultWebSearchRetryMax       = 2
+	DefaultWebSearchRetryBaseMs    = 300
+
+	DefaultWebSearchRoutingMode     = "free-first"
+	DefaultWebSearchPrimaryProvider = "searxng"
+
+	DefaultSearXNGBaseURL    = "http://searxng:8080"
+	DefaultSearXNGTimeout    = 12
+	DefaultSearXNGSafeSearch = 1
+	DefaultSearXNGMinResults = 3
+
+	DefaultTavilyMonthlyCredits = 1000
+	DefaultTavilyTimeout        = 15
+
+	DefaultWebSearchCacheTTL         = 900
+	DefaultWebSearchCacheEntries     = 1000
+	DefaultWebSearchRerankCandidates = 20
+)
+
+// providerSearXNG / providerTavily are the canonical provider name tokens used
+// in routing config and metrics labels.
+const (
+	providerSearXNG = "searxng"
+	providerTavily  = "tavily"
+)
+
+// GetWebSearchConfig returns the web_search execution settings with zero-valued
+// caps resolved to their defaults. Enabled and the API key are returned as-is.
+// The returned value is a copy; callers cannot mutate shared config state.
+func GetWebSearchConfig() WebSearchConfig {
+	cfgLock.RLock()
+	var ws WebSearchConfig
+	if cfg != nil {
+		ws = cfg.WebSearch
+	}
+	cfgLock.RUnlock()
+	return resolveWebSearchDefaults(ws)
+}
+
+// resolveWebSearchDefaults fills zero-valued fields across every nested section
+// with their defaults. Applied centrally so resolution is identical whether or
+// not a config is loaded.
+func resolveWebSearchDefaults(ws WebSearchConfig) WebSearchConfig {
+	// Routing.
+	if strings.TrimSpace(ws.Routing.Mode) == "" {
+		ws.Routing.Mode = DefaultWebSearchRoutingMode
+	}
+	if strings.TrimSpace(ws.Routing.PrimaryProvider) == "" {
+		ws.Routing.PrimaryProvider = DefaultWebSearchPrimaryProvider
+	}
+	if ws.Routing.FallbackProviders == nil {
+		ws.Routing.FallbackProviders = []string{providerTavily}
+	}
+
+	// Limits.
+	if ws.Limits.MaxRounds <= 0 {
+		ws.Limits.MaxRounds = DefaultWebSearchMaxRounds
+	}
+	if ws.Limits.MaxSearchesPerRequest <= 0 {
+		ws.Limits.MaxSearchesPerRequest = DefaultWebSearchMaxSearches
+	}
+	if ws.Limits.MaxConcurrentSearches <= 0 {
+		ws.Limits.MaxConcurrentSearches = DefaultWebSearchMaxConcurrency
+	}
+	if ws.Limits.MaxResultsPerSearch <= 0 {
+		ws.Limits.MaxResultsPerSearch = DefaultWebSearchMaxResults
+	}
+	if ws.Limits.TotalTimeoutSeconds <= 0 {
+		ws.Limits.TotalTimeoutSeconds = DefaultWebSearchTotalTimeout
+	}
+
+	// SearXNG (primary, free). Enabled defaults to true.
+	if ws.SearXNG.Enabled == nil {
+		t := true
+		ws.SearXNG.Enabled = &t
+	}
+	if strings.TrimSpace(ws.SearXNG.BaseURL) == "" {
+		ws.SearXNG.BaseURL = DefaultSearXNGBaseURL
+	}
+	if ws.SearXNG.TimeoutSeconds <= 0 {
+		ws.SearXNG.TimeoutSeconds = DefaultSearXNGTimeout
+	}
+	if strings.TrimSpace(ws.SearXNG.Language) == "" {
+		ws.SearXNG.Language = "auto"
+	}
+	if ws.SearXNG.SafeSearch == nil {
+		s := DefaultSearXNGSafeSearch
+		ws.SearXNG.SafeSearch = &s
+	}
+	if len(ws.SearXNG.Categories) == 0 {
+		ws.SearXNG.Categories = []string{"general"}
+	}
+	if ws.SearXNG.MinimumResults <= 0 {
+		ws.SearXNG.MinimumResults = DefaultSearXNGMinResults
+	}
+
+	// Tavily (optional fallback). FreeOnly defaults to true.
+	if ws.Tavily.FreeOnly == nil {
+		t := true
+		ws.Tavily.FreeOnly = &t
+	}
+	if ws.Tavily.MonthlyCreditLimit <= 0 {
+		ws.Tavily.MonthlyCreditLimit = DefaultTavilyMonthlyCredits
+	}
+	if strings.TrimSpace(ws.Tavily.SearchDepth) == "" {
+		ws.Tavily.SearchDepth = "basic"
+	}
+	if ws.Tavily.TimeoutSeconds <= 0 {
+		ws.Tavily.TimeoutSeconds = DefaultTavilyTimeout
+	}
+	if ws.Tavily.RetryMax <= 0 {
+		ws.Tavily.RetryMax = DefaultWebSearchRetryMax
+	}
+	if ws.Tavily.RetryBaseDelayMs <= 0 {
+		ws.Tavily.RetryBaseDelayMs = DefaultWebSearchRetryBaseMs
+	}
+
+	// Cache. Enabled defaults to true.
+	if ws.Cache.Enabled == nil {
+		t := true
+		ws.Cache.Enabled = &t
+	}
+	if strings.TrimSpace(ws.Cache.Provider) == "" {
+		ws.Cache.Provider = "memory"
+	}
+	if ws.Cache.TTLSeconds <= 0 {
+		ws.Cache.TTLSeconds = DefaultWebSearchCacheTTL
+	}
+	if ws.Cache.MaxEntries <= 0 {
+		ws.Cache.MaxEntries = DefaultWebSearchCacheEntries
+	}
+
+	// Reranking.
+	if strings.TrimSpace(ws.Reranking.Provider) == "" {
+		ws.Reranking.Provider = "heuristic"
+	}
+	if ws.Reranking.MaxCandidates <= 0 {
+		ws.Reranking.MaxCandidates = DefaultWebSearchRerankCandidates
+	}
+	if ws.Reranking.MaxFinalResults <= 0 {
+		ws.Reranking.MaxFinalResults = DefaultWebSearchMaxResults
+	}
+
+	return ws
+}
+
+// WebSearchAppendSources reports whether a deterministic "Sources:" list should
+// be appended to the final answer. Defaults to true when unset.
+func WebSearchAppendSources() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.WebSearch.AppendSources == nil {
+		return true
+	}
+	return *cfg.WebSearch.AppendSources
+}
+
+// TavilyAPIKeyResolved returns the effective Tavily API key, with the
+// TAVILY_API_KEY environment variable taking precedence over config.
+func TavilyAPIKeyResolved() string {
+	if env := strings.TrimSpace(os.Getenv("TAVILY_API_KEY")); env != "" {
+		return env
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.WebSearch.Tavily.APIKey)
+}
+
+// WebSearchToggledOn reports only the operator toggle, independent of whether a
+// provider is configured. Lets the handler distinguish "feature off" (pass
+// through silently) from "on but misconfigured" (fail fast with a config error).
+func WebSearchToggledOn() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.WebSearch.Enabled
+}
+
+// SearXNGProviderEnabled reports whether SearXNG is usable: enabled (default
+// true) with a non-empty base URL. No API key is needed — it is the free path.
+func SearXNGProviderEnabled() bool {
+	ws := GetWebSearchConfig()
+	return ws.SearXNG.Enabled != nil && *ws.SearXNG.Enabled && strings.TrimSpace(ws.SearXNG.BaseURL) != ""
+}
+
+// TavilyProviderEnabled reports whether Tavily is usable as a fallback: turned on
+// AND a key is resolvable (env or config).
+func TavilyProviderEnabled() bool {
+	ws := GetWebSearchConfig()
+	return ws.Tavily.Enabled && TavilyAPIKeyResolved() != ""
+}
+
+// WebSearchAllowPaidUsage reports the hard paid-usage gate. When false (default),
+// no provider may incur cost regardless of per-provider settings.
+func WebSearchAllowPaidUsage() bool {
+	ws := GetWebSearchConfig()
+	return ws.Routing.AllowPaidUsage
+}
+
+// WebSearchEnabled reports whether the server-side search sub-loop should run:
+// the operator toggle is on AND at least one provider is usable. Free-first:
+// SearXNG alone (no API key) satisfies this; Tavily is not required.
+func WebSearchEnabled() bool {
+	if !WebSearchToggledOn() {
+		return false
+	}
+	return SearXNGProviderEnabled() || TavilyProviderEnabled()
 }
 
 // GetLogLevel returns the configured log level (debug/info/warn/error). Defaults to "info".

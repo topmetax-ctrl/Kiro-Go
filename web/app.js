@@ -2405,6 +2405,7 @@
     $('routeForm_targetModel').value = '';
     $('routeForm_enabled').checked = true;
     populateRouteProviderSelect(pid);
+    populateClientModelDatalist();
     populateTargetModelDatalist(pid);
     openDialog('modelRouteModal');
   }
@@ -2429,16 +2430,50 @@
     } catch (e) { /* suggestions only; ignore failures */ }
   }
 
-  // Fill the Target Model datalist: kiro-go models + models loaded for this provider.
+  // Fill the Client Model datalist with the models this kiro-go instance serves.
+  // These are the names clients send; the field stays free-text and optional.
+  function populateClientModelDatalist() {
+    const dl = $('routeClientModelList');
+    if (!dl) return;
+    dl.innerHTML = kiroGoModels.map(m => '<option value="' + escapeAttr(m) + '"></option>').join('');
+  }
+
+  // Fill the Target Model datalist with the selected provider's models.
+  // Target Model rewrites the model name sent upstream, so suggest provider names only.
   // The field stays free-text and optional; this only adds dropdown suggestions.
   function populateTargetModelDatalist(pid) {
     const dl = $('routeTargetModelList');
     if (!dl) return;
-    const seen = {};
-    const opts = [];
-    (providerModels[pid] || []).forEach(m => { if (m && !seen[m]) { seen[m] = 1; opts.push(m); } });
-    kiroGoModels.forEach(m => { if (m && !seen[m]) { seen[m] = 1; opts.push(m); } });
+    const opts = (providerModels[pid] || []).filter(Boolean);
     dl.innerHTML = opts.map(m => '<option value="' + escapeAttr(m) + '"></option>').join('');
+    // If we've never fetched this provider's models, fetch quietly (no modal) so
+    // the datalist fills in without the user having to open the model browser first.
+    if (pid && providerModels[pid] === undefined && !providerModelsLoading[pid]) {
+      fetchProviderModelsSilently(pid);
+    }
+  }
+
+  // Fetch a provider's model list without opening the browser modal. Populates the
+  // providerModels cache and re-renders the Target Model datalist if the route modal
+  // still targets this provider. Failures are swallowed (suggestions only).
+  async function fetchProviderModelsSilently(pid) {
+    const p = upstreamCache.providers.find(x => x.id === pid);
+    if (!p) return;
+    providerModelsLoading[pid] = true;
+    try {
+      const res = await api('/upstream-models', {
+        method: 'POST',
+        body: JSON.stringify({ id: pid, baseUrl: p.baseUrl, proxyURL: p.proxyURL })
+      });
+      const d = await res.json().catch(() => ({}));
+      providerModels[pid] = (res.ok && !d.error && Array.isArray(d.models)) ? d.models : [];
+    } catch (e) {
+      providerModels[pid] = [];
+    } finally {
+      providerModelsLoading[pid] = false;
+      const sel = $('routeForm_upstreamId');
+      if (sel && sel.value === pid) populateTargetModelDatalist(pid);
+    }
   }
 
   function openRouteModal(entry) {
@@ -2448,6 +2483,7 @@
     $('routeForm_targetModel').value = entry ? (entry.targetModel || '') : '';
     $('routeForm_enabled').checked = entry ? !!entry.enabled : true;
     populateRouteProviderSelect(entry ? entry.upstreamId : (upstreamCache.providers[0] && upstreamCache.providers[0].id));
+    populateClientModelDatalist();
     populateTargetModelDatalist($('routeForm_upstreamId').value);
     openDialog('modelRouteModal');
   }
