@@ -44,6 +44,16 @@ func SetExternalIdpTokenURLFnForTest(fn func(issuerURL string) (string, error)) 
 	}
 }
 
+// SetAllowInsecureExternalIdpEndpointForTest lets tests target a local httptest
+// server for IdP token/discovery endpoints (which are otherwise required to be
+// HTTPS on an allow-listed host). Returns the previous value so callers can
+// restore it. Test-only; never used in production.
+func SetAllowInsecureExternalIdpEndpointForTest(v bool) bool {
+	old := allowInsecureExternalIdpEndpointForTest
+	allowInsecureExternalIdpEndpointForTest = v
+	return old
+}
+
 // SetKiroLoopbackPortsForTest overrides the loopback port list used by
 // bindKiroLoopback. Pass []int{0} to force an ephemeral random port and avoid
 // port conflicts during parallel test runs. Returns the previous override so

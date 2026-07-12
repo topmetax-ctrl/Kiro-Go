@@ -169,6 +169,8 @@ func TestKiroSsoSessionNotFound(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRefreshExternalIdpToken_Success(t *testing.T) {
+	// Allow the local httptest (http) endpoint; production requires HTTPS + allow-listed host.
+	defer SetAllowInsecureExternalIdpEndpointForTest(SetAllowInsecureExternalIdpEndpointForTest(true))
 	// Mock IdP token endpoint
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
@@ -207,6 +209,7 @@ func TestRefreshExternalIdpToken_Success(t *testing.T) {
 }
 
 func TestRefreshExternalIdpToken_ErrorResponse(t *testing.T) {
+	defer SetAllowInsecureExternalIdpEndpointForTest(SetAllowInsecureExternalIdpEndpointForTest(true))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(400)
 		w.Write([]byte(`{"error":"invalid_grant"}`))
@@ -232,6 +235,58 @@ func TestRefreshExternalIdpToken_MissingIssuerURL(t *testing.T) {
 	_, _, _, _, err := RefreshExternalIdpToken("token", "", "", "client", "", nil)
 	if err == nil {
 		t.Fatal("expected error for missing issuer URL")
+	}
+}
+
+// A persisted/cached token endpoint that is not HTTPS, is an IP literal, or is
+// off the allow-list must be rejected at the outbound boundary on refresh — the
+// config value is not trusted.
+func TestRefreshExternalIdpToken_RejectsUntrustedCachedEndpoint(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+	}{
+		{"non-https", "http://login.microsoftonline.com/test/oauth2/v2.0/token"},
+		{"ip-literal", "https://169.254.169.254/token"},
+		{"off-allowlist", "https://evil.example.com/token"},
+		{"lookalike-suffix", "https://evil-microsoftonline.com/token"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, _, _, _, err := RefreshExternalIdpToken(
+				"refresh", "https://login.microsoftonline.com/test/v2.0", c.endpoint, "client", "", nil,
+			)
+			if err == nil {
+				t.Fatalf("expected rejection of untrusted cached endpoint %q", c.endpoint)
+			}
+			if !strings.Contains(err.Error(), "validation") {
+				t.Fatalf("expected validation error, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateExternalIdpURL(t *testing.T) {
+	good := []string{
+		"https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+		"https://login.microsoftonline.us/x/token",
+	}
+	for _, u := range good {
+		if err := validateExternalIdpURL(u); err != nil {
+			t.Errorf("expected %q to pass, got %v", u, err)
+		}
+	}
+	bad := []string{
+		"http://login.microsoftonline.com/token", // not https
+		"https://1.2.3.4/token",                  // ip literal
+		"https://evil.com/token",                 // off allow-list
+		"https://notmicrosoftonline.com.evil.io/token",
+		"https://microsoftonline.com.attacker.net/token",
+	}
+	for _, u := range bad {
+		if err := validateExternalIdpURL(u); err == nil {
+			t.Errorf("expected %q to be rejected", u)
+		}
 	}
 }
 

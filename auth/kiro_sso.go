@@ -346,6 +346,15 @@ func RefreshExternalIdpToken(refreshToken, issuerURL, tokenEndpoint, clientID, s
 		}
 	}
 
+	// Re-validate the token endpoint at the outbound boundary. It may have come
+	// from persisted config (IdPTokenEndpoint) written in a prior session or by a
+	// lower-privilege path; a persisted value is not trusted. Discovery results are
+	// validated at login, but a cached endpoint bypasses that check — so enforce it
+	// here on every refresh, immediately before the request leaves the process.
+	if err := validateExternalIdpURL(tokenEndpoint); err != nil {
+		return "", "", 0, "", fmt.Errorf("token endpoint failed validation: %w", err)
+	}
+
 	// POST refresh_token grant (form-encoded, giống zsec postExternalIdpToken)
 	payload := url.Values{}
 	payload.Set("client_id", clientID)
@@ -618,15 +627,15 @@ func (s *KiroSsoSession) handleOAuthCallback(w http.ResponseWriter, r *http.Requ
 	// Push kết quả
 	select {
 	case s.ResultCh <- KiroSsoResult{
-		AccessToken:  tokenResult.AccessToken,
-		RefreshToken: tokenResult.RefreshToken,
-		ExpiresIn:    tokenResult.ExpiresIn,
-		IssuerURL:    s.IssuerURL,
-		IdPClientID:  s.IdPClientID,
-		Scopes:       s.IdPScopes,
-		LoginHint:    s.LoginHint,
-		UserEmail:    email,
-				IdPTokenEndpoint: s.IdPTokenEndpoint,
+		AccessToken:      tokenResult.AccessToken,
+		RefreshToken:     tokenResult.RefreshToken,
+		ExpiresIn:        tokenResult.ExpiresIn,
+		IssuerURL:        s.IssuerURL,
+		IdPClientID:      s.IdPClientID,
+		Scopes:           s.IdPScopes,
+		LoginHint:        s.LoginHint,
+		UserEmail:        email,
+		IdPTokenEndpoint: s.IdPTokenEndpoint,
 	}:
 	default:
 	}
@@ -713,7 +722,27 @@ type oidcDiscoveryResponse struct {
 // discoverOIDCEndpoints fetch OIDC discovery document từ issuer URL.
 // Không follow redirect (CheckRedirect → ErrUseLastResponse) — zsec pattern.
 func discoverOIDCEndpoints(issuerURL string) (authEndpoint, tokenEndpoint string, err error) {
+	// Validate the issuer before fetching its discovery document: issuerURL may
+	// originate from persisted config, and an unvalidated fetch is an SSRF vector.
+	if verr := validateExternalIdpURL(issuerURL); verr != nil {
+		return "", "", fmt.Errorf("issuer failed validation: %w", verr)
+	}
 	discoveryURL := strings.TrimRight(issuerURL, "/") + "/.well-known/openid-configuration"
+
+	// Discovered endpoints are attacker-influenced (the issuer returns them), so
+	// validate before returning them to callers that will make outbound requests.
+	defer func() {
+		if err != nil {
+			return
+		}
+		if verr := validateExternalIdpURL(tokenEndpoint); verr != nil {
+			authEndpoint, tokenEndpoint, err = "", "", fmt.Errorf("discovered token endpoint failed validation: %w", verr)
+			return
+		}
+		if verr := validateExternalIdpURL(authEndpoint); verr != nil {
+			authEndpoint, tokenEndpoint, err = "", "", fmt.Errorf("discovered auth endpoint failed validation: %w", verr)
+		}
+	}()
 
 	client := externalIdpHTTPClient()
 	resp, err := client.Get(discoveryURL)
@@ -760,10 +789,19 @@ func resolveExternalIdpTokenEndpoint(issuerURL string) (string, error) {
 //   - Host phải thuộc allow-list (Microsoft Entra domains)
 //
 // (zsec validateExternalIdpEndpoint)
+// allowInsecureExternalIdpEndpointForTest, when true, lets tests point the IdP
+// token/discovery endpoints at a local httptest server (http://127.0.0.1). It is
+// never set in production and defaults to false.
+var allowInsecureExternalIdpEndpointForTest bool
+
 func validateExternalIdpURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("URL không hợp lệ: %w", err)
+	}
+
+	if allowInsecureExternalIdpEndpointForTest {
+		return nil
 	}
 
 	if !strings.EqualFold(u.Scheme, "https") {
