@@ -10,6 +10,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -79,6 +80,26 @@ func GetClientForProxy(proxyURL string) *http.Client {
 	return client
 }
 
+// GetForwardClientForProxy returns an http.Client for upstream forwarding. Unlike
+// GetClientForProxy it sets NO blanket Client.Timeout: a forwarded SSE stream can
+// run for many minutes, and a total timeout would truncate a valid long stream.
+// Connection setup and time-to-first-byte are bounded by the transport
+// (Dial/TLSHandshake/ResponseHeader timeouts); overall lifetime is bounded by the
+// request context (client disconnect cancels it).
+func GetForwardClientForProxy(proxyURL string) *http.Client {
+	cacheKey := "forward:" + proxyURL
+	if cached, ok := proxyClientCache.Load(cacheKey); ok {
+		return cached.(*http.Client)
+	}
+	client := &http.Client{
+		// No Timeout on purpose (streaming-safe). Transport timeouts + request
+		// context govern liveness.
+		Transport: buildKiroTransport(proxyURL),
+	}
+	proxyClientCache.Store(cacheKey, client)
+	return client
+}
+
 // GetRestClientForProxy returns a rest http.Client (30s timeout) for the given proxy URL.
 // If proxyURL is empty, returns the global kiro REST HTTP client.
 func GetRestClientForProxy(proxyURL string) *http.Client {
@@ -107,13 +128,26 @@ func ResolveAccountProxyURL(account *config.Account) string {
 }
 
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
+//
+// The dial / TLS-handshake / response-header timeouts bound connection setup and
+// time-to-first-byte WITHOUT capping the total response time — an SSE stream can
+// still run for as long as the upstream keeps sending, because ResponseHeaderTimeout
+// only limits how long we wait for the response headers, not the body. This is the
+// streaming-safe alternative to a blanket http.Client.Timeout.
 func buildKiroTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		DisableCompression:    false,
+		ForceAttemptHTTP2:     true,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
