@@ -13,6 +13,11 @@ services:
     environment:
       - CONFIG_PATH=/app/data/config.json
       - LOOPBACK_HOST=0.0.0.0
+      # Public bind (0.0.0.0) with the current weak posture (default admin
+      # password / auth-off) is refused by the startup safety gate. This override
+      # downgrades that hard-fail to a loud warning. INSECURE — set a strong
+      # ADMIN_PASSWORD and enable API-key auth to remove the exposure properly.
+      - ALLOW_INSECURE_PUBLIC_BIND=true
     restart: unless-stopped
     networks:
       - websearch
