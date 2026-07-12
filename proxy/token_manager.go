@@ -148,8 +148,18 @@ func (tm *TokenManager) tokenFresh(expiresAt int64) bool {
 // EnsureFresh guarantees the account identified by accountID has a non-expired
 // token, refreshing via the IdP if needed. All concurrent callers for the same
 // account share a single refresh. It returns a fresh account snapshot.
+// resolveAccount returns the freshest snapshot for accountID, preferring the pool
+// (live runtime state) but falling back to the full config so admin operations on
+// disabled/banned accounts — which the pool excludes — can still refresh tokens.
+func (tm *TokenManager) resolveAccount(accountID string) *config.Account {
+	if acc := tm.pool.GetByID(accountID); acc != nil {
+		return acc
+	}
+	return config.GetAccountByID(accountID)
+}
+
 func (tm *TokenManager) EnsureFresh(accountID string) (*config.Account, error) {
-	cur := tm.pool.GetByID(accountID)
+	cur := tm.resolveAccount(accountID)
 	if cur == nil {
 		return nil, fmt.Errorf("account %s not found", accountID)
 	}
@@ -187,8 +197,10 @@ func (tm *TokenManager) refreshCoalesced(accountID string) (*config.Account, err
 // the in-flight map).
 func (tm *TokenManager) doRefresh(accountID string) refreshResult {
 	// (1) Re-read the freshest snapshot so we refresh with the latest refresh
-	// token (avoids reusing a token already rotated by a prior refresh).
-	cur := tm.pool.GetByID(accountID)
+	// token (avoids reusing a token already rotated by a prior refresh). Falls back
+	// to config so a disabled/banned account (absent from the pool) can still be
+	// refreshed during an admin profile operation.
+	cur := tm.resolveAccount(accountID)
 	if cur == nil {
 		return refreshResult{err: fmt.Errorf("account %s not found", accountID)}
 	}

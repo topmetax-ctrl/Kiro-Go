@@ -826,6 +826,22 @@ func GetAccounts() []Account {
 	return accounts
 }
 
+// GetAccountByID returns a copy of the account with the given ID, or nil if no
+// such account exists. Unlike the pool, this sees ALL accounts including disabled
+// and banned ones — admin/setup operations (e.g. profile discovery) need to act on
+// accounts that are not currently routable.
+func GetAccountByID(id string) *Account {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			a := cfg.Accounts[i]
+			return &a
+		}
+	}
+	return nil
+}
+
 func GetEnabledAccounts() []Account {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()

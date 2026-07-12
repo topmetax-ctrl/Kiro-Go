@@ -777,7 +777,10 @@ func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request
 // Probes all candidate regions and returns the discovered profiles (deduped,
 // sorted) plus any per-region errors. Never returns tokens or secrets.
 func (h *Handler) apiDiscoverAccountProfiles(w http.ResponseWriter, r *http.Request, id string) {
-	account := h.pool.GetByID(id)
+	// Admin/setup op: resolve from the full config, not just the routable pool,
+	// so profile discovery works on disabled/banned accounts too (the picker is
+	// often used precisely to recover such an account).
+	account := h.lookupAccountForAdmin(id)
 	if account == nil {
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})

@@ -166,11 +166,24 @@ type PinnedProfile struct {
 	Region string `json:"region"`
 }
 
-// GetPinnedProfile returns the account's currently active profile from its
-// snapshot. This is a cheap pool read — the request hot path uses exactly this,
-// never discovery.
+// lookupAccountForAdmin resolves an account for an admin/setup operation. It
+// prefers the live pool snapshot (fresh runtime stats) but falls back to the full
+// config so disabled/banned accounts — which the pool excludes — are still
+// addressable. Profile discovery/selection is an admin op, never on the hot path,
+// so seeing a non-routable account here is intended.
+func (h *Handler) lookupAccountForAdmin(accountID string) *config.Account {
+	if acc := h.pool.GetByID(accountID); acc != nil {
+		return acc
+	}
+	return config.GetAccountByID(accountID)
+}
+
+// GetPinnedProfile returns the account's currently active profile. It resolves
+// via the pool first, then the full config, so a disabled/banned account's pinned
+// profile is still reported. The request hot path reads the pool snapshot directly
+// elsewhere and never calls this.
 func (h *Handler) GetPinnedProfile(accountID string) (PinnedProfile, bool) {
-	acc := h.pool.GetByID(accountID)
+	acc := h.lookupAccountForAdmin(accountID)
 	if acc == nil {
 		return PinnedProfile{}, false
 	}
@@ -198,7 +211,7 @@ func (h *Handler) SelectProfile(ctx context.Context, accountID, profileARN, regi
 		return fmt.Errorf("accountID, profileARN and region are required")
 	}
 
-	acc := h.pool.GetByID(accountID)
+	acc := h.lookupAccountForAdmin(accountID)
 	if acc == nil {
 		return fmt.Errorf("account %s not found", accountID)
 	}
