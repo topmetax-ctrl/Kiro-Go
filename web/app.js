@@ -1320,10 +1320,10 @@
       '</div>' +
 
       '<div class="detail-section">' +
-      '<h4>Profiles' +
-      ' <button class="btn btn-sm btn-outline" data-detail-action="discoverProfiles" data-id="' + idAttr + '" type="button">Discover</button>' +
+      '<h4>' + escapeHtml(t('detail.profiles')) +
+      ' <button class="btn btn-sm btn-outline" data-detail-action="discoverProfiles" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.discover')) + '</button>' +
       '</h4>' +
-      '<div id="profilesList" class="model-list"><p class="empty-state">Click Discover to list profiles across regions.</p></div>' +
+      '<div id="profilesList" class="model-list"><p class="empty-state">' + escapeHtml(t('detail.profilesHint')) + '</p></div>' +
       '</div>';
 
     openDialog('detailModal');
@@ -1342,7 +1342,7 @@
       const res = await api('/accounts/' + id + '/profiles');
       const d = await res.json();
       if (!res.ok || !d.profiles || d.profiles.length === 0) {
-        c.innerHTML = '<p class="message message-error">' + escapeHtml(d.error || 'No profiles found') + '</p>';
+        c.innerHTML = '<p class="message message-error">' + escapeHtml(d.error || t('detail.noProfiles')) + '</p>';
         return;
       }
       let pinnedArn = '';
@@ -1353,17 +1353,17 @@
       } catch (e) { /* non-fatal */ }
 
       const warn = (d.regionErrors && Object.keys(d.regionErrors).length)
-        ? '<p class="message message-warning">Some regions failed: ' + escapeHtml(Object.keys(d.regionErrors).join(', ')) + '</p>'
+        ? '<p class="message message-warning">' + escapeHtml(t('detail.profileRegionsFailed', Object.keys(d.regionErrors).join(', '))) + '</p>'
         : '';
       c.innerHTML = warn + d.profiles.map(p => {
         const isPinned = p.arn === pinnedArn;
-        const tag = isPinned ? ' <span class="credit-ratio">pinned</span>' : '';
+        const tag = isPinned ? ' <span class="credit-ratio">' + escapeHtml(t('detail.profilePinned')) + '</span>' : '';
         const disabled = isPinned ? ' disabled' : '';
         return '<div class="model-item">' +
           '<div class="model-name">' + escapeHtml(p.displayName || p.arn) + tag + '</div>' +
           '<div class="model-info">' + escapeHtml(p.region) + ' — ' + escapeHtml(p.arn) + '</div>' +
           '<button class="btn btn-sm btn-primary" data-profile-select="1" data-id="' + escapeHtml(id) +
-          '" data-arn="' + escapeHtml(p.arn) + '" data-region="' + escapeHtml(p.region) + '" type="button"' + disabled + '>Use</button>' +
+          '" data-arn="' + escapeHtml(p.arn) + '" data-region="' + escapeHtml(p.region) + '" type="button"' + disabled + '>' + escapeHtml(t('detail.profileUse')) + '</button>' +
           '</div>';
       }).join('');
     } catch (e) {
@@ -1374,7 +1374,7 @@
   }
 
   async function selectProfile(id, arn, region, btn) {
-    if (!confirm('Switch this account to profile ' + arn + ' (' + region + ')? Active requests keep the old profile; new requests use the new one.')) return;
+    if (!confirm(t('detail.profileSwitchConfirm', arn, region))) return;
     if (btn) btn.disabled = true;
     try {
       const res = await api('/accounts/' + id + '/profile', {
@@ -1383,14 +1383,19 @@
       });
       const d = await res.json();
       if (res.ok && d.success) {
-        toast('Profile switched; model cache refreshed', 'success');
+        if (d.modelCacheRefreshed) {
+          toast(t('detail.profileSwitchedModels', d.modelCount != null ? d.modelCount : 0), 'success');
+        } else {
+          toast(t('detail.profileSwitched'), 'success');
+        }
+        loadAccounts();
         discoverProfiles(id);
       } else {
-        toast(d.error || 'Profile switch failed', 'error');
+        toast(d.error || t('detail.profileSwitchFailed'), 'error');
         if (btn) btn.disabled = false;
       }
     } catch (e) {
-      toast('Profile switch failed', 'error');
+      toast(t('detail.profileSwitchFailed'), 'error');
       if (btn) btn.disabled = false;
     }
   }

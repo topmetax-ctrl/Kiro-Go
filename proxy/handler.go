@@ -44,8 +44,18 @@ type Handler struct {
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
-	promptCache     *promptCacheTracker
-	tokenManager    *TokenManager
+	// modelInfoByAccount keeps the last-known model metadata per account so the
+	// global aggregate can be rebuilt in-memory (no network) when one account's
+	// profile changes — dropping models no account offers anymore while keeping
+	// other accounts' models. Guarded by modelsCacheMu.
+	modelInfoByAccount map[string][]ModelInfo
+	promptCache        *promptCacheTracker
+	tokenManager       *TokenManager
+	// profileSwitchLocks serializes profile switches per account so two concurrent
+	// switches of the SAME account cannot interleave persist/publish. Switches of
+	// DIFFERENT accounts still run in parallel (no global lock on the hot path).
+	profileSwitchMu    sync.Mutex
+	profileSwitchLocks map[string]*sync.Mutex
 	// conversationRunner orchestrates multi-round Kiro calls with server-side
 	// web_search execution. Injected so tests can supply fakes.
 	conversationRunner ConversationRunner
@@ -237,6 +247,8 @@ func NewHandler() *Handler {
 		stopStatsSaver:     make(chan struct{}),
 		promptCache:        newPromptCacheTracker(defaultPromptCacheTTL),
 		conversationRunner: NewKiroConversationRunner(),
+		modelInfoByAccount: make(map[string][]ModelInfo),
+		profileSwitchLocks: make(map[string]*sync.Mutex),
 	}
 	h.tokenManager = NewTokenManager(h.pool, nil, nil)
 	// 恢复转发指标聚合数据 (事件日志与时序为内存态，不持久化)
@@ -689,7 +701,7 @@ func (h *Handler) refreshModelsCache() {
 			continue
 		}
 
-		models, err := ListAvailableModels(account)
+		models, err := modelLister(account)
 		if err != nil {
 			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
 			h.handleAccountFailure(account, err)
@@ -701,6 +713,7 @@ func (h *Handler) refreshModelsCache() {
 			modelIDs = append(modelIDs, m.ModelId)
 		}
 		h.pool.SetModelList(account.ID, modelIDs)
+		h.setAccountModelInfo(account.ID, models)
 		aggregated = mergeUniqueModels(aggregated, models)
 	}
 
@@ -713,13 +726,42 @@ func (h *Handler) refreshModelsCache() {
 	}
 }
 
+// modelLister is the seam for fetching an account's available models; overridable
+// in tests. Production uses the real Kiro ListAvailableModels call.
+var modelLister = ListAvailableModels
+
+// setAccountModelInfo records the last-known model metadata for an account so the
+// global aggregate can later be rebuilt in memory. Guarded by modelsCacheMu.
+func (h *Handler) setAccountModelInfo(accountID string, models []ModelInfo) {
+	cp := make([]ModelInfo, len(models))
+	copy(cp, models)
+	h.modelsCacheMu.Lock()
+	if h.modelInfoByAccount == nil {
+		h.modelInfoByAccount = make(map[string][]ModelInfo)
+	}
+	h.modelInfoByAccount[accountID] = cp
+	h.modelsCacheMu.Unlock()
+}
+
+// rebuildAggregateLocked recomputes cachedModels from the per-account metadata,
+// so models that no remaining account offers drop out while every other account's
+// models are preserved. Caller must hold modelsCacheMu. It performs no network I/O.
+func (h *Handler) rebuildAggregateLocked() {
+	aggregated := make([]ModelInfo, 0)
+	for _, models := range h.modelInfoByAccount {
+		aggregated = mergeUniqueModels(aggregated, models)
+	}
+	h.cachedModels = aggregated
+	h.modelsCacheTime = time.Now().Unix()
+}
+
 // fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
 // 同时更新 pool 的路由缓存与全局聚合模型列表。
 func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	if err := h.ensureValidToken(account); err != nil {
 		return fmt.Errorf("token refresh failed: %w", err)
 	}
-	models, err := ListAvailableModels(account)
+	models, err := modelLister(account)
 	if err != nil {
 		return err
 	}
@@ -729,10 +771,15 @@ func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	}
 	h.pool.SetModelList(account.ID, modelIDs)
 
-	// 合并到聚合缓存
+	// Record per-account metadata and rebuild the aggregate so stale models drop.
+	cp := make([]ModelInfo, len(models))
+	copy(cp, models)
 	h.modelsCacheMu.Lock()
-	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
-	h.modelsCacheTime = time.Now().Unix()
+	if h.modelInfoByAccount == nil {
+		h.modelInfoByAccount = make(map[string][]ModelInfo)
+	}
+	h.modelInfoByAccount[account.ID] = cp
+	h.rebuildAggregateLocked()
 	h.modelsCacheMu.Unlock()
 
 	logger.Infof("[ModelsCache] Refreshed %d models for account %s", len(models), account.Email)
@@ -830,16 +877,23 @@ func (h *Handler) apiSelectAccountProfile(w http.ResponseWriter, r *http.Request
 		json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
 		return
 	}
-	if err := h.SelectProfile(r.Context(), id, req.ARN, req.Region); err != nil {
+	result, err := h.SelectProfile(r.Context(), id, req.ARN, req.Region)
+	if err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 	pinned, _ := h.GetPinnedProfile(id)
+	warnings := result.Warnings
+	if warnings == nil {
+		warnings = []string{}
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":             true,
 		"pinned":              pinned,
-		"modelCacheRefreshed": true,
+		"modelCacheRefreshed": result.ModelCacheRefreshed,
+		"modelCount":          result.ModelCount,
+		"warnings":            warnings,
 	})
 }
 

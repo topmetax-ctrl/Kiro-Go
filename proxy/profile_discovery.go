@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -190,30 +191,66 @@ func (h *Handler) GetPinnedProfile(accountID string) (PinnedProfile, bool) {
 	return PinnedProfile{ARN: acc.ProfileArn, Region: acc.EffectiveApiRegion()}, true
 }
 
+// SelectProfileResult reports the outcome of a successful profile switch, so the
+// admin API can tell the operator what actually happened (no false success).
+type SelectProfileResult struct {
+	ModelCacheRefreshed bool
+	ModelCount          int
+	Warnings            []string
+}
+
+// profileSwitchLock returns the per-account mutex used to serialize profile
+// switches of the SAME account. Switches of different accounts get different
+// locks and run in parallel. The tiny map guard (profileSwitchMu) is never held
+// across I/O — only long enough to fetch/create the per-account lock.
+func (h *Handler) profileSwitchLock(accountID string) *sync.Mutex {
+	h.profileSwitchMu.Lock()
+	defer h.profileSwitchMu.Unlock()
+	if h.profileSwitchLocks == nil {
+		h.profileSwitchLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := h.profileSwitchLocks[accountID]
+	if !ok {
+		mu = &sync.Mutex{}
+		h.profileSwitchLocks[accountID] = mu
+	}
+	return mu
+}
+
 // SelectProfile switches an account to a specific discovered profile. It is an
-// admin/setup operation, never on the request hot path. Ordering matters for
-// safety:
+// admin/setup operation, never on the request hot path. Ordering is
+// prefetch-before-commit so a switch is atomic from the caller's point of view
+// and never leaves a half-applied state:
 //
-//  1. validate inputs
-//  2. ensure a fresh token via the TokenManager (no side refresh)
+//  1. validate inputs; resolve account (pool→config admin lookup)
+//  2. ensure a fresh token via the TokenManager
 //  3. re-discover and verify the target ARN still exists in that region
-//  4. persist the new profile ARN + region atomically
-//  5. publish the new snapshot to the pool
-//  6. invalidate ONLY this account's model cache (region-scoped model list)
+//  4. build a value-copy CANDIDATE snapshot (target ARN + region)
+//  5. fetch the candidate profile's model list — OUTSIDE any cache lock
+//     - on failure: do NOT persist; the old profile stays intact; return error
+//  6. persist the new ARN + region atomically
+//  7. publish the new snapshot to the pool
+//  8. replace ONLY this account's routing model list with the candidate models
+//  9. rebuild the global aggregate in-memory (drop models no account offers,
+//     keep other accounts' models) — no network I/O under the lock
 //
-// If any pre-commit step (1-3) fails, the account is left unchanged. If persistence
-// fails, the account/config durability policy applies (atomic save; no partial
-// write). The account is never left with a new ARN but a stale region/model cache.
-func (h *Handler) SelectProfile(ctx context.Context, accountID, profileARN, region string) error {
+// The whole sequence is serialized per account so two concurrent switches of the
+// same account cannot interleave; different accounts switch in parallel.
+func (h *Handler) SelectProfile(ctx context.Context, accountID, profileARN, region string) (SelectProfileResult, error) {
 	profileARN = strings.TrimSpace(profileARN)
 	region = strings.TrimSpace(region)
 	if accountID == "" || profileARN == "" || region == "" {
-		return fmt.Errorf("accountID, profileARN and region are required")
+		return SelectProfileResult{}, fmt.Errorf("accountID, profileARN and region are required")
 	}
+
+	// Serialize switches of THIS account (different accounts stay parallel).
+	lock := h.profileSwitchLock(accountID)
+	lock.Lock()
+	defer lock.Unlock()
 
 	acc := h.lookupAccountForAdmin(accountID)
 	if acc == nil {
-		return fmt.Errorf("account %s not found", accountID)
+		return SelectProfileResult{}, fmt.Errorf("account %s not found", accountID)
 	}
 
 	// Ensure a valid token via the central manager (does not itself pin/select).
@@ -221,14 +258,14 @@ func (h *Handler) SelectProfile(ctx context.Context, accountID, profileARN, regi
 		if fresh, err := h.tokenManager.EnsureFresh(accountID); err == nil && fresh != nil {
 			acc = fresh
 		} else if err != nil {
-			return fmt.Errorf("token refresh failed: %w", err)
+			return SelectProfileResult{}, fmt.Errorf("token refresh failed: %w", err)
 		}
 	}
 
 	// Verify the target ARN still exists at that region before committing.
 	profiles, err := profileLister(ctx, acc, region)
 	if err != nil {
-		return fmt.Errorf("verify profile in %s: %w", region, err)
+		return SelectProfileResult{}, fmt.Errorf("verify profile in %s: %w", region, err)
 	}
 	found := false
 	for _, p := range profiles {
@@ -238,22 +275,45 @@ func (h *Handler) SelectProfile(ctx context.Context, accountID, profileARN, regi
 		}
 	}
 	if !found {
-		return fmt.Errorf("profile %s not found in region %s", shortARN(profileARN), region)
+		return SelectProfileResult{}, fmt.Errorf("profile %s not found in region %s", shortARN(profileARN), region)
 	}
 
-	// Persist atomically (config.Save is atomic). This updates ProfileArn + ApiRegion.
+	// Build a value-copy candidate snapshot pointing at the target profile and
+	// prefetch its model list BEFORE committing. If the new profile cannot serve
+	// models, we refuse the switch and leave the old profile untouched.
+	candidate := *acc
+	candidate.ProfileArn = profileARN
+	candidate.ApiRegion = region
+	models, err := modelLister(&candidate)
+	if err != nil {
+		return SelectProfileResult{}, fmt.Errorf("fetch models for new profile: %w", err)
+	}
+
+	// Commit: persist ARN+region atomically, then publish the new snapshot.
 	if err := config.UpdateAccountProfileArnWithRegion(accountID, profileARN, region); err != nil {
-		return fmt.Errorf("persist profile selection: %w", err)
+		return SelectProfileResult{}, fmt.Errorf("persist profile selection: %w", err)
 	}
-
-	// Publish the new snapshot to the pool (Reload rebuilds from config).
 	h.pool.Reload()
 
-	// Invalidate ONLY this account's model list (model entitlements are
-	// region/profile-scoped). Do not flush any global model cache.
-	h.pool.SetModelList(accountID, nil)
+	// Replace this account's routing model list with the candidate's models, then
+	// rebuild the global aggregate in-memory so stale old-profile models drop out
+	// while other accounts' models stay. No network I/O under the lock.
+	modelIDs := make([]string, 0, len(models))
+	for _, m := range models {
+		modelIDs = append(modelIDs, m.ModelId)
+	}
+	h.pool.SetModelList(accountID, modelIDs)
+	cp := make([]ModelInfo, len(models))
+	copy(cp, models)
+	h.modelsCacheMu.Lock()
+	if h.modelInfoByAccount == nil {
+		h.modelInfoByAccount = make(map[string][]ModelInfo)
+	}
+	h.modelInfoByAccount[accountID] = cp
+	h.rebuildAggregateLocked()
+	h.modelsCacheMu.Unlock()
 
-	logger.Infof("[ProfileDiscovery] account %s pinned to profile %s in %s",
-		accountID, shortARN(profileARN), region)
-	return nil
+	logger.Infof("[ProfileDiscovery] account %s pinned to profile %s in %s (%d models)",
+		accountID, shortARN(profileARN), region, len(models))
+	return SelectProfileResult{ModelCacheRefreshed: true, ModelCount: len(models)}, nil
 }
