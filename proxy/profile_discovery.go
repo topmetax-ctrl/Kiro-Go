@@ -99,7 +99,10 @@ func DiscoverProfiles(ctx context.Context, account *config.Account) (ProfileDisc
 // profiles (not just the first). It reuses the account's REST client and headers.
 func listProfilesInRegion(ctx context.Context, account *config.Account, region string) ([]DiscoveredProfile, error) {
 	url := regionalizeURLForRegion(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), region)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(`{"maxResults":50}`))
+	// maxResults must match the value the proven-working listAvailableProfiles
+	// uses: the CodeWhisperer API rejects larger values with HTTP 400
+	// REQUEST_BODY_INVALID ("Improperly formed request").
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(`{"maxResults":10}`))
 	if err != nil {
 		return nil, err
 	}
