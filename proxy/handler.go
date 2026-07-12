@@ -39,6 +39,7 @@ type Handler struct {
 	startTime       int64
 	stopRefresh     chan struct{}
 	stopStatsSaver  chan struct{}
+	shutdownOnce    sync.Once
 	// 模型缓存
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
@@ -1597,6 +1598,27 @@ func (h *Handler) backgroundStatsSaver() {
 			return
 		}
 	}
+}
+
+// Shutdown stops the handler's background workers and flushes dirty state. It is
+// safe to call once during graceful shutdown; the stop channels are closed so the
+// backgroundRefresh / backgroundStatsSaver loops exit (the stats saver persists a
+// final snapshot on its way out). Any token whose persistence was deferred
+// (PersistenceDegraded) gets a final flush attempt so a rotated credential is not
+// lost across restart.
+func (h *Handler) Shutdown() {
+	// Closing the channels signals the background loops to return. Guard against a
+	// double close in case Shutdown is invoked more than once.
+	h.shutdownOnce.Do(func() {
+		if h.tokenManager != nil {
+			h.tokenManager.FlushPending()
+		}
+		close(h.stopRefresh)
+		close(h.stopStatsSaver)
+		// Persist a final stats snapshot synchronously (the stats saver also does
+		// this on exit, but do it here too in case that goroutine already returned).
+		h.saveStats()
+	})
 }
 
 // saveStats 保存统计到配置文件

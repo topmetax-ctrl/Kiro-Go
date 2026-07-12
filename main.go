@@ -14,6 +14,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -22,7 +23,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -95,22 +98,51 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	if cert, key := config.GetTLSFiles(); cert != "" && key != "" {
-		// Fail fast rather than silently downgrading to cleartext on a box the
-		// operator has marked TLS-on.
-		if _, err := os.Stat(cert); err != nil {
-			logger.Fatalf("TLS cert not readable: %v", err)
+	// Serve in the background so main can wait for a shutdown signal. A clean
+	// shutdown (SIGINT/SIGTERM) drains in-flight requests within a deadline,
+	// stops background workers, and flushes dirty token/stats state; ungraceful
+	// exit is reserved for a genuine listen failure.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serveErr := make(chan error, 1)
+	go func() {
+		if cert, key := config.GetTLSFiles(); cert != "" && key != "" {
+			// Fail fast rather than silently downgrading to cleartext on a box the
+			// operator has marked TLS-on.
+			if _, err := os.Stat(cert); err != nil {
+				logger.Fatalf("TLS cert not readable: %v", err)
+			}
+			if _, err := os.Stat(key); err != nil {
+				logger.Fatalf("TLS key not readable: %v", err)
+			}
+			logger.Infof("TLS enabled; serving https://%s", addr)
+			serveErr <- srv.ListenAndServeTLS(cert, key)
+		} else {
+			serveErr <- srv.ListenAndServe()
 		}
-		if _, err := os.Stat(key); err != nil {
-			logger.Fatalf("TLS key not readable: %v", err)
-		}
-		logger.Infof("TLS enabled; serving https://%s", addr)
-		if err := srv.ListenAndServeTLS(cert, key); err != nil {
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && err != http.ErrServerClosed {
 			logger.Fatalf("Server failed: %v", err)
 		}
-	} else {
-		if err := srv.ListenAndServe(); err != nil {
-			logger.Fatalf("Server failed: %v", err)
+	case <-ctx.Done():
+		stop() // restore default signal handling so a second signal force-quits
+		logger.Infof("Shutdown signal received; draining in-flight requests...")
+
+		// Stop background workers and flush dirty state first.
+		handler.Shutdown()
+
+		// Drain in-flight requests (including SSE) within a bounded deadline.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Warnf("Graceful shutdown timed out: %v (forcing close)", err)
+			_ = srv.Close()
+		} else {
+			logger.Infof("Shutdown complete.")
 		}
 	}
 }
