@@ -559,11 +559,15 @@ func Load() error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Create default configuration.
-			// Binds to 0.0.0.0 by default for Docker/container compatibility.
+			// Binds to loopback by default: a fresh install ships with the default
+			// "changeme" password and auth off, so a public bind would expose an
+			// unauthenticated admin surface. Operators who need a public/container
+			// bind set Host explicitly (and are then subject to the startup safety
+			// gate — see config/startup_safety.go).
 			cfg = &Config{
 				Password:      "changeme",
 				Port:          8080,
-				Host:          "0.0.0.0",
+				Host:          "127.0.0.1",
 				RequireApiKey: false,
 				Accounts:      []Account{},
 			}

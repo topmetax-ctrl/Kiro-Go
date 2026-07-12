@@ -57,6 +57,16 @@ func main() {
 		logger.Warnf("SECURITY: %s", warn.Msg)
 	}
 
+	// Hard-fail on an exposed insecure posture (public bind + default password or
+	// disabled auth), unless the operator explicitly opted in via
+	// ALLOW_INSECURE_PUBLIC_BIND. Runs after the ADMIN_PASSWORD override so an
+	// env-set password satisfies the gate.
+	if warning, err := config.CheckStartupSafety(); err != nil {
+		logger.Fatalf("%v", err)
+	} else if warning != "" {
+		logger.Warnf("SECURITY: %s", warning)
+	}
+
 	// 初始化账号池
 	pool.GetPool()
 
