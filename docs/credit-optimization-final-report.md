@@ -47,7 +47,7 @@ Therefore the token inflation in answer (1) is a **display/accounting bug, not a
 - **Web-search multi-round (Confirmed mechanism).** Each runner round is one Kiro inference and bills its own credits; a search conversation is 2-4+ inferences vs. 1 for a plain chat. Credits sum across rounds (correct, not a bug), but a search-augmented request legitimately costs more than a bare one. Not a defect; a cost driver to be aware of when comparing "same prompt" across interfaces.
 
 **Ruled out as real-credit causes:**
-- **Retry double-metering (Disproved).** Retries fire only pre-stream (`!messageStarted`) and only on a **different** account; credits are recorded once on success. A mid-stream failure after a metering event attributes 0 credits/0 tokens for that attempt on the proxy side; any upstream double-bill is not proxy-observable (Case F). No proxy-side double count.
+- **Retry double-metering (proxy-side Disproved; backend-side `Chưa xác minh`).** Retries fire only pre-stream (`!messageStarted`) and only on a **different** account; the proxy records credits once, on success. A mid-stream failure after a metering event attributes 0 credits/0 tokens for that attempt on the proxy side (Case F). What the harness canNOT prove: whether Kiro's **backend** already billed the truncated attempt that emitted a `meteringEvent` before the stream broke. So: no proxy-side double count; backend-side double-bill of an interrupted attempt is not proxy-observable and remains unverified.
 - **Duplicate payload (Disproved).** System-prompt priming is prepended once (`translator.go:283-299`); history is serialized once; no duplicated turn, schema, or tool result found. Full-history replay is stateless-protocol compatibility, not a duplication bug.
 - **Forwarded requests (not a Kiro-credit path).** `upstream_forward.go` never touches Kiro credits; it now records real forwarded tokens for per-key quota (`:146`) instead of the old `recordSuccess(0,0,0)`, with credits fixed at 0 — no fabricated pricing.
 - **Prompt cache (metadata only).** `billedClaudeInputTokens` subtracts local cache-tracker tokens from the *displayed* input, but the payload sends no backend `cache-control` and no backend cache-hit is consumed. It affects display only, not credits.
@@ -61,9 +61,10 @@ Therefore the token inflation in answer (1) is a **display/accounting bug, not a
 **Accounting-only (Phase A) — reduces the *displayed* number, spends the same credits.** Stop using context occupancy as input tokens; prefer upstream-reported input, fall back to estimator only when upstream is absent; prefer upstream output over the estimator. Keep context occupancy as a separate metric. This is payload-identical and credit-identical by construction — the correct fix for the *reported* inflation. It does not reduce real credits (there is nothing to reduce; the credits were always correct). Client-facing `usage.input_tokens` should change only behind a `legacy/accurate/dual` mode defaulting to current behavior, to avoid breaking any client that keys off the old number.
 
 **Real-credit reduction (Phase B/C) — requires operator approval + measured A/B:**
-- The one lever with real credit impact and confirmed semantics is **model selection** (use Auto or a lower-multiplier model). But this is a **product decision with a quality trade-off**, explicitly out of bounds for silent "optimization" per the prompt. It must be operator-approved and A/B-measured, not applied as a correctness fix.
+- The **best-documented** lever with confirmed semantics is **model selection** (use Auto or a lower-multiplier model). This is a **product decision with a quality trade-off**, explicitly out of bounds for silent "optimization" per the prompt. It must be operator-approved and A/B-measured, not applied as a correctness fix.
+- This is *not* the only conceivable real-credit lever — it is the only one this audit could confirm. A future audit could still find a genuine credit-reducing **bug** (a redundant Kiro inference, a superfluous web-search finalization round, a retry issued after the backend already processed a turn, or a duplicated context/tool-result block). This audit found none of those at `ced9eec`, but "none found" is not "none exist." Any such fix would qualify as Phase B (semantics-preserving) once proven by a measured `meteringEvent.usage` drop.
 
-**Bottom line:** the thing that looks like a cost problem is a reporting problem; the thing that might be a real cost problem (model multiplier) is a product choice, not a bug to be fixed silently.
+**Bottom line:** the thing that looks like a cost problem is, on current evidence, a reporting problem; the one confirmed *real* cost difference (model multiplier) is a product choice, not a bug to be fixed silently — but the search for credit-reducing bugs is "nothing found so far," not "proven impossible."
 
 ## Findings table
 
@@ -74,7 +75,7 @@ Therefore the token inflation in answer (1) is a **display/accounting bug, not a
 | F3 | Credits sourced only from meteringEvent, summed correctly | Case E | Confirmed | accurate | n/a | none | none |
 | F4 | Fix applied to only 1 of 7 tails (asymmetric reporting) | override inventory | Confirmed | none | path-dependent | none | none |
 | F5 | Model/Auto multiplier can raise real credits | kiro.dev docs | Confirmed semantics / runtime `Chưa xác minh` | up to ~1.3× | none | none | quality trade-off if changed |
-| F6 | Retry does not double-meter on proxy side | Case F; failover code | Disproved (as a bug) | none | none | none | none |
+| F6 | No proxy-side retry double-meter; backend-side billing of interrupted attempt unverified | Case F; failover code | Proxy-side Disproved / backend-side `Chưa xác minh` | none proven (proxy); backend unverified | none | none | none |
 | F7 | No duplicate payload / system prompt / history | translator read | Disproved (as a bug) | none | none | none | none |
 
 ## Unknowns (`Chưa xác minh`)

@@ -96,6 +96,10 @@ The context-derived `realInputTokens` replaces the real upstream `inputTokens` a
 
 **Impact:** token dashboard / `usage.input_tokens` / per-key `TokensUsed` / account `TotalTokens` are inflated by (window/actual-input). Credit accounting is **unaffected** (separate path, F3). This is the number the operator *sees* and mistakes for "the proxy costs more."
 
+**Harness limitation (must close before implementing A1).** The current harness proves the bug at two layers: the real `parseEventStream` decoder (upstream tokens vs context pct vs credits arrive as distinct quantities) and the finalize **arithmetic** (`TestAudit_HandlerTail_*`). The arithmetic tests *reproduce* the tails' precedence logic rather than driving a real HTTP request end-to-end, so they do NOT assert on the actual client `usage` map, per-key `TokensUsed` delta, account `TotalTokens` delta, and credit delta emerging from the live handler. That gap is real and was flagged in cross-review.
+
+The seam to close it exists and is already used by the repo's own tests: `swapKiroEndpointsForTest` (`responses_handler_test.go:290`) swaps the package-level `kiroEndpoints` to an `httptest.NewServer`, and `kiroHttpStore.Store(...)` (`handler_test.go:83-85`) points the client at it. This drives the *real* handler through `HTTP → fake Kiro event stream → client response → API-key stats → account stats`. Before A1 ships, add one end-to-end test per tail — Claude stream, Claude non-stream, Claude web-search runner, OpenAI stream, OpenAI non-stream, Responses stream, Responses non-stream — each asserting client usage, quota delta, account stats delta, and credit delta together. (An earlier note in this session that the non-runner tails were not HTTP-injectable was wrong; the `kiroEndpoints`/`kiroHttpStore` swap makes all seven injectable.)
+
 **Regression risk of the non-stream runner sub-path:** at `handler.go:1793` the runner sum (`run.TotalInputTokens`, correct across rounds) is computed, then line 1843 unconditionally throws it away and substitutes the final round's context occupancy. So the non-stream path is strictly worse than the (fixed) stream runner path.
 
 ### F2 — Output tokens are always the estimator, never upstream — **CONFIRMED**
@@ -136,7 +140,7 @@ Retry loop (`handler.go:1143`, `maxAccountRetryAttempts=3`) only continues to an
 
 ### F8 — Profile switch is atomic prefetch-before-commit — **CONFIRMED (profile-picker scope)**
 
-`SelectProfile` (`profile_discovery.go:239-319`): per-account lock, fresh token, re-verify ARN in region, prefetch model list *before* persisting, and only then persist + publish + refresh model cache. A model-fetch failure leaves the old profile intact. No half-applied state. This is correctness, not a credit lever — but a *wrong* pinned profile IS a real-credit lever (§4, Q8).
+`SelectProfile` (`profile_discovery.go:239-319`): per-account lock, fresh token, re-verify ARN in region, prefetch model list *before* persisting, and only then persist + publish + refresh model cache. A model-fetch failure leaves the old profile intact. No half-applied state. This is correctness — it fixes *which subscription/bucket is billed* and *which entitlement/models/quota* apply. It is **not** proven to lower credits-per-request: the documented multiplier is per-model, not per-profile-name, so a "Power" profile is not evidence of a cheaper rate for the same model+task.
 
 ---
 
@@ -147,7 +151,7 @@ Retry loop (`handler.go:1143`, `maxAccountRetryAttempts=3`) only continues to an
 | Context-occupancy override (F1) | **No** | Confirmed no-impact | Separate path from credits (F3) |
 | Output estimator (F2) | **No** | Confirmed no-impact | Display only |
 | Model mapping (`gpt-*`→`claude-sonnet-4.5`, passthrough for `claude-*`) | **Yes** | **Semantics confirmed, runtime Chưa xác minh** | Official docs: Sonnet 4.6 ≈ **1.3×** Auto credit rate. Proxy pins a concrete model; IDE on "Auto" is cheaper. Not measured in an A/B here. |
-| Profile US vs EU Power (Q8) | **Yes (plan/rate)** | **Chưa xác minh** | Needs live probe of `usageBreakdownList` per profile — not run (no live-credit approval) |
+| Profile / plan (US vs EU Power) (Q8) | **Correct-billing, NOT proven per-request cheaper** | **Chưa xác minh** | Power grants MORE credits (bigger bucket) and correct entitlement/model/quota. Kiro docs attach the multiplier to the **model**, not to a profile named "Power" — no evidence that the same model+task via Power costs fewer credits/request. Pinning the right profile fixes *which bucket is billed*, not the *rate*. |
 | Thinking / reasoning effort | Only via bigger output | Confirmed OFF by default | `ThinkingModePrompt` injected only when thinking=true (`translator.go`); no separate credit mechanism in docs |
 | Web-search extra rounds | **Yes** (each round = 1 Kiro call = credits) | Confirmed mechanism | Runner does 1 call/round, up to `MaxRounds=4` + 1 finalization; each metered. More rounds ⇒ more credits, by design |
 | Retry after backend metering | Possibly, at backend | **Chưa xác minh** | Proxy can't observe whether upstream billed a truncated attempt (F5) |
