@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -578,9 +579,25 @@ func Load() error {
 
 	var c Config
 	if err := json.Unmarshal(data, &c); err != nil {
-		return err
+		// Primary is present but corrupt. Fall back to the last-known-good backup
+		// written by atomicWriteFile before the most recent rename, rather than
+		// refusing to start (which would strand every account/token).
+		if bakData, bakErr := os.ReadFile(cfgPath + ".bak"); bakErr == nil {
+			var bc Config
+			if json.Unmarshal(bakData, &bc) == nil {
+				cfg = &bc
+				// Re-establish a good primary from the backup.
+				if werr := atomicWriteFile(cfgPath, bakData, 0600); werr != nil {
+					return fmt.Errorf("primary config corrupt (%v); restored from backup but failed to rewrite primary: %w", err, werr)
+				}
+				goto migrations
+			}
+		}
+		return fmt.Errorf("config file is corrupt and no valid backup exists: %w", err)
 	}
 	cfg = &c
+
+migrations:
 
 	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
 	// promote it into the new structure. The migrated entry inherits the legacy
@@ -639,14 +656,80 @@ func newUUID() string {
 	return GenerateMachineId()
 }
 
-// Save persists the current configuration to the JSON file.
-// Uses indented formatting for human readability.
+// Save persists the current configuration to the JSON file atomically and
+// durably. A plain os.WriteFile truncates the target before writing, so a crash
+// (or full disk) mid-write can leave a truncated/corrupt config and lose every
+// account and token. Instead we:
+//  1. marshal and validate (round-trip) the JSON,
+//  2. write it to a temp file in the same directory,
+//  3. fsync + close the temp file,
+//  4. copy the current good config to a .bak (last-known-good),
+//  5. atomically rename the temp file over the target,
+//  6. best-effort fsync the parent directory so the rename is durable.
+//
+// Callers already serialize on cfgLock, so there is no concurrent writer.
 func Save() error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfgPath, data, 0600)
+	// Validate the bytes round-trip before we let them near the primary file, so
+	// a marshaling bug can never overwrite a good config with garbage.
+	var probe Config
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return fmt.Errorf("refusing to save unparsable config: %w", err)
+	}
+	return atomicWriteFile(cfgPath, data, 0600)
+}
+
+// atomicWriteFile writes data to path via a temp file + fsync + rename, keeping a
+// .bak of the previous contents. It never truncates the primary in place.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// Best-effort cleanup if we bail before the rename.
+	defer func() {
+		if tmpName != "" {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return err
+	}
+
+	// Keep a last-known-good backup of the existing primary (ignore if absent).
+	if existing, rerr := os.ReadFile(path); rerr == nil {
+		_ = os.WriteFile(path+".bak", existing, perm)
+	}
+
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	tmpName = "" // renamed successfully; disable cleanup
+
+	// Durably record the directory entry for the rename (best-effort: not all
+	// filesystems support directory fsync, and failure here is non-fatal).
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 // SetPassword updates the admin password.
