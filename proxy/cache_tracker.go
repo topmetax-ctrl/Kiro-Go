@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"container/list"
 	"crypto/sha256"
 	"encoding/json"
 	"sort"
@@ -52,20 +53,143 @@ type promptCacheEntry struct {
 	TTL       time.Duration
 }
 
+// defaultPromptCacheCapacity bounds the total number of live cache entries across
+// ALL accounts. The account ID is part of the key, so isolation is preserved while
+// memory stays bounded regardless of account count (a single global cap, not one
+// per account). ~50k entries × ~small-struct is a few MB.
+const defaultPromptCacheCapacity = 50000
+
+// promptCacheKey identifies a stored prefix by account and fingerprint. Including the
+// account ID guarantees account A's prompt can never hit account B's entry.
+type promptCacheKey struct {
+	AccountID   string
+	Fingerprint [32]byte
+}
+
+// lruEntry is the value stored in each list element.
+type lruEntry struct {
+	key   promptCacheKey
+	entry promptCacheEntry
+}
+
+// promptCacheMetrics are cumulative counters for observability. They contain no
+// prompt text, fingerprints, or token secrets — only counts.
+type promptCacheMetrics struct {
+	Hits         int64
+	Misses       int64
+	Creations    int64
+	Evictions    int64
+	ExpiredEvict int64
+}
+
+// promptCacheTracker is a bounded, O(1) LRU of prompt-prefix fingerprints used to
+// synthesize Anthropic cache-usage metadata. It is NOT a model/inference cache and
+// stores no computation — only (account, fingerprint) -> {expiry, ttl}.
+//
+// Previously this was a per-account nested map with an O(total entries) prune scan
+// on every Compute/Update. It is now a single global map + container/list LRU:
+// lookup/insert/update/move-to-front/evict are all O(1) amortized, memory is bounded
+// by capacity, and there is no full-map scan on the hot path.
 type promptCacheTracker struct {
-	mu               sync.Mutex
-	entriesByAccount map[string]map[[32]byte]promptCacheEntry
-	maxSupportedTTL  time.Duration
+	mu              sync.Mutex
+	items           map[promptCacheKey]*list.Element
+	lru             *list.List // front = most-recently-used
+	perAccount      map[string]int
+	capacity        int
+	maxSupportedTTL time.Duration
+	metrics         promptCacheMetrics
 }
 
 func newPromptCacheTracker(maxTTL time.Duration) *promptCacheTracker {
+	return newPromptCacheTrackerWithCapacity(maxTTL, defaultPromptCacheCapacity)
+}
+
+func newPromptCacheTrackerWithCapacity(maxTTL time.Duration, capacity int) *promptCacheTracker {
 	if maxTTL <= 0 {
 		maxTTL = defaultPromptCacheTTL
 	}
-	return &promptCacheTracker{
-		entriesByAccount: make(map[string]map[[32]byte]promptCacheEntry),
-		maxSupportedTTL:  maxTTL,
+	if capacity <= 0 {
+		capacity = defaultPromptCacheCapacity
 	}
+	return &promptCacheTracker{
+		items:           make(map[promptCacheKey]*list.Element),
+		lru:             list.New(),
+		perAccount:      make(map[string]int),
+		capacity:        capacity,
+		maxSupportedTTL: maxTTL,
+	}
+}
+
+// getLive returns the live (non-expired) entry for key, removing it if expired.
+// Callers hold t.mu. A hit is moved to the LRU front.
+func (t *promptCacheTracker) getLive(key promptCacheKey, now time.Time) (promptCacheEntry, bool) {
+	el, ok := t.items[key]
+	if !ok {
+		return promptCacheEntry{}, false
+	}
+	le := el.Value.(*lruEntry)
+	if !le.entry.ExpiresAt.After(now) {
+		t.removeElementLocked(el)
+		t.metrics.ExpiredEvict++
+		return promptCacheEntry{}, false
+	}
+	t.lru.MoveToFront(el)
+	return le.entry, true
+}
+
+// putLocked inserts or updates key's entry, moving it to the front and evicting the
+// LRU tail if over capacity. Callers hold t.mu.
+func (t *promptCacheTracker) putLocked(key promptCacheKey, entry promptCacheEntry) {
+	if el, ok := t.items[key]; ok {
+		le := el.Value.(*lruEntry)
+		le.entry = entry
+		t.lru.MoveToFront(el)
+		return
+	}
+	el := t.lru.PushFront(&lruEntry{key: key, entry: entry})
+	t.items[key] = el
+	t.perAccount[key.AccountID]++
+	if t.lru.Len() > t.capacity {
+		t.evictOldestLocked()
+	}
+}
+
+func (t *promptCacheTracker) evictOldestLocked() {
+	el := t.lru.Back()
+	if el == nil {
+		return
+	}
+	t.removeElementLocked(el)
+	t.metrics.Evictions++
+}
+
+func (t *promptCacheTracker) removeElementLocked(el *list.Element) {
+	le := el.Value.(*lruEntry)
+	t.lru.Remove(el)
+	delete(t.items, le.key)
+	if n := t.perAccount[le.key.AccountID]; n <= 1 {
+		delete(t.perAccount, le.key.AccountID)
+	} else {
+		t.perAccount[le.key.AccountID] = n - 1
+	}
+}
+
+// accountHasLiveEntries reports whether the account has at least one entry (live or
+// not-yet-pruned). Because expired entries are pruned lazily on access, a stale
+// count can linger; that is acceptable for the "first request" heuristic and never
+// causes a cross-account hit (Compute still verifies each breakpoint by key).
+func (t *promptCacheTracker) accountHasEntries(accountID string) bool {
+	return t.perAccount[accountID] > 0
+}
+
+// Metrics returns a snapshot of the cumulative counters plus current size/capacity.
+func (t *promptCacheTracker) Metrics() (m promptCacheMetrics, entries, capacity int) {
+	if t == nil {
+		return promptCacheMetrics{}, 0, 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.metrics, t.lru.Len(), t.capacity
 }
 
 func (t *promptCacheTracker) BuildClaudeProfile(req *ClaudeRequest, totalInputTokens int) *promptCacheProfile {
@@ -137,11 +261,10 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.pruneExpiredLocked(now)
 
-	entries := t.entriesByAccount[accountID]
-	if len(entries) == 0 {
-		// First request for this account: report creation only if above threshold.
+	if !t.accountHasEntries(accountID) {
+		// First request for this account: no prior prefix to match (a miss).
+		t.metrics.Misses++
 		effectiveCreation := lastTokens
 		if effectiveCreation < minTokens {
 			effectiveCreation = 0
@@ -170,17 +293,24 @@ func (t *promptCacheTracker) Compute(accountID string, profile *promptCacheProfi
 		if breakpoint.CumulativeTokens < minTokens {
 			continue
 		}
-		entry, ok := entries[breakpoint.Fingerprint]
-		if !ok || entry.ExpiresAt.Before(now) {
+		key := promptCacheKey{AccountID: accountID, Fingerprint: breakpoint.Fingerprint}
+		entry, ok := t.getLive(key, now)
+		if !ok {
 			continue
 		}
+		// Refresh the entry's expiry (a hit extends its life) and keep it hot.
 		entry.ExpiresAt = now.Add(entry.TTL)
-		entries[breakpoint.Fingerprint] = entry
+		t.putLocked(key, entry)
 		matchedTokens = minInt(breakpoint.CumulativeTokens, profile.TotalInputTokens)
 		if matchedTokens > lastTokens {
 			matchedTokens = lastTokens
 		}
 		break
+	}
+	if matchedTokens > 0 {
+		t.metrics.Hits++
+	} else {
+		t.metrics.Misses++
 	}
 
 	creation := maxInt(lastTokens-matchedTokens, 0)
@@ -202,35 +332,20 @@ func (t *promptCacheTracker) Update(accountID string, profile *promptCacheProfil
 	now := time.Now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.pruneExpiredLocked(now)
-
-	entries := t.entriesByAccount[accountID]
-	if entries == nil {
-		entries = make(map[[32]byte]promptCacheEntry)
-		t.entriesByAccount[accountID] = entries
-	}
 
 	for _, breakpoint := range profile.Breakpoints {
 		// Skip breakpoints below the minimum cacheable token threshold.
 		if breakpoint.CumulativeTokens < minTokens {
 			continue
 		}
-		entries[breakpoint.Fingerprint] = promptCacheEntry{
+		key := promptCacheKey{AccountID: accountID, Fingerprint: breakpoint.Fingerprint}
+		_, existed := t.items[key]
+		t.putLocked(key, promptCacheEntry{
 			ExpiresAt: now.Add(breakpoint.TTL),
 			TTL:       breakpoint.TTL,
-		}
-	}
-}
-
-func (t *promptCacheTracker) pruneExpiredLocked(now time.Time) {
-	for accountID, entries := range t.entriesByAccount {
-		for fingerprint, entry := range entries {
-			if !entry.ExpiresAt.After(now) {
-				delete(entries, fingerprint)
-			}
-		}
-		if len(entries) == 0 {
-			delete(t.entriesByAccount, accountID)
+		})
+		if !existed {
+			t.metrics.Creations++
 		}
 	}
 }
