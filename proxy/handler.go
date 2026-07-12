@@ -2674,6 +2674,14 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"totalTokens":       stats.TotalTokens,
 			"totalCredits":      stats.TotalCredits,
 			"lastUsed":          stats.LastUsed,
+			// Current pinned Kiro/CodeWhisperer profile (read-only, from the
+			// persisted snapshot). No network call, no secrets — the ARN and its
+			// region are not credentials. Lets the card show the active profile
+			// without a per-card discovery call.
+			"currentProfileArn":    a.ProfileArn,
+			"currentProfileRegion": a.EffectiveApiRegion(),
+			"currentProfileLabel":  shortARN(a.ProfileArn),
+			"hasPinnedProfile":     strings.TrimSpace(a.ProfileArn) != "",
 		}
 	}
 	json.NewEncoder(w).Encode(result)
