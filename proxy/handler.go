@@ -908,7 +908,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Forward to an external upstream when the (raw, un-normalized) client model
 	// matches an enabled route. Passthrough bypasses the Kiro pool entirely.
-	if h.tryForwardUpstream(w, body, req.Model, req.Stream, "/messages", true) {
+	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/messages", true) {
 		return
 	}
 
@@ -1803,7 +1803,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	// Forward to an external upstream when the (raw, un-normalized) client model
 	// matches an enabled route. Passthrough bypasses the Kiro pool entirely.
-	if h.tryForwardUpstream(w, body, req.Model, req.Stream, "/chat/completions", false) {
+	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/chat/completions", false) {
 		return
 	}
 
