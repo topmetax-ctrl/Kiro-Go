@@ -1,0 +1,33 @@
+Baseline benchmarks — before profile-picker-correctness changes
+Source SHA: 5e8be59b7e7cbcb5b25e2ff757b1fdf1d7b2f78c
+Command: go test -run=^$ -bench=. -benchmem ./pool/... ./proxy/...
+
+goos: darwin
+goarch: amd64
+pkg: kiro-go/pool
+cpu: Intel(R) Core(TM) i5-8500B CPU @ 3.00GHz
+BenchmarkGetNextExcluding/accounts=1-6         	 4154338	       297.8 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetNextExcluding/accounts=8-6         	 3310755	       357.1 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetNextExcluding/accounts=64-6        	 3938180	       342.7 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=1-6 	 3348013	       358.6 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=8-6 	 3203884	       393.8 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=64-6         	 3287802	       404.7 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetByID-6                                      	 4225610	       257.5 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetNextExcludingParallel-6                     	 3817254	       480.2 ns/op	     704 B/op	       1 allocs/op
+PASS
+ok  	kiro-go/pool	13.554s
+goos: darwin
+goarch: amd64
+pkg: kiro-go/proxy
+cpu: Intel(R) Core(TM) i5-8500B CPU @ 3.00GHz
+BenchmarkRoute-6                    	  229224	      4827 ns/op	    2848 B/op	      33 allocs/op
+BenchmarkPromptCacheUpdate/accounts=1/entries=4-6         	 2938906	       367.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=8/entries=16-6        	 3153942	       392.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=64/entries=16-6       	 2993168	       403.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=1/entries=4-6        	 5546244	       309.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=8/entries=16-6       	 4950159	       245.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=64/entries=16-6      	 4513933	       255.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheComputeMiss-6                         	 4266367	       283.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheParallel-6                            	  675694	      1752 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	kiro-go/proxy	15.811s

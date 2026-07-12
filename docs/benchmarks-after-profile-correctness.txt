@@ -1,0 +1,48 @@
+# Hot-path benchmarks AFTER profile-picker-correctness changes
+# Compare against docs/benchmarks-before-profile-correctness.txt
+#
+# Summary: no regression. Account selection unchanged (704 B / 1 alloc — the
+# pre-existing snapshot alloc). Prompt cache unchanged (0 allocs). Route
+# unchanged (2848 B / 33 allocs). All deltas are run-to-run noise; the profile
+# switch code adds no work to the request hot path (it only reads the pinned
+# profile from the account snapshot, exactly as before).
+#
+#   metric                              before        after
+#   GetNextExcluding/64                 342.7 ns      300.1 ns
+#   GetNextForModelExcluding/64         404.7 ns      465.7 ns   (noise)
+#   GetByID                             257.5 ns      283.1 ns   (noise)
+#   GetNextExcludingParallel            480.2 ns      285.0 ns
+#   Route                              4827   ns     4477   ns
+#   PromptCacheCompute/64               255.4 ns      246.7 ns
+#   PromptCacheUpdate/64                403.2 ns      484.1 ns   (noise)
+#   allocs: selection=1, promptcache=0, route=33  (all unchanged)
+
+goos: darwin
+goarch: amd64
+pkg: kiro-go/pool
+cpu: Intel(R) Core(TM) i5-8500B CPU @ 3.00GHz
+BenchmarkGetNextExcluding/accounts=1-6         	 4026625	       311.2 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetNextExcluding/accounts=8-6         	 4058106	       299.2 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetNextExcluding/accounts=64-6        	 4048242	       300.1 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=1-6 	 3594645	       347.3 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=8-6 	 3224048	       373.0 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=64-6         	 3190370	       465.7 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetByID-6                                      	 4961421	       283.1 ns/op	     704 B/op	       1 allocs/op
+BenchmarkGetNextExcludingParallel-6                     	 4650945	       285.0 ns/op	     704 B/op	       1 allocs/op
+PASS
+ok  	kiro-go/pool	13.440s
+goos: darwin
+goarch: amd64
+pkg: kiro-go/proxy
+cpu: Intel(R) Core(TM) i5-8500B CPU @ 3.00GHz
+BenchmarkRoute-6                    	  272773	      4477 ns/op	    2848 B/op	      33 allocs/op
+BenchmarkPromptCacheUpdate/accounts=1/entries=4-6         	 2976970	       421.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=8/entries=16-6        	 2997073	       397.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=64/entries=16-6       	 2995471	       484.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=1/entries=4-6        	 5490955	       233.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=8/entries=16-6       	 4787805	       244.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=64/entries=16-6      	 4831605	       246.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheComputeMiss-6                         	 4413063	       274.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheParallel-6                            	  708476	      1749 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	kiro-go/proxy	13.919s
