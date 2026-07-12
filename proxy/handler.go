@@ -399,9 +399,40 @@ func adminIPAllowed(ipStr string) bool {
 	return false
 }
 
+// Ingress body-size caps by endpoint class. Applied centrally in ServeHTTP via
+// http.MaxBytesReader so every downstream body read (io.ReadAll or
+// json.Decoder) is bounded and returns 413 on overflow, without wrapping each of
+// the ~30 read sites individually. Inference/messages payloads can be large
+// (long conversations, base64 images); admin/config/import payloads are small.
+const (
+	maxInferenceBodyBytes = 32 << 20 // 32 MiB: /v1/messages, /chat/completions, /responses
+	maxAdminBodyBytes     = 4 << 20  // 4 MiB: admin/config/import/token-count/other
+)
+
+// bodyLimitForPath returns the max request body size for a path's endpoint class.
+func bodyLimitForPath(path string) int64 {
+	switch path {
+	case "/v1/messages", "/messages", "/anthropic/v1/messages",
+		"/v1/chat/completions", "/chat/completions",
+		"/v1/responses", "/responses":
+		return maxInferenceBodyBytes
+	default:
+		// Everything else that accepts a body (admin APIs, import, config,
+		// count_tokens) is small by nature.
+		return maxAdminBodyBytes
+	}
+}
+
 // ServeHTTP 路由分发
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+
+	// Bound the request body before any handler reads it. MaxBytesReader makes an
+	// over-limit read fail (surfaced as 400/413 by the handlers' error paths) and
+	// prevents an unbounded body from exhausting memory.
+	if r.Body != nil && r.Method != "GET" && r.Method != "OPTIONS" {
+		r.Body = http.MaxBytesReader(w, r.Body, bodyLimitForPath(path))
+	}
 
 	// Debug-level request trace for fine-grained visibility
 	logger.Debugf("[HTTP] %s %s from %s", r.Method, path, r.RemoteAddr)
