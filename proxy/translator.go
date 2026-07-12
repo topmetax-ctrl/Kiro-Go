@@ -233,6 +233,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
 	var currentContent string
+	var currentHasRealText bool
 	var currentImages []KiroImage
 	var currentToolResults []KiroToolResult
 
@@ -240,11 +241,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		isLast := i == len(req.Messages)-1
 
 		if msg.Role == "user" {
-			content, images, toolResults := extractClaudeUserContent(msg.Content)
-			content = normalizeUserContent(content, len(images) > 0)
+			rawContent, images, toolResults := extractClaudeUserContent(msg.Content)
+			content := normalizeUserContent(rawContent, len(images) > 0)
 
 			if isLast {
 				currentContent = content
+				currentHasRealText = strings.TrimSpace(rawContent) != ""
 				currentImages = images
 				currentToolResults = toolResults
 			} else {
@@ -314,13 +316,17 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 构建最终内容
 	finalContent := ""
-	if currentContent != "" {
+	switch {
+	case currentHasRealText:
 		finalContent = currentContent
-	} else if len(currentImages) > 0 {
-		finalContent = normalizeUserContent("", true)
-	} else if len(currentToolResults) > 0 {
+	case !keepCurrentToolResults && len(currentToolResults) > 0:
+		// Orphaned tool results are not attached structurally (that would trip an
+		// upstream 400). Fold their text into the message so a mixed text+image
+		// tool result does not silently lose its text when an image is present.
 		finalContent = buildToolResultsContinuation(currentToolResults)
-	} else {
+	case len(currentImages) > 0:
+		finalContent = normalizeUserContent("", true)
+	default:
 		finalContent = minimalFallbackUserContent
 	}
 

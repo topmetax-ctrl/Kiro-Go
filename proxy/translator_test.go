@@ -549,17 +549,19 @@ func TestClaudeToolResultMixedTextAndImage(t *testing.T) {
 		},
 	}
 
+	// This is an ORPHANED tool_result (no preceding assistant tool_use in the
+	// same request). Per the flatten design (#104), orphaned tool results are not
+	// attached structurally — they would trip an upstream 400 — so their text is
+	// folded into the current message content and the image is extracted. We
+	// assert the shipped contract: image extracted + original text preserved in
+	// content, not a structural ToolResults entry.
 	payload := ClaudeToKiro(req, false)
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 1 {
 		t.Fatalf("expected one image extracted, got %d", len(cur.Images))
 	}
-	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
-		t.Fatalf("expected one tool result")
-	}
-	gotText := cur.UserInputMessageContext.ToolResults[0].Content[0].Text
-	if gotText != "here is the screenshot" {
-		t.Fatalf("expected original tool text preserved, got %q", gotText)
+	if !strings.Contains(cur.Content, "here is the screenshot") {
+		t.Fatalf("expected original tool text preserved in content, got %q", cur.Content)
 	}
 }
 
@@ -624,10 +626,16 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 
 	payload := OpenAIToKiro(req, false)
 
+	// The tool result is followed by a later user turn, so it is flushed into
+	// history. sanitizeKiroHistory narrates the tool result into the user turn's
+	// text (via the "Tool results:" prefix) and drops the structured ToolResults,
+	// but the extracted image stays attached to that same flushed user turn. We
+	// assert the shipped contract: the image rides on the narrated tool-result
+	// history turn, identified by its "Tool results:" content prefix.
 	var toolHistImages int
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil &&
-			len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+		if h.UserInputMessage != nil &&
+			strings.HasPrefix(h.UserInputMessage.Content, toolResultsContinuationPrefix) {
 			toolHistImages += len(h.UserInputMessage.Images)
 		}
 	}
