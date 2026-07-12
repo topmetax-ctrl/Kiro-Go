@@ -4,6 +4,7 @@ package pool
 
 import (
 	"kiro-go/config"
+	"kiro-go/logger"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -493,7 +494,14 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 		}
 	}
 	if updated {
-		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+		// Persist synchronously. This runs after a request completes (not on the
+		// SSE streaming path), and config.Save is now an atomic temp+rename, so the
+		// cost is bounded. The previous fire-and-forget goroutine had no lifecycle
+		// management: it could outlive a shutdown (losing the write) or land after
+		// a caller expected persistence to be settled, and it raced other saves.
+		if err := config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed); err != nil {
+			logger.Warnf("[Pool] persist account stats for %s failed: %v", id, err)
+		}
 	}
 }
 
