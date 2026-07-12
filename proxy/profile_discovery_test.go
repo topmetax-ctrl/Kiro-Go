@@ -20,8 +20,31 @@ func withStubProfileLister(t *testing.T, fn func(ctx context.Context, acc *confi
 	t.Cleanup(func() { profileLister = old })
 }
 
+// withStubModelLister swaps modelLister for the duration of a test, so
+// SelectProfile's candidate-model prefetch does not hit the network.
+func withStubModelLister(t *testing.T, fn func(acc *config.Account) ([]ModelInfo, error)) {
+	t.Helper()
+	old := modelLister
+	modelLister = fn
+	t.Cleanup(func() { modelLister = old })
+}
+
 func discoveryTestAccount() *config.Account {
 	return &config.Account{ID: "acct-1", Enabled: true, Region: "us-east-1", AuthMethod: "external_idp"}
+}
+
+// newTestHandler builds a Handler with the model-cache maps initialized and a
+// no-op token manager, matching what NewHandler wires up in production.
+func newTestHandler(p *accountpool.AccountPool) *Handler {
+	h := &Handler{
+		pool:               p,
+		modelInfoByAccount: make(map[string][]ModelInfo),
+		profileSwitchLocks: make(map[string]*sync.Mutex),
+	}
+	h.tokenManager = NewTokenManager(p, func(*config.Account) (string, string, int64, string, error) {
+		return "t", "r", 0, "", nil
+	}, func(string, string, string, int64) error { return nil })
+	return h
 }
 
 func TestDiscoverProfilesSingleRegion(t *testing.T) {
@@ -127,7 +150,7 @@ func TestDiscoverProfilesContextCancelled(t *testing.T) {
 	}
 }
 
-func TestSelectProfilePersistsAndInvalidatesModelCache(t *testing.T) {
+func TestSelectProfilePersistsAndReplacesModelCache(t *testing.T) {
 	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatalf("config.Init: %v", err)
 	}
@@ -136,7 +159,7 @@ func TestSelectProfilePersistsAndInvalidatesModelCache(t *testing.T) {
 	}
 	p := accountpool.GetPool()
 	p.Reload()
-	p.SetModelList("acct-1", []string{"claude-sonnet-4.5"}) // seed a model list
+	p.SetModelList("acct-1", []string{"old-model"}) // seed an old-profile model list
 
 	withStubProfileLister(t, func(_ context.Context, _ *config.Account, region string) ([]DiscoveredProfile, error) {
 		if region == "eu-central-1" {
@@ -144,14 +167,22 @@ func TestSelectProfilePersistsAndInvalidatesModelCache(t *testing.T) {
 		}
 		return nil, fmt.Errorf("empty")
 	})
+	// The new profile serves a different model set.
+	withStubModelLister(t, func(acc *config.Account) ([]ModelInfo, error) {
+		if acc.ProfileArn != "arn:eu-target" || acc.ApiRegion != "eu-central-1" {
+			t.Fatalf("candidate must carry target ARN/region, got %q/%q", acc.ProfileArn, acc.ApiRegion)
+		}
+		return []ModelInfo{{ModelId: "new-model-a"}, {ModelId: "new-model-b"}}, nil
+	})
 
-	h := &Handler{pool: p}
-	h.tokenManager = NewTokenManager(p, func(*config.Account) (string, string, int64, string, error) {
-		return "t", "r", 0, "", nil
-	}, func(string, string, string, int64) error { return nil })
+	h := newTestHandler(p)
 
-	if err := h.SelectProfile(context.Background(), "acct-1", "arn:eu-target", "eu-central-1"); err != nil {
+	res, err := h.SelectProfile(context.Background(), "acct-1", "arn:eu-target", "eu-central-1")
+	if err != nil {
 		t.Fatalf("SelectProfile: %v", err)
+	}
+	if !res.ModelCacheRefreshed || res.ModelCount != 2 {
+		t.Fatalf("expected refreshed cache with 2 models, got %+v", res)
 	}
 
 	// Persisted ARN + region.
@@ -159,9 +190,20 @@ func TestSelectProfilePersistsAndInvalidatesModelCache(t *testing.T) {
 	if acc.ProfileArn != "arn:eu-target" {
 		t.Fatalf("expected pinned ARN, got %q", acc.ProfileArn)
 	}
-	// Model cache for that account was invalidated (list reset to empty).
-	if ml := p.GetModelList("acct-1"); len(ml) != 0 {
-		t.Fatalf("expected model cache invalidated, got %v", ml)
+	if acc.ApiRegion != "eu-central-1" {
+		t.Fatalf("expected persisted region eu-central-1, got %q", acc.ApiRegion)
+	}
+	// Routing model list is REPLACED with the new profile's models (old-model gone).
+	ml := p.GetModelList("acct-1")
+	got := map[string]bool{}
+	for _, m := range ml {
+		got[m] = true
+	}
+	if got["old-model"] {
+		t.Fatalf("old-profile model must be gone, got %v", ml)
+	}
+	if !got["new-model-a"] || !got["new-model-b"] {
+		t.Fatalf("expected new profile models, got %v", ml)
 	}
 }
 
@@ -177,18 +219,53 @@ func TestSelectProfileRejectsVanishedProfile(t *testing.T) {
 	withStubProfileLister(t, func(_ context.Context, _ *config.Account, _ string) ([]DiscoveredProfile, error) {
 		return []DiscoveredProfile{{ARN: "arn:other", Region: "us-east-1"}}, nil
 	})
-	h := &Handler{pool: p}
-	h.tokenManager = NewTokenManager(p, func(*config.Account) (string, string, int64, string, error) {
-		return "t", "r", 0, "", nil
-	}, func(string, string, string, int64) error { return nil })
+	withStubModelLister(t, func(*config.Account) ([]ModelInfo, error) {
+		t.Fatal("model prefetch must not run when the target profile is absent")
+		return nil, nil
+	})
+	h := newTestHandler(p)
 
-	err := h.SelectProfile(context.Background(), "acct-1", "arn:gone", "us-east-1")
+	_, err := h.SelectProfile(context.Background(), "acct-1", "arn:gone", "us-east-1")
 	if err == nil {
 		t.Fatal("expected error when target profile is not present at region")
 	}
 	// Account unchanged.
 	if got := p.GetByID("acct-1").ProfileArn; got != before {
 		t.Fatalf("account must be unchanged on failed select, was %q now %q", before, got)
+	}
+}
+
+// TestSelectProfileKeepsOldProfileWhenModelFetchFails proves prefetch-before-commit:
+// if the new profile cannot serve models, the switch is refused and nothing changes.
+func TestSelectProfileKeepsOldProfileWhenModelFetchFails(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	_ = config.AddAccount(config.Account{ID: "acct-1", Enabled: true, Region: "us-east-1", ApiRegion: "us-east-1", ProfileArn: "arn:old", AccessToken: "t"})
+	p := accountpool.GetPool()
+	p.Reload()
+	p.SetModelList("acct-1", []string{"old-model"})
+
+	withStubProfileLister(t, func(_ context.Context, _ *config.Account, region string) ([]DiscoveredProfile, error) {
+		if region == "eu-central-1" {
+			return []DiscoveredProfile{{ARN: "arn:eu-target", Region: region}}, nil
+		}
+		return nil, fmt.Errorf("empty")
+	})
+	withStubModelLister(t, func(*config.Account) ([]ModelInfo, error) {
+		return nil, fmt.Errorf("boom: new profile cannot list models")
+	})
+	h := newTestHandler(p)
+
+	if _, err := h.SelectProfile(context.Background(), "acct-1", "arn:eu-target", "eu-central-1"); err == nil {
+		t.Fatal("expected error when candidate model fetch fails")
+	}
+	acc := p.GetByID("acct-1")
+	if acc.ProfileArn != "arn:old" || acc.EffectiveApiRegion() != "us-east-1" {
+		t.Fatalf("old profile must be intact, got %q/%q", acc.ProfileArn, acc.EffectiveApiRegion())
+	}
+	if ml := p.GetModelList("acct-1"); len(ml) != 1 || ml[0] != "old-model" {
+		t.Fatalf("old model list must be intact, got %v", ml)
 	}
 }
 

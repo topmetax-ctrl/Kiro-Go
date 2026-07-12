@@ -24,10 +24,7 @@ func setupProfileAdmin(t *testing.T) *Handler {
 	}
 	p := accountpool.GetPool()
 	p.Reload()
-	h := &Handler{pool: p}
-	h.tokenManager = NewTokenManager(p, func(*config.Account) (string, string, int64, string, error) {
-		return "t", "r", 0, "", nil
-	}, func(string, string, string, int64) error { return nil })
+	h := newTestHandler(p)
 	return h
 }
 
@@ -66,6 +63,9 @@ func TestApiSelectAccountProfileHappyPath(t *testing.T) {
 			return []DiscoveredProfile{{ARN: "arn:eu", Region: region}}, nil
 		}
 		return nil, fmt.Errorf("empty")
+	})
+	withStubModelLister(t, func(*config.Account) ([]ModelInfo, error) {
+		return []ModelInfo{{ModelId: "m1"}}, nil
 	})
 
 	rec := httptest.NewRecorder()
