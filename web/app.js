@@ -970,6 +970,33 @@
     });
   }
 
+  // maskProfileLabel masks the profile identifier under privacy mode. The region
+  // is not a secret and stays visible; only the ARN/short-id is masked.
+  function maskProfileLabel(label) {
+    if (!privacyModeEnabled || !label) return label;
+    return label.length <= 4 ? '***' : label.substring(0, 4) + '***';
+  }
+
+  // renderProfileLine shows the account's currently pinned Kiro profile
+  // (region + short identifier) as a dedicated line, distinct from the auth
+  // region badge. Data comes from the /accounts payload — no per-card API call.
+  function renderProfileLine(a) {
+    if (!a.hasPinnedProfile) {
+      return '<div class="account-profile account-profile-none" title="' + escapeAttr(t('accounts.profileNone')) + '">' +
+        '<span class="account-profile-label">' + escapeHtml(t('accounts.profileNone')) + '</span>' +
+        '</div>';
+    }
+    const region = a.currentProfileRegion || '';
+    const label = maskProfileLabel(a.currentProfileLabel || '');
+    const fullTitle = t('accounts.profile') + ': ' + region + ' · ' + (a.currentProfileLabel || '');
+    return '<div class="account-profile" title="' + escapeAttr(fullTitle) + '">' +
+      '<span class="account-profile-tag">' + escapeHtml(t('accounts.profile')) + '</span>' +
+      '<span class="account-profile-region">' + escapeHtml(region) + '</span>' +
+      '<span class="account-profile-sep">·</span>' +
+      '<span class="account-profile-label">' + escapeHtml(label) + '</span>' +
+      '</div>';
+  }
+
   function renderAccounts() {
     const container = $('accountsList');
     if (!container) return;
@@ -1025,6 +1052,7 @@
         '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '">' + escapeHtml(t('accounts.delete')) + '</button>' +
         '</div>' +
         '</div>' +
+        renderProfileLine(a) +
         (a.usageLimit > 0 ?
           '<div class="account-usage">' +
           '<div class="usage-label">' + escapeHtml(t('accounts.mainQuota')) + '</div>' +

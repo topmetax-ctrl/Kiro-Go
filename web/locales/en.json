@@ -46,6 +46,8 @@
   "accounts.add": "Add Account",
   "accounts.empty": "No accounts",
   "accounts.refresh": "Refresh",
+  "accounts.profile": "Profile",
+  "accounts.profileNone": "Profile not resolved",
   "accounts.selectAccount": "Select account {0}",
   "accounts.detail": "Details",
   "accounts.enable": "Enable",

@@ -46,6 +46,8 @@
   "accounts.add": "添加账号",
   "accounts.empty": "暂无账号",
   "accounts.refresh": "刷新",
+  "accounts.profile": "配置文件",
+  "accounts.profileNone": "配置文件未解析",
   "accounts.selectAccount": "选择账号 {0}",
   "accounts.detail": "详情",
   "accounts.enable": "启用",
