@@ -115,10 +115,10 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 			continue
 		}
 
-		return acc
+		return snapshotAccount(acc)
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
+	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -135,10 +135,10 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 				earliest = cooldown
 			}
 		} else {
-			return acc
+			return snapshotAccount(acc)
 		}
 	}
-	return best
+	return snapshotAccount(best)
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -226,7 +226,7 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 			seen[acc.ID] = true
 			continue
 		}
-		return acc
+		return snapshotAccount(acc)
 	}
 
 	// fallback：找冷却时间最短且支持该模型的账号
@@ -249,19 +249,34 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 				earliest = cooldown
 			}
 		} else {
-			return acc
+			return snapshotAccount(acc)
 		}
 	}
-	return best
+	return snapshotAccount(best)
 }
 
-// GetByID 根据 ID 获取账号
+// snapshotAccount returns an independent copy of acc (or nil). config.Account is
+// entirely value-typed (no nested maps/slices/pointers), so a shallow copy is a
+// complete, immutable snapshot. Getters return these instead of pointers into the
+// live p.accounts backing slice: a raw &p.accounts[i] escapes the read lock and can
+// be observed mid-write by a concurrent UpdateToken/UpdateStats/Reload, yielding a
+// torn read (e.g. an access token from one refresh generation paired with an expiry
+// from another). Snapshotting under the lock removes that race by construction.
+func snapshotAccount(acc *config.Account) *config.Account {
+	if acc == nil {
+		return nil
+	}
+	c := *acc
+	return &c
+}
+
+// GetByID 根据 ID 获取账号。返回该账号的独立快照（非指向池内切片的指针）。
 func (p *AccountPool) GetByID(id string) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
-			return &p.accounts[i]
+			return snapshotAccount(&p.accounts[i])
 		}
 	}
 	return nil
