@@ -28,6 +28,21 @@ var (
 	poolOnce sync.Once
 )
 
+// NewTestPool builds an isolated pool preloaded with the given accounts, for use
+// by tests in other packages. It does not touch the global singleton. The
+// accounts are used directly (weight expansion is skipped) so selection over a
+// known set is deterministic.
+func NewTestPool(accounts ...config.Account) *AccountPool {
+	p := &AccountPool{
+		cooldowns:   make(map[string]time.Time),
+		errorCounts: make(map[string]int),
+		modelLists:  make(map[string]map[string]bool),
+	}
+	p.accounts = accounts
+	p.totalAccounts = len(accounts)
+	return p
+}
+
 // GetPool 获取全局账号池单例
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {

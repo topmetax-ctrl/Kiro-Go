@@ -44,7 +44,7 @@ type Handler struct {
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
-	tokenRefreshMu  sync.Mutex
+	tokenManager    *TokenManager
 	// conversationRunner orchestrates multi-round Kiro calls with server-side
 	// web_search execution. Injected so tests can supply fakes.
 	conversationRunner ConversationRunner
@@ -237,6 +237,7 @@ func NewHandler() *Handler {
 		promptCache:        newPromptCacheTracker(defaultPromptCacheTTL),
 		conversationRunner: NewKiroConversationRunner(),
 	}
+	h.tokenManager = NewTokenManager(h.pool, nil, nil)
 	// 恢复转发指标聚合数据 (事件日志与时序为内存态，不持久化)
 	if err := metrics.Load(forwardMetricsPath()); err != nil {
 		logger.Warnf("[Metrics] failed to load forward stats: %v", err)
@@ -280,24 +281,21 @@ func (h *Handler) refreshAllAccounts() {
 			continue
 		}
 
-		// 检查 token 是否需要刷新
+		// 检查 token 是否需要刷新。Route through the TokenManager so background
+		// and foreground refreshes share the same per-account coordination,
+		// validation, atomic persist, and pool publish.
 		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-			newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
+			fresh, err := h.tokenManager.EnsureFresh(account.ID)
 			if err != nil {
 				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
 				h.handleAccountFailure(account, err)
 				continue
 			}
-			account.AccessToken = newAccessToken
-			if newRefreshToken != "" {
-				account.RefreshToken = newRefreshToken
-			}
-			account.ExpiresAt = newExpiresAt
-			config.UpdateAccountToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			h.pool.UpdateToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			if profileArn != "" {
-				account.ProfileArn = profileArn
-				config.UpdateAccountProfileArn(account.ID, profileArn)
+			if fresh != nil {
+				account.AccessToken = fresh.AccessToken
+				account.RefreshToken = fresh.RefreshToken
+				account.ExpiresAt = fresh.ExpiresAt
+				account.ProfileArn = fresh.ProfileArn
 			}
 		}
 
@@ -2276,46 +2274,28 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 	})
 }
 
-// ensureValidToken 确保 token 有效
+// ensureValidToken 确保 token 有效。
+//
+// Coordination, IdP call, validation, atomic persist, and pool publish are all
+// owned by the TokenManager: concurrent requests for the same account coalesce
+// onto a single refresh (one IdP call), while different accounts refresh in
+// parallel (no global lock). On success the freshest snapshot is copied back into
+// the caller's account struct so the in-flight request uses the new credentials.
 func (h *Handler) ensureValidToken(account *config.Account) error {
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
 
-	h.tokenRefreshMu.Lock()
-	defer h.tokenRefreshMu.Unlock()
-
-	// Another concurrent request may have refreshed this account while we waited.
-	if latest := h.pool.GetByID(account.ID); latest != nil {
-		account.AccessToken = latest.AccessToken
-		account.RefreshToken = latest.RefreshToken
-		account.ExpiresAt = latest.ExpiresAt
-		account.ProfileArn = latest.ProfileArn
-		if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
-			return nil
-		}
-	}
-
-	accessToken, refreshToken, expiresAt, profileArn, err := auth.RefreshToken(account)
+	fresh, err := h.tokenManager.EnsureFresh(account.ID)
 	if err != nil {
 		return err
 	}
-
-	// 更新内存
-	h.pool.UpdateToken(account.ID, accessToken, refreshToken, expiresAt)
-	account.AccessToken = accessToken
-	if refreshToken != "" {
-		account.RefreshToken = refreshToken
+	if fresh != nil {
+		account.AccessToken = fresh.AccessToken
+		account.RefreshToken = fresh.RefreshToken
+		account.ExpiresAt = fresh.ExpiresAt
+		account.ProfileArn = fresh.ProfileArn
 	}
-	account.ExpiresAt = expiresAt
-	if profileArn != "" {
-		account.ProfileArn = profileArn
-		config.UpdateAccountProfileArn(account.ID, profileArn)
-	}
-
-	// 持久化
-	config.UpdateAccountToken(account.ID, accessToken, refreshToken, expiresAt)
-
 	return nil
 }
 
