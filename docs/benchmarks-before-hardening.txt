@@ -1,0 +1,105 @@
+# Baseline benchmarks (before hardening)
+# Branch base: 9bdc617; green-baseline commit: 4bd9221
+# benchtime=200ms -count=5 (bounded for CI runtime)
+# Generated: 2026-07-12T07:55:04Z
+
+===== pool =====
+goos: darwin
+goarch: amd64
+pkg: kiro-go/pool
+cpu: Intel(R) Core(TM) i5-8500B CPU @ 3.00GHz
+BenchmarkGetNextExcluding/accounts=1-6         	 1419964	       171.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=1-6         	 1401717	       169.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=1-6         	 1399603	       170.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=1-6         	 1410614	       170.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=1-6         	 1410702	       169.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=8-6         	 1388728	       178.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=8-6         	 1397122	       267.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=8-6         	 1295114	       174.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=8-6         	 1414656	       174.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=8-6         	 1385040	       172.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=64-6        	 1372418	       175.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=64-6        	 1333563	       188.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=64-6        	 1337414	       178.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=64-6        	 1356920	       173.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcluding/accounts=64-6        	 1390459	       175.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=1-6 	 1000000	       213.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=1-6 	 1000000	       211.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=1-6 	 1000000	       210.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=1-6 	 1000000	       212.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=1-6 	 1000000	       215.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=8-6 	 1000000	       234.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=8-6 	 1000000	       234.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=8-6 	 1000000	       242.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=8-6 	 1000000	       236.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=8-6 	 1000000	       233.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=64-6         	 1000000	       224.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=64-6         	 1000000	       222.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=64-6         	 1000000	       225.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=64-6         	 1000000	       226.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextForModelExcluding/accounts=64-6         	 1000000	       228.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetByID-6                                      	 2086134	       115.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetByID-6                                      	 2121360	       113.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetByID-6                                      	 2076843	       113.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetByID-6                                      	 2135190	       113.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetByID-6                                      	 2127934	       113.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcludingParallel-6                     	 2279928	       103.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcludingParallel-6                     	 2312672	       105.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcludingParallel-6                     	 1898012	       189.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcludingParallel-6                     	 2356230	       138.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGetNextExcludingParallel-6                     	 2107087	       101.8 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	kiro-go/pool	14.096s
+
+===== proxy (PromptCache|Route) =====
+goos: darwin
+goarch: amd64
+pkg: kiro-go/proxy
+cpu: Intel(R) Core(TM) i5-8500B CPU @ 3.00GHz
+BenchmarkRoute-6                    	   54601	      4369 ns/op	    2848 B/op	      33 allocs/op
+BenchmarkRoute-6                    	   55854	      4441 ns/op	    2848 B/op	      33 allocs/op
+BenchmarkRoute-6                    	   55032	      4184 ns/op	    2848 B/op	      33 allocs/op
+BenchmarkRoute-6                    	   55600	      4183 ns/op	    2848 B/op	      33 allocs/op
+BenchmarkRoute-6                    	   55725	      4111 ns/op	    2848 B/op	      33 allocs/op
+BenchmarkPromptCacheUpdate/accounts=1/entries=4-6         	  530514	       454.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=1/entries=4-6         	  532706	       453.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=1/entries=4-6         	  520268	       456.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=1/entries=4-6         	  525967	       461.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=1/entries=4-6         	  534391	       458.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=8/entries=16-6        	  106005	      2333 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=8/entries=16-6        	  106070	      2293 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=8/entries=16-6        	  104013	      2286 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=8/entries=16-6        	  106164	      2399 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=8/entries=16-6        	  103369	      2324 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=64/entries=16-6       	   14012	     17045 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=64/entries=16-6       	   13602	     18062 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=64/entries=16-6       	   13569	     17881 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=64/entries=16-6       	   13455	     17303 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=64/entries=16-6       	   13664	     17282 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=1/entries=4-6        	  735625	       329.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=1/entries=4-6        	  732313	       331.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=1/entries=4-6        	  725234	       333.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=1/entries=4-6        	  719956	       329.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=1/entries=4-6        	  717579	       328.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=8/entries=16-6       	   98272	      2534 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=8/entries=16-6       	  104634	      2244 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=8/entries=16-6       	  107665	      2946 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=8/entries=16-6       	  107380	      2365 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=8/entries=16-6       	  102055	      2262 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=64/entries=16-6      	   13966	     17209 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=64/entries=16-6      	   14109	     18720 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=64/entries=16-6      	   13834	     20791 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=64/entries=16-6      	   10000	     25570 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=64/entries=16-6      	   13431	     18007 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheComputeMiss-6                         	   12679	     17682 ns/op	      28 B/op	       0 allocs/op
+BenchmarkPromptCacheComputeMiss-6                         	   13876	     18500 ns/op	      25 B/op	       0 allocs/op
+BenchmarkPromptCacheComputeMiss-6                         	   13194	     17433 ns/op	      27 B/op	       0 allocs/op
+BenchmarkPromptCacheComputeMiss-6                         	   14048	     16966 ns/op	      25 B/op	       0 allocs/op
+BenchmarkPromptCacheComputeMiss-6                         	   13416	     17865 ns/op	      26 B/op	       0 allocs/op
+BenchmarkPromptCacheParallel-6                            	    6274	     38436 ns/op	      58 B/op	       0 allocs/op
+BenchmarkPromptCacheParallel-6                            	    6195	     40475 ns/op	      58 B/op	       0 allocs/op
+BenchmarkPromptCacheParallel-6                            	    6208	     38295 ns/op	      58 B/op	       0 allocs/op
+BenchmarkPromptCacheParallel-6                            	    6385	     38592 ns/op	      56 B/op	       0 allocs/op
+BenchmarkPromptCacheParallel-6                            	    6295	     37752 ns/op	      57 B/op	       0 allocs/op
+PASS
+ok  	kiro-go/proxy	15.507s
