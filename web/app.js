@@ -1289,9 +1289,82 @@
       ' <button class="btn btn-sm btn-outline" data-detail-action="refreshModels" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.refreshModelCache')) + '</button>' +
       '</h4>' +
       '<div id="modelsList" class="model-list"></div>' +
+      '</div>' +
+
+      '<div class="detail-section">' +
+      '<h4>Profiles' +
+      ' <button class="btn btn-sm btn-outline" data-detail-action="discoverProfiles" data-id="' + idAttr + '" type="button">Discover</button>' +
+      '</h4>' +
+      '<div id="profilesList" class="model-list"><p class="empty-state">Click Discover to list profiles across regions.</p></div>' +
       '</div>';
 
     openDialog('detailModal');
+  }
+
+  // discoverProfiles lists an account's profiles across all candidate regions and
+  // renders a picker. Selecting a profile pins it (with a confirm) and refreshes
+  // that account's model cache. No secrets are shown or stored.
+  async function discoverProfiles(id) {
+    const c = $('profilesList');
+    if (!c) return;
+    c.innerHTML = '<p class="empty-state">' + escapeHtml(t('detail.loading')) + '</p>';
+    let btns = document.querySelectorAll('[data-detail-action="discoverProfiles"][data-id="' + id + '"]');
+    btns.forEach(b => { b.disabled = true; });
+    try {
+      const res = await api('/accounts/' + id + '/profiles');
+      const d = await res.json();
+      if (!res.ok || !d.profiles || d.profiles.length === 0) {
+        c.innerHTML = '<p class="message message-error">' + escapeHtml(d.error || 'No profiles found') + '</p>';
+        return;
+      }
+      let pinnedArn = '';
+      try {
+        const pr = await api('/accounts/' + id + '/profile');
+        const pd = await pr.json();
+        if (pd.pinned) pinnedArn = pd.pinned.arn || '';
+      } catch (e) { /* non-fatal */ }
+
+      const warn = (d.regionErrors && Object.keys(d.regionErrors).length)
+        ? '<p class="message message-warning">Some regions failed: ' + escapeHtml(Object.keys(d.regionErrors).join(', ')) + '</p>'
+        : '';
+      c.innerHTML = warn + d.profiles.map(p => {
+        const isPinned = p.arn === pinnedArn;
+        const tag = isPinned ? ' <span class="credit-ratio">pinned</span>' : '';
+        const disabled = isPinned ? ' disabled' : '';
+        return '<div class="model-item">' +
+          '<div class="model-name">' + escapeHtml(p.displayName || p.arn) + tag + '</div>' +
+          '<div class="model-info">' + escapeHtml(p.region) + ' — ' + escapeHtml(p.arn) + '</div>' +
+          '<button class="btn btn-sm btn-primary" data-profile-select="1" data-id="' + escapeHtml(id) +
+          '" data-arn="' + escapeHtml(p.arn) + '" data-region="' + escapeHtml(p.region) + '" type="button"' + disabled + '>Use</button>' +
+          '</div>';
+      }).join('');
+    } catch (e) {
+      c.innerHTML = '<p class="message message-error">' + escapeHtml(t('detail.loadFailed')) + '</p>';
+    } finally {
+      btns.forEach(b => { b.disabled = false; });
+    }
+  }
+
+  async function selectProfile(id, arn, region, btn) {
+    if (!confirm('Switch this account to profile ' + arn + ' (' + region + ')? Active requests keep the old profile; new requests use the new one.')) return;
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api('/accounts/' + id + '/profile', {
+        method: 'POST',
+        body: JSON.stringify({ arn: arn, region: region }),
+      });
+      const d = await res.json();
+      if (res.ok && d.success) {
+        toast('Profile switched; model cache refreshed', 'success');
+        discoverProfiles(id);
+      } else {
+        toast(d.error || 'Profile switch failed', 'error');
+        if (btn) btn.disabled = false;
+      }
+    } catch (e) {
+      toast('Profile switch failed', 'error');
+      if (btn) btn.disabled = false;
+    }
   }
   async function loadModels(id) {
     const c = $('modelsList');
@@ -4278,6 +4351,8 @@
   function bindDetailEvents() {
     $('detailBody').addEventListener('click', e => {
       if (e.target.id === 'generateMachineIdBtn') { generateMachineId(); return; }
+      const ps = e.target.closest('[data-profile-select]');
+      if (ps) { selectProfile(ps.dataset.id, ps.dataset.arn, ps.dataset.region, ps); return; }
       const b = e.target.closest('[data-detail-action]');
       if (!b) return;
       const id = b.dataset.id;
@@ -4289,6 +4364,7 @@
       else if (a === 'saveProxyURL') saveProxyURL(id);
       else if (a === 'loadModels') loadModels(id);
       else if (a === 'refreshModels') refreshAccountModels(id);
+      else if (a === 'discoverProfiles') discoverProfiles(id);
     });
   }
 

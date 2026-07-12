@@ -772,6 +772,73 @@ func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// apiDiscoverAccountProfiles GET /admin/api/accounts/{id}/profiles
+// Probes all candidate regions and returns the discovered profiles (deduped,
+// sorted) plus any per-region errors. Never returns tokens or secrets.
+func (h *Handler) apiDiscoverAccountProfiles(w http.ResponseWriter, r *http.Request, id string) {
+	account := h.pool.GetByID(id)
+	if account == nil {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	// Ensure a valid token via the central manager before probing.
+	if h.tokenManager != nil {
+		if fresh, err := h.tokenManager.EnsureFresh(id); err == nil && fresh != nil {
+			account = fresh
+		}
+	}
+	res, err := DiscoverProfiles(r.Context(), account)
+	if err != nil && len(res.Profiles) == 0 {
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":        err.Error(),
+			"regionErrors": res.RegionErrors,
+		})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"profiles":     res.Profiles,
+		"regionErrors": res.RegionErrors,
+	})
+}
+
+// apiGetAccountPinnedProfile GET /admin/api/accounts/{id}/profile
+func (h *Handler) apiGetAccountPinnedProfile(w http.ResponseWriter, r *http.Request, id string) {
+	pinned, ok := h.GetPinnedProfile(id)
+	if !ok {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"pinned": pinned})
+}
+
+// apiSelectAccountProfile POST /admin/api/accounts/{id}/profile
+// Body: {"arn": "...", "region": "..."}
+func (h *Handler) apiSelectAccountProfile(w http.ResponseWriter, r *http.Request, id string) {
+	var req struct {
+		ARN    string `json:"arn"`
+		Region string `json:"region"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid request body"})
+		return
+	}
+	if err := h.SelectProfile(r.Context(), id, req.ARN, req.Region); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	pinned, _ := h.GetPinnedProfile(id)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":             true,
+		"pinned":              pinned,
+		"modelCacheRefreshed": true,
+	})
+}
+
 // apiRefreshAllAccountsModels POST /admin/api/accounts/models/refresh
 // 直接复用 refreshModelsCache，为所有已启用账号刷新模型路由缓存。
 func (h *Handler) apiRefreshAllAccountsModels(w http.ResponseWriter, r *http.Request) {
@@ -2391,6 +2458,16 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models") && r.Method == "GET":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models")
 		h.apiGetAccountModels(w, r, id)
+
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/profiles") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/profiles")
+		h.apiDiscoverAccountProfiles(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/profile") && r.Method == "GET":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/profile")
+		h.apiGetAccountPinnedProfile(w, r, id)
+	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/profile") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/profile")
+		h.apiSelectAccountProfile(w, r, id)
 
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/overage") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/overage")
