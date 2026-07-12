@@ -14,12 +14,12 @@ const maxResponsesHistoryDepth = 64
 // If a link in the chain is missing on disk (e.g. expired past TTL or the
 // referenced ID was deleted), expansion stops at the deepest reachable
 // ancestor instead of failing — the most recent context is still useful.
-func expandPreviousResponseHistory(prev *ResponsesObject) []OpenAIMessage {
+func expandPreviousResponseHistory(prev *ResponsesObject, ownerPrincipal string, authEnabled bool) []OpenAIMessage {
 	if prev == nil {
 		return nil
 	}
 
-	chain := collectAncestorChain(prev)
+	chain := collectAncestorChain(prev, ownerPrincipal, authEnabled)
 
 	messages := make([]OpenAIMessage, 0)
 	for _, node := range chain {
@@ -46,7 +46,7 @@ func expandPreviousResponseHistory(prev *ResponsesObject) []OpenAIMessage {
 // chain in oldest-first order: [root, ..., parent, prev]. The walker is
 // bounded by maxResponsesHistoryDepth and a visited-set to short-circuit
 // any cycle in the stored data.
-func collectAncestorChain(prev *ResponsesObject) []*ResponsesObject {
+func collectAncestorChain(prev *ResponsesObject, ownerPrincipal string, authEnabled bool) []*ResponsesObject {
 	stack := []*ResponsesObject{prev}
 	visited := map[string]bool{prev.ID: true}
 
@@ -58,7 +58,10 @@ func collectAncestorChain(prev *ResponsesObject) []*ResponsesObject {
 		if visited[cursor.PreviousResponseID] {
 			break
 		}
-		ancestor, err := loadResponse(cursor.PreviousResponseID)
+		// Every ancestor must pass the same ownership check as the entry point, so
+		// a forged/cross-owner previous_response_id chain cannot pull in another
+		// principal's stored turns.
+		ancestor, err := loadResponseForOwner(cursor.PreviousResponseID, ownerPrincipal, authEnabled)
 		if err != nil || ancestor == nil {
 			break
 		}

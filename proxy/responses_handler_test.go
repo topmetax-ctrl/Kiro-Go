@@ -82,11 +82,11 @@ func TestResponsesStoreAndLoad(t *testing.T) {
 		StoredInput: json.RawMessage(`"hi"`),
 	}
 
-	if err := saveResponse(resp); err != nil {
+	if err := saveResponse(resp, anonymousOwner, ""); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
-	loaded, err := loadResponse(resp.ID)
+	loaded, err := loadResponseForOwner(resp.ID, anonymousOwner, false)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestResponsesStoreAndLoad(t *testing.T) {
 		t.Fatalf("stored input mismatch: %s", string(loaded.StoredInput))
 	}
 
-	if _, err := loadResponse("does_not_exist"); err == nil {
+	if _, err := loadResponseForOwner("does_not_exist", anonymousOwner, false); err == nil {
 		t.Fatalf("expected load error for missing id")
 	}
 }
@@ -127,7 +127,7 @@ func TestResponsesPreviousResponseIDExpands(t *testing.T) {
 		},
 	}
 
-	expanded := expandPreviousResponseHistory(prev)
+	expanded := expandPreviousResponseHistory(prev, anonymousOwner, false)
 	if len(expanded) != 3 {
 		t.Fatalf("expected 3 messages from history, got %d (%+v)", len(expanded), expanded)
 	}
@@ -180,14 +180,14 @@ func TestResponsesPreviousResponseIDExpandsFullChain(t *testing.T) {
 			Content: []ResponseContentPart{{Type: "output_text", Text: "turn B assistant"}},
 		}},
 	}
-	if err := saveResponse(a); err != nil {
+	if err := saveResponse(a, anonymousOwner, ""); err != nil {
 		t.Fatalf("save a: %v", err)
 	}
-	if err := saveResponse(b); err != nil {
+	if err := saveResponse(b, anonymousOwner, ""); err != nil {
 		t.Fatalf("save b: %v", err)
 	}
 
-	expanded := expandPreviousResponseHistory(b)
+	expanded := expandPreviousResponseHistory(b, anonymousOwner, false)
 
 	var transcript []string
 	for _, m := range expanded {
@@ -222,7 +222,7 @@ func TestResponsesContinuationKeepsNewInstructions(t *testing.T) {
 			Content: []ResponseContentPart{{Type: "output_text", Text: "first reply"}},
 		}},
 	}
-	if err := saveResponse(prev); err != nil {
+	if err := saveResponse(prev, anonymousOwner, ""); err != nil {
 		t.Fatalf("save prev: %v", err)
 	}
 
@@ -347,7 +347,7 @@ func TestResponsesNonStreamRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected text: %q", resp.Output[0].Content[0].Text)
 	}
 
-	loaded, err := loadResponse(resp.ID)
+	loaded, err := loadResponseForOwner(resp.ID, anonymousOwner, false)
 	if err != nil {
 		t.Fatalf("loadResponse: %v", err)
 	}

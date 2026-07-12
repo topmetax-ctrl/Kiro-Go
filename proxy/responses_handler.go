@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,15 +48,23 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		storeResponse = *req.Store
 	}
 
+	// Derive the requesting principal so a stored response can only be continued
+	// by its owner. With auth enabled the principal is the matched API key ID;
+	// with auth disabled the proxy is single-user and shares one anonymous scope.
+	authEnabled := config.IsApiKeyRequired()
+	ownerPrincipal := responsesOwnerPrincipal(r.Context(), authEnabled)
+
 	var historyMessages []OpenAIMessage
 	if req.PreviousResponseID != "" {
-		prev, loadErr := loadResponse(req.PreviousResponseID)
+		prev, loadErr := loadResponseForOwner(req.PreviousResponseID, ownerPrincipal, authEnabled)
 		if loadErr != nil {
+			// Generic message: never reveal whether the ID exists but is owned by
+			// someone else vs. does not exist at all.
 			h.sendOpenAIError(w, 404, "invalid_request_error",
-				fmt.Sprintf("previous_response_id not found: %v", loadErr))
+				"previous_response_id not found")
 			return
 		}
-		historyMessages = expandPreviousResponseHistory(prev)
+		historyMessages = expandPreviousResponseHistory(prev, ownerPrincipal, authEnabled)
 	}
 
 	inputMessages, err := parseResponsesInput(req.Input)
@@ -121,17 +130,31 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	if req.Stream {
 		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-			apiKeyID, respID, &req, storedInputCopy, storeResponse)
+			apiKeyID, ownerPrincipal, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
 	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
-		apiKeyID, respID, &req, storedInputCopy, storeResponse)
+		apiKeyID, ownerPrincipal, respID, &req, storedInputCopy, storeResponse)
+}
+
+// responsesOwnerPrincipal returns the principal that owns responses created on
+// this request: the API key ID when auth is enabled, else the shared anonymous
+// scope. Falls back to anonymous if auth is enabled but no key ID is present
+// (should not happen once authenticate() has run, but stay fail-safe).
+func responsesOwnerPrincipal(ctx context.Context, authEnabled bool) string {
+	if !authEnabled {
+		return anonymousOwner
+	}
+	if id := apiKeyIDFromContext(ctx); id != "" {
+		return id
+	}
+	return anonymousOwner
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, apiKeyID, ownerPrincipal, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	excluded := make(map[string]bool)
@@ -200,7 +223,7 @@ func (h *Handler) handleResponsesNonStream(
 		respObj.Instructions = req.Instructions
 
 		if storeResponse {
-			if saveErr := saveResponse(respObj); saveErr != nil {
+			if saveErr := saveResponse(respObj, ownerPrincipal, apiKeyID); saveErr != nil {
 				logResponsesPersistFailure(respObj.ID, saveErr)
 			}
 		}
@@ -277,7 +300,7 @@ func buildResponsesObject(
 
 func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
-	estimatedInputTokens int, apiKeyID, respID string,
+	estimatedInputTokens int, apiKeyID, ownerPrincipal, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -546,7 +569,7 @@ func (h *Handler) handleResponsesStream(
 		respObj.Instructions = req.Instructions
 
 		if storeResponse {
-			if saveErr := saveResponse(respObj); saveErr != nil {
+			if saveErr := saveResponse(respObj, ownerPrincipal, apiKeyID); saveErr != nil {
 				logResponsesPersistFailure(respObj.ID, saveErr)
 			}
 		}

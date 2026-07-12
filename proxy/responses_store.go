@@ -38,7 +38,10 @@ func generateOutputItemID(prefix string) string {
 	return prefix + "_" + hex.EncodeToString(buf)
 }
 
-func saveResponse(resp *ResponsesObject) error {
+// saveResponse persists a response scoped to ownerPrincipalID. createdByKeyID is
+// recorded for audit (may equal ownerPrincipalID). When auth is disabled the
+// caller passes anonymousOwner.
+func saveResponse(resp *ResponsesObject, ownerPrincipalID, createdByKeyID string) error {
 	if resp == nil || resp.ID == "" {
 		return fmt.Errorf("response missing id")
 	}
@@ -63,6 +66,8 @@ func saveResponse(resp *ResponsesObject) error {
 		Instructions:       resp.Instructions,
 		StoredInput:        resp.StoredInput,
 		StoredAt:           resp.StoredAt,
+		OwnerPrincipalID:   ownerPrincipalID,
+		CreatedByKeyID:     createdByKeyID,
 	}
 
 	path := filepath.Join(dir, sanitizeResponseID(resp.ID)+".json")
@@ -81,23 +86,65 @@ func saveResponse(resp *ResponsesObject) error {
 	return nil
 }
 
-func loadResponse(id string) (*ResponsesObject, error) {
+// loadResponseForOwner loads a stored response only if it belongs to the given
+// principal. requesterID is the caller's principal (ApiKeyEntry.ID), or
+// anonymousOwner when auth is disabled. authEnabled distinguishes the two
+// deployment modes so legacy (owner-empty) docs are handled correctly:
+//   - owner matches requester            → allowed
+//   - owner differs                      → generic not-found (no existence leak)
+//   - legacy empty owner + auth enabled  → denied (do NOT let the first accessor
+//     adopt an orphaned conversation)
+//   - legacy empty owner + auth disabled → allowed (single anonymous scope)
+//
+// Expired docs are pruned and reported as not-found.
+func loadResponseForOwner(id, requesterID string, authEnabled bool) (*ResponsesObject, error) {
+	doc, path, err := loadResponseDoc(id)
+	if err != nil {
+		return nil, err
+	}
+	if doc.StoredAt > 0 && time.Since(time.Unix(doc.StoredAt, 0)) > responsesDefaultTTL {
+		_ = os.Remove(path)
+		return nil, errResponseNotFound
+	}
+
+	if !ownerAuthorized(doc.OwnerPrincipalID, requesterID, authEnabled) {
+		return nil, errResponseNotFound
+	}
+
+	return docToResponsesObject(doc), nil
+}
+
+// ownerAuthorized applies the ownership policy described on loadResponseForOwner.
+func ownerAuthorized(owner, requester string, authEnabled bool) bool {
+	if owner == "" {
+		// Legacy doc with no owner. Only reachable in single-user (auth-off) mode.
+		return !authEnabled
+	}
+	return owner == requester
+}
+
+// loadResponseDoc reads and decodes a stored response document (no ownership or
+// TTL checks). Returns the on-disk path for pruning.
+func loadResponseDoc(id string) (storedResponseDoc, string, error) {
 	if id == "" {
-		return nil, fmt.Errorf("empty response id")
+		return storedResponseDoc{}, "", fmt.Errorf("empty response id")
 	}
 	path := filepath.Join(responsesDir(), sanitizeResponseID(id)+".json")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		if os.IsNotExist(err) {
+			return storedResponseDoc{}, path, errResponseNotFound
+		}
+		return storedResponseDoc{}, path, err
 	}
 	var doc storedResponseDoc
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return nil, fmt.Errorf("decode stored response: %w", err)
+		return storedResponseDoc{}, path, fmt.Errorf("decode stored response: %w", err)
 	}
-	if doc.StoredAt > 0 && time.Since(time.Unix(doc.StoredAt, 0)) > responsesDefaultTTL {
-		_ = os.Remove(path)
-		return nil, fmt.Errorf("stored response expired")
-	}
+	return doc, path, nil
+}
+
+func docToResponsesObject(doc storedResponseDoc) *ResponsesObject {
 	return &ResponsesObject{
 		ID:                 doc.ID,
 		Object:             doc.Object,
@@ -111,7 +158,7 @@ func loadResponse(id string) (*ResponsesObject, error) {
 		Instructions:       doc.Instructions,
 		StoredInput:        doc.StoredInput,
 		StoredAt:           doc.StoredAt,
-	}, nil
+	}
 }
 
 func purgeExpiredResponses(ttl time.Duration) {
@@ -179,4 +226,24 @@ type storedResponseDoc struct {
 	Instructions       string               `json:"instructions,omitempty"`
 	StoredInput        json.RawMessage      `json:"stored_input,omitempty"`
 	StoredAt           int64                `json:"stored_at"`
+
+	// OwnerPrincipalID scopes a stored response to the principal that created it,
+	// so one API key cannot read another key's conversation via
+	// previous_response_id. The owner is the stable ApiKeyEntry.ID (survives raw
+	// key rotation-in-place). CreatedByKeyID is kept for audit only.
+	//
+	// Legacy docs written before this field exists have an empty OwnerPrincipalID;
+	// see loadResponseForOwner for how they are handled (denied under auth, not
+	// adopted by the first accessor).
+	OwnerPrincipalID string `json:"owner_principal_id,omitempty"`
+	CreatedByKeyID   string `json:"created_by_key_id,omitempty"`
 }
+
+// anonymousOwner is the owner assigned when API-key auth is disabled: the proxy is
+// effectively single-user, so all stored responses share one anonymous scope.
+const anonymousOwner = "anonymous"
+
+// errResponseNotFound is the single generic error returned for both "no such
+// stored response" and "owned by a different principal", so a caller cannot probe
+// which response IDs exist.
+var errResponseNotFound = fmt.Errorf("stored response not found")
