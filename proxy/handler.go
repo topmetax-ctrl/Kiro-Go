@@ -528,8 +528,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleStats 统计数据（需要 API Key 鉴权）
 func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	resp := map[string]interface{}{
 		"status":          "ok",
 		"version":         config.Version,
 		"accounts":        h.pool.Count(),
@@ -540,7 +539,23 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
 		"totalCredits":    h.getCredits(),
 		"uptime":          time.Now().Unix() - h.startTime,
-	})
+	}
+	// Additive, backward-compatible prompt-cache observability. Counts only — no
+	// prompt text, fingerprints, or token secrets.
+	if h.promptCache != nil {
+		m, entries, capacity := h.promptCache.Metrics()
+		resp["promptCache"] = map[string]interface{}{
+			"hits":           m.Hits,
+			"misses":         m.Misses,
+			"creations":      m.Creations,
+			"evictions":      m.Evictions,
+			"expiredEvicted": m.ExpiredEvict,
+			"currentEntries": entries,
+			"capacity":       capacity,
+		}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // handleModels 模型列表
