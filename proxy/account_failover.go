@@ -67,6 +67,9 @@ func (h *Handler) disableAccount(account *config.Account, banStatus, banReason s
 
 	logger.Warnf("[AccountFailover] Disabled %s: %s", account.Email, banReason)
 	h.pool.Reload()
+	// A disabled account leaves the routable pool; drop its cached models so the
+	// global aggregate stops advertising models only it offered.
+	h.dropAccountModels(account.ID)
 }
 
 func (h *Handler) disableAccountOverage(account *config.Account) {

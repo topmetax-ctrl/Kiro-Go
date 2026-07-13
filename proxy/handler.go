@@ -692,43 +692,118 @@ func (h *Handler) refreshModelsCache() {
 		return
 	}
 
-	aggregated := make([]ModelInfo, 0)
+	ctx := context.Background()
+	enabled := make(map[string]bool, len(accounts))
 	for i := range accounts {
 		account := &accounts[i]
+		enabled[account.ID] = true
 		if err := h.ensureValidToken(account); err != nil {
 			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
 
-		models, err := modelLister(account)
+		models, err := modelLister(ctx, account)
 		if err != nil {
 			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
 			h.handleAccountFailure(account, err)
 			continue
 		}
-		// 缓存每账号可用模型，用于路由时过滤
-		modelIDs := make([]string, 0, len(models))
-		for _, m := range models {
-			modelIDs = append(modelIDs, m.ModelId)
-		}
-		h.pool.SetModelList(account.ID, modelIDs)
-		h.setAccountModelInfo(account.ID, models)
-		aggregated = mergeUniqueModels(aggregated, models)
+		// Publish through the gated path: a profile switch that raced this sweep
+		// must win, so the fetch (done against the account's profile at read time)
+		// is only committed if that profile is still current.
+		h.publishAccountModelsGated(account.ID, account.ProfileArn, account.EffectiveApiRegion(), models)
 	}
 
-	if len(aggregated) > 0 {
-		h.modelsCacheMu.Lock()
-		h.cachedModels = aggregated
-		h.modelsCacheTime = time.Now().Unix()
-		h.modelsCacheMu.Unlock()
-		logger.Infof("[ModelsCache] Cached %d models", len(aggregated))
-	}
+	// Backstop prune: drop per-account metadata (and pool routing sets) for
+	// accounts that are no longer enabled, so the global aggregate cannot keep
+	// serving a disabled/deleted account's models.
+	h.pruneStaleAccountModels(enabled)
 }
 
 // modelLister is the seam for fetching an account's available models; overridable
-// in tests. Production uses the real Kiro ListAvailableModels call.
-var modelLister = ListAvailableModels
+// in tests. Production uses the real Kiro ListAvailableModels call (context-aware
+// so a cancelled admin op aborts the in-flight fetch).
+var modelLister = func(ctx context.Context, account *config.Account) ([]ModelInfo, error) {
+	return ListAvailableModelsContext(ctx, account)
+}
+
+// publishAccountModelsGated publishes a freshly-fetched model list to the pool
+// routing set and the per-account metadata cache, but ONLY if the account still
+// points at the profile the models were fetched for. It serializes against
+// profile switches via the per-account switch lock and re-checks the current
+// ARN/region under it, so a background or admin refresh that started before a
+// concurrent SelectProfile cannot clobber the newer profile's model list with a
+// stale result. Returns true when the models were published.
+//
+// Lock order is profileSwitchLock → modelsCacheMu, matching SelectProfile, so the
+// two paths cannot deadlock.
+func (h *Handler) publishAccountModelsGated(accountID, fetchedForARN, fetchedForRegion string, models []ModelInfo) bool {
+	lock := h.profileSwitchLock(accountID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	cur := h.lookupAccountForAdmin(accountID)
+	if cur == nil {
+		return false // account deleted while the fetch was in flight
+	}
+	if strings.TrimSpace(cur.ProfileArn) != strings.TrimSpace(fetchedForARN) ||
+		cur.EffectiveApiRegion() != fetchedForRegion {
+		return false // profile switched under us — discard the stale fetch
+	}
+
+	modelIDs := make([]string, 0, len(models))
+	for _, m := range models {
+		modelIDs = append(modelIDs, m.ModelId)
+	}
+	h.pool.SetModelList(accountID, modelIDs)
+
+	cp := make([]ModelInfo, len(models))
+	copy(cp, models)
+	h.modelsCacheMu.Lock()
+	if h.modelInfoByAccount == nil {
+		h.modelInfoByAccount = make(map[string][]ModelInfo)
+	}
+	h.modelInfoByAccount[accountID] = cp
+	h.rebuildAggregateLocked()
+	h.modelsCacheMu.Unlock()
+	return true
+}
+
+// pruneStaleAccountModels drops per-account model metadata and pool routing sets
+// for accounts not present in keep (disabled, deleted, or otherwise gone), then
+// rebuilds the aggregate so /v1/models cannot resurrect a removed account's
+// models. keep is the set of account IDs that should retain their models.
+func (h *Handler) pruneStaleAccountModels(keep map[string]bool) {
+	h.modelsCacheMu.Lock()
+	var dropped []string
+	for id := range h.modelInfoByAccount {
+		if !keep[id] {
+			delete(h.modelInfoByAccount, id)
+			dropped = append(dropped, id)
+		}
+	}
+	h.rebuildAggregateLocked()
+	h.modelsCacheMu.Unlock()
+	for _, id := range dropped {
+		h.pool.DeleteModelList(id)
+	}
+}
+
+// dropAccountModels eagerly removes one account's model metadata and pool routing
+// set (called when an account is disabled or deleted) and rebuilds the aggregate
+// so its models leave /v1/models immediately, without waiting for the next full
+// refresh. Safe to call for an account that has no cached models.
+func (h *Handler) dropAccountModels(accountID string) {
+	h.modelsCacheMu.Lock()
+	_, had := h.modelInfoByAccount[accountID]
+	delete(h.modelInfoByAccount, accountID)
+	if had {
+		h.rebuildAggregateLocked()
+	}
+	h.modelsCacheMu.Unlock()
+	h.pool.DeleteModelList(accountID)
+}
 
 // setAccountModelInfo records the last-known model metadata for an account so the
 // global aggregate can later be rebuilt in memory. Guarded by modelsCacheMu.
@@ -756,33 +831,22 @@ func (h *Handler) rebuildAggregateLocked() {
 }
 
 // fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
-// 同时更新 pool 的路由缓存与全局聚合模型列表。
+// 同时更新 pool 的路由缓存与全局聚合模型列表。The publish is gated on the
+// account still pointing at the profile the models were fetched for, so a manual
+// or background refresh cannot clobber a concurrent profile switch.
 func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
 	if err := h.ensureValidToken(account); err != nil {
 		return fmt.Errorf("token refresh failed: %w", err)
 	}
-	models, err := modelLister(account)
+	models, err := modelLister(context.Background(), account)
 	if err != nil {
 		return err
 	}
-	modelIDs := make([]string, 0, len(models))
-	for _, m := range models {
-		modelIDs = append(modelIDs, m.ModelId)
+	if h.publishAccountModelsGated(account.ID, account.ProfileArn, account.EffectiveApiRegion(), models) {
+		logger.Infof("[ModelsCache] Refreshed %d models for account %s", len(models), account.Email)
+	} else {
+		logger.Infof("[ModelsCache] Discarded stale model refresh for account %s (profile changed)", account.Email)
 	}
-	h.pool.SetModelList(account.ID, modelIDs)
-
-	// Record per-account metadata and rebuild the aggregate so stale models drop.
-	cp := make([]ModelInfo, len(models))
-	copy(cp, models)
-	h.modelsCacheMu.Lock()
-	if h.modelInfoByAccount == nil {
-		h.modelInfoByAccount = make(map[string][]ModelInfo)
-	}
-	h.modelInfoByAccount[account.ID] = cp
-	h.rebuildAggregateLocked()
-	h.modelsCacheMu.Unlock()
-
-	logger.Infof("[ModelsCache] Refreshed %d models for account %s", len(models), account.Email)
 	return nil
 }
 
@@ -2885,6 +2949,9 @@ func (h *Handler) apiDeleteAccount(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 	h.pool.Reload()
+	// Drop the deleted account's cached models so /v1/models stops advertising them
+	// immediately (and a later aggregate rebuild cannot resurrect them).
+	h.dropAccountModels(id)
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
@@ -4817,23 +4884,16 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	models, err := ListAvailableModels(account)
+	models, err := modelLister(r.Context(), account)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	// 同步更新路由缓存
-	modelIDs := make([]string, 0, len(models))
-	for _, m := range models {
-		modelIDs = append(modelIDs, m.ModelId)
-	}
-	h.pool.SetModelList(id, modelIDs)
-	h.modelsCacheMu.Lock()
-	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
-	h.modelsCacheTime = time.Now().Unix()
-	h.modelsCacheMu.Unlock()
+	// Publish through the gated path so a concurrent profile switch wins and the
+	// aggregate rebuild drops any stale models, instead of the old grow-only merge.
+	h.publishAccountModelsGated(id, account.ProfileArn, account.EffectiveApiRegion(), models)
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,

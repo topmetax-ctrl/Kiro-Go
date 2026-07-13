@@ -21,8 +21,21 @@ func withStubProfileLister(t *testing.T, fn func(ctx context.Context, acc *confi
 }
 
 // withStubModelLister swaps modelLister for the duration of a test, so
-// SelectProfile's candidate-model prefetch does not hit the network.
+// SelectProfile's candidate-model prefetch does not hit the network. The stub
+// takes only the account (the context is rarely relevant to a test's assertion);
+// an internal adapter satisfies the context-aware seam.
 func withStubModelLister(t *testing.T, fn func(acc *config.Account) ([]ModelInfo, error)) {
+	t.Helper()
+	old := modelLister
+	modelLister = func(_ context.Context, account *config.Account) ([]ModelInfo, error) {
+		return fn(account)
+	}
+	t.Cleanup(func() { modelLister = old })
+}
+
+// withStubModelListerCtx is like withStubModelLister but exposes the context, for
+// tests that assert cancellation is honored through the model prefetch.
+func withStubModelListerCtx(t *testing.T, fn func(ctx context.Context, acc *config.Account) ([]ModelInfo, error)) {
 	t.Helper()
 	old := modelLister
 	modelLister = fn
