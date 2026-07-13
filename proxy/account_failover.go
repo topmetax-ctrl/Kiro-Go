@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"strings"
@@ -96,21 +97,51 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		return
 	}
 
+	// Prefer the typed category when the upstream layer produced one: the decision
+	// was made where the HTTP status code was authoritative, so it cannot be fooled
+	// by digits embedded in request-IDs or bodies. Fall back to legacy substring
+	// matching for non-HTTP producers (profile resolution, suspension probes) and
+	// any error that predates the typed path.
+	var ke *KiroUpstreamError
+	if errors.As(err, &ke) && ke.Category != KiroErrUnknown {
+		h.applyFailureCategory(account, ke.Category)
+		return
+	}
+
 	errMsg := err.Error()
 	switch {
 	case isOverageErrorMessage(errMsg):
+		h.applyFailureCategory(account, KiroErrOverage)
+	case isQuotaErrorMessage(errMsg):
+		h.applyFailureCategory(account, KiroErrQuota)
+	case isSuspensionErrorMessage(errMsg):
+		h.applyFailureCategory(account, KiroErrSuspension)
+	case isProfileUnavailableErrorMessage(errMsg):
+		h.applyFailureCategory(account, KiroErrProfileUnavail)
+	case isAuthErrorMessage(errMsg):
+		h.applyFailureCategory(account, KiroErrAuth)
+	default:
+		h.pool.RecordError(account.ID, false)
+	}
+}
+
+// applyFailureCategory maps a classified failure to its pool/ban side effects.
+// Kept as a single switch so the typed and legacy paths cannot drift apart.
+func (h *Handler) applyFailureCategory(account *config.Account, cat KiroErrorCategory) {
+	switch cat {
+	case KiroErrOverage:
 		h.disableAccountOverage(account)
 		h.pool.RecordError(account.ID, false)
-	case isQuotaErrorMessage(errMsg):
+	case KiroErrQuota:
 		h.pool.RecordError(account.ID, true)
-	case isSuspensionErrorMessage(errMsg):
+	case KiroErrSuspension:
 		h.disableAccount(account, "BANNED", "AWS temporarily suspended - unusual user activity detected")
-	case isProfileUnavailableErrorMessage(errMsg):
+	case KiroErrProfileUnavail:
 		// Profile ARN may be transiently unresolvable (upstream blip, stale token).
 		// Treat as a soft failure: short cooldown so the next request rotates account,
 		// but never auto-disable — operators can still investigate via warn logs.
 		h.pool.RecordError(account.ID, false)
-	case isAuthErrorMessage(errMsg):
+	case KiroErrAuth:
 		h.disableAccount(account, "BANNED", "Authentication failed - token invalid or expired")
 	default:
 		h.pool.RecordError(account.ID, false)
