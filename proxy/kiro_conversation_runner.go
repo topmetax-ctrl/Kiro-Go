@@ -70,7 +70,7 @@ type kiroConversationRunner struct {
 // than silently passing an unresolved tool_use back to the client.
 func NewKiroConversationRunner() ConversationRunner {
 	return &kiroConversationRunner{
-		caller:   NewKiroRoundCaller(),
+		caller: NewKiroRoundCaller(),
 		executor: newWebSearchExecutor(search.NewOrchestratorFromConfig(
 			func() *http.Client { return GetRestClientForProxy(config.GetProxyURL()) },
 		)),

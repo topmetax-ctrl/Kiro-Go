@@ -53,7 +53,9 @@ type fakeSearchProvider struct {
 
 func (p *fakeSearchProvider) Name() string { return "fake" }
 
-func (p *fakeSearchProvider) Health() search.ProviderHealth { return search.ProviderHealth{State: search.ProviderHealthy} }
+func (p *fakeSearchProvider) Health() search.ProviderHealth {
+	return search.ProviderHealth{State: search.ProviderHealthy}
+}
 
 func (p *fakeSearchProvider) Search(ctx context.Context, req search.Request) (search.Response, error) {
 	if err := ctx.Err(); err != nil {
@@ -473,8 +475,10 @@ type concurrentProvider struct {
 	perQuery map[string]string
 }
 
-func (p *concurrentProvider) Name() string           { return "concurrent" }
-func (p *concurrentProvider) Health() search.ProviderHealth { return search.ProviderHealth{State: search.ProviderHealthy} }
+func (p *concurrentProvider) Name() string { return "concurrent" }
+func (p *concurrentProvider) Health() search.ProviderHealth {
+	return search.ProviderHealth{State: search.ProviderHealthy}
+}
 func (p *concurrentProvider) Search(ctx context.Context, req search.Request) (search.Response, error) {
 	p.mu.Lock()
 	p.inFlight++
