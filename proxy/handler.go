@@ -1449,6 +1449,70 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			})
 		}
 
+		// emitWebSearchNativeBlocks streams the Anthropic-native server_tool_use +
+		// web_search_tool_result pair for each search the proxy ran, so a client like
+		// Claude Code renders "Web Search(query)" and counts it. Emitted before the
+		// final round's text (the searches happened before the answer). The proxy
+		// cannot mint real encrypted_content; an empty placeholder is sent. Gated by
+		// the caller (webSearch.emitNativeToolBlocks) so it can be turned off.
+		emitWebSearchNativeBlocks := func(searches []WebSearchInvocation) {
+			for _, s := range searches {
+				ensureMessageStart()
+				closeActiveBlock()
+
+				stuIdx := nextContentIndex
+				nextContentIndex++
+				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+					"type":  "content_block_start",
+					"index": stuIdx,
+					"content_block": map[string]interface{}{
+						"type":  "server_tool_use",
+						"id":    s.ToolUseID,
+						"name":  "web_search",
+						"input": map[string]interface{}{},
+					},
+				})
+				inputJSON, _ := json.Marshal(map[string]interface{}{"query": s.Query})
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": stuIdx,
+					"delta": map[string]interface{}{
+						"type":         "input_json_delta",
+						"partial_json": string(inputJSON),
+					},
+				})
+				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": stuIdx,
+				})
+
+				items := make([]map[string]interface{}, 0, len(s.Sources))
+				for _, src := range s.Sources {
+					items = append(items, map[string]interface{}{
+						"type":              "web_search_result",
+						"title":             src.Title,
+						"url":               src.URL,
+						"encrypted_content": "",
+					})
+				}
+				resIdx := nextContentIndex
+				nextContentIndex++
+				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+					"type":  "content_block_start",
+					"index": resIdx,
+					"content_block": map[string]interface{}{
+						"type":        "web_search_tool_result",
+						"tool_use_id": s.ToolUseID,
+						"content":     items,
+					},
+				})
+				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": resIdx,
+				})
+			}
+		}
+
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
@@ -1478,6 +1542,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		// let the final round's context-occupancy override the summed input total.
 		usedRunner := false
 		var runSources []SearchSource
+		var runSearches []WebSearchInvocation
 
 		if useRunner {
 			usedRunner = true
@@ -1514,6 +1579,15 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 					"error": map[string]string{"type": "api_error", "message": err.Error()},
 				})
 				return
+			}
+
+			// Emit the synthetic Anthropic-native web_search blocks first: the
+			// searches ran before the model composed the final answer, so they
+			// precede its text in the stream. Gated by the kill-switch; empty when
+			// off or when no search ran.
+			if config.WebSearchEmitNativeToolBlocks() {
+				runSearches = run.Searches
+				emitWebSearchNativeBlocks(runSearches)
 			}
 
 			// Replay only the final round's ordered events through the same
@@ -1612,12 +1686,20 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		}
 
 		ensureMessageStart()
+		usageMap := buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil)
+		// Report the server-side searches the proxy ran so the client counts them
+		// instead of "Did 0 searches". Gated by the same kill-switch as the blocks.
+		if usedRunner && len(runSearches) > 0 {
+			usageMap["server_tool_use"] = map[string]interface{}{
+				"web_search_requests": len(runSearches),
+			}
+		}
 		h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
 			"type": "message_delta",
 			"delta": map[string]interface{}{
 				"stop_reason": stopReason,
 			},
-			"usage": buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil),
+			"usage": usageMap,
 		})
 
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
@@ -1763,6 +1845,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		var credits float64
 		var realInputTokens int
 		var sources []SearchSource
+		var searches []WebSearchInvocation
 
 		if useRunner {
 			// Server-side web_search path: the runner drives as many Kiro rounds as
@@ -1797,6 +1880,9 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 				realInputTokens = int(fr.ContextUsagePct * float64(getContextWindowSize(model)) / 100.0)
 			}
 			sources = run.Sources
+			if config.WebSearchEmitNativeToolBlocks() {
+				searches = run.Searches
+			}
 		} else {
 			callback := &KiroStreamCallback{
 				OnText: func(text string, isThinking bool) {
@@ -1876,10 +1962,13 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model)
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model, searches)
 		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
+		if len(searches) > 0 {
+			resp.Usage.ServerToolUse = &ClaudeServerToolUsage{WebSearchRequests: len(searches)}
+		}
 		if cacheProfile != nil {
 			resp.Usage.CacheCreation = &ClaudeCacheCreationUsage{
 				Ephemeral5mInputTokens: cacheUsage.CacheCreation5mInputTokens,

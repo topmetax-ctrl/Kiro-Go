@@ -38,6 +38,21 @@ type KiroRunResult struct {
 	// this request (e.g. ["searxng"], or ["searxng","tavily"] if a fallback fired),
 	// for observability. Order is first-seen.
 	Providers []string
+	// Searches records one entry per web_search tool_use the model issued across
+	// all rounds, in issue order, so the handler can synthesize Anthropic-native
+	// server_tool_use / web_search_tool_result blocks (and the web_search_requests
+	// counter) for clients that display searches. Empty when no search ran.
+	Searches []WebSearchInvocation
+}
+
+// WebSearchInvocation is one web_search the model requested: the tool_use ID it
+// was keyed to, the query, and the citation sources returned. It carries no
+// snippet body (that already went to Kiro as the tool_result) — only what a
+// client needs to render "Web Search(query)" and its result links.
+type WebSearchInvocation struct {
+	ToolUseID string
+	Query     string
+	Sources   []SearchSource
 }
 
 // kiroConversationRunner is the production ConversationRunner.
@@ -73,8 +88,11 @@ func (r *kiroConversationRunner) Run(ctx context.Context, account *config.Accoun
 	agg := KiroRunResult{}
 
 	// Per-request query cache: a repeated normalized query does not burn a second
-	// provider credit, but each tool_use still gets its own result.
+	// provider credit, but each tool_use still gets its own result. sourcesByQuery
+	// mirrors it for citation sources so a cross-round cache hit can still be
+	// attributed to its native invocation block.
 	cache := map[string]KiroToolResult{}
+	sourcesByQuery := map[string][]SearchSource{}
 
 	for round := 0; round < policy.MaxRounds; round++ {
 		if err := ctx.Err(); err != nil {
@@ -118,7 +136,7 @@ func (r *kiroConversationRunner) Run(ctx context.Context, account *config.Accoun
 			return r.finalize(ctx, account, working, result, agg, "max_searches")
 		}
 
-		toolResults, sources, credits, execErr := r.executeAll(ctx, internal, policy, cache)
+		toolResults, sources, credits, invocations, execErr := r.executeAll(ctx, internal, policy, cache, sourcesByQuery)
 		if execErr != nil {
 			// A hard search error (auth/config/context). Do NOT fail the Kiro
 			// account; the handler maps this to a search-specific status.
@@ -128,6 +146,7 @@ func (r *kiroConversationRunner) Run(ctx context.Context, account *config.Accoun
 		agg.SearchRounds++
 		agg.Sources = append(agg.Sources, sources...)
 		agg.TavilyCredits += credits
+		agg.Searches = append(agg.Searches, invocations...)
 
 		working = advancePayload(working, result, toolResults)
 	}
@@ -195,7 +214,7 @@ type searchWork struct {
 	execMeta   ToolExecutionMetadata
 }
 
-func (r *kiroConversationRunner) executeAll(ctx context.Context, calls []KiroToolUse, policy WebSearchPolicy, cache map[string]KiroToolResult) ([]KiroToolResult, []SearchSource, int, error) {
+func (r *kiroConversationRunner) executeAll(ctx context.Context, calls []KiroToolUse, policy WebSearchPolicy, cache map[string]KiroToolResult, sourcesByQuery map[string][]SearchSource) ([]KiroToolResult, []SearchSource, int, []WebSearchInvocation, error) {
 	results := make([]KiroToolResult, len(calls))
 	metas := make([]ToolExecutionMetadata, len(calls))
 
@@ -222,41 +241,56 @@ func (r *kiroConversationRunner) executeAll(ctx context.Context, calls []KiroToo
 	tavilyCredits := 0
 	if len(toRun) > 0 {
 		if err := r.runSearches(ctx, toRun, policy); err != nil {
-			return nil, nil, 0, err
+			return nil, nil, 0, nil, err
 		}
 		// Fold the freshly executed results into the per-request cache and the
 		// index slots they were run from. Only fresh executions accrue provider
-		// credits; a query resolved from cache spent nothing this round.
+		// credits; a query resolved from cache spent nothing this round. Sources
+		// are cached by query too so a cross-round cache hit can still be attributed
+		// to its invocation for the native block.
 		for _, w := range toRun {
 			results[w.index] = w.execResult
 			metas[w.index] = w.execMeta
 			tavilyCredits += w.execMeta.TavilyCredits
 			if key := cacheKey(w.call); key != "" {
 				cache[key] = w.execResult
+				sourcesByQuery[key] = w.execMeta.Sources
 			}
 		}
 	}
 
 	// Assemble every call's result in order, re-keying cached/deduped results to
-	// the exact ToolUseID they answer so the continuation linkage stays exact.
+	// the exact ToolUseID they answer so the continuation linkage stays exact. In
+	// the same pass, build one invocation per call (issue order) for the native
+	// server_tool_use block, attributing sources from the fresh meta or the
+	// per-query source cache.
 	var sources []SearchSource
+	invocations := make([]WebSearchInvocation, 0, len(calls))
 	for i, call := range calls {
+		key := cacheKey(call)
+		var callSources []SearchSource
 		if results[i].ToolUseID != "" {
 			// Filled by a fresh execution above.
-			sources = append(sources, metas[i].Sources...)
-			continue
+			callSources = metas[i].Sources
+		} else {
+			cached, ok := cache[key]
+			if !ok || key == "" {
+				// Should not happen: every call is either cached or was scheduled.
+				return nil, nil, 0, nil, &SearchConfigError{Reason: "internal: search result missing for tool_use"}
+			}
+			cp := cached
+			cp.ToolUseID = call.ToolUseID
+			results[i] = cp
+			callSources = sourcesByQuery[key]
 		}
-		key := cacheKey(call)
-		cached, ok := cache[key]
-		if !ok || key == "" {
-			// Should not happen: every call is either cached or was scheduled.
-			return nil, nil, 0, &SearchConfigError{Reason: "internal: search result missing for tool_use"}
-		}
-		cp := cached
-		cp.ToolUseID = call.ToolUseID
-		results[i] = cp
+		sources = append(sources, callSources...)
+		invocations = append(invocations, WebSearchInvocation{
+			ToolUseID: call.ToolUseID,
+			Query:     key,
+			Sources:   callSources,
+		})
 	}
-	return results, sources, tavilyCredits, nil
+	return results, sources, tavilyCredits, invocations, nil
 }
 
 // runSearches executes the given work items concurrently, bounded by

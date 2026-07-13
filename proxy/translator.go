@@ -217,6 +217,15 @@ type ClaudeUsage struct {
 	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens,omitempty"`
 	CacheReadInputTokens     int                       `json:"cache_read_input_tokens,omitempty"`
 	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
+	// ServerToolUse reports server-side tool usage (e.g. web_search) the proxy ran
+	// on the client's behalf, so a client that displays search counts renders the
+	// real number instead of "Did 0 searches". Omitted when no server tool ran.
+	ServerToolUse *ClaudeServerToolUsage `json:"server_tool_use,omitempty"`
+}
+
+// ClaudeServerToolUsage mirrors Anthropic's usage.server_tool_use object.
+type ClaudeServerToolUsage struct {
+	WebSearchRequests int `json:"web_search_requests"`
 }
 
 // ==================== Claude -> Kiro 转换 ====================
@@ -969,7 +978,49 @@ func shortenToolName(name string) string {
 
 // ==================== Kiro -> Claude 转换 ====================
 
-func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string) *ClaudeResponse {
+// buildWebSearchNativeBlocks synthesizes the Anthropic-native content blocks for
+// the web searches the proxy ran on the client's behalf: one server_tool_use
+// block paired with one web_search_tool_result block per invocation, in issue
+// order. Clients like Claude Code read these to render "Web Search(query)" and
+// the result links, and count them via usage.server_tool_use.web_search_requests.
+//
+// The proxy cannot mint Anthropic's real encrypted_content (server-signed state
+// for citation replay); an empty placeholder is emitted. This is exactly why the
+// whole mechanism is a kill-switch (webSearch.emitNativeToolBlocks): a client
+// that hard-validates encrypted_content would reject the block and can turn it
+// off. On the return trip these blocks are ignored by extractClaudeAssistantContent
+// (its type switch has no default), so they never leak back to Kiro.
+func buildWebSearchNativeBlocks(searches []WebSearchInvocation) []ClaudeContentBlock {
+	blocks := make([]ClaudeContentBlock, 0, len(searches)*2)
+	for _, s := range searches {
+		blocks = append(blocks, ClaudeContentBlock{
+			Type:  "server_tool_use",
+			ID:    s.ToolUseID,
+			Name:  "web_search",
+			Input: map[string]interface{}{"query": s.Query},
+		})
+		// content is always a (possibly empty) array; the field is interface{} with
+		// omitempty, so a non-nil empty slice still serializes as [] rather than
+		// being dropped.
+		items := make([]map[string]interface{}, 0, len(s.Sources))
+		for _, src := range s.Sources {
+			items = append(items, map[string]interface{}{
+				"type":              "web_search_result",
+				"title":             src.Title,
+				"url":               src.URL,
+				"encrypted_content": "",
+			})
+		}
+		blocks = append(blocks, ClaudeContentBlock{
+			Type:      "web_search_tool_result",
+			ToolUseID: s.ToolUseID,
+			Content:   items,
+		})
+	}
+	return blocks
+}
+
+func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string, searches []WebSearchInvocation) *ClaudeResponse {
 	blocks := make([]ClaudeContentBlock, 0)
 
 	if thinkingContent != "" || includeEmptyThinkingBlock {
@@ -978,6 +1029,11 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 			Thinking: thinkingContent,
 		})
 	}
+
+	// Native web_search blocks precede the answer text: the searches ran before
+	// the model composed its answer. Empty when the caller passes no searches
+	// (feature off, or a non-web_search request).
+	blocks = append(blocks, buildWebSearchNativeBlocks(searches)...)
 
 	if content != "" {
 		blocks = append(blocks, ClaudeContentBlock{

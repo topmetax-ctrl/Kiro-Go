@@ -369,6 +369,14 @@ type WebSearchConfig struct {
 	// AppendSources controls whether a deterministic "Sources:" list is appended
 	// to the final answer. Defaults to true when unset (see GetWebSearchConfig).
 	AppendSources *bool `json:"appendSources,omitempty"`
+
+	// EmitNativeToolBlocks controls whether the proxy synthesizes Anthropic-native
+	// server_tool_use / web_search_tool_result content blocks (and the
+	// usage.server_tool_use.web_search_requests counter) so clients like Claude
+	// Code display the searches they ran instead of "Did 0 searches". Defaults to
+	// true when unset. A kill-switch: set false if a client rejects the synthetic
+	// shape.
+	EmitNativeToolBlocks *bool `json:"emitNativeToolBlocks,omitempty"`
 }
 
 // WebSearchRouting selects providers and enforces the free-first / no-paid-usage
@@ -1585,6 +1593,19 @@ func WebSearchAppendSources() bool {
 		return true
 	}
 	return *cfg.WebSearch.AppendSources
+}
+
+// WebSearchEmitNativeToolBlocks reports whether the proxy should synthesize
+// Anthropic-native server_tool_use / web_search_tool_result content blocks (and
+// the usage.server_tool_use.web_search_requests counter). Defaults to true when
+// unset, so clients display the searches the proxy ran.
+func WebSearchEmitNativeToolBlocks() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.WebSearch.EmitNativeToolBlocks == nil {
+		return true
+	}
+	return *cfg.WebSearch.EmitNativeToolBlocks
 }
 
 // TavilyAPIKeyResolved returns the effective Tavily API key, with the

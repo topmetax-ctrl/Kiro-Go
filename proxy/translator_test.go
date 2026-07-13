@@ -268,7 +268,7 @@ func TestClaudeToKiroDropsLeadingAssistantHistory(t *testing.T) {
 }
 
 func TestKiroToClaudeResponseCanEmitEmptyThinkingBlock(t *testing.T) {
-	resp := KiroToClaudeResponse("final answer", "", true, nil, 10, 20, "claude-sonnet-4.6")
+	resp := KiroToClaudeResponse("final answer", "", true, nil, 10, 20, "claude-sonnet-4.6", nil)
 
 	if len(resp.Content) != 2 {
 		t.Fatalf("expected empty thinking block plus text block, got %d blocks", len(resp.Content))
@@ -646,5 +646,96 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 0 {
 		t.Fatalf("tool image should not leak into a later user message, got %d on current", len(cur.Images))
+	}
+}
+
+// TestBuildWebSearchNativeBlocksPairsToolUseWithResult verifies the synthetic
+// blocks: one server_tool_use + one web_search_tool_result per invocation, in
+// issue order, keyed to the same tool_use ID, carrying the query and result
+// links. This is what a client reads to render "Web Search(query)" and count it.
+func TestBuildWebSearchNativeBlocksPairsToolUseWithResult(t *testing.T) {
+	searches := []WebSearchInvocation{
+		{
+			ToolUseID: "tool-1",
+			Query:     "latest go release",
+			Sources: []SearchSource{
+				{Title: "Go Downloads", URL: "https://go.dev/dl/"},
+				{Title: "Release Notes", URL: "https://go.dev/doc/devel/release"},
+			},
+		},
+		{ToolUseID: "tool-2", Query: "second query"},
+	}
+
+	blocks := buildWebSearchNativeBlocks(searches)
+	if len(blocks) != 4 {
+		t.Fatalf("expected 2 blocks per invocation (4 total), got %d", len(blocks))
+	}
+
+	stu := blocks[0]
+	if stu.Type != "server_tool_use" || stu.Name != "web_search" || stu.ID != "tool-1" {
+		t.Fatalf("first block wrong: %#v", stu)
+	}
+	input, ok := stu.Input.(map[string]interface{})
+	if !ok || input["query"] != "latest go release" {
+		t.Fatalf("server_tool_use query not carried: %#v", stu.Input)
+	}
+
+	res := blocks[1]
+	if res.Type != "web_search_tool_result" || res.ToolUseID != "tool-1" {
+		t.Fatalf("second block must be a result keyed to tool-1: %#v", res)
+	}
+	items, ok := res.Content.([]map[string]interface{})
+	if !ok || len(items) != 2 {
+		t.Fatalf("expected 2 result items, got %#v", res.Content)
+	}
+	if items[0]["type"] != "web_search_result" || items[0]["url"] != "https://go.dev/dl/" {
+		t.Fatalf("result item shape wrong: %#v", items[0])
+	}
+
+	// An invocation with no sources still emits a paired result block with an
+	// empty (but non-nil) content array.
+	res2 := blocks[3]
+	if res2.Type != "web_search_tool_result" || res2.ToolUseID != "tool-2" {
+		t.Fatalf("fourth block must be tool-2 result: %#v", res2)
+	}
+	items2, ok := res2.Content.([]map[string]interface{})
+	if !ok || items2 == nil || len(items2) != 0 {
+		t.Fatalf("expected non-nil empty items for source-less search, got %#v", res2.Content)
+	}
+}
+
+// TestSyntheticNativeBlocksStrippedFromAssistantHistory proves the return-trip
+// safety: when a client echoes an assistant turn containing the synthetic
+// server_tool_use / web_search_tool_result blocks back to the proxy, they are
+// dropped (the assistant-content type switch has no default), so nothing leaks
+// to Kiro. Only genuine text and client tool_use survive.
+func TestSyntheticNativeBlocksStrippedFromAssistantHistory(t *testing.T) {
+	content := []interface{}{
+		map[string]interface{}{"type": "text", "text": "here is my answer"},
+		map[string]interface{}{
+			"type":  "server_tool_use",
+			"id":    "srv-1",
+			"name":  "web_search",
+			"input": map[string]interface{}{"query": "q"},
+		},
+		map[string]interface{}{
+			"type":        "web_search_tool_result",
+			"tool_use_id": "srv-1",
+			"content":     []interface{}{map[string]interface{}{"type": "web_search_result", "url": "https://x"}},
+		},
+		map[string]interface{}{
+			"type":  "tool_use",
+			"id":    "client-1",
+			"name":  "real_client_tool",
+			"input": map[string]interface{}{},
+		},
+	}
+
+	text, toolUses := extractClaudeAssistantContent(content)
+	if text != "here is my answer" {
+		t.Fatalf("expected only genuine text, got %q", text)
+	}
+	if len(toolUses) != 1 || toolUses[0].Name != "real_client_tool" {
+		t.Fatalf("synthetic web_search blocks must be dropped, only the client tool_use kept: %#v", toolUses)
 	}
 }
