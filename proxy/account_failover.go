@@ -70,7 +70,7 @@ func (h *Handler) disableAccount(account *config.Account, banStatus, banReason s
 	h.pool.Reload()
 	// A disabled account leaves the routable pool; drop its cached models so the
 	// global aggregate stops advertising models only it offered.
-	h.dropAccountModels(account.ID)
+	h.modelCache.DropAccount(account.ID)
 }
 
 func (h *Handler) disableAccountOverage(account *config.Account) {

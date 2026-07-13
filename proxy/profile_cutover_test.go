@@ -10,10 +10,87 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
 )
+
+// TestPublishGatedAndSelectProfileShareSwitchLock is the regression guard for the
+// shared per-account lock that closes the profile-switch/model-cache race (commit
+// 2afe75d). It proves publishAccountModelsGated and SelectProfile serialize on the
+// SAME per-account lock instance: while SelectProfile holds the lock (blocked in
+// its candidate-model prefetch), a concurrent gated publish for the account cannot
+// make progress. Once the switch commits and releases the lock, the gated publish
+// runs but — having fetched against the OLD profile — is discarded, so the newer
+// profile wins. If the two paths ever stop sharing one lock, the gated publish
+// would run immediately and this test fails.
+func TestPublishGatedAndSelectProfileShareSwitchLock(t *testing.T) {
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	_ = config.AddAccount(config.Account{ID: "acct-1", Enabled: true, Region: "us-east-1", ApiRegion: "us-east-1", ProfileArn: "arn:old", AccessToken: "t", AuthMethod: "external_idp"})
+	p := accountpool.GetPool()
+	p.Reload()
+	p.SetModelList("acct-1", []string{"old-model"})
+	h := newTestHandler(p)
+	h.modelCache.SetAccountModelInfo("acct-1", []ModelInfo{{ModelId: "old-model"}})
+
+	withStubProfileLister(t, func(_ context.Context, _ *config.Account, region string) ([]DiscoveredProfile, error) {
+		if region == "eu-central-1" {
+			return []DiscoveredProfile{{ARN: "arn:new", Region: region}}, nil
+		}
+		return nil, fmt.Errorf("empty")
+	})
+
+	// The candidate-model prefetch blocks until released, so SelectProfile holds the
+	// per-account switch lock for a controlled window.
+	enteredFetch := make(chan struct{})
+	releaseFetch := make(chan struct{})
+	withStubModelListerCtx(t, func(_ context.Context, _ *config.Account) ([]ModelInfo, error) {
+		close(enteredFetch)
+		<-releaseFetch
+		return []ModelInfo{{ModelId: "new-model"}}, nil
+	})
+
+	selDone := make(chan error, 1)
+	go func() {
+		_, err := h.SelectProfile(context.Background(), "acct-1", "arn:new", "eu-central-1")
+		selDone <- err
+	}()
+	<-enteredFetch // SelectProfile now holds the per-account switch lock.
+
+	// A gated publish for the OLD profile launched now must block on the SAME lock.
+	published := make(chan bool, 1)
+	go func() {
+		published <- h.modelCache.PublishGated("acct-1", "arn:old", "us-east-1", []ModelInfo{{ModelId: "stale-old-model"}})
+	}()
+
+	select {
+	case <-published:
+		t.Fatal("publishAccountModelsGated ran while SelectProfile held the per-account lock — the two paths are not sharing one lock instance (race fix regressed)")
+	case <-time.After(200 * time.Millisecond):
+		// Still blocked: serialized on the shared lock, as required.
+	}
+
+	// Let SelectProfile commit the new profile and release the lock.
+	close(releaseFetch)
+	if err := <-selDone; err != nil {
+		t.Fatalf("SelectProfile: %v", err)
+	}
+
+	// The gated publish now proceeds but fetched against the OLD profile → discarded.
+	if got := <-published; got {
+		t.Fatal("stale gated publish (old ARN) must be discarded after the switch won")
+	}
+	acc := p.GetByID("acct-1")
+	if acc.ProfileArn != "arn:new" || acc.EffectiveApiRegion() != "eu-central-1" {
+		t.Fatalf("newer profile must win, got %q/%q", acc.ProfileArn, acc.EffectiveApiRegion())
+	}
+	if ml := p.GetModelList("acct-1"); len(ml) != 1 || ml[0] != "new-model" {
+		t.Fatalf("routing set must be the new profile's, got %v", ml)
+	}
+}
 
 // TestSelectProfileRebuildsAggregateDroppingStaleModels proves that after a
 // switch the global /v1/models aggregate loses models only the old profile
@@ -29,11 +106,9 @@ func TestSelectProfileRebuildsAggregateDroppingStaleModels(t *testing.T) {
 
 	h := newTestHandler(p)
 	// Seed the aggregate: acct-1 currently offers old-only-model; acct-2 offers shared-model.
-	h.setAccountModelInfo("acct-1", []ModelInfo{{ModelId: "old-only-model"}, {ModelId: "shared-model"}})
-	h.setAccountModelInfo("acct-2", []ModelInfo{{ModelId: "shared-model"}})
-	h.modelsCacheMu.Lock()
-	h.rebuildAggregateLocked()
-	h.modelsCacheMu.Unlock()
+	h.modelCache.SetAccountModelInfo("acct-1", []ModelInfo{{ModelId: "old-only-model"}, {ModelId: "shared-model"}})
+	h.modelCache.SetAccountModelInfo("acct-2", []ModelInfo{{ModelId: "shared-model"}})
+	h.modelCache.RebuildAggregate()
 
 	withStubProfileLister(t, func(_ context.Context, _ *config.Account, region string) ([]DiscoveredProfile, error) {
 		if region == "eu-central-1" {
@@ -50,12 +125,10 @@ func TestSelectProfileRebuildsAggregateDroppingStaleModels(t *testing.T) {
 		t.Fatalf("SelectProfile: %v", err)
 	}
 
-	h.modelsCacheMu.RLock()
 	agg := map[string]bool{}
-	for _, m := range h.cachedModels {
+	for _, m := range h.modelCache.Snapshot() {
 		agg[m.ModelId] = true
 	}
-	h.modelsCacheMu.RUnlock()
 
 	if agg["old-only-model"] {
 		t.Fatalf("old-only-model must drop from aggregate after switch, got %v", agg)
@@ -309,11 +382,11 @@ func TestPublishAccountModelsGatedDiscardsStaleRefresh(t *testing.T) {
 	// The account is already on the NEW profile with the new model list published.
 	p.SetModelList("acct-1", []string{"new-model"})
 	h := newTestHandler(p)
-	h.setAccountModelInfo("acct-1", []ModelInfo{{ModelId: "new-model"}})
+	h.modelCache.SetAccountModelInfo("acct-1", []ModelInfo{{ModelId: "new-model"}})
 
 	// A background refresh that started earlier, against the OLD profile, now tries
 	// to publish its stale result.
-	published := h.publishAccountModelsGated("acct-1", "arn:old", "us-east-1", []ModelInfo{{ModelId: "stale-old-model"}})
+	published := h.modelCache.PublishGated("acct-1", "arn:old", "us-east-1", []ModelInfo{{ModelId: "stale-old-model"}})
 	if published {
 		t.Fatal("stale refresh (old ARN) must be discarded, not published")
 	}
@@ -322,7 +395,7 @@ func TestPublishAccountModelsGatedDiscardsStaleRefresh(t *testing.T) {
 	}
 
 	// A refresh that matches the CURRENT profile does publish.
-	published = h.publishAccountModelsGated("acct-1", "arn:new", "eu-central-1", []ModelInfo{{ModelId: "new-model"}, {ModelId: "new-model-2"}})
+	published = h.modelCache.PublishGated("acct-1", "arn:new", "eu-central-1", []ModelInfo{{ModelId: "new-model"}, {ModelId: "new-model-2"}})
 	if !published {
 		t.Fatal("a refresh matching the current profile must publish")
 	}
@@ -344,22 +417,18 @@ func TestDropAccountModelsRemovesFromAggregate(t *testing.T) {
 	p := accountpool.GetPool()
 	p.Reload()
 	h := newTestHandler(p)
-	h.setAccountModelInfo("acct-1", []ModelInfo{{ModelId: "only-1"}, {ModelId: "shared"}})
-	h.setAccountModelInfo("acct-2", []ModelInfo{{ModelId: "shared"}})
+	h.modelCache.SetAccountModelInfo("acct-1", []ModelInfo{{ModelId: "only-1"}, {ModelId: "shared"}})
+	h.modelCache.SetAccountModelInfo("acct-2", []ModelInfo{{ModelId: "shared"}})
 	p.SetModelList("acct-1", []string{"only-1", "shared"})
 	p.SetModelList("acct-2", []string{"shared"})
-	h.modelsCacheMu.Lock()
-	h.rebuildAggregateLocked()
-	h.modelsCacheMu.Unlock()
+	h.modelCache.RebuildAggregate()
 
-	h.dropAccountModels("acct-1")
+	h.modelCache.DropAccount("acct-1")
 
-	h.modelsCacheMu.RLock()
 	agg := map[string]bool{}
-	for _, m := range h.cachedModels {
+	for _, m := range h.modelCache.Snapshot() {
 		agg[m.ModelId] = true
 	}
-	h.modelsCacheMu.RUnlock()
 	if agg["only-1"] {
 		t.Fatalf("dropped account's exclusive model must leave the aggregate, got %v", agg)
 	}
@@ -371,12 +440,8 @@ func TestDropAccountModelsRemovesFromAggregate(t *testing.T) {
 	}
 
 	// A rebuild after the drop must not resurrect the removed account's models.
-	h.modelsCacheMu.Lock()
-	h.rebuildAggregateLocked()
-	h.modelsCacheMu.Unlock()
-	h.modelsCacheMu.RLock()
-	defer h.modelsCacheMu.RUnlock()
-	for _, m := range h.cachedModels {
+	h.modelCache.RebuildAggregate()
+	for _, m := range h.modelCache.Snapshot() {
 		if m.ModelId == "only-1" {
 			t.Fatal("rebuild resurrected a dropped account's model")
 		}
@@ -394,21 +459,17 @@ func TestPruneStaleAccountModelsDropsDisabled(t *testing.T) {
 	p := accountpool.GetPool()
 	p.Reload()
 	h := newTestHandler(p)
-	h.setAccountModelInfo("live", []ModelInfo{{ModelId: "live-model"}})
-	h.setAccountModelInfo("gone", []ModelInfo{{ModelId: "gone-model"}})
+	h.modelCache.SetAccountModelInfo("live", []ModelInfo{{ModelId: "live-model"}})
+	h.modelCache.SetAccountModelInfo("gone", []ModelInfo{{ModelId: "gone-model"}})
 	p.SetModelList("gone", []string{"gone-model"})
-	h.modelsCacheMu.Lock()
-	h.rebuildAggregateLocked()
-	h.modelsCacheMu.Unlock()
+	h.modelCache.RebuildAggregate()
 
-	h.pruneStaleAccountModels(map[string]bool{"live": true})
+	h.modelCache.PruneStale(map[string]bool{"live": true})
 
-	h.modelsCacheMu.RLock()
 	agg := map[string]bool{}
-	for _, m := range h.cachedModels {
+	for _, m := range h.modelCache.Snapshot() {
 		agg[m.ModelId] = true
 	}
-	h.modelsCacheMu.RUnlock()
 	if agg["gone-model"] {
 		t.Fatalf("pruned account's model must be gone, got %v", agg)
 	}

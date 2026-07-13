@@ -286,7 +286,7 @@ func (h *Handler) SelectProfile(ctx context.Context, accountID, profileARN, regi
 	candidate := *acc
 	candidate.ProfileArn = profileARN
 	candidate.ApiRegion = region
-	models, err := modelLister(ctx, &candidate)
+	models, err := h.modelCache.ListModels(ctx, &candidate)
 	if err != nil {
 		return SelectProfileResult{}, fmt.Errorf("fetch models for new profile: %w", err)
 	}
@@ -313,20 +313,12 @@ func (h *Handler) SelectProfile(ctx context.Context, accountID, profileARN, regi
 	// old profile's model set (the cutover is atomic). Then rebuild the global
 	// aggregate in-memory so stale old-profile models drop out while other
 	// accounts' models stay — no network I/O under the cache lock.
-	modelIDs := make([]string, 0, len(models))
-	for _, m := range models {
-		modelIDs = append(modelIDs, m.ModelId)
-	}
-	h.pool.PublishProfileSwitch(accountID, modelIDs)
-	cp := make([]ModelInfo, len(models))
-	copy(cp, models)
-	h.modelsCacheMu.Lock()
-	if h.modelInfoByAccount == nil {
-		h.modelInfoByAccount = make(map[string][]ModelInfo)
-	}
-	h.modelInfoByAccount[accountID] = cp
-	h.rebuildAggregateLocked()
-	h.modelsCacheMu.Unlock()
+	//
+	// We ALREADY hold the per-account switch lock (acquired above and shared with
+	// ModelCache.PublishGated), so PublishSwitch takes only the cache mutex and must
+	// NOT re-acquire the switch lock — doing so would deadlock. This preserves the
+	// documented lock order switchLock → cache mu across both paths.
+	h.modelCache.PublishSwitch(accountID, models)
 
 	logger.Infof("[ProfileDiscovery] account %s pinned to profile %s in %s (%d models)",
 		accountID, shortARN(profileARN), region, len(models))
