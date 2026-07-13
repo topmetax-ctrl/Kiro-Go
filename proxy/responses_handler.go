@@ -157,21 +157,12 @@ func (h *Handler) handleResponsesNonStream(
 	estimatedInputTokens int, apiKeyID, ownerPrincipal, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
-	excluded := make(map[string]bool)
-	var lastErr error
+	// Non-stream: fully buffered, so the guard is never committed and a late
+	// upstream error can still retry (invariant #7). No committed-failure branch.
+	guard := &streamGuard{}
+	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
-		}
-
+	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
 		var content, reasoningContent string
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
@@ -196,10 +187,7 @@ func (h *Handler) handleResponsesNonStream(
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
+			return attemptAccountFailed(err)
 		}
 
 		finalContent, _ := extractThinkingFromContent(content)
@@ -230,15 +218,19 @@ func (h *Handler) handleResponsesNonStream(
 
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(respObj)
-		return
+		return attemptHandled()
 	}
 
-	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
-		return
+	onExhausted := func(noAccounts bool, lastErr error) {
+		if noAccounts {
+			h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+			return
+		}
+		h.recordFailure()
+		h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 	}
-	h.recordFailure()
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+
+	ex.Run(context.Background(), guard, attempt, nil, onExhausted)
 }
 
 func buildResponsesObject(
@@ -339,22 +331,10 @@ func (h *Handler) handleResponsesStream(
 		"response": initial,
 	})
 
-	excluded := make(map[string]bool)
-	var lastErr error
-	responseStarted := false
+	guard := &streamGuard{}
+	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
-		}
-
+	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
 		send("response.in_progress", map[string]interface{}{
 			"type":     "response.in_progress",
 			"response": initial,
@@ -421,7 +401,7 @@ func (h *Handler) handleResponsesStream(
 					"content_index": contentIndex,
 					"delta":         text,
 				})
-				responseStarted = true
+				guard.Commit()
 			},
 			OnToolUse: func(tu KiroToolUse) {
 				if messageStarted {
@@ -487,7 +467,7 @@ func (h *Handler) handleResponsesStream(
 					},
 				})
 				outputIndex++
-				responseStarted = true
+				guard.Commit()
 			},
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
@@ -496,27 +476,8 @@ func (h *Handler) handleResponsesStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
-		if err != nil {
-			if !responseStarted {
-				lastErr = err
-				excluded[account.ID] = true
-				h.handleAccountFailure(account, err)
-				continue
-			}
-			send("response.failed", map[string]interface{}{
-				"type": "response.failed",
-				"response": map[string]interface{}{
-					"id":     respID,
-					"status": "failed",
-					"error": map[string]string{
-						"type":    "server_error",
-						"message": err.Error(),
-					},
-				},
-			})
-			h.recordFailure()
-			return
+		if err := CallKiroAPI(account, payload, callback); err != nil {
+			return attemptAccountFailed(err)
 		}
 
 		finalContent, _ := extractThinkingFromContent(fullText.String())
@@ -580,10 +541,10 @@ func (h *Handler) handleResponsesStream(
 		})
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
-		return
+		return attemptHandled()
 	}
 
-	if lastErr == nil {
+	sendResponseFailed := func(message string) {
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
 			"response": map[string]interface{}{
@@ -591,22 +552,31 @@ func (h *Handler) handleResponsesStream(
 				"status": "failed",
 				"error": map[string]string{
 					"type":    "server_error",
-					"message": "No available accounts",
+					"message": message,
 				},
 			},
 		})
-		return
 	}
-	h.recordFailure()
-	send("response.failed", map[string]interface{}{
-		"type": "response.failed",
-		"response": map[string]interface{}{
-			"id":     respID,
-			"status": "failed",
-			"error": map[string]string{
-				"type":    "server_error",
-				"message": lastErr.Error(),
-			},
-		},
-	})
+
+	// Responses' mid-stream (post-commit) failure surface: emit response.failed +
+	// recordFailure. Unlike Claude/OpenAI, the pre-refactor loop did NOT call
+	// handleAccountFailure on the committed branch (only the uncommitted retry
+	// branch did), so onCommitted must not either.
+	onCommitted := func(_ *config.Account, err error) {
+		sendResponseFailed(err.Error())
+		h.recordFailure()
+	}
+
+	onExhausted := func(noAccounts bool, lastErr error) {
+		if noAccounts {
+			// No account was ever usable: emit response.failed with no recordFailure,
+			// matching the pre-refactor tail.
+			sendResponseFailed("No available accounts")
+			return
+		}
+		h.recordFailure()
+		sendResponseFailed(lastErr.Error())
+	}
+
+	ex.Run(context.Background(), guard, attempt, onCommitted, onExhausted)
 }

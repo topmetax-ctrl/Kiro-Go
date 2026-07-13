@@ -820,44 +820,35 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := estimatedInputTokens
-	excluded := make(map[string]bool)
-	var lastErr error
-	messageStarted := false
-	var messageStartUsage promptCacheUsage
+	// guard replaces the hand-maintained messageStarted flag: the executor's one
+	// Committed() check enforces "no retry after the first client-visible byte".
+	// message_start is Claude's first byte, so ensureMessageStart commits the guard.
+	guard := &streamGuard{}
+	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
-	ensureMessageStart := func() {
-		if messageStarted {
-			return
-		}
-		h.sendSSE(w, flusher, "message_start", map[string]interface{}{
-			"type": "message_start",
-			"message": map[string]interface{}{
-				"id":            msgID,
-				"type":          "message",
-				"role":          "assistant",
-				"content":       []interface{}{},
-				"model":         model,
-				"stop_reason":   nil,
-				"stop_sequence": nil,
-				"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
-			},
-		})
-		messageStarted = true
-	}
-
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
-		}
+	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
-		messageStartUsage = cacheUsage
+		messageStartUsage := cacheUsage
+
+		ensureMessageStart := func() {
+			if guard.Committed() {
+				return
+			}
+			h.sendSSE(w, flusher, "message_start", map[string]interface{}{
+				"type": "message_start",
+				"message": map[string]interface{}{
+					"id":            msgID,
+					"type":          "message",
+					"role":          "assistant",
+					"content":       []interface{}{},
+					"model":         model,
+					"stop_reason":   nil,
+					"stop_sequence": nil,
+					"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
+				},
+			})
+			guard.Commit()
+		}
 
 		var inputTokens, outputTokens int
 		var credits float64
@@ -1254,36 +1245,29 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			run, err := h.conversationRunner.Run(ctx, account, payload, policy)
 			if err != nil {
 				if classifyRunError(err) {
-					// Kiro/account error: retry from the original payload on another
-					// account, but only if we have not started streaming yet.
-					lastErr = err
-					excluded[account.ID] = true
-					h.handleAccountFailure(account, err)
-					if !messageStarted {
-						continue
-					}
-					h.recordFailure()
-					h.sendSSE(w, flusher, "error", map[string]interface{}{
-						"type":  "error",
-						"error": map[string]string{"type": "api_error", "message": err.Error()},
-					})
-					return
+					// Kiro/account error: identical to the CallKiroAPIContext failure
+					// path. Report it to the executor, which retries onto another
+					// account when nothing has been flushed yet, or routes to
+					// onCommitted (the "no retry after first byte" surface) once the
+					// stream has started.
+					return attemptAccountFailed(err)
 				}
-				// Search/config/mixed/cancel: do not fail the account.
+				// Search/config/mixed/cancel: NOT an account failure. Surface it here
+				// (terminal) so the account is neither blamed nor retried, then tell
+				// the executor the attempt is fully handled.
 				if ctx.Err() != nil {
-					return
+					return attemptHandled()
 				}
-				lastErr = err
-				if !messageStarted {
+				if !guard.Committed() {
 					h.sendClaudeErrorForWebSearch(w, err)
-					return
+					return attemptHandled()
 				}
 				h.recordFailure()
 				h.sendSSE(w, flusher, "error", map[string]interface{}{
 					"type":  "error",
 					"error": map[string]string{"type": "api_error", "message": err.Error()},
 				})
-				return
+				return attemptHandled()
 			}
 
 			// Emit the synthetic Anthropic-native web_search blocks first: the
@@ -1323,18 +1307,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		} else {
 			err := CallKiroAPIContext(ctx, account, payload, callback)
 			if err != nil {
-				lastErr = err
-				excluded[account.ID] = true
-				h.handleAccountFailure(account, err)
-				if !messageStarted {
-					continue
-				}
-				h.recordFailure()
-				h.sendSSE(w, flusher, "error", map[string]interface{}{
-					"type":  "error",
-					"error": map[string]string{"type": "api_error", "message": err.Error()},
-				})
-				return
+				return attemptAccountFailed(err)
 			}
 		}
 
@@ -1410,16 +1383,34 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
 			"type": "message_stop",
 		})
-		return
+		return attemptHandled()
 	}
 
-	if lastErr == nil {
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
-		return
+	// Claude's mid-stream (post-commit) failure surface: blame the account (the
+	// executor does not on the committed branch, matching the original loop which
+	// called handleAccountFailure on both the pre- and post-commit paths), record
+	// the request failure, and emit an `error` SSE event. This differs from OpenAI
+	// (silent) and Responses (response.failed) — the asymmetry is intentional and
+	// lives here in the per-protocol renderer.
+	onCommitted := func(account *config.Account, err error) {
+		h.handleAccountFailure(account, err)
+		h.recordFailure()
+		h.sendSSE(w, flusher, "error", map[string]interface{}{
+			"type":  "error",
+			"error": map[string]string{"type": "api_error", "message": err.Error()},
+		})
 	}
 
-	h.recordFailure()
-	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+	onExhausted := func(noAccounts bool, lastErr error) {
+		if noAccounts {
+			h.sendClaudeError(w, 503, "api_error", "No available accounts")
+			return
+		}
+		h.recordFailure()
+		h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+	}
+
+	ex.Run(ctx, guard, attempt, onCommitted, onExhausted)
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
@@ -1527,20 +1518,12 @@ func (h *Handler) recordFailure() {
 
 // handleClaudeNonStream Claude 非流式响应
 func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, useRunner bool, policy WebSearchPolicy) {
-	excluded := make(map[string]bool)
-	var lastErr error
+	// Non-stream: fully buffered, so the guard is never committed and a late
+	// upstream error can still retry (invariant #7). No committed-failure branch.
+	guard := &streamGuard{}
+	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
-		}
+	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 		var content string
@@ -1561,18 +1544,17 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 				if classifyRunError(err) {
 					// A Kiro/account error: fail the account and retry from the
 					// original payload on a different account.
-					lastErr = err
-					excluded[account.ID] = true
-					h.handleAccountFailure(account, err)
-					continue
+					return attemptAccountFailed(err)
 				}
-				// Search/config/mixed/cancel error: do not fail the account.
+				// Search/config/mixed/cancel error: do not fail the account. A
+				// cancelled context renders nothing (client is gone); otherwise map
+				// the error to a Claude-compatible response. Both are terminal — the
+				// executor must not retry or fall through to the exhaustion tail.
 				if ctx.Err() != nil {
-					return
+					return attemptHandled()
 				}
-				lastErr = err
 				h.sendClaudeErrorForWebSearch(w, err)
-				return
+				return attemptHandled()
 			}
 			fr := run.FinalRound
 			content = fr.VisibleContent
@@ -1614,10 +1596,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 
 			err := CallKiroAPIContext(ctx, account, payload, callback)
 			if err != nil {
-				lastErr = err
-				excluded[account.ID] = true
-				h.handleAccountFailure(account, err)
-				continue
+				return attemptAccountFailed(err)
 			}
 		}
 
@@ -1682,16 +1661,19 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
-		return
+		return attemptHandled()
 	}
 
-	if lastErr == nil {
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
-		return
+	onExhausted := func(noAccounts bool, lastErr error) {
+		if noAccounts {
+			h.sendClaudeError(w, 503, "api_error", "No available accounts")
+			return
+		}
+		h.recordFailure()
+		h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 	}
 
-	h.recordFailure()
-	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+	ex.Run(ctx, guard, attempt, nil, onExhausted)
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
@@ -1794,21 +1776,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 
 	chatID := "chatcmpl-" + uuid.New().String()
-	excluded := make(map[string]bool)
-	var lastErr error
+	guard := &streamGuard{}
+	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
-		}
-
+	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
 		var toolCalls []ToolCall
 		var toolCallIndex int
 		var inputTokens, outputTokens int
@@ -1822,7 +1793,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
-		responseStarted := false
 
 		sendChunk := func(content string, thinkingState int) {
 			if content == "" && thinkingState == 2 {
@@ -1919,7 +1889,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			data, _ := json.Marshal(chunk)
 			fmt.Fprintf(w, "data: %s\n\n", string(data))
 			flusher.Flush()
-			responseStarted = true
+			guard.Commit()
 		}
 
 		processText := func(text string, isThinking bool, forceFlush bool) {
@@ -2076,7 +2046,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				data, _ := json.Marshal(chunk)
 				fmt.Fprintf(w, "data: %s\n\n", string(data))
 				flusher.Flush()
-				responseStarted = true
+				guard.Commit()
 			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
@@ -2092,14 +2062,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			if !responseStarted {
-				continue
-			}
-			h.recordFailure()
-			return
+			return attemptAccountFailed(err)
 		}
 
 		processText("", false, true)
@@ -2155,35 +2118,41 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		fmt.Fprintf(w, "data: %s\n\n", string(data))
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
-		return
+		return attemptHandled()
 	}
 
-	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
-		return
+	// OpenAI's mid-stream (post-commit) failure surface is deliberately SILENT: no
+	// error object, no [DONE] — just handleAccountFailure + recordFailure + return.
+	// This asymmetry (Claude emits an error SSE, Responses emits response.failed) is
+	// intentional and is preserved by making it this protocol's committed-failure
+	// renderer. handleAccountFailure runs here because the executor does not blame
+	// the account on the committed branch (the original loop called it on both the
+	// pre- and post-commit paths).
+	onCommitted := func(account *config.Account, err error) {
+		h.handleAccountFailure(account, err)
+		h.recordFailure()
 	}
 
-	h.recordFailure()
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	onExhausted := func(noAccounts bool, lastErr error) {
+		if noAccounts {
+			h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+			return
+		}
+		h.recordFailure()
+		h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	}
+
+	ex.Run(context.Background(), guard, attempt, onCommitted, onExhausted)
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
 func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
-	excluded := make(map[string]bool)
-	var lastErr error
+	// Non-stream: fully buffered, so the guard is never committed and a late
+	// upstream error can still retry (invariant #7). No committed-failure branch.
+	guard := &streamGuard{}
+	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
-		}
-
+	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
 		var content string
 		var reasoningContent string
 		var toolUses []KiroToolUse
@@ -2209,10 +2178,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
+			return attemptAccountFailed(err)
 		}
 
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
@@ -2237,16 +2203,19 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
-		return
+		return attemptHandled()
 	}
 
-	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
-		return
+	onExhausted := func(noAccounts bool, lastErr error) {
+		if noAccounts {
+			h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+			return
+		}
+		h.recordFailure()
+		h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 	}
 
-	h.recordFailure()
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	ex.Run(context.Background(), guard, attempt, nil, onExhausted)
 }
 
 func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, message string) {
