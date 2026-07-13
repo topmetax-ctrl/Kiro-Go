@@ -82,7 +82,7 @@ func TestUsageIntegration_Current_ClaudeDirectStream_ContextOverridesInput(t *te
 	// Credits come from meteringEvent, faithfully.
 	assertCreditDelta(t, res, caseACred)
 	// Internal token sinks equal the (inflated) input + estimated output.
-	assertInternalTokensInflated(t, res)
+	assertInternalTokensAccurate(t, res)
 	assertOneUpstreamCall(t, res)
 }
 
@@ -148,7 +148,7 @@ func TestUsageIntegration_Current_ClaudeDirectNonStream_ContextOverridesInput(t 
 		t.Fatalf("client output unexpectedly equals upstream %d; expected estimator value", caseAOut)
 	}
 	assertCreditDelta(t, res, caseACred)
-	assertInternalTokensInflated(t, res)
+	assertInternalTokensAccurate(t, res)
 	assertOneUpstreamCall(t, res)
 }
 
@@ -181,14 +181,18 @@ func TestUsageIntegration_Current_ClaudeRunnerNonStream_ContextOverridesRunnerTo
 	res.RawBody = rec.Body.String()
 	res.parseClaudeJSON(t)
 
-	// The runner computed 1200, but the tail overwrote it with context-derived.
+	// CLIENT still sees the legacy context-derived number (unchanged by Phase A):
+	// the runner supplied ContextUsagePct, so legacy input is context occupancy.
 	if res.ClientInputTokens != caseAContextDerived {
-		t.Fatalf("runner-nonstream input: got %d, want %d (context override discards run total)",
+		t.Fatalf("runner-nonstream client input: got %d, want %d (legacy context-derived)",
 			res.ClientInputTokens, caseAContextDerived)
 	}
-	// Internal per-key tokens are the inflated input + estimated output.
-	if res.APIKeyTokensDelta < int64(caseAContextDerived) {
-		t.Fatalf("expected inflated per-key tokens >= %d, got %d", caseAContextDerived, res.APIKeyTokensDelta)
+	// INTERNAL accounting now records the accurate runner total (1200 in + 300 out),
+	// NOT the context occupancy that used to override run.TotalInputTokens. This is
+	// the special-case tail Phase A most needed to fix.
+	if res.APIKeyTokensDelta != int64(caseAAccountedTokens) {
+		t.Fatalf("runner-nonstream per-key tokens: got %d, want accurate %d (run total, not context)",
+			res.APIKeyTokensDelta, caseAAccountedTokens)
 	}
 	assertCreditDelta(t, res, caseACred)
 }
@@ -213,7 +217,7 @@ func TestUsageIntegration_Current_OpenAIStream_ContextOverridesInput(t *testing.
 		t.Fatalf("openai-stream input: got %d, want %d (context-derived)", got, caseAContextDerived)
 	}
 	assertCreditDelta(t, res, caseACred)
-	assertInternalTokensInflated(t, res)
+	assertInternalTokensAccurate(t, res)
 	assertOneUpstreamCall(t, res)
 }
 
@@ -236,7 +240,7 @@ func TestUsageIntegration_Current_OpenAINonStream_ContextOverridesInput(t *testi
 		t.Fatalf("openai-nonstream input: got %d, want %d", res.ClientInputTokens, caseAContextDerived)
 	}
 	assertCreditDelta(t, res, caseACred)
-	assertInternalTokensInflated(t, res)
+	assertInternalTokensAccurate(t, res)
 	assertOneUpstreamCall(t, res)
 }
 
@@ -260,7 +264,7 @@ func TestUsageIntegration_Current_ResponsesStream_ContextOverridesInput(t *testi
 		t.Fatalf("responses-stream input: got %d, want %d", got, caseAContextDerived)
 	}
 	assertCreditDelta(t, res, caseACred)
-	assertInternalTokensInflated(t, res)
+	assertInternalTokensAccurate(t, res)
 	assertOneUpstreamCall(t, res)
 }
 
@@ -283,7 +287,7 @@ func TestUsageIntegration_Current_ResponsesNonStream_ContextOverridesInput(t *te
 		t.Fatalf("responses-nonstream input: got %d, want %d", res.ClientInputTokens, caseAContextDerived)
 	}
 	assertCreditDelta(t, res, caseACred)
-	assertInternalTokensInflated(t, res)
+	assertInternalTokensAccurate(t, res)
 	assertOneUpstreamCall(t, res)
 }
 
@@ -387,6 +391,62 @@ func TestUsageIntegration_Current_OutputAlwaysEstimator(t *testing.T) {
 	}
 }
 
+// ---- accurate-mode tests ----------------------------------------------------
+//
+// With KIRO_USAGE_REPORTING=accurate the CLIENT sees the upstream-accurate input
+// (1200), not context occupancy (40000). Credits, upstream call count and the
+// internal sinks are identical to legacy mode — only the client number changes.
+
+func TestUsageIntegration_Accurate_ClaudeNonStream_ClientSeesUpstreamInput(t *testing.T) {
+	t.Setenv("KIRO_USAGE_REPORTING", "accurate")
+	env := newIntegrationEnv(t, "acct-acc-cn", "key-acc-cn", nil)
+	fb := newFakeKiroBackend(t, caseAFrames()...)
+	defer swapKiroEndpointsForTest(t, fb.server)()
+
+	body := `{"model":"` + bigModel + `","stream":false,"max_tokens":64,` +
+		`"messages":[{"role":"user","content":"hello"}]}`
+	res := env.serveHTTP(t, fb, http.MethodPost, "/v1/messages", body)
+	if res.HTTPStatus != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.HTTPStatus, res.RawBody)
+	}
+	res.parseClaudeJSON(t)
+
+	// Client now reports the upstream input (1200), NOT context-derived (40000).
+	if res.ClientInputTokens != caseAInTok {
+		t.Fatalf("accurate client input: got %d, want upstream %d", res.ClientInputTokens, caseAInTok)
+	}
+	// Output: upstream 300 now reaches the client too (was estimator in legacy).
+	if res.ClientOutputTokens != caseAOut {
+		t.Fatalf("accurate client output: got %d, want upstream %d", res.ClientOutputTokens, caseAOut)
+	}
+	// Everything else is unchanged: credits, internal sinks, one upstream call.
+	assertCreditDelta(t, res, caseACred)
+	assertInternalTokensAccurate(t, res)
+	assertOneUpstreamCall(t, res)
+}
+
+func TestUsageIntegration_Accurate_OpenAIStream_ClientSeesUpstreamInput(t *testing.T) {
+	t.Setenv("KIRO_USAGE_REPORTING", "accurate")
+	env := newIntegrationEnv(t, "acct-acc-os", "key-acc-os", nil)
+	fb := newFakeKiroBackend(t, caseAFrames()...)
+	defer swapKiroEndpointsForTest(t, fb.server)()
+
+	body := `{"model":"` + bigModel + `","stream":true,` +
+		`"messages":[{"role":"user","content":"hello"}]}`
+	res := env.serveHTTP(t, fb, http.MethodPost, "/v1/chat/completions", body)
+	if res.HTTPStatus != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.HTTPStatus, res.RawBody)
+	}
+	res.parseSSE(t)
+	got := openAIStreamUsageInput(t, res)
+	if got != caseAInTok {
+		t.Fatalf("accurate openai-stream input: got %d, want upstream %d", got, caseAInTok)
+	}
+	assertCreditDelta(t, res, caseACred)
+	assertInternalTokensAccurate(t, res)
+	assertOneUpstreamCall(t, res)
+}
+
 // ---- shared assertions ------------------------------------------------------
 
 func assertSSEFraming(t *testing.T, events []string) {
@@ -416,13 +476,21 @@ func assertCreditDelta(t *testing.T, res UsageIntegrationResult, want float64) {
 	}
 }
 
-// assertInternalTokensInflated checks that the per-key, per-account and global
-// token counters all advanced by the SAME inflated (input+output) sum — proving
-// the context-occupancy bug flows into every internal sink, not just the client.
-func assertInternalTokensInflated(t *testing.T, res UsageIntegrationResult) {
+// caseAAccountedTokens is the upstream-accurate (input+output) sum the internal
+// sinks record after Phase A: upstream input 1200 + upstream output 300 = 1500.
+// It is NOT the estimator (output is now the upstream 300, not the short-text
+// estimate) and NEVER context occupancy.
+const caseAAccountedTokens = caseAInTok + caseAOut
+
+// assertInternalTokensAccurate checks that the per-key, per-account and global
+// token counters all advanced by the SAME upstream-accurate (input+output) sum —
+// proving Phase A moved every internal sink off context occupancy and onto the
+// real upstream counts, in lockstep. This is the post-fix contract: the sinks are
+// accurate regardless of the client-facing reporting mode.
+func assertInternalTokensAccurate(t *testing.T, res UsageIntegrationResult) {
 	t.Helper()
-	if res.APIKeyTokensDelta < int64(caseAContextDerived) {
-		t.Fatalf("per-key tokens delta %d not inflated (>= %d expected)", res.APIKeyTokensDelta, caseAContextDerived)
+	if res.APIKeyTokensDelta != int64(caseAAccountedTokens) {
+		t.Fatalf("per-key tokens delta: got %d, want accurate %d", res.APIKeyTokensDelta, caseAAccountedTokens)
 	}
 	if res.AccountTokensDelta != res.APIKeyTokensDelta {
 		t.Fatalf("account tokens delta %d != per-key %d (should be same sum)", res.AccountTokensDelta, res.APIKeyTokensDelta)

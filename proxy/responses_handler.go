@@ -207,18 +207,25 @@ func (h *Handler) handleResponsesNonStream(
 			reasoningContent = ""
 		}
 
+		upstreamInput := inputTokens
+		var legacyInput int
 		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+			legacyInput = realInputTokens
+		} else if upstreamInput > 0 {
+			legacyInput = upstreamInput
+		} else {
+			legacyInput = estimatedInputTokens
 		}
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+		estimatedOutput := estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
+		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
+
+		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, clientInput, clientOutput, req)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 
@@ -552,18 +559,25 @@ func (h *Handler) handleResponsesStream(
 			})
 		}
 
+		upstreamInput := inputTokens
+		var legacyInput int
 		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+			legacyInput = realInputTokens
+		} else if upstreamInput > 0 {
+			legacyInput = upstreamInput
+		} else {
+			legacyInput = estimatedInputTokens
 		}
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
+		estimatedOutput := estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
+		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
+
+		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, clientInput, clientOutput, req)
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
