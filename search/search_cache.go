@@ -1,4 +1,4 @@
-package proxy
+package search
 
 import (
 	"container/list"
@@ -17,13 +17,13 @@ import (
 // window. The interface admits a Redis backend for multi-replica deployments
 // without touching the orchestrator.
 type SearchCache interface {
-	Get(key string) (SearchResponse, bool)
-	Put(key string, value SearchResponse, ttl time.Duration)
+	Get(key string) (Response, bool)
+	Put(key string, value Response, ttl time.Duration)
 }
 
 // SearchCacheKey builds the deterministic cache key from every parameter that
 // changes the result set. Two requests with the same key are interchangeable.
-func SearchCacheKey(req SearchRequest, routingMode string) string {
+func SearchCacheKey(req Request, routingMode string) string {
 	var b strings.Builder
 	b.WriteString(strings.ToLower(strings.TrimSpace(req.Query)))
 	b.WriteByte('|')
@@ -71,7 +71,7 @@ type lruSearchCache struct {
 
 type cacheEntry struct {
 	key       string
-	value     SearchResponse
+	value     Response
 	expiresAt time.Time
 }
 
@@ -86,23 +86,23 @@ func newLRUSearchCache(maxItems int) *lruSearchCache {
 	}
 }
 
-func (c *lruSearchCache) Get(key string) (SearchResponse, bool) {
+func (c *lruSearchCache) Get(key string) (Response, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.items[key]
 	if !ok {
-		return SearchResponse{}, false
+		return Response{}, false
 	}
 	ent := el.Value.(*cacheEntry)
 	if time.Now().After(ent.expiresAt) {
 		c.removeElement(el)
-		return SearchResponse{}, false
+		return Response{}, false
 	}
 	c.ll.MoveToFront(el)
 	return ent.value, true
 }
 
-func (c *lruSearchCache) Put(key string, value SearchResponse, ttl time.Duration) {
+func (c *lruSearchCache) Put(key string, value Response, ttl time.Duration) {
 	if ttl <= 0 {
 		return
 	}
@@ -134,5 +134,5 @@ func (c *lruSearchCache) removeElement(el *list.Element) {
 // noopSearchCache disables caching (used when config.cache.enabled is false).
 type noopSearchCache struct{}
 
-func (noopSearchCache) Get(string) (SearchResponse, bool)         { return SearchResponse{}, false }
-func (noopSearchCache) Put(string, SearchResponse, time.Duration) {}
+func (noopSearchCache) Get(string) (Response, bool)         { return Response{}, false }
+func (noopSearchCache) Put(string, Response, time.Duration) {}

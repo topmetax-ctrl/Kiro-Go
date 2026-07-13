@@ -1,4 +1,4 @@
-package proxy
+package search
 
 import (
 	"encoding/json"

@@ -1,12 +1,12 @@
-package proxy
+package search
 
 import (
 	"errors"
 	"testing"
 )
 
-// asProviderError is a test helper wrapping errors.As for *SearchProviderError.
-func asProviderError(err error, target **SearchProviderError) bool {
+// asProviderError is a test helper wrapping errors.As for *ProviderError.
+func asProviderError(err error, target **ProviderError) bool {
 	return errors.As(err, target)
 }
 
@@ -20,7 +20,7 @@ func TestQualityRejectsEmpty(t *testing.T) {
 
 func TestQualityRejectsBelowMinimum(t *testing.T) {
 	e := newHeuristicQualityEvaluator(3)
-	q := e.Evaluate("go release", []SearchResult{
+	q := e.Evaluate("go release", []Result{
 		{Title: "A", URL: "https://a.example", Content: "go release info"},
 		{Title: "B", URL: "https://b.example", Content: "more go"},
 	})
@@ -34,7 +34,7 @@ func TestQualityRejectsBelowMinimum(t *testing.T) {
 
 func TestQualityAcceptsGoodSet(t *testing.T) {
 	e := newHeuristicQualityEvaluator(2)
-	q := e.Evaluate("go release version", []SearchResult{
+	q := e.Evaluate("go release version", []Result{
 		{Title: "Go Downloads", URL: "https://go.dev/dl", Content: "go release version 1.26"},
 		{Title: "Go Blog", URL: "https://blog.example", Content: "go release notes"},
 		{Title: "Wiki", URL: "https://wiki.example", Content: "go version history"},
@@ -50,7 +50,7 @@ func TestQualityAcceptsGoodSet(t *testing.T) {
 func TestQualityRejectsSingleDomainDominance(t *testing.T) {
 	e := newHeuristicQualityEvaluator(2)
 	// 4 results all on one domain: dominated.
-	q := e.Evaluate("topic", []SearchResult{
+	q := e.Evaluate("topic", []Result{
 		{Title: "1", URL: "https://x.example/a", Content: "topic a"},
 		{Title: "2", URL: "https://x.example/b", Content: "topic b"},
 		{Title: "3", URL: "https://x.example/c", Content: "topic c"},
@@ -63,7 +63,7 @@ func TestQualityRejectsSingleDomainDominance(t *testing.T) {
 
 func TestQualityDropsInvalidURLs(t *testing.T) {
 	e := newHeuristicQualityEvaluator(1)
-	q := e.Evaluate("x", []SearchResult{
+	q := e.Evaluate("x", []Result{
 		{Title: "bad", URL: "ftp://nope", Content: "x"},
 		{Title: "", URL: "https://ok.example", Content: ""}, // no title/snippet → invalid
 		{Title: "good", URL: "https://good.example", Content: "x"},
@@ -75,12 +75,12 @@ func TestQualityDropsInvalidURLs(t *testing.T) {
 
 func TestQueryWantsFreshness(t *testing.T) {
 	for _, s := range []string{"latest go version", "what is TODAY's date", "current president", "newest iPhone"} {
-		if !queryWantsFreshness(s) {
+		if !QueryWantsFreshness(s) {
 			t.Errorf("%q should want freshness", s)
 		}
 	}
 	for _, s := range []string{"history of rome", "how does tcp work"} {
-		if queryWantsFreshness(s) {
+		if QueryWantsFreshness(s) {
 			t.Errorf("%q should not want freshness", s)
 		}
 	}

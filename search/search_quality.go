@@ -1,4 +1,4 @@
-package proxy
+package search
 
 import (
 	"net/url"
@@ -6,9 +6,9 @@ import (
 	"time"
 )
 
-// SearchQuality is the deterministic verdict on a provider's result set. The
+// Quality is the deterministic verdict on a provider's result set. The
 // router uses Acceptable to decide whether to fall back to another provider.
-type SearchQuality struct {
+type Quality struct {
 	// Acceptable is the go/no-go: enough distinct, usable, on-topic results.
 	Acceptable bool
 	// Score is a 0..1 heuristic used only for logging/ranking, never as a gate by
@@ -26,7 +26,7 @@ type SearchQuality struct {
 // deterministic and free (no LLM), so it is safe on the hot path and easy to
 // test.
 type SearchQualityEvaluator interface {
-	Evaluate(query string, results []SearchResult) SearchQuality
+	Evaluate(query string, results []Result) Quality
 }
 
 // heuristicQualityEvaluator is the default evaluator. minResults is the floor
@@ -52,8 +52,8 @@ func newHeuristicQualityEvaluator(minResults int) *heuristicQualityEvaluator {
 // and a non-empty title or snippet. The set is Acceptable when it has at least
 // minResults valid results, at least one distinct domain, and is not almost
 // entirely duplicates.
-func (e *heuristicQualityEvaluator) Evaluate(query string, results []SearchResult) SearchQuality {
-	q := SearchQuality{}
+func (e *heuristicQualityEvaluator) Evaluate(query string, results []Result) Quality {
+	q := Quality{}
 	if len(results) == 0 {
 		q.Reason = "no results"
 		return q
@@ -146,9 +146,11 @@ func lexicalOverlap(queryTerms map[string]bool, text string) int {
 	return n
 }
 
-// queryWantsFreshness reports whether a query implies it wants recent results,
-// so a caller can bias a time_range. Deterministic keyword match.
-func queryWantsFreshness(query string) bool {
+// QueryWantsFreshness reports whether a query implies it wants recent results,
+// so a caller can bias a time_range. Deterministic keyword match. Exported so
+// the tool-loop tier can apply the same freshness heuristic when building a
+// request.
+func QueryWantsFreshness(query string) bool {
 	q := strings.ToLower(query)
 	for _, kw := range []string{"latest", "today", "current", "newest", "recent", "this year", "right now"} {
 		if strings.Contains(q, kw) {

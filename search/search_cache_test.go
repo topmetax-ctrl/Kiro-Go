@@ -1,4 +1,4 @@
-package proxy
+package search
 
 import (
 	"testing"
@@ -6,7 +6,7 @@ import (
 )
 
 func TestSearchCacheKeyStableAndSensitive(t *testing.T) {
-	base := SearchRequest{
+	base := Request{
 		Query:      "Latest Go Version",
 		Language:   "en",
 		SafeSearch: 1,
@@ -44,7 +44,7 @@ func TestSearchCacheKeyStableAndSensitive(t *testing.T) {
 
 func TestLRUCachePutGetTTL(t *testing.T) {
 	c := newLRUSearchCache(10)
-	resp := SearchResponse{Provider: "searxng", Results: goodResults(2)}
+	resp := Response{Provider: "searxng", Results: goodResults(2)}
 	c.Put("k", resp, time.Minute)
 
 	got, ok := c.Get("k")
@@ -68,13 +68,13 @@ func TestLRUCachePutGetTTL(t *testing.T) {
 
 func TestLRUCacheEvictsOldest(t *testing.T) {
 	c := newLRUSearchCache(2)
-	c.Put("a", SearchResponse{Provider: "a"}, time.Minute)
-	c.Put("b", SearchResponse{Provider: "b"}, time.Minute)
+	c.Put("a", Response{Provider: "a"}, time.Minute)
+	c.Put("b", Response{Provider: "b"}, time.Minute)
 	// Touch "a" so "b" becomes the LRU victim.
 	if _, ok := c.Get("a"); !ok {
 		t.Fatalf("a should be present")
 	}
-	c.Put("c", SearchResponse{Provider: "c"}, time.Minute)
+	c.Put("c", Response{Provider: "c"}, time.Minute)
 	if _, ok := c.Get("b"); ok {
 		t.Fatalf("b should have been evicted as LRU")
 	}
@@ -88,7 +88,7 @@ func TestLRUCacheEvictsOldest(t *testing.T) {
 
 func TestNoopCacheNeverStores(t *testing.T) {
 	var c SearchCache = noopSearchCache{}
-	c.Put("k", SearchResponse{Provider: "x"}, time.Minute)
+	c.Put("k", Response{Provider: "x"}, time.Minute)
 	if _, ok := c.Get("k"); ok {
 		t.Fatalf("noop cache must never return a hit")
 	}

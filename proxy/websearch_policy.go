@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"kiro-go/config"
+	"kiro-go/search"
 )
 
 // WebSearchPolicy carries the effective, validated settings for one logical
@@ -100,7 +101,7 @@ func extractWebSearchPolicy(tools []ClaudeTool) (policy WebSearchPolicy, ok bool
 	allowed := normalizeDomains(found.AllowedDomains)
 	blocked := normalizeDomains(found.BlockedDomains)
 	if len(allowed) > 0 && len(blocked) > 0 {
-		return WebSearchPolicy{}, true, &SearchConfigError{
+		return WebSearchPolicy{}, true, &search.ConfigError{
 			Reason: "web_search tool specifies both allowed_domains and blocked_domains; only one is permitted",
 		}
 	}
@@ -112,7 +113,7 @@ func extractWebSearchPolicy(tools []ClaudeTool) (policy WebSearchPolicy, ok bool
 	if found.MaxUses != nil {
 		mu := *found.MaxUses
 		if mu < 0 {
-			return WebSearchPolicy{}, true, &SearchConfigError{
+			return WebSearchPolicy{}, true, &search.ConfigError{
 				Reason: "web_search max_uses must be >= 0",
 			}
 		}

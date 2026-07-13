@@ -1,4 +1,4 @@
-package proxy
+package search
 
 import (
 	"context"
@@ -13,7 +13,7 @@ import (
 // base URL is fixed at construction, exactly as production does from config).
 func newSearXNGTestProvider(t *testing.T, srv *httptest.Server) *SearXNGProvider {
 	t.Helper()
-	p, err := NewSearXNGProvider(srv.URL)
+	p, err := NewSearXNGProvider(srv.URL, nil)
 	if err != nil {
 		t.Fatalf("construct searxng provider: %v", err)
 	}
@@ -36,7 +36,7 @@ func TestSearXNGBuildsQueryParams(t *testing.T) {
 	defer srv.Close()
 
 	p := newSearXNGTestProvider(t, srv)
-	_, _ = p.Search(context.Background(), SearchRequest{
+	_, _ = p.Search(context.Background(), Request{
 		Query:      "go release",
 		Language:   "en",
 		SafeSearch: 2,
@@ -80,7 +80,7 @@ func TestSearXNGParsesResults(t *testing.T) {
 	defer srv.Close()
 
 	p := newSearXNGTestProvider(t, srv)
-	resp, err := p.Search(context.Background(), SearchRequest{Query: "go"})
+	resp, err := p.Search(context.Background(), Request{Query: "go"})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestSearXNGEmptyResults(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newSearXNGTestProvider(t, srv)
-	resp, err := p.Search(context.Background(), SearchRequest{Query: "nothing"})
+	resp, err := p.Search(context.Background(), Request{Query: "nothing"})
 	if err != nil {
 		t.Fatalf("empty results must not error: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestSearXNG403SignalsJSONDisabled(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newSearXNGTestProvider(t, srv)
-	_, err := p.Search(context.Background(), SearchRequest{Query: "x"})
+	_, err := p.Search(context.Background(), Request{Query: "x"})
 	if err == nil {
 		t.Fatal("expected error on 403")
 	}
@@ -141,9 +141,9 @@ func TestSearXNGMalformedJSON(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newSearXNGTestProvider(t, srv)
-	_, err := p.Search(context.Background(), SearchRequest{Query: "x"})
-	var provErr *SearchProviderError
-	if !asProviderError(err, &provErr) || provErr.Kind != SearchErrMalformed {
+	_, err := p.Search(context.Background(), Request{Query: "x"})
+	var provErr *ProviderError
+	if !asProviderError(err, &provErr) || provErr.Kind != ErrMalformed {
 		t.Fatalf("expected malformed error, got %v", err)
 	}
 }
@@ -154,9 +154,9 @@ func TestSearXNG5xxIsRetryableKind(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newSearXNGTestProvider(t, srv)
-	_, err := p.Search(context.Background(), SearchRequest{Query: "x"})
-	var provErr *SearchProviderError
-	if !asProviderError(err, &provErr) || provErr.Kind != SearchErrUpstream5xx {
+	_, err := p.Search(context.Background(), Request{Query: "x"})
+	var provErr *ProviderError
+	if !asProviderError(err, &provErr) || provErr.Kind != ErrUpstream5xx {
 		t.Fatalf("expected upstream_5xx, got %v", err)
 	}
 }
@@ -170,20 +170,20 @@ func TestSearXNGContextCancel(t *testing.T) {
 	p := newSearXNGTestProvider(t, srv)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	_, err := p.Search(ctx, SearchRequest{Query: "slow"})
+	_, err := p.Search(ctx, Request{Query: "slow"})
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
 }
 
 func TestSearXNGRejectsBadBaseURL(t *testing.T) {
-	if _, err := NewSearXNGProvider(""); err == nil {
+	if _, err := NewSearXNGProvider("", nil); err == nil {
 		t.Error("empty base URL must error")
 	}
-	if _, err := NewSearXNGProvider("ftp://searxng"); err == nil {
+	if _, err := NewSearXNGProvider("ftp://searxng", nil); err == nil {
 		t.Error("non-http(s) base URL must error")
 	}
-	if _, err := NewSearXNGProvider("not a url"); err == nil {
+	if _, err := NewSearXNGProvider("not a url", nil); err == nil {
 		t.Error("malformed base URL must error")
 	}
 }

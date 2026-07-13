@@ -10,6 +10,7 @@ import (
 
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
+	"kiro-go/search"
 )
 
 // fakeConversationRunner returns a scripted KiroRunResult, so the handler can be
@@ -115,7 +116,7 @@ func TestNonStreamRunnerFinalHasNoInternalToolUseAndSources(t *testing.T) {
 
 func TestNonStreamRunnerProviderErrorDoesNotFailAccount(t *testing.T) {
 	runner := &fakeConversationRunner{
-		err: &SearchProviderError{Kind: SearchErrAuth, StatusCode: 401, Err: errStub("unauthorized")},
+		err: &search.ProviderError{Kind: search.ErrAuth, StatusCode: 401, Err: errStub("unauthorized")},
 	}
 	h := newWebSearchTestHandler(t, runner)
 
@@ -257,7 +258,7 @@ func TestStreamRunnerFinalReplayNoInternalToolUse(t *testing.T) {
 
 func TestStreamRunnerErrorBeforeStreamStartsSendsError(t *testing.T) {
 	runner := &fakeConversationRunner{
-		err: &SearchProviderError{Kind: SearchErrAuth, StatusCode: 401, Err: errStub("unauthorized")},
+		err: &search.ProviderError{Kind: search.ErrAuth, StatusCode: 401, Err: errStub("unauthorized")},
 	}
 	h := newWebSearchTestHandler(t, runner)
 

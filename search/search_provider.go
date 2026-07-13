@@ -1,14 +1,14 @@
-package proxy
+package search
 
 import (
 	"context"
 	"time"
 )
 
-// SearchRequest is the provider-agnostic input for one web search. The
+// Request is the provider-agnostic input for one web search. The
 // orchestrator builds it from a web_search tool_use plus the request's
 // WebSearchPolicy and the resolved config.
-type SearchRequest struct {
+type Request struct {
 	Query          string
 	MaxResults     int
 	SearchDepth    string   // "basic" or "advanced" (Tavily); SearXNG ignores it
@@ -26,8 +26,8 @@ type SearchRequest struct {
 	TimeRange string
 }
 
-// SearchResult is one normalized hit. Providers map their native shape onto this.
-type SearchResult struct {
+// Result is one normalized hit. Providers map their native shape onto this.
+type Result struct {
 	Title         string
 	URL           string
 	Content       string
@@ -36,11 +36,11 @@ type SearchResult struct {
 	Engine        string // discovery engine/source that produced the hit (SearXNG)
 }
 
-// SearchResponse is the normalized provider output.
-type SearchResponse struct {
+// Response is the normalized provider output.
+type Response struct {
 	Query    string
 	Answer   string
-	Results  []SearchResult
+	Results  []Result
 	Provider string
 	// Credits is provider cost for this call (Tavily usage.credits); 0 for free
 	// providers like SearXNG. Tracked separately from Kiro credits.
@@ -70,14 +70,14 @@ type ProviderHealth struct {
 	LastError   string
 }
 
-// SearchProvider is a web-search discovery backend. SearXNG (free, primary) and
+// Provider is a web-search discovery backend. SearXNG (free, primary) and
 // Tavily (optional, paid-capped fallback) implement it. Implementations must:
 //   - honor ctx cancellation (NewRequestWithContext),
-//   - return a *SearchProviderError (typed kind) on failure, never a bare error,
+//   - return a *ProviderError (typed kind) on failure, never a bare error,
 //   - never log the API key or Authorization header.
-type SearchProvider interface {
+type Provider interface {
 	Name() string
-	Search(ctx context.Context, req SearchRequest) (SearchResponse, error)
+	Search(ctx context.Context, req Request) (Response, error)
 	// Health reports the provider's current eligibility. A provider with no
 	// health tracking returns ProviderHealthy.
 	Health() ProviderHealth

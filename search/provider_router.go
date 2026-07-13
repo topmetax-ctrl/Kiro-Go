@@ -1,24 +1,18 @@
-package proxy
+package search
 
 import (
 	"context"
 	"errors"
 	"time"
 
+	"kiro-go/config"
 	"kiro-go/logger"
-)
-
-// Canonical provider name tokens, mirrored from config for use in routing and
-// metrics without importing the config constants (they are unexported there).
-const (
-	providerSearXNG = "searxng"
-	providerTavily  = "tavily"
 )
 
 // providerEntry pairs a discovery provider with the paid-usage flag that governs
 // whether it may be used when routing.allowPaidUsage is false.
 type providerEntry struct {
-	provider SearchProvider
+	provider Provider
 	// paid marks a provider that can incur cost (Tavily). When the router is in
 	// free-only mode, a paid provider is used only after its budget gate allows it.
 	paid bool
@@ -44,7 +38,7 @@ type ProviderRouter struct {
 type routerOutcome struct {
 	Provider     string
 	FallbackUsed bool
-	Quality      SearchQuality
+	Quality      Quality
 }
 
 // newProviderRouter builds a router. entries are tried in order; the first is the
@@ -60,11 +54,11 @@ func newProviderRouter(entries []providerEntry, quality SearchQualityEvaluator, 
 // Route runs the free-first search. It returns the first acceptable response, or
 // the last provider's response/error if none is acceptable. Context cancellation
 // aborts immediately without trying further providers.
-func (r *ProviderRouter) Route(ctx context.Context, req SearchRequest) (SearchResponse, routerOutcome, error) {
+func (r *ProviderRouter) Route(ctx context.Context, req Request) (Response, routerOutcome, error) {
 	var (
 		lastErr    error
-		lastResp   SearchResponse
-		lastQual   SearchQuality
+		lastResp   Response
+		lastQual   Quality
 		lastName   string
 		anyTried   bool
 		firstIndex = -1
@@ -72,7 +66,7 @@ func (r *ProviderRouter) Route(ctx context.Context, req SearchRequest) (SearchRe
 
 	for i, e := range r.entries {
 		if err := ctx.Err(); err != nil {
-			return SearchResponse{}, routerOutcome{}, err
+			return Response{}, routerOutcome{}, err
 		}
 		if e.provider == nil {
 			continue
@@ -103,7 +97,7 @@ func (r *ProviderRouter) Route(ctx context.Context, req SearchRequest) (SearchRe
 		if err != nil {
 			// Context cancellation is terminal — do not try other providers.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return SearchResponse{}, routerOutcome{}, err
+				return Response{}, routerOutcome{}, err
 			}
 			lastErr = err
 			lastName = e.provider.Name()
@@ -120,13 +114,13 @@ func (r *ProviderRouter) Route(ctx context.Context, req SearchRequest) (SearchRe
 	}
 
 	if !anyTried {
-		return SearchResponse{}, routerOutcome{}, &SearchConfigError{Reason: "no usable search provider configured"}
+		return Response{}, routerOutcome{}, &ConfigError{Reason: "no usable search provider configured"}
 	}
 	// Nothing was acceptable. If the last thing we saw was an error, surface it.
 	// Otherwise return the last (sub-threshold) response so the model still gets
 	// whatever was found — an empty or thin result set is not itself a failure.
 	if lastErr != nil {
-		return SearchResponse{}, routerOutcome{Provider: lastName, FallbackUsed: true}, lastErr
+		return Response{}, routerOutcome{Provider: lastName, FallbackUsed: true}, lastErr
 	}
 	return lastResp, routerOutcome{Provider: lastName, FallbackUsed: firstIndex >= 0 && lastName != r.primaryName(), Quality: lastQual}, nil
 }
@@ -167,8 +161,8 @@ func (r *ProviderRouter) providerNames() []string {
 
 // recordTavilyCredits books Tavily spend against the monthly budget after a
 // successful paid call. Safe to call with 0 (no-op).
-func recordTavilyCredits(resp SearchResponse) {
-	if resp.Provider == providerTavily && resp.Credits > 0 {
+func recordTavilyCredits(resp Response) {
+	if resp.Provider == config.ProviderTavily && resp.Credits > 0 {
 		getTavilyBudget().record(resp.Credits)
 	}
 }

@@ -30,7 +30,7 @@ func TestWebSearchDefaultsResolveWhenUnset(t *testing.T) {
 	if ws.Routing.PrimaryProvider != DefaultWebSearchPrimaryProvider {
 		t.Fatalf("primary provider = %q, want %q", ws.Routing.PrimaryProvider, DefaultWebSearchPrimaryProvider)
 	}
-	if len(ws.Routing.FallbackProviders) != 1 || ws.Routing.FallbackProviders[0] != providerTavily {
+	if len(ws.Routing.FallbackProviders) != 1 || ws.Routing.FallbackProviders[0] != ProviderTavily {
 		t.Fatalf("fallback providers = %v, want [tavily]", ws.Routing.FallbackProviders)
 	}
 	if ws.Routing.AllowPaidUsage {

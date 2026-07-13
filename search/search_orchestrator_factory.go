@@ -1,6 +1,7 @@
-package proxy
+package search
 
 import (
+	"net/http"
 	"strings"
 	"time"
 
@@ -8,7 +9,7 @@ import (
 	"kiro-go/logger"
 )
 
-// newSearchOrchestratorFromConfig builds the production SearchOrchestrator from
+// NewOrchestratorFromConfig builds the production Orchestrator from
 // the resolved web-search config. It is free-first: SearXNG is wired as the
 // primary provider (no API key needed) and Tavily is appended only when it is
 // enabled AND a key is resolvable. Provider order follows routing.primaryProvider
@@ -18,15 +19,24 @@ import (
 // monthly-budget gate, so in free-only mode the router stops using it once the
 // budget is spent. It returns nil when no provider is usable, so the caller can
 // treat web-search as unconfigured rather than build a router that always fails.
-func newSearchOrchestratorFromConfig() SearchOrchestrator {
+//
+// httpClient is the seam through which the caller injects its HTTP client
+// (proxy-aware in production). It keeps this package free of any dependency on
+// the proxy transport layer; a nil httpClient falls back to http.DefaultClient.
+func NewOrchestratorFromConfig(httpClient func() *http.Client) Orchestrator {
 	ws := config.GetWebSearchConfig()
 
 	// Build the pool of usable providers keyed by name.
 	pool := map[string]providerEntry{}
 
+	restClient := httpClient
+	if restClient == nil {
+		restClient = func() *http.Client { return http.DefaultClient }
+	}
+
 	if config.SearXNGProviderEnabled() {
-		if p, err := NewSearXNGProvider(ws.SearXNG.BaseURL); err == nil {
-			pool[providerSearXNG] = providerEntry{provider: p, paid: false}
+		if p, err := NewSearXNGProvider(ws.SearXNG.BaseURL, restClient); err == nil {
+			pool[config.ProviderSearXNG] = providerEntry{provider: p, paid: false}
 		} else {
 			logger.Warnf("[WebSearch] searxng disabled: %v", err)
 		}
@@ -34,8 +44,8 @@ func newSearchOrchestratorFromConfig() SearchOrchestrator {
 
 	if config.TavilyProviderEnabled() {
 		budget := getTavilyBudget()
-		pool[providerTavily] = providerEntry{
-			provider:    NewTavilyProvider(""),
+		pool[config.ProviderTavily] = providerEntry{
+			provider:    NewTavilyProvider("", restClient),
 			paid:        true,
 			budgetAllow: budget.allow,
 		}

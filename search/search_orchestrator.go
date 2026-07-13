@@ -1,4 +1,4 @@
-package proxy
+package search
 
 import (
 	"context"
@@ -18,27 +18,27 @@ func queryHash(query string) string {
 	return hex.EncodeToString(sum[:])[:12]
 }
 
-// SearchOrchestrator is the single seam the web_search executor depends on. It
+// Orchestrator is the single seam the web_search executor depends on. It
 // owns the whole "run one search" pipeline: cache lookup, provider routing
 // (free-first), quality gating, reranking, and cache write. The executor never
 // talks to a provider directly.
-type SearchOrchestrator interface {
-	Search(ctx context.Context, req SearchRequest) (SearchResponse, SearchMetadata, error)
+type Orchestrator interface {
+	Search(ctx context.Context, req Request) (Response, Metadata, error)
 }
 
-// SearchMetadata reports what one orchestrated search did, for accounting and
+// Metadata reports what one orchestrated search did, for accounting and
 // observability. It carries no secrets and no raw result bodies.
-type SearchMetadata struct {
+type Metadata struct {
 	Provider      string
 	FallbackUsed  bool
 	CacheHit      bool
 	ResultCount   int
 	LatencyMs     int64
 	TavilyCredits int
-	Quality       SearchQuality
+	Quality       Quality
 }
 
-// searchOrchestrator is the production SearchOrchestrator.
+// searchOrchestrator is the production Orchestrator.
 type searchOrchestrator struct {
 	router   *ProviderRouter
 	cache    SearchCache
@@ -78,14 +78,14 @@ func newSearchOrchestrator(router *ProviderRouter, cache SearchCache, reranker S
 }
 
 // Search runs the pipeline for one query.
-func (o *searchOrchestrator) Search(ctx context.Context, req SearchRequest) (SearchResponse, SearchMetadata, error) {
+func (o *searchOrchestrator) Search(ctx context.Context, req Request) (Response, Metadata, error) {
 	started := time.Now()
 	key := SearchCacheKey(req, o.routingMode)
 
 	// Process cache: a hit skips the provider entirely (and any Tavily credit).
 	if o.cache != nil {
 		if cached, ok := o.cache.Get(key); ok {
-			meta := SearchMetadata{
+			meta := Metadata{
 				Provider:    cached.Provider,
 				CacheHit:    true,
 				ResultCount: len(cached.Results),
@@ -107,7 +107,7 @@ func (o *searchOrchestrator) Search(ctx context.Context, req SearchRequest) (Sea
 
 	resp, outcome, err := o.router.Route(callCtx, req)
 	if err != nil {
-		return SearchResponse{}, SearchMetadata{Provider: outcome.Provider, FallbackUsed: outcome.FallbackUsed, LatencyMs: time.Since(started).Milliseconds()}, err
+		return Response{}, Metadata{Provider: outcome.Provider, FallbackUsed: outcome.FallbackUsed, LatencyMs: time.Since(started).Milliseconds()}, err
 	}
 
 	// Book Tavily credits (if any) against the monthly budget.
@@ -116,7 +116,7 @@ func (o *searchOrchestrator) Search(ctx context.Context, req SearchRequest) (Sea
 	// Rerank deterministically and cap to the final result count.
 	resp.Results = o.reranker.Rerank(req.Query, resp.Results, o.maxFinalResults)
 
-	meta := SearchMetadata{
+	meta := Metadata{
 		Provider:      outcome.Provider,
 		FallbackUsed:  outcome.FallbackUsed,
 		ResultCount:   len(resp.Results),

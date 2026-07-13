@@ -13,6 +13,7 @@ import (
 	"kiro-go/logger"
 	"kiro-go/metrics"
 	"kiro-go/pool"
+	"kiro-go/search"
 	"net"
 	"net/http"
 	"strconv"
@@ -1694,8 +1695,8 @@ func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, me
 // client can act on; anything else falls back to a generic 502.
 func (h *Handler) sendClaudeErrorForWebSearch(w http.ResponseWriter, err error) {
 	h.recordFailure()
-	var cfgErr *SearchConfigError
-	var provErr *SearchProviderError
+	var cfgErr *search.ConfigError
+	var provErr *search.ProviderError
 	var mixed *MixedToolUseError
 	switch {
 	case errors.As(err, &mixed):
@@ -1705,7 +1706,7 @@ func (h *Handler) sendClaudeErrorForWebSearch(w http.ResponseWriter, err error) 
 	case errors.As(err, &provErr):
 		// Auth against the provider is a server misconfiguration from the client's
 		// perspective; rate/timeout/5xx are upstream unavailability.
-		if provErr.Kind == SearchErrAuth {
+		if provErr.Kind == search.ErrAuth {
 			h.sendClaudeError(w, 500, "api_error", "web_search provider authentication failed")
 		} else {
 			h.sendClaudeError(w, 502, "api_error", "web_search provider unavailable: "+string(provErr.Kind))
