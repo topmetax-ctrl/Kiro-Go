@@ -20,43 +20,61 @@ func withStubProfileLister(t *testing.T, fn func(ctx context.Context, acc *confi
 	t.Cleanup(func() { profileLister = old })
 }
 
-// withStubModelLister swaps modelLister for the duration of a test, so
-// SelectProfile's candidate-model prefetch does not hit the network. The stub
-// takes only the account (the context is rarely relevant to a test's assertion);
-// an internal adapter satisfies the context-aware seam.
+// testModelLister is the model-fetch seam used by handlers built with
+// newTestHandler. It is read at CALL time (not when the handler is constructed),
+// so the stub helpers below work whether they run before or after newTestHandler.
+var testModelLister modelListerFunc = func(context.Context, *config.Account) ([]ModelInfo, error) {
+	return nil, fmt.Errorf("testModelLister not configured; call withStubModelLister")
+}
+
+// withStubModelLister points the injected model-fetch seam at fn for the duration
+// of a test, so SelectProfile's candidate-model prefetch does not hit the network.
+// The stub takes only the account (the context is rarely relevant to a test's
+// assertion); an internal adapter satisfies the context-aware seam.
 func withStubModelLister(t *testing.T, fn func(acc *config.Account) ([]ModelInfo, error)) {
 	t.Helper()
-	old := modelLister
-	modelLister = func(_ context.Context, account *config.Account) ([]ModelInfo, error) {
+	old := testModelLister
+	testModelLister = func(_ context.Context, account *config.Account) ([]ModelInfo, error) {
 		return fn(account)
 	}
-	t.Cleanup(func() { modelLister = old })
+	t.Cleanup(func() { testModelLister = old })
 }
 
 // withStubModelListerCtx is like withStubModelLister but exposes the context, for
 // tests that assert cancellation is honored through the model prefetch.
 func withStubModelListerCtx(t *testing.T, fn func(ctx context.Context, acc *config.Account) ([]ModelInfo, error)) {
 	t.Helper()
-	old := modelLister
-	modelLister = fn
-	t.Cleanup(func() { modelLister = old })
+	old := testModelLister
+	testModelLister = fn
+	t.Cleanup(func() { testModelLister = old })
 }
 
 func discoveryTestAccount() *config.Account {
 	return &config.Account{ID: "acct-1", Enabled: true, Region: "us-east-1", AuthMethod: "external_idp"}
 }
 
-// newTestHandler builds a Handler with the model-cache maps initialized and a
-// no-op token manager, matching what NewHandler wires up in production.
+// newTestHandler builds a Handler with a ModelCache wired to the test model-fetch
+// seam and a no-op token manager, matching what NewHandler wires up in production.
+// The ModelCache borrows the Handler's per-account profile-switch lock, exactly as
+// production does, so the shared-lock race invariant is exercised under test too.
 func newTestHandler(p *accountpool.AccountPool) *Handler {
 	h := &Handler{
 		pool:               p,
-		modelInfoByAccount: make(map[string][]ModelInfo),
 		profileSwitchLocks: make(map[string]*sync.Mutex),
 	}
 	h.tokenManager = NewTokenManager(p, func(*config.Account) (string, string, int64, string, error) {
 		return "t", "r", 0, "", nil
 	}, func(string, string, string, int64) error { return nil })
+	h.modelCache = NewModelCache(
+		p,
+		func(ctx context.Context, acc *config.Account) ([]ModelInfo, error) {
+			return testModelLister(ctx, acc)
+		},
+		h.ensureValidToken,
+		h.handleAccountFailure,
+		h.lookupAccountForAdmin,
+		h.profileSwitchLock,
+	)
 	return h
 }
 

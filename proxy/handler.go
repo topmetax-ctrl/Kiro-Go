@@ -40,17 +40,12 @@ type Handler struct {
 	stopRefresh     chan struct{}
 	stopStatsSaver  chan struct{}
 	shutdownOnce    sync.Once
-	// 模型缓存
-	cachedModels    []ModelInfo
-	modelsCacheMu   sync.RWMutex
-	modelsCacheTime int64
-	// modelInfoByAccount keeps the last-known model metadata per account so the
-	// global aggregate can be rebuilt in-memory (no network) when one account's
-	// profile changes — dropping models no account offers anymore while keeping
-	// other accounts' models. Guarded by modelsCacheMu.
-	modelInfoByAccount map[string][]ModelInfo
-	promptCache        *promptCacheTracker
-	tokenManager       *TokenManager
+	// modelCache owns the model-routing cache concern (the /v1/models aggregate,
+	// per-account model metadata, and their locking). Extracted from this
+	// god-object; see proxy/model_cache.go.
+	modelCache   *ModelCache
+	promptCache  *promptCacheTracker
+	tokenManager *TokenManager
 	// profileSwitchLocks serializes profile switches per account so two concurrent
 	// switches of the SAME account cannot interleave persist/publish. Switches of
 	// DIFFERENT accounts still run in parallel (no global lock on the hot path).
@@ -247,10 +242,22 @@ func NewHandler() *Handler {
 		stopStatsSaver:     make(chan struct{}),
 		promptCache:        newPromptCacheTracker(defaultPromptCacheTTL),
 		conversationRunner: NewKiroConversationRunner(),
-		modelInfoByAccount: make(map[string][]ModelInfo),
 		profileSwitchLocks: make(map[string]*sync.Mutex),
 	}
 	h.tokenManager = NewTokenManager(h.pool, nil, nil)
+	// The model-routing cache borrows Handler's per-account profile-switch lock
+	// (h.profileSwitchLock) — the SAME lock SelectProfile takes — so a gated model
+	// refresh and a profile switch of one account serialize, closing the
+	// profile-switch/model-cache race (commit 2afe75d). The lock stays owned by
+	// Handler; ModelCache only borrows it via the injected accessor.
+	h.modelCache = NewModelCache(
+		h.pool,
+		nil, // production default: ListAvailableModelsContext
+		h.ensureValidToken,
+		h.handleAccountFailure,
+		h.lookupAccountForAdmin,
+		h.profileSwitchLock,
+	)
 	// 恢复转发指标聚合数据 (事件日志与时序为内存态，不持久化)
 	if err := metrics.Load(forwardMetricsPath()); err != nil {
 		logger.Warnf("[Metrics] failed to load forward stats: %v", err)
@@ -271,13 +278,13 @@ func (h *Handler) backgroundRefresh() {
 
 	// 启动时延迟 10 秒后执行一次
 	time.Sleep(10 * time.Second)
-	h.refreshModelsCache()
+	h.modelCache.RefreshAll()
 	h.refreshAllAccounts()
 
 	for {
 		select {
 		case <-ticker.C:
-			h.refreshModelsCache()
+			h.modelCache.RefreshAll()
 			h.refreshAllAccounts()
 		case <-h.stopRefresh:
 			return
@@ -574,14 +581,10 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 // handleModels 模型列表
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	// 尝试用缓存的真实模型列表
-	h.modelsCacheMu.RLock()
-	cached := h.cachedModels
-	h.modelsCacheMu.RUnlock()
+	cached := h.modelCache.Snapshot()
 	if len(cached) == 0 {
-		h.refreshModelsCache()
-		h.modelsCacheMu.RLock()
-		cached = h.cachedModels
-		h.modelsCacheMu.RUnlock()
+		h.modelCache.RefreshAll()
+		cached = h.modelCache.Snapshot()
 	}
 
 	thinkingSuffix := config.GetThinkingConfig().Suffix
@@ -604,284 +607,6 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		"data":   models,
 	})
 	return
-}
-
-func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []map[string]interface{} {
-	if len(cached) == 0 {
-		return nil
-	}
-
-	models := make([]map[string]interface{}, 0, len(cached)*2)
-	if len(cached) > 0 {
-		for _, m := range cached {
-			supportsImage := modelSupportsImage(m.InputTypes)
-			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
-			// 自动生成 thinking 变体
-			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
-		}
-	}
-	return models
-}
-
-func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
-	return []map[string]interface{}{
-		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.6", "anthropic", true),
-		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.7", "anthropic", true),
-		buildModelInfo("claude-opus-4.7"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4", "anthropic", true),
-		buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-haiku-4.5", "anthropic", true),
-		buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.5", "anthropic", true),
-		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
-	}
-}
-
-func modelSupportsImage(inputTypes []string) bool {
-	for _, t := range inputTypes {
-		lt := strings.ToLower(t)
-		if strings.Contains(lt, "image") || strings.Contains(lt, "vision") {
-			return true
-		}
-	}
-	return false
-}
-
-func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface{} {
-	modalities := []string{"text"}
-	if supportsImage {
-		modalities = append(modalities, "image")
-	}
-	modalitiesMap := map[string][]string{
-		"input":  modalities,
-		"output": []string{"text"},
-	}
-
-	return map[string]interface{}{
-		"id":               id,
-		"object":           "model",
-		"owned_by":         ownedBy,
-		"supports_image":   supportsImage,
-		"input_modalities": modalities,
-		"modalities":       modalitiesMap,
-		"capabilities": map[string]bool{
-			"vision":       supportsImage,
-			"image":        supportsImage,
-			"image_vision": supportsImage,
-		},
-		"info": map[string]interface{}{
-			"meta": map[string]interface{}{
-				"capabilities": map[string]bool{
-					"vision":       supportsImage,
-					"image_vision": supportsImage,
-				},
-			},
-		},
-	}
-}
-
-// refreshModelsCache 从 Kiro API 拉取模型列表并缓存
-func (h *Handler) refreshModelsCache() {
-	accounts := config.GetEnabledAccounts()
-	if len(accounts) == 0 {
-		return
-	}
-
-	ctx := context.Background()
-	enabled := make(map[string]bool, len(accounts))
-	for i := range accounts {
-		account := &accounts[i]
-		enabled[account.ID] = true
-		if err := h.ensureValidToken(account); err != nil {
-			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
-			h.handleAccountFailure(account, err)
-			continue
-		}
-
-		models, err := modelLister(ctx, account)
-		if err != nil {
-			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
-			h.handleAccountFailure(account, err)
-			continue
-		}
-		// Publish through the gated path: a profile switch that raced this sweep
-		// must win, so the fetch (done against the account's profile at read time)
-		// is only committed if that profile is still current.
-		h.publishAccountModelsGated(account.ID, account.ProfileArn, account.EffectiveApiRegion(), models)
-	}
-
-	// Backstop prune: drop per-account metadata (and pool routing sets) for
-	// accounts that are no longer enabled, so the global aggregate cannot keep
-	// serving a disabled/deleted account's models.
-	h.pruneStaleAccountModels(enabled)
-}
-
-// modelLister is the seam for fetching an account's available models; overridable
-// in tests. Production uses the real Kiro ListAvailableModels call (context-aware
-// so a cancelled admin op aborts the in-flight fetch).
-var modelLister = func(ctx context.Context, account *config.Account) ([]ModelInfo, error) {
-	return ListAvailableModelsContext(ctx, account)
-}
-
-// publishAccountModelsGated publishes a freshly-fetched model list to the pool
-// routing set and the per-account metadata cache, but ONLY if the account still
-// points at the profile the models were fetched for. It serializes against
-// profile switches via the per-account switch lock and re-checks the current
-// ARN/region under it, so a background or admin refresh that started before a
-// concurrent SelectProfile cannot clobber the newer profile's model list with a
-// stale result. Returns true when the models were published.
-//
-// Lock order is profileSwitchLock → modelsCacheMu, matching SelectProfile, so the
-// two paths cannot deadlock.
-func (h *Handler) publishAccountModelsGated(accountID, fetchedForARN, fetchedForRegion string, models []ModelInfo) bool {
-	lock := h.profileSwitchLock(accountID)
-	lock.Lock()
-	defer lock.Unlock()
-
-	cur := h.lookupAccountForAdmin(accountID)
-	if cur == nil {
-		return false // account deleted while the fetch was in flight
-	}
-	if strings.TrimSpace(cur.ProfileArn) != strings.TrimSpace(fetchedForARN) ||
-		cur.EffectiveApiRegion() != fetchedForRegion {
-		return false // profile switched under us — discard the stale fetch
-	}
-
-	modelIDs := make([]string, 0, len(models))
-	for _, m := range models {
-		modelIDs = append(modelIDs, m.ModelId)
-	}
-	h.pool.SetModelList(accountID, modelIDs)
-
-	cp := make([]ModelInfo, len(models))
-	copy(cp, models)
-	h.modelsCacheMu.Lock()
-	if h.modelInfoByAccount == nil {
-		h.modelInfoByAccount = make(map[string][]ModelInfo)
-	}
-	h.modelInfoByAccount[accountID] = cp
-	h.rebuildAggregateLocked()
-	h.modelsCacheMu.Unlock()
-	return true
-}
-
-// pruneStaleAccountModels drops per-account model metadata and pool routing sets
-// for accounts not present in keep (disabled, deleted, or otherwise gone), then
-// rebuilds the aggregate so /v1/models cannot resurrect a removed account's
-// models. keep is the set of account IDs that should retain their models.
-func (h *Handler) pruneStaleAccountModels(keep map[string]bool) {
-	h.modelsCacheMu.Lock()
-	var dropped []string
-	for id := range h.modelInfoByAccount {
-		if !keep[id] {
-			delete(h.modelInfoByAccount, id)
-			dropped = append(dropped, id)
-		}
-	}
-	h.rebuildAggregateLocked()
-	h.modelsCacheMu.Unlock()
-	for _, id := range dropped {
-		h.pool.DeleteModelList(id)
-	}
-}
-
-// dropAccountModels eagerly removes one account's model metadata and pool routing
-// set (called when an account is disabled or deleted) and rebuilds the aggregate
-// so its models leave /v1/models immediately, without waiting for the next full
-// refresh. Safe to call for an account that has no cached models.
-func (h *Handler) dropAccountModels(accountID string) {
-	h.modelsCacheMu.Lock()
-	_, had := h.modelInfoByAccount[accountID]
-	delete(h.modelInfoByAccount, accountID)
-	if had {
-		h.rebuildAggregateLocked()
-	}
-	h.modelsCacheMu.Unlock()
-	h.pool.DeleteModelList(accountID)
-}
-
-// setAccountModelInfo records the last-known model metadata for an account so the
-// global aggregate can later be rebuilt in memory. Guarded by modelsCacheMu.
-func (h *Handler) setAccountModelInfo(accountID string, models []ModelInfo) {
-	cp := make([]ModelInfo, len(models))
-	copy(cp, models)
-	h.modelsCacheMu.Lock()
-	if h.modelInfoByAccount == nil {
-		h.modelInfoByAccount = make(map[string][]ModelInfo)
-	}
-	h.modelInfoByAccount[accountID] = cp
-	h.modelsCacheMu.Unlock()
-}
-
-// rebuildAggregateLocked recomputes cachedModels from the per-account metadata,
-// so models that no remaining account offers drop out while every other account's
-// models are preserved. Caller must hold modelsCacheMu. It performs no network I/O.
-func (h *Handler) rebuildAggregateLocked() {
-	aggregated := make([]ModelInfo, 0)
-	for _, models := range h.modelInfoByAccount {
-		aggregated = mergeUniqueModels(aggregated, models)
-	}
-	h.cachedModels = aggregated
-	h.modelsCacheTime = time.Now().Unix()
-}
-
-// fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
-// 同时更新 pool 的路由缓存与全局聚合模型列表。The publish is gated on the
-// account still pointing at the profile the models were fetched for, so a manual
-// or background refresh cannot clobber a concurrent profile switch.
-func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
-	if err := h.ensureValidToken(account); err != nil {
-		return fmt.Errorf("token refresh failed: %w", err)
-	}
-	models, err := modelLister(context.Background(), account)
-	if err != nil {
-		return err
-	}
-	if h.publishAccountModelsGated(account.ID, account.ProfileArn, account.EffectiveApiRegion(), models) {
-		logger.Infof("[ModelsCache] Refreshed %d models for account %s", len(models), account.Email)
-	} else {
-		logger.Infof("[ModelsCache] Discarded stale model refresh for account %s (profile changed)", account.Email)
-	}
-	return nil
-}
-
-// apiRefreshAccountModels POST /admin/api/accounts/{id}/models/refresh
-// 立即为指定账号拉取并更新模型路由缓存。
-func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request, id string) {
-	accounts := config.GetAccounts()
-	var account *config.Account
-	for i := range accounts {
-		if accounts[i].ID == id {
-			account = &accounts[i]
-			break
-		}
-	}
-	if account == nil {
-		w.WriteHeader(404)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
-		return
-	}
-	// 从 pool 取运行时最新 token（与 refreshModelsCache 逻辑一致）
-	if latest := h.pool.GetByID(id); latest != nil {
-		account.AccessToken = latest.AccessToken
-		account.RefreshToken = latest.RefreshToken
-		account.ExpiresAt = latest.ExpiresAt
-		account.ProfileArn = latest.ProfileArn
-	}
-	if err := h.fetchAndCacheAccountModels(account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"count":   len(h.pool.GetModelList(id)),
-	})
 }
 
 // apiDiscoverAccountProfiles GET /admin/api/accounts/{id}/profiles
@@ -959,90 +684,6 @@ func (h *Handler) apiSelectAccountProfile(w http.ResponseWriter, r *http.Request
 		"modelCount":          result.ModelCount,
 		"warnings":            warnings,
 	})
-}
-
-// apiRefreshAllAccountsModels POST /admin/api/accounts/models/refresh
-// 直接复用 refreshModelsCache，为所有已启用账号刷新模型路由缓存。
-func (h *Handler) apiRefreshAllAccountsModels(w http.ResponseWriter, r *http.Request) {
-	h.refreshModelsCache()
-	h.modelsCacheMu.RLock()
-	cachedLen := len(h.cachedModels)
-	h.modelsCacheMu.RUnlock()
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":   true,
-		"refreshed": cachedLen,
-		"failed":    0,
-	})
-}
-
-func mergeUniqueModels(existing []ModelInfo, incoming []ModelInfo) []ModelInfo {
-	if len(incoming) == 0 {
-		return existing
-	}
-
-	indexByID := make(map[string]int, len(existing))
-	merged := make([]ModelInfo, len(existing))
-	copy(merged, existing)
-	for i, model := range merged {
-		indexByID[strings.ToLower(strings.TrimSpace(model.ModelId))] = i
-	}
-
-	for _, model := range incoming {
-		key := strings.ToLower(strings.TrimSpace(model.ModelId))
-		if key == "" {
-			continue
-		}
-		if idx, ok := indexByID[key]; ok {
-			merged[idx] = mergeModelInfo(merged[idx], model)
-			continue
-		}
-		indexByID[key] = len(merged)
-		merged = append(merged, model)
-	}
-
-	return merged
-}
-
-func mergeModelInfo(base ModelInfo, extra ModelInfo) ModelInfo {
-	if base.ModelName == "" {
-		base.ModelName = extra.ModelName
-	}
-	if base.Description == "" {
-		base.Description = extra.Description
-	}
-	if base.RateMultiplier == 0 {
-		base.RateMultiplier = extra.RateMultiplier
-	}
-	if base.TokenLimits == nil {
-		base.TokenLimits = extra.TokenLimits
-	}
-	base.InputTypes = mergeStringLists(base.InputTypes, extra.InputTypes)
-	return base
-}
-
-func mergeStringLists(base []string, extra []string) []string {
-	if len(extra) == 0 {
-		return base
-	}
-	seen := make(map[string]bool, len(base)+len(extra))
-	merged := make([]string, 0, len(base)+len(extra))
-	for _, item := range base {
-		key := strings.ToLower(strings.TrimSpace(item))
-		if key == "" || seen[key] {
-			continue
-		}
-		seen[key] = true
-		merged = append(merged, item)
-	}
-	for _, item := range extra {
-		key := strings.ToLower(strings.TrimSpace(item))
-		if key == "" || seen[key] {
-			continue
-		}
-		seen[key] = true
-		merged = append(merged, item)
-	}
-	return merged
 }
 
 // handleCountTokens Token 计数（Claude Code 会调用）
@@ -2674,10 +2315,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiBatchAccounts(w, r)
 	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
 	case path == "/accounts/models/refresh" && r.Method == "POST":
-		h.apiRefreshAllAccountsModels(w, r)
+		h.modelCache.apiRefreshAllAccountsModels(w, r)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/refresh")
-		h.apiRefreshAccountModels(w, r, id)
+		h.modelCache.apiRefreshAccountModels(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/refresh")
 		h.apiRefreshAccount(w, r, id)
@@ -2934,7 +2575,7 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	// 新账号若已启用且有 token（或是 API-key 账号），立即拉取并缓存模型列表
 	if account.Enabled && (account.AccessToken != "" || account.IsApiKeyCredential()) {
 		go func(acc config.Account) {
-			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+			if err := h.modelCache.FetchAndCache(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for new account %s: %v", acc.Email, err)
 			}
 		}(account)
@@ -2951,7 +2592,7 @@ func (h *Handler) apiDeleteAccount(w http.ResponseWriter, r *http.Request, id st
 	h.pool.Reload()
 	// Drop the deleted account's cached models so /v1/models stops advertising them
 	// immediately (and a later aggregate rebuild cannot resurrect them).
-	h.dropAccountModels(id)
+	h.modelCache.DropAccount(id)
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
@@ -3006,7 +2647,7 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	// 账号从禁用→启用时，自动拉取并缓存模型列表
 	if !oldEnabled && existing.Enabled && existing.AccessToken != "" {
 		go func(acc config.Account) {
-			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+			if err := h.modelCache.FetchAndCache(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, err)
 			}
 		}(*existing)
@@ -3149,7 +2790,7 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 		for _, acc := range toRefreshModels {
 			go func(a config.Account) {
 				a.Enabled = true
-				if err := h.fetchAndCacheAccountModels(&a); err != nil {
+				if err := h.modelCache.FetchAndCache(&a); err != nil {
 					logger.Warnf("[ModelsCache] Auto-refresh failed for batch-enabled account %s: %v", a.Email, err)
 				}
 			}(acc)
@@ -3491,7 +3132,7 @@ func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
 		if _, err := RefreshAccountInfo(&account); err != nil {
 			logger.Warnf("[apiPollKiroSso] Account info refresh failed for external_idp account %s: %v", account.Email, err)
 		}
-		h.fetchAndCacheAccountModels(&account)
+		h.modelCache.FetchAndCache(&account)
 	}()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -3655,7 +3296,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 
 		h.pool.Reload()
 		go func(acc config.Account) {
-			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+			if err := h.modelCache.FetchAndCache(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for new api_key account %s: %v", acc.Email, err)
 			}
 		}(account)
@@ -4884,7 +4525,7 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	models, err := modelLister(r.Context(), account)
+	models, err := h.modelCache.ListModels(r.Context(), account)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -4893,7 +4534,7 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 
 	// Publish through the gated path so a concurrent profile switch wins and the
 	// aggregate rebuild drops any stale models, instead of the old grow-only merge.
-	h.publishAccountModelsGated(id, account.ProfileArn, account.EffectiveApiRegion(), models)
+	h.modelCache.PublishGated(id, account.ProfileArn, account.EffectiveApiRegion(), models)
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
