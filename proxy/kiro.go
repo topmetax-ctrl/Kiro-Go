@@ -161,19 +161,31 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 	return t
 }
 
+// kiroTransportWrapper, when non-nil, wraps the RoundTripper of every Kiro HTTP
+// client built by InitKiroHttpClient. It is nil in normal builds (set only by
+// the kirotest build tag), so a shipped binary gets the real transport verbatim
+// and this adds zero behavior. It exists because InitKiroHttpClient is also
+// called at runtime (NewHandler → applyProxyConfig), which would otherwise
+// clobber any client a test had swapped in during init.
+var kiroTransportWrapper func(http.RoundTripper) http.RoundTripper
+
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
-	client := &http.Client{
-		Timeout:   5 * time.Minute,
-		Transport: buildKiroTransport(proxyURL),
+	var streamTransport http.RoundTripper = buildKiroTransport(proxyURL)
+	var restTransport http.RoundTripper = buildKiroTransport(proxyURL)
+	if kiroTransportWrapper != nil {
+		streamTransport = kiroTransportWrapper(streamTransport)
+		restTransport = kiroTransportWrapper(restTransport)
 	}
-	kiroHttpStore.Store(client)
 
-	restClient := &http.Client{
+	kiroHttpStore.Store(&http.Client{
+		Timeout:   5 * time.Minute,
+		Transport: streamTransport,
+	})
+	kiroRestHttpStore.Store(&http.Client{
 		Timeout:   30 * time.Second,
-		Transport: buildKiroTransport(proxyURL),
-	}
-	kiroRestHttpStore.Store(restClient)
+		Transport: restTransport,
+	})
 }
 
 // ==================== Request Structs ====================

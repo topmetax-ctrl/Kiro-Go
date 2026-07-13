@@ -447,6 +447,76 @@ func TestUsageIntegration_Accurate_OpenAIStream_ClientSeesUpstreamInput(t *testi
 	assertOneUpstreamCall(t, res)
 }
 
+// ---- token-limit effect (the one behavior Phase A actually changes) ---------
+//
+// Phase A does not reduce credit — it makes the INTERNAL per-key token counter
+// accurate. The one observable consequence is per-key token-limit enforcement
+// (auth.go: TokensUsed >= TokenLimit → HTTP 429). Before the fix each request
+// charged context occupancy (40000) against the key; after it charges the real
+// upstream sum (1500). This test pins that difference by choosing a limit that
+// sits BETWEEN the two: 3000.
+//
+//   - accurate accounting (1500/req): req1 → 1500, req2 → 3000, req3 → 429.
+//   - context-derived accounting (40000/req): req1 alone → 40000 ≥ 3000, so req2
+//     would already 429.
+//
+// Therefore req2 succeeding is the decisive evidence that the key is charged the
+// real 1500, not the inflated 40000. Credit is untouched throughout.
+func TestUsageIntegration_TokenLimitTripsOnAccurateNotInflated(t *testing.T) {
+	env := newIntegrationEnv(t, "acct-tl", "key-tl", nil)
+	// Limit strictly between the accurate per-req sum (1500) and the
+	// context-derived one (40000). Two accurate requests exactly reach it.
+	const tokenLimit = 3000
+	if err := config.UpdateApiKey(env.apiKeyID, config.ApiKeyEntry{Enabled: true, TokenLimit: tokenLimit}); err != nil {
+		t.Fatalf("set token limit: %v", err)
+	}
+
+	fb := newFakeKiroBackend(t, caseAFrames()...)
+	defer swapKiroEndpointsForTest(t, fb.server)()
+
+	body := `{"model":"` + bigModel + `","stream":false,"max_tokens":64,` +
+		`"messages":[{"role":"user","content":"hello"}]}`
+
+	// Request 1: succeeds, charges the accurate 1500 (not 40000).
+	res1 := env.serveHTTP(t, fb, http.MethodPost, "/v1/messages", body)
+	if res1.HTTPStatus != http.StatusOK {
+		t.Fatalf("req1 status=%d body=%s", res1.HTTPStatus, res1.RawBody)
+	}
+	if res1.APIKeyTokensDelta != int64(caseAAccountedTokens) {
+		t.Fatalf("req1 per-key tokens delta: got %d, want accurate %d", res1.APIKeyTokensDelta, caseAAccountedTokens)
+	}
+
+	// Request 2: MUST still succeed. Under the old inflated accounting the key
+	// would already be at 40000 ≥ 3000 and this would be a 429. Its success is the
+	// proof that accounting charges the real upstream tokens.
+	res2 := env.serveHTTP(t, fb, http.MethodPost, "/v1/messages", body)
+	if res2.HTTPStatus != http.StatusOK {
+		t.Fatalf("req2 status=%d (would be 429 under inflated accounting) body=%s", res2.HTTPStatus, res2.RawBody)
+	}
+
+	// After two accurate requests the key has used exactly the limit (3000).
+	if e := config.GetApiKeyEntry(env.apiKeyID); e == nil || e.TokensUsed != int64(2*caseAAccountedTokens) {
+		got := int64(-1)
+		if e != nil {
+			got = e.TokensUsed
+		}
+		t.Fatalf("after 2 requests TokensUsed=%d, want %d", got, 2*caseAAccountedTokens)
+	}
+
+	// Request 3: now at the limit → auth rejects with 429 before any upstream call.
+	// UpstreamCalls is the fake backend's CUMULATIVE call count, so a rejected
+	// request means it does not advance past req2's total (2).
+	res3 := env.serveHTTP(t, fb, http.MethodPost, "/v1/messages", body)
+	if res3.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("req3 status=%d, want 429 (token limit exceeded)", res3.HTTPStatus)
+	}
+	// The rejection is at the auth layer: no third upstream call was made.
+	if res3.UpstreamCalls != res2.UpstreamCalls {
+		t.Fatalf("req3 upstream calls=%d, want unchanged from req2=%d (rejected before dispatch)",
+			res3.UpstreamCalls, res2.UpstreamCalls)
+	}
+}
+
 // ---- shared assertions ------------------------------------------------------
 
 func assertSSEFraming(t *testing.T, events []string) {
