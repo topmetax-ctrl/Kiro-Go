@@ -1,0 +1,30 @@
+cpu: Intel(R) Core(TM) i5-8500B CPU @ 3.00GHz
+BenchmarkRoute-6                    	  252586	      4242 ns/op	    2848 B/op	      33 allocs/op
+BenchmarkRoute-6                    	  280528	      4357 ns/op	    2848 B/op	      33 allocs/op
+BenchmarkRoute-6                    	  281364	      4626 ns/op	    2848 B/op	      33 allocs/op
+BenchmarkPromptCacheUpdate/accounts=1/entries=4-6         	 3307238	       370.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=1/entries=4-6         	 3072026	       367.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=1/entries=4-6         	 3288698	       362.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=8/entries=16-6        	 3288252	       366.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=8/entries=16-6        	 3222564	       372.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=8/entries=16-6        	 3195254	       391.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=64/entries=16-6       	 2946183	       429.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=64/entries=16-6       	 2882341	       408.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheUpdate/accounts=64/entries=16-6       	 2976013	       403.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=1/entries=4-6        	 5461076	       220.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=1/entries=4-6        	 5437515	       220.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=1/entries=4-6        	 5324360	       249.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=8/entries=16-6       	 4925080	       248.1 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=8/entries=16-6       	 4717957	       247.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=8/entries=16-6       	 4930699	       248.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=64/entries=16-6      	 4811700	       250.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=64/entries=16-6      	 4834062	       253.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheCompute/accounts=64/entries=16-6      	 4740730	       259.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheComputeMiss-6                         	 4418992	       290.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheComputeMiss-6                         	 4456201	       286.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheComputeMiss-6                         	 4339494	       269.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheParallel-6                            	  693586	      1698 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheParallel-6                            	  655033	      1800 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromptCacheParallel-6                            	  672286	      1683 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	kiro-go/proxy	40.891s
