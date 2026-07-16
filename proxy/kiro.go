@@ -474,14 +474,19 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 		if resp.StatusCode == 429 {
 			resp.Body.Close()
 			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
+			lastErr = &KiroUpstreamError{Category: KiroErrQuota, StatusCode: 429, Endpoint: ep.Name}
 			continue
 		}
 
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			lastErr = &KiroUpstreamError{
+				Category:   categorizeUpstream(resp.StatusCode, string(errBody)),
+				StatusCode: resp.StatusCode,
+				Endpoint:   ep.Name,
+				Body:       string(errBody),
+			}
 			// Authentication errors and payment errors are not retried across endpoints.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 				return lastErr

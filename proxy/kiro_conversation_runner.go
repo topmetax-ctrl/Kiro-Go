@@ -3,10 +3,12 @@ package proxy
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 
 	"kiro-go/config"
 	"kiro-go/logger"
+	"kiro-go/search"
 )
 
 // ConversationRunner orchestrates one logical Claude request across as many Kiro
@@ -68,8 +70,10 @@ type kiroConversationRunner struct {
 // than silently passing an unresolved tool_use back to the client.
 func NewKiroConversationRunner() ConversationRunner {
 	return &kiroConversationRunner{
-		caller:   NewKiroRoundCaller(),
-		executor: newWebSearchExecutor(newSearchOrchestratorFromConfig()),
+		caller: NewKiroRoundCaller(),
+		executor: newWebSearchExecutor(search.NewOrchestratorFromConfig(
+			func() *http.Client { return GetRestClientForProxy(config.GetProxyURL()) },
+		)),
 	}
 }
 
@@ -276,7 +280,7 @@ func (r *kiroConversationRunner) executeAll(ctx context.Context, calls []KiroToo
 			cached, ok := cache[key]
 			if !ok || key == "" {
 				// Should not happen: every call is either cached or was scheduled.
-				return nil, nil, 0, nil, &SearchConfigError{Reason: "internal: search result missing for tool_use"}
+				return nil, nil, 0, nil, &search.ConfigError{Reason: "internal: search result missing for tool_use"}
 			}
 			cp := cached
 			cp.ToolUseID = call.ToolUseID
@@ -374,8 +378,8 @@ func classifyRunError(err error) (accountFailure bool) {
 	if err == nil {
 		return false
 	}
-	var cfgErr *SearchConfigError
-	var provErr *SearchProviderError
+	var cfgErr *search.ConfigError
+	var provErr *search.ProviderError
 	var mixed *MixedToolUseError
 	var loop *LoopLimitError
 	switch {

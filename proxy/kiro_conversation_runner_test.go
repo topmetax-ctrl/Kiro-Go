@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"kiro-go/config"
+	"kiro-go/search"
 )
 
 // ---- fakes -------------------------------------------------------------
@@ -44,7 +45,7 @@ func (f *fakeRoundCaller) CallRound(ctx context.Context, account *config.Account
 
 // fakeSearchProvider returns a canned response and counts calls per query.
 type fakeSearchProvider struct {
-	byQuery map[string]SearchResponse
+	byQuery map[string]search.Response
 	err     error
 	calls   int
 	queries []string
@@ -52,37 +53,39 @@ type fakeSearchProvider struct {
 
 func (p *fakeSearchProvider) Name() string { return "fake" }
 
-func (p *fakeSearchProvider) Health() ProviderHealth { return ProviderHealth{State: ProviderHealthy} }
+func (p *fakeSearchProvider) Health() search.ProviderHealth {
+	return search.ProviderHealth{State: search.ProviderHealthy}
+}
 
-func (p *fakeSearchProvider) Search(ctx context.Context, req SearchRequest) (SearchResponse, error) {
+func (p *fakeSearchProvider) Search(ctx context.Context, req search.Request) (search.Response, error) {
 	if err := ctx.Err(); err != nil {
-		return SearchResponse{}, err
+		return search.Response{}, err
 	}
 	p.calls++
 	p.queries = append(p.queries, req.Query)
 	if p.err != nil {
-		return SearchResponse{}, p.err
+		return search.Response{}, p.err
 	}
 	if resp, ok := p.byQuery[req.Query]; ok {
 		return resp, nil
 	}
-	return SearchResponse{Query: req.Query, Provider: "fake"}, nil
+	return search.Response{Query: req.Query, Provider: "fake"}, nil
 }
 
-// passthroughOrchestrator adapts a bare SearchProvider into a SearchOrchestrator
+// passthroughOrchestrator adapts a bare search.Provider into a search.Orchestrator
 // with no routing, quality gating, caching, or reranking. It lets the runner
 // tests keep asserting on the runner's own per-request dedup cache and provider
 // call counts without pulling the full orchestration pipeline into scope.
 type passthroughOrchestrator struct {
-	provider SearchProvider
+	provider search.Provider
 }
 
-func (o passthroughOrchestrator) Search(ctx context.Context, req SearchRequest) (SearchResponse, SearchMetadata, error) {
+func (o passthroughOrchestrator) Search(ctx context.Context, req search.Request) (search.Response, search.Metadata, error) {
 	resp, err := o.provider.Search(ctx, req)
 	if err != nil {
-		return SearchResponse{}, SearchMetadata{}, err
+		return search.Response{}, search.Metadata{}, err
 	}
-	return resp, SearchMetadata{Provider: o.provider.Name(), ResultCount: len(resp.Results), TavilyCredits: resp.Credits}, nil
+	return resp, search.Metadata{Provider: o.provider.Name(), ResultCount: len(resp.Results), TavilyCredits: resp.Credits}, nil
 }
 
 // helpers to build rounds
@@ -130,7 +133,7 @@ func testPolicy() WebSearchPolicy {
 	return WebSearchPolicy{Enabled: true, MaxSearches: 6, MaxRounds: 4, MaxResults: 5}
 }
 
-func newTestRunner(caller KiroRoundCaller, provider SearchProvider) *kiroConversationRunner {
+func newTestRunner(caller KiroRoundCaller, provider search.Provider) *kiroConversationRunner {
 	return newRunnerWithDeps(caller, newWebSearchExecutor(passthroughOrchestrator{provider: provider}))
 }
 
@@ -157,8 +160,8 @@ func TestRunnerNoSearchSingleRound(t *testing.T) {
 }
 
 func TestRunnerSingleSearchThenFinal(t *testing.T) {
-	provider := &fakeSearchProvider{byQuery: map[string]SearchResponse{
-		"latest go version": {Results: []SearchResult{{Title: "Go", URL: "https://go.dev/dl", Content: "Go 1.26"}}},
+	provider := &fakeSearchProvider{byQuery: map[string]search.Response{
+		"latest go version": {Results: []search.Result{{Title: "Go", URL: "https://go.dev/dl", Content: "Go 1.26"}}},
 	}}
 	caller := &fakeRoundCaller{scripted: []scriptedRound{
 		{result: searchRound("latest go version", "tool-1", 100, 10, 0.01)},
@@ -191,8 +194,8 @@ func TestRunnerSingleSearchThenFinal(t *testing.T) {
 }
 
 func TestRunnerSecondRoundReceivesStructuredToolResult(t *testing.T) {
-	provider := &fakeSearchProvider{byQuery: map[string]SearchResponse{
-		"q1": {Results: []SearchResult{{Title: "A", URL: "https://a.example", Content: "x"}}},
+	provider := &fakeSearchProvider{byQuery: map[string]search.Response{
+		"q1": {Results: []search.Result{{Title: "A", URL: "https://a.example", Content: "x"}}},
 	}}
 	caller := &fakeRoundCaller{scripted: []scriptedRound{
 		{result: searchRound("q1", "tool-1", 10, 5, 0)},
@@ -229,9 +232,9 @@ func TestRunnerSecondRoundReceivesStructuredToolResult(t *testing.T) {
 func TestRunnerTwoSearchCallsInOneRound(t *testing.T) {
 	tu1 := KiroToolUse{ToolUseID: "t1", Name: "web_search", Input: map[string]interface{}{"query": "alpha"}}
 	tu2 := KiroToolUse{ToolUseID: "t2", Name: "web_search", Input: map[string]interface{}{"query": "beta"}}
-	provider := &fakeSearchProvider{byQuery: map[string]SearchResponse{
-		"alpha": {Results: []SearchResult{{Title: "A", URL: "https://a.example"}}},
-		"beta":  {Results: []SearchResult{{Title: "B", URL: "https://b.example"}}},
+	provider := &fakeSearchProvider{byQuery: map[string]search.Response{
+		"alpha": {Results: []search.Result{{Title: "A", URL: "https://a.example"}}},
+		"beta":  {Results: []search.Result{{Title: "B", URL: "https://b.example"}}},
 	}}
 	caller := &fakeRoundCaller{scripted: []scriptedRound{
 		{result: KiroRoundResult{ToolUses: []KiroToolUse{tu1, tu2}}},
@@ -259,8 +262,8 @@ func TestRunnerTwoSearchCallsInOneRound(t *testing.T) {
 func TestRunnerDuplicateQueryUsesCache(t *testing.T) {
 	tu1 := KiroToolUse{ToolUseID: "t1", Name: "web_search", Input: map[string]interface{}{"query": "same"}}
 	tu2 := KiroToolUse{ToolUseID: "t2", Name: "web_search", Input: map[string]interface{}{"query": "same"}}
-	provider := &fakeSearchProvider{byQuery: map[string]SearchResponse{
-		"same": {Results: []SearchResult{{Title: "S", URL: "https://s.example"}}},
+	provider := &fakeSearchProvider{byQuery: map[string]search.Response{
+		"same": {Results: []search.Result{{Title: "S", URL: "https://s.example"}}},
 	}}
 	caller := &fakeRoundCaller{scripted: []scriptedRound{
 		{result: KiroRoundResult{ToolUses: []KiroToolUse{tu1, tu2}}},
@@ -282,8 +285,8 @@ func TestRunnerDuplicateQueryUsesCache(t *testing.T) {
 }
 
 func TestRunnerDoesNotMutateInputPayload(t *testing.T) {
-	provider := &fakeSearchProvider{byQuery: map[string]SearchResponse{
-		"latest go version": {Results: []SearchResult{{Title: "Go", URL: "https://go.dev"}}},
+	provider := &fakeSearchProvider{byQuery: map[string]search.Response{
+		"latest go version": {Results: []search.Result{{Title: "Go", URL: "https://go.dev"}}},
 	}}
 	caller := &fakeRoundCaller{scripted: []scriptedRound{
 		{result: searchRound("latest go version", "tool-1", 0, 0, 0)},
@@ -322,8 +325,8 @@ func TestRunnerCloasePreservesToolNameMap(t *testing.T) {
 }
 
 func TestRunnerMaxRoundsForcesFinalization(t *testing.T) {
-	provider := &fakeSearchProvider{byQuery: map[string]SearchResponse{
-		"q": {Results: []SearchResult{{Title: "Q", URL: "https://q.example"}}},
+	provider := &fakeSearchProvider{byQuery: map[string]search.Response{
+		"q": {Results: []search.Result{{Title: "Q", URL: "https://q.example"}}},
 	}}
 	// Model keeps searching every round; MaxRounds=2 must force a finalization
 	// round with web_search stripped.
@@ -355,8 +358,8 @@ func TestRunnerMaxRoundsForcesFinalization(t *testing.T) {
 }
 
 func TestRunnerMaxSearchesForcesFinalization(t *testing.T) {
-	provider := &fakeSearchProvider{byQuery: map[string]SearchResponse{
-		"q": {Results: []SearchResult{{Title: "Q", URL: "https://q.example"}}},
+	provider := &fakeSearchProvider{byQuery: map[string]search.Response{
+		"q": {Results: []search.Result{{Title: "Q", URL: "https://q.example"}}},
 	}}
 	caller := &fakeRoundCaller{scripted: []scriptedRound{
 		{result: searchRound("q", "t1", 0, 0, 0)},
@@ -380,7 +383,7 @@ func TestRunnerMaxSearchesForcesFinalization(t *testing.T) {
 }
 
 func TestRunnerProviderErrorIsNotAccountFailure(t *testing.T) {
-	provider := &fakeSearchProvider{err: &SearchProviderError{Kind: SearchErrAuth, StatusCode: 401, Err: errors.New("bad key")}}
+	provider := &fakeSearchProvider{err: &search.ProviderError{Kind: search.ErrAuth, StatusCode: 401, Err: errors.New("bad key")}}
 	caller := &fakeRoundCaller{scripted: []scriptedRound{
 		{result: searchRound("q", "t1", 0, 0, 0)},
 	}}
@@ -472,9 +475,11 @@ type concurrentProvider struct {
 	perQuery map[string]string
 }
 
-func (p *concurrentProvider) Name() string           { return "concurrent" }
-func (p *concurrentProvider) Health() ProviderHealth { return ProviderHealth{State: ProviderHealthy} }
-func (p *concurrentProvider) Search(ctx context.Context, req SearchRequest) (SearchResponse, error) {
+func (p *concurrentProvider) Name() string { return "concurrent" }
+func (p *concurrentProvider) Health() search.ProviderHealth {
+	return search.ProviderHealth{State: search.ProviderHealthy}
+}
+func (p *concurrentProvider) Search(ctx context.Context, req search.Request) (search.Response, error) {
 	p.mu.Lock()
 	p.inFlight++
 	if p.inFlight > p.peak {
@@ -488,7 +493,7 @@ func (p *concurrentProvider) Search(ctx context.Context, req SearchRequest) (Sea
 		p.mu.Lock()
 		p.inFlight--
 		p.mu.Unlock()
-		return SearchResponse{}, ctx.Err()
+		return search.Response{}, ctx.Err()
 	case <-time.After(30 * time.Millisecond):
 	}
 
@@ -497,7 +502,7 @@ func (p *concurrentProvider) Search(ctx context.Context, req SearchRequest) (Sea
 	p.mu.Unlock()
 
 	url := p.perQuery[req.Query]
-	return SearchResponse{Query: req.Query, Provider: "concurrent", Results: []SearchResult{
+	return search.Response{Query: req.Query, Provider: "concurrent", Results: []search.Result{
 		{Title: req.Query, URL: url, Content: "content for " + req.Query},
 	}}, nil
 }

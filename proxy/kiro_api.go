@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -197,8 +198,18 @@ func GetUserInfo(account *config.Account) (*UserInfoResponse, error) {
 	return &result, nil
 }
 
-// ListAvailableModels 获取可用模型列表
+// ListAvailableModels 获取可用模型列表. Uses a background context; prefer
+// ListAvailableModelsContext when a request/admin-op context is available so the
+// call is cancelled when the caller goes away.
 func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
+	return ListAvailableModelsContext(context.Background(), account)
+}
+
+// ListAvailableModelsContext is ListAvailableModels with caller cancellation:
+// when ctx is cancelled (e.g. the admin closed the request mid-profile-switch)
+// the in-flight HTTP call is aborted and no result is returned, so a cancelled
+// switch cannot persist a profile off the back of a late-arriving response.
+func ListAvailableModelsContext(ctx context.Context, account *config.Account) ([]ModelInfo, error) {
 	if err := ensureRestProfileArn(account); err != nil {
 		return nil, fmt.Errorf("resolve profileArn: %w", err)
 	}
@@ -207,7 +218,7 @@ func ListAvailableModels(account *config.Account) ([]ModelInfo, error) {
 	url = regionalizeURL(url, account)
 	url = withProfileArnQuery(url, account)
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}

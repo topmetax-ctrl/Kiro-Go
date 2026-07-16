@@ -1,23 +1,11 @@
 package proxy
 
 import (
-	"context"
 	"crypto/sha256"
 	"fmt"
 	"testing"
 	"time"
 )
-
-func BenchmarkRoute(b *testing.B) {
-	primary := &scriptedProvider{name: providerSearXNG, resp: SearchResponse{Results: goodResults(5)}, state: ProviderHealthy}
-	router := newProviderRouter([]providerEntry{{provider: primary}}, nil, false)
-	ctx := context.Background()
-	req := SearchRequest{Query: "golang concurrency", MaxResults: 5}
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_, _, _ = router.Route(ctx, req)
-	}
-}
 
 // benchProfile builds a profile with `breakpoints` cache breakpoints, each above
 // the default min-cacheable threshold, seeded so fingerprints are distinct per

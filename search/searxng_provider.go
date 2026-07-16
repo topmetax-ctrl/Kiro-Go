@@ -1,4 +1,4 @@
-package proxy
+package search
 
 import (
 	"context"
@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"kiro-go/config"
 	"kiro-go/logger"
 )
 
@@ -20,7 +19,7 @@ import (
 // against a misbehaving instance.
 const searxngMaxResponseBytes = 2 << 20
 
-// SearXNGProvider implements SearchProvider against a self-hosted SearXNG JSON
+// SearXNGProvider implements Provider against a self-hosted SearXNG JSON
 // search API. It is the free, primary discovery provider.
 //
 // The base URL is fixed at construction from server config and validated once;
@@ -57,19 +56,24 @@ type searxngResponse struct {
 
 // NewSearXNGProvider builds a provider bound to the configured base URL. It
 // returns an error if the base URL is missing or not an http(s) URL, so the
-// caller can decide whether SearXNG is eligible at wiring time.
-func NewSearXNGProvider(baseURL string) (*SearXNGProvider, error) {
+// caller can decide whether SearXNG is eligible at wiring time. httpClient is
+// the seam through which the proxy injects its rest client (proxy-aware); it
+// keeps this package free of any dependency on the proxy transport layer.
+func NewSearXNGProvider(baseURL string, httpClient func() *http.Client) (*SearXNGProvider, error) {
 	baseURL = strings.TrimSpace(baseURL)
 	if baseURL == "" {
-		return nil, &SearchConfigError{Reason: "searxng base URL not configured"}
+		return nil, &ConfigError{Reason: "searxng base URL not configured"}
 	}
 	u, err := url.Parse(baseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, &SearchConfigError{Reason: "searxng base URL must be an absolute http(s) URL"}
+		return nil, &ConfigError{Reason: "searxng base URL must be an absolute http(s) URL"}
+	}
+	if httpClient == nil {
+		httpClient = func() *http.Client { return http.DefaultClient }
 	}
 	return &SearXNGProvider{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  func() *http.Client { return GetRestClientForProxy(config.GetProxyURL()) },
+		client:  httpClient,
 		health:  newHealthTracker(3, 30*time.Second),
 	}, nil
 }
@@ -88,17 +92,17 @@ func (p *SearXNGProvider) Health() ProviderHealth {
 // retry contract for the JSON API (the limiter is off by default on a private
 // instance), so a single attempt is made; transient failures surface as typed
 // errors and the router decides fallback.
-func (p *SearXNGProvider) Search(ctx context.Context, req SearchRequest) (SearchResponse, error) {
+func (p *SearXNGProvider) Search(ctx context.Context, req Request) (Response, error) {
 	started := time.Now()
 	resp, err := p.doSearch(ctx, req)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return SearchResponse{}, err
+			return Response{}, err
 		}
 		if p.health != nil {
 			p.health.observeFailure(time.Since(started), err.Error())
 		}
-		return SearchResponse{}, err
+		return Response{}, err
 	}
 	if p.health != nil {
 		p.health.observeSuccess(time.Since(started))
@@ -106,7 +110,7 @@ func (p *SearXNGProvider) Search(ctx context.Context, req SearchRequest) (Search
 	return resp, nil
 }
 
-func (p *SearXNGProvider) doSearch(ctx context.Context, req SearchRequest) (SearchResponse, error) {
+func (p *SearXNGProvider) doSearch(ctx context.Context, req Request) (Response, error) {
 	q := url.Values{}
 	q.Set("q", req.Query)
 	q.Set("format", "json")
@@ -125,37 +129,37 @@ func (p *SearXNGProvider) doSearch(ctx context.Context, req SearchRequest) (Sear
 	endpoint := p.baseURL + "/search?" + q.Encode()
 	httpReq, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
-		return SearchResponse{}, &SearchProviderError{Kind: SearchErrInvalid, Err: err}
+		return Response{}, &ProviderError{Kind: ErrInvalid, Err: err}
 	}
 	httpReq.Header.Set("Accept", "application/json")
 
 	resp, err := p.client().Do(httpReq)
 	if err != nil {
 		if ctx.Err() != nil {
-			return SearchResponse{}, ctx.Err()
+			return Response{}, ctx.Err()
 		}
-		return SearchResponse{}, &SearchProviderError{Kind: SearchErrTimeout, Err: err}
+		return Response{}, &ProviderError{Kind: ErrTimeout, Err: err}
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, searxngMaxResponseBytes))
 
 	if resp.StatusCode != 200 {
-		return SearchResponse{}, classifySearXNGStatus(resp.StatusCode, respBody)
+		return Response{}, classifySearXNGStatus(resp.StatusCode, respBody)
 	}
 
 	var sr searxngResponse
 	if err := json.Unmarshal(respBody, &sr); err != nil {
-		return SearchResponse{}, &SearchProviderError{Kind: SearchErrMalformed, StatusCode: 200, Err: err}
+		return Response{}, &ProviderError{Kind: ErrMalformed, StatusCode: 200, Err: err}
 	}
 
-	out := SearchResponse{Query: req.Query, Provider: "searxng"}
+	out := Response{Query: req.Query, Provider: "searxng"}
 	for _, r := range sr.Results {
 		published := ""
 		if r.PublishedDate != nil {
 			published = strings.TrimSpace(*r.PublishedDate)
 		}
-		out.Results = append(out.Results, SearchResult{
+		out.Results = append(out.Results, Result{
 			Title:         strings.TrimSpace(r.Title),
 			URL:           strings.TrimSpace(r.URL),
 			Content:       strings.TrimSpace(r.Content),
@@ -180,22 +184,22 @@ func (p *SearXNGProvider) doSearch(ctx context.Context, req SearchRequest) (Sear
 // almost always means the JSON format is not enabled in settings.yml — call it
 // out explicitly so operators can fix the instance rather than chase a generic
 // error.
-func classifySearXNGStatus(status int, body []byte) *SearchProviderError {
+func classifySearXNGStatus(status int, body []byte) *ProviderError {
 	msg := strings.TrimSpace(string(body))
 	if len(msg) > 300 {
 		msg = msg[:300]
 	}
-	e := &SearchProviderError{StatusCode: status, Err: fmt.Errorf("searxng http %d: %s", status, msg)}
+	e := &ProviderError{StatusCode: status, Err: fmt.Errorf("searxng http %d: %s", status, msg)}
 	switch {
 	case status == 403:
-		e.Kind = SearchErrAuth
+		e.Kind = ErrAuth
 		e.Err = fmt.Errorf("searxng http 403 (is JSON format enabled in settings.yml search.formats?): %s", msg)
 	case status == 429:
-		e.Kind = SearchErrRateLimit
+		e.Kind = ErrRateLimit
 	case status >= 500:
-		e.Kind = SearchErrUpstream5xx
+		e.Kind = ErrUpstream5xx
 	default:
-		e.Kind = SearchErrInvalid
+		e.Kind = ErrInvalid
 	}
 	return e
 }

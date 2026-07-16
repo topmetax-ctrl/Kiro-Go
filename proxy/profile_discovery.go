@@ -280,38 +280,45 @@ func (h *Handler) SelectProfile(ctx context.Context, accountID, profileARN, regi
 
 	// Build a value-copy candidate snapshot pointing at the target profile and
 	// prefetch its model list BEFORE committing. If the new profile cannot serve
-	// models, we refuse the switch and leave the old profile untouched.
+	// models, we refuse the switch and leave the old profile untouched. The fetch
+	// is context-aware: if the caller (admin request) is cancelled mid-flight, the
+	// HTTP call aborts and we never persist off a late response.
 	candidate := *acc
 	candidate.ProfileArn = profileARN
 	candidate.ApiRegion = region
-	models, err := modelLister(&candidate)
+	models, err := h.modelCache.ListModels(ctx, &candidate)
 	if err != nil {
 		return SelectProfileResult{}, fmt.Errorf("fetch models for new profile: %w", err)
 	}
+	// A profile that serves zero models is not a usable switch target: persisting
+	// it would report a false "refreshed" success, and an empty routing set is
+	// read by the pool as "cache not ready → optimistically allow every model",
+	// silently mis-routing. Refuse and keep the old profile.
+	if len(models) == 0 {
+		return SelectProfileResult{}, fmt.Errorf("selected profile %s returned no available models", shortARN(profileARN))
+	}
+	// The caller may have gone away while the fetch was in flight; do not commit a
+	// switch nobody is waiting for.
+	if err := ctx.Err(); err != nil {
+		return SelectProfileResult{}, err
+	}
 
-	// Commit: persist ARN+region atomically, then publish the new snapshot.
+	// Commit: persist ARN+region atomically.
 	if err := config.UpdateAccountProfileArnWithRegion(accountID, profileARN, region); err != nil {
 		return SelectProfileResult{}, fmt.Errorf("persist profile selection: %w", err)
 	}
-	h.pool.Reload()
 
-	// Replace this account's routing model list with the candidate's models, then
-	// rebuild the global aggregate in-memory so stale old-profile models drop out
-	// while other accounts' models stay. No network I/O under the lock.
-	modelIDs := make([]string, 0, len(models))
-	for _, m := range models {
-		modelIDs = append(modelIDs, m.ModelId)
-	}
-	h.pool.SetModelList(accountID, modelIDs)
-	cp := make([]ModelInfo, len(models))
-	copy(cp, models)
-	h.modelsCacheMu.Lock()
-	if h.modelInfoByAccount == nil {
-		h.modelInfoByAccount = make(map[string][]ModelInfo)
-	}
-	h.modelInfoByAccount[accountID] = cp
-	h.rebuildAggregateLocked()
-	h.modelsCacheMu.Unlock()
+	// Publish the new account snapshot AND the new routing model list under a
+	// single pool lock, so no reader can observe the new profile paired with the
+	// old profile's model set (the cutover is atomic). Then rebuild the global
+	// aggregate in-memory so stale old-profile models drop out while other
+	// accounts' models stay — no network I/O under the cache lock.
+	//
+	// We ALREADY hold the per-account switch lock (acquired above and shared with
+	// ModelCache.PublishGated), so PublishSwitch takes only the cache mutex and must
+	// NOT re-acquire the switch lock — doing so would deadlock. This preserves the
+	// documented lock order switchLock → cache mu across both paths.
+	h.modelCache.PublishSwitch(accountID, models)
 
 	logger.Infof("[ProfileDiscovery] account %s pinned to profile %s in %s (%d models)",
 		accountID, shortARN(profileARN), region, len(models))

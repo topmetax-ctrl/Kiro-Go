@@ -1,4 +1,4 @@
-package proxy
+package search
 
 import (
 	"net/url"
@@ -10,7 +10,7 @@ import (
 // SearchReranker reorders and trims merged results. The default is a
 // deterministic heuristic (no paid LLM), so it is testable and free.
 type SearchReranker interface {
-	Rerank(query string, results []SearchResult, maxFinal int) []SearchResult
+	Rerank(query string, results []Result, maxFinal int) []Result
 }
 
 // heuristicReranker scores each result on topical overlap with the query, the
@@ -21,19 +21,19 @@ type heuristicReranker struct{}
 func newHeuristicReranker() *heuristicReranker { return &heuristicReranker{} }
 
 type rankedResult struct {
-	res   SearchResult
+	res   Result
 	score float64
 	idx   int // original index, for stable tie-breaking
 }
 
 // Rerank returns up to maxFinal results ordered by blended score. Ties keep
 // original order (stable). maxFinal <= 0 keeps all.
-func (r *heuristicReranker) Rerank(query string, results []SearchResult, maxFinal int) []SearchResult {
+func (r *heuristicReranker) Rerank(query string, results []Result, maxFinal int) []Result {
 	if len(results) == 0 {
 		return results
 	}
 	terms := tokenize(query)
-	wantFresh := queryWantsFreshness(query)
+	wantFresh := QueryWantsFreshness(query)
 	now := time.Now()
 
 	ranked := make([]rankedResult, 0, len(results))
@@ -89,18 +89,28 @@ func (r *heuristicReranker) Rerank(query string, results []SearchResult, maxFina
 	if maxFinal > 0 && len(ranked) > maxFinal {
 		ranked = ranked[:maxFinal]
 	}
-	out := make([]SearchResult, 0, len(ranked))
+	out := make([]Result, 0, len(ranked))
 	for _, rr := range ranked {
 		out = append(out, rr.res)
 	}
 	return out
 }
 
+// CanonicalURL builds a dedup key: scheme+host+path, lowercased host, trailing
+// slash trimmed, query/fragment dropped. Exported so the tool-loop tier (which
+// normalizes and dedups results before handing them to Kiro) shares the exact
+// canonicalization the core uses.
+func CanonicalURL(u *url.URL) string {
+	host := strings.ToLower(u.Host)
+	path := strings.TrimRight(u.Path, "/")
+	return u.Scheme + "://" + host + path
+}
+
 // mergeResults concatenates result sets from multiple providers and dedups by
 // canonical URL, keeping the first occurrence (primary provider wins ties).
-func mergeResults(sets ...[]SearchResult) []SearchResult {
+func mergeResults(sets ...[]Result) []Result {
 	seen := make(map[string]bool)
-	var out []SearchResult
+	var out []Result
 	for _, set := range sets {
 		for _, r := range set {
 			u := strings.TrimSpace(r.URL)
@@ -108,7 +118,7 @@ func mergeResults(sets ...[]SearchResult) []SearchResult {
 			if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 				continue
 			}
-			key := canonicalURL(parsed)
+			key := CanonicalURL(parsed)
 			if seen[key] {
 				continue
 			}

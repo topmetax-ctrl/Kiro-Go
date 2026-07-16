@@ -1,4 +1,4 @@
-package proxy
+package search
 
 import (
 	"bytes"
@@ -25,7 +25,7 @@ const defaultTavilyEndpoint = "https://api.tavily.com/search"
 // misbehaving or hostile upstream.
 const tavilyMaxResponseBytes = 1 << 20
 
-// TavilyProvider implements SearchProvider against the Tavily Search API.
+// TavilyProvider implements Provider against the Tavily Search API.
 type TavilyProvider struct {
 	endpoint string
 	apiKey   func() string // indirection so key rotation/env override is picked up per call
@@ -76,15 +76,21 @@ type tavilyAPIResponse struct {
 }
 
 // NewTavilyProvider builds a provider. endpoint may be "" to use the default.
-func NewTavilyProvider(endpoint string) *TavilyProvider {
+// httpClient is the seam through which the proxy injects its rest client
+// (proxy-aware); it keeps this package free of any dependency on the proxy
+// transport layer. A nil httpClient falls back to http.DefaultClient.
+func NewTavilyProvider(endpoint string, httpClient func() *http.Client) *TavilyProvider {
 	if strings.TrimSpace(endpoint) == "" {
 		endpoint = defaultTavilyEndpoint
+	}
+	if httpClient == nil {
+		httpClient = func() *http.Client { return http.DefaultClient }
 	}
 	ws := config.GetWebSearchConfig()
 	return &TavilyProvider{
 		endpoint:    endpoint,
 		apiKey:      config.TavilyAPIKeyResolved,
-		client:      func() *http.Client { return GetRestClientForProxy(config.GetProxyURL()) },
+		client:      httpClient,
 		retryMax:    ws.Tavily.RetryMax,
 		retryBaseMs: ws.Tavily.RetryBaseDelayMs,
 		health:      newHealthTracker(3, 30*time.Second),
@@ -102,10 +108,10 @@ func (p *TavilyProvider) Health() ProviderHealth {
 }
 
 // Search executes one Tavily query with bounded, context-cancelable retry.
-func (p *TavilyProvider) Search(ctx context.Context, req SearchRequest) (SearchResponse, error) {
+func (p *TavilyProvider) Search(ctx context.Context, req Request) (Response, error) {
 	apiKey := strings.TrimSpace(p.apiKey())
 	if apiKey == "" {
-		return SearchResponse{}, &SearchConfigError{Reason: "tavily api key not configured"}
+		return Response{}, &ConfigError{Reason: "tavily api key not configured"}
 	}
 
 	attempts := p.retryMax + 1
@@ -116,7 +122,7 @@ func (p *TavilyProvider) Search(ctx context.Context, req SearchRequest) (SearchR
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return SearchResponse{}, err
+			return Response{}, err
 		}
 		resp, err := p.doSearch(ctx, apiKey, req)
 		if err == nil {
@@ -124,10 +130,10 @@ func (p *TavilyProvider) Search(ctx context.Context, req SearchRequest) (SearchR
 			return resp, nil
 		}
 		lastErr = err
-		var provErr *SearchProviderError
+		var provErr *ProviderError
 		if !errors.As(err, &provErr) || !provErr.Kind.retryable() {
 			p.observe(err, time.Since(started))
-			return SearchResponse{}, err
+			return Response{}, err
 		}
 		// Retryable: back off (honoring Retry-After) unless this was the last attempt.
 		if attempt == attempts-1 {
@@ -136,12 +142,12 @@ func (p *TavilyProvider) Search(ctx context.Context, req SearchRequest) (SearchR
 		delay := p.backoff(attempt, provErr)
 		select {
 		case <-ctx.Done():
-			return SearchResponse{}, ctx.Err()
+			return Response{}, ctx.Err()
 		case <-time.After(delay):
 		}
 	}
 	p.observe(lastErr, time.Since(started))
-	return SearchResponse{}, lastErr
+	return Response{}, lastErr
 }
 
 // observe feeds the health tracker. Context cancellation is not a provider fault,
@@ -161,7 +167,7 @@ func (p *TavilyProvider) observe(err error, latency time.Duration) {
 }
 
 // doSearch performs a single HTTP attempt and classifies the outcome.
-func (p *TavilyProvider) doSearch(ctx context.Context, apiKey string, req SearchRequest) (SearchResponse, error) {
+func (p *TavilyProvider) doSearch(ctx context.Context, apiKey string, req Request) (Response, error) {
 	depth := req.SearchDepth
 	if depth == "" {
 		depth = "basic"
@@ -179,7 +185,7 @@ func (p *TavilyProvider) doSearch(ctx context.Context, apiKey string, req Search
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return SearchResponse{}, &SearchProviderError{Kind: SearchErrInvalid, Err: err}
+		return Response{}, &ProviderError{Kind: ErrInvalid, Err: err}
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
@@ -190,29 +196,29 @@ func (p *TavilyProvider) doSearch(ctx context.Context, apiKey string, req Search
 		// Context cancellation surfaces as-is (caller distinguishes it); other
 		// transport errors are treated as transient timeouts.
 		if ctx.Err() != nil {
-			return SearchResponse{}, ctx.Err()
+			return Response{}, ctx.Err()
 		}
-		return SearchResponse{}, &SearchProviderError{Kind: SearchErrTimeout, Err: err}
+		return Response{}, &ProviderError{Kind: ErrTimeout, Err: err}
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, tavilyMaxResponseBytes))
 
 	if resp.StatusCode != 200 {
-		return SearchResponse{}, classifyTavilyStatus(resp, respBody)
+		return Response{}, classifyTavilyStatus(resp, respBody)
 	}
 
 	var tr tavilyAPIResponse
 	if err := json.Unmarshal(respBody, &tr); err != nil {
-		return SearchResponse{}, &SearchProviderError{Kind: SearchErrMalformed, StatusCode: 200, Err: err}
+		return Response{}, &ProviderError{Kind: ErrMalformed, StatusCode: 200, Err: err}
 	}
 
-	out := SearchResponse{Query: req.Query, Answer: tr.Answer, Provider: "tavily"}
+	out := Response{Query: req.Query, Answer: tr.Answer, Provider: "tavily"}
 	if tr.Usage != nil && tr.Usage.Credits > 0 {
 		out.Credits = tr.Usage.Credits
 	}
 	for _, r := range tr.Results {
-		out.Results = append(out.Results, SearchResult{
+		out.Results = append(out.Results, Result{
 			Title:         r.Title,
 			URL:           r.URL,
 			Content:       r.Content,
@@ -226,21 +232,21 @@ func (p *TavilyProvider) doSearch(ctx context.Context, apiKey string, req Search
 }
 
 // classifyTavilyStatus maps a non-200 status to a typed provider error.
-func classifyTavilyStatus(resp *http.Response, body []byte) *SearchProviderError {
+func classifyTavilyStatus(resp *http.Response, body []byte) *ProviderError {
 	msg := strings.TrimSpace(string(body))
 	if len(msg) > 300 {
 		msg = msg[:300]
 	}
-	e := &SearchProviderError{StatusCode: resp.StatusCode, Err: fmt.Errorf("tavily http %d: %s", resp.StatusCode, msg)}
+	e := &ProviderError{StatusCode: resp.StatusCode, Err: fmt.Errorf("tavily http %d: %s", resp.StatusCode, msg)}
 	switch {
 	case resp.StatusCode == 401 || resp.StatusCode == 403:
-		e.Kind = SearchErrAuth
+		e.Kind = ErrAuth
 	case resp.StatusCode == 429:
-		e.Kind = SearchErrRateLimit
+		e.Kind = ErrRateLimit
 	case resp.StatusCode >= 500:
-		e.Kind = SearchErrUpstream5xx
+		e.Kind = ErrUpstream5xx
 	default:
-		e.Kind = SearchErrInvalid
+		e.Kind = ErrInvalid
 	}
 	if ra, ok := parseRetryAfter(resp.Header.Get("Retry-After")); ok {
 		e.RetryAfter = ra
@@ -250,7 +256,7 @@ func classifyTavilyStatus(resp *http.Response, body []byte) *SearchProviderError
 
 // backoff returns the delay before the next retry: Retry-After if the provider
 // sent one, else exponential base*2^attempt with jitter.
-func (p *TavilyProvider) backoff(attempt int, provErr *SearchProviderError) time.Duration {
+func (p *TavilyProvider) backoff(attempt int, provErr *ProviderError) time.Duration {
 	// A provider Retry-After hint wins over computed backoff.
 	if provErr != nil && provErr.RetryAfter > 0 {
 		return provErr.RetryAfter

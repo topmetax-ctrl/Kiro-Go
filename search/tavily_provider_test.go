@@ -1,4 +1,4 @@
-package proxy
+package search
 
 import (
 	"context"
@@ -43,7 +43,7 @@ func TestTavilySearchHappyPath(t *testing.T) {
 	defer srv.Close()
 
 	p := newTestTavily(srv.URL, 0)
-	resp, err := p.Search(context.Background(), SearchRequest{
+	resp, err := p.Search(context.Background(), Request{
 		Query:          "go version",
 		MaxResults:     5,
 		SearchDepth:    "basic",
@@ -79,7 +79,7 @@ func TestTavilyEmptyResultsIsSuccess(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newTestTavily(srv.URL, 0)
-	resp, err := p.Search(context.Background(), SearchRequest{Query: "x", MaxResults: 5})
+	resp, err := p.Search(context.Background(), Request{Query: "x", MaxResults: 5})
 	if err != nil {
 		t.Fatalf("empty results must not be an error, got %v", err)
 	}
@@ -94,9 +94,9 @@ func TestTavilyMalformedJSON(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newTestTavily(srv.URL, 0)
-	_, err := p.Search(context.Background(), SearchRequest{Query: "x", MaxResults: 5})
-	var provErr *SearchProviderError
-	if !errors.As(err, &provErr) || provErr.Kind != SearchErrMalformed {
+	_, err := p.Search(context.Background(), Request{Query: "x", MaxResults: 5})
+	var provErr *ProviderError
+	if !errors.As(err, &provErr) || provErr.Kind != ErrMalformed {
 		t.Fatalf("expected malformed provider error, got %v", err)
 	}
 }
@@ -104,15 +104,15 @@ func TestTavilyMalformedJSON(t *testing.T) {
 func TestTavilyStatusClassification(t *testing.T) {
 	cases := []struct {
 		status int
-		kind   SearchProviderErrorKind
+		kind   ProviderErrorKind
 		retry  bool
 	}{
-		{400, SearchErrInvalid, false},
-		{401, SearchErrAuth, false},
-		{403, SearchErrAuth, false},
-		{429, SearchErrRateLimit, true},
-		{500, SearchErrUpstream5xx, true},
-		{503, SearchErrUpstream5xx, true},
+		{400, ErrInvalid, false},
+		{401, ErrAuth, false},
+		{403, ErrAuth, false},
+		{429, ErrRateLimit, true},
+		{500, ErrUpstream5xx, true},
+		{503, ErrUpstream5xx, true},
 	}
 	for _, tc := range cases {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -120,9 +120,9 @@ func TestTavilyStatusClassification(t *testing.T) {
 			w.Write([]byte("error body"))
 		}))
 		p := newTestTavily(srv.URL, 0)
-		_, err := p.Search(context.Background(), SearchRequest{Query: "x", MaxResults: 5})
+		_, err := p.Search(context.Background(), Request{Query: "x", MaxResults: 5})
 		srv.Close()
-		var provErr *SearchProviderError
+		var provErr *ProviderError
 		if !errors.As(err, &provErr) {
 			t.Errorf("status %d: expected provider error, got %v", tc.status, err)
 			continue
@@ -144,7 +144,7 @@ func TestTavilyAuthErrorNotRetried(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newTestTavily(srv.URL, 3)
-	_, err := p.Search(context.Background(), SearchRequest{Query: "x", MaxResults: 5})
+	_, err := p.Search(context.Background(), Request{Query: "x", MaxResults: 5})
 	if err == nil {
 		t.Fatal("expected auth error")
 	}
@@ -165,7 +165,7 @@ func TestTavilyRateLimitRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newTestTavily(srv.URL, 3)
-	_, err := p.Search(context.Background(), SearchRequest{Query: "x", MaxResults: 5})
+	_, err := p.Search(context.Background(), Request{Query: "x", MaxResults: 5})
 	if err != nil {
 		t.Fatalf("expected success after retries, got %v", err)
 	}
@@ -182,7 +182,7 @@ func TestTavilyRetriesExhausted(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newTestTavily(srv.URL, 2)
-	_, err := p.Search(context.Background(), SearchRequest{Query: "x", MaxResults: 5})
+	_, err := p.Search(context.Background(), Request{Query: "x", MaxResults: 5})
 	if err == nil {
 		t.Fatal("expected error after exhausting retries")
 	}
@@ -199,7 +199,7 @@ func TestTavilyContextCancellation(t *testing.T) {
 	p := newTestTavily(srv.URL, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
-	_, err := p.Search(ctx, SearchRequest{Query: "x", MaxResults: 5})
+	_, err := p.Search(ctx, Request{Query: "x", MaxResults: 5})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
@@ -211,10 +211,10 @@ func TestTavilyMissingKeyIsConfigError(t *testing.T) {
 		apiKey:   func() string { return "" },
 		client:   func() *http.Client { return &http.Client{} },
 	}
-	_, err := p.Search(context.Background(), SearchRequest{Query: "x"})
-	var cfgErr *SearchConfigError
+	_, err := p.Search(context.Background(), Request{Query: "x"})
+	var cfgErr *ConfigError
 	if !errors.As(err, &cfgErr) {
-		t.Fatalf("expected SearchConfigError, got %v", err)
+		t.Fatalf("expected ConfigError, got %v", err)
 	}
 }
 
@@ -225,7 +225,7 @@ func TestTavilyKeyNeverInError(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newTestTavily(srv.URL, 0)
-	_, err := p.Search(context.Background(), SearchRequest{Query: "x", MaxResults: 5})
+	_, err := p.Search(context.Background(), Request{Query: "x", MaxResults: 5})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -243,7 +243,7 @@ func TestTavilyDomainMappingExclude(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := newTestTavily(srv.URL, 0)
-	_, err := p.Search(context.Background(), SearchRequest{
+	_, err := p.Search(context.Background(), Request{
 		Query:          "x",
 		MaxResults:     5,
 		BlockedDomains: []string{"spam.example"},

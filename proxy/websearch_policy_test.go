@@ -3,6 +3,8 @@ package proxy
 import (
 	"encoding/json"
 	"testing"
+
+	"kiro-go/search"
 )
 
 func intPtr(i int) *int { return &i }
@@ -50,8 +52,8 @@ func TestExtractWebSearchPolicyDomainsMutuallyExclusive(t *testing.T) {
 	if !ok {
 		t.Fatal("expected ok=true (tool present)")
 	}
-	if _, isCfg := err.(*SearchConfigError); !isCfg {
-		t.Fatalf("expected SearchConfigError, got %T (%v)", err, err)
+	if _, isCfg := err.(*search.ConfigError); !isCfg {
+		t.Fatalf("expected search.ConfigError, got %T (%v)", err, err)
 	}
 }
 
@@ -60,8 +62,8 @@ func TestExtractWebSearchPolicyNegativeMaxUses(t *testing.T) {
 		Name:    "web_search",
 		MaxUses: intPtr(-1),
 	}})
-	if _, isCfg := err.(*SearchConfigError); !isCfg {
-		t.Fatalf("expected SearchConfigError for negative max_uses, got %T (%v)", err, err)
+	if _, isCfg := err.(*search.ConfigError); !isCfg {
+		t.Fatalf("expected search.ConfigError for negative max_uses, got %T (%v)", err, err)
 	}
 }
 

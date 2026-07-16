@@ -65,6 +65,14 @@ func GetPool() *AccountPool {
 func (p *AccountPool) Reload() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.reloadLocked()
+}
+
+// reloadLocked rebuilds the weighted account list from config. The caller must
+// hold p.mu. Split out of Reload so other pool mutations (e.g.
+// PublishProfileSwitch) can reload and update related state within one critical
+// section, without a lock-release window between the two.
+func (p *AccountPool) reloadLocked() {
 	enabled := config.GetEnabledAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
 	var weighted []config.Account
@@ -79,6 +87,32 @@ func (p *AccountPool) Reload() {
 	}
 	p.accounts = weighted
 	p.totalAccounts = len(enabled)
+}
+
+// PublishProfileSwitch atomically republishes the account snapshot (from the
+// freshly-persisted config) AND replaces the account's routing model list under a
+// single pool lock. This closes the cutover window that a separate Reload() then
+// SetModelList() would open: between those two calls a request could observe the
+// NEW profile snapshot while still routed against the OLD profile's model set.
+// Holding p.mu across both updates makes the switch atomic to every reader.
+func (p *AccountPool) PublishProfileSwitch(accountID string, modelIDs []string) {
+	set := make(map[string]bool, len(modelIDs))
+	for _, id := range modelIDs {
+		set[strings.ToLower(strings.TrimSpace(id))] = true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reloadLocked()
+	p.modelLists[accountID] = set
+}
+
+// DeleteModelList drops an account's cached routing model set (e.g. when the
+// account is disabled or deleted) so a later aggregate rebuild cannot resurrect
+// its models. Safe to call for an unknown ID.
+func (p *AccountPool) DeleteModelList(accountID string) {
+	p.mu.Lock()
+	delete(p.modelLists, accountID)
+	p.mu.Unlock()
 }
 
 // GetNext 获取下一个可用账号（加权轮询）

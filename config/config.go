@@ -1457,11 +1457,12 @@ const (
 	DefaultWebSearchRerankCandidates = 20
 )
 
-// providerSearXNG / providerTavily are the canonical provider name tokens used
-// in routing config and metrics labels.
+// ProviderSearXNG / ProviderTavily are the canonical provider name tokens used
+// in routing config and metrics labels. Exported so the search package can share
+// them without redefining (search imports config, never the reverse).
 const (
-	providerSearXNG = "searxng"
-	providerTavily  = "tavily"
+	ProviderSearXNG = "searxng"
+	ProviderTavily  = "tavily"
 )
 
 // GetWebSearchConfig returns the web_search execution settings with zero-valued
@@ -1489,7 +1490,7 @@ func resolveWebSearchDefaults(ws WebSearchConfig) WebSearchConfig {
 		ws.Routing.PrimaryProvider = DefaultWebSearchPrimaryProvider
 	}
 	if ws.Routing.FallbackProviders == nil {
-		ws.Routing.FallbackProviders = []string{providerTavily}
+		ws.Routing.FallbackProviders = []string{ProviderTavily}
 	}
 
 	// Limits.

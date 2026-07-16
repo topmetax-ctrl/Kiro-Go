@@ -125,7 +125,7 @@ func (h *Handler) ImportApiKeys(rawText, region, authRegion, apiRegion string) [
 
 		// Cache model list asynchronously for the new account.
 		go func(acc config.Account) {
-			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+			if err := h.modelCache.FetchAndCache(&acc); err != nil {
 				logger.Warnf("[ApiKeyImport] Model cache failed for %s: %v", maskKey(acc.KiroApiKey), err)
 			}
 		}(account)

@@ -1,4 +1,4 @@
-package proxy
+package search
 
 import (
 	"context"
@@ -16,10 +16,10 @@ func testOrchestrator(t *testing.T, entries []providerEntry, cache SearchCache) 
 }
 
 func TestOrchestratorReturnsRoutedResultsReranked(t *testing.T) {
-	prov := &scriptedProvider{name: "searxng", resp: SearchResponse{Results: goodResults(5)}}
+	prov := &scriptedProvider{name: "searxng", resp: Response{Results: goodResults(5)}}
 	o := testOrchestrator(t, []providerEntry{{provider: prov}}, nil)
 
-	resp, meta, err := o.Search(context.Background(), SearchRequest{Query: "latest go version", MaxResults: 5})
+	resp, meta, err := o.Search(context.Background(), Request{Query: "latest go version", MaxResults: 5})
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -35,11 +35,11 @@ func TestOrchestratorReturnsRoutedResultsReranked(t *testing.T) {
 }
 
 func TestOrchestratorCacheHitSkipsProvider(t *testing.T) {
-	prov := &scriptedProvider{name: "searxng", resp: SearchResponse{Results: goodResults(4)}}
+	prov := &scriptedProvider{name: "searxng", resp: Response{Results: goodResults(4)}}
 	cache := newLRUSearchCache(10)
 	o := testOrchestrator(t, []providerEntry{{provider: prov}}, cache)
 
-	req := SearchRequest{Query: "cached query", MaxResults: 5}
+	req := Request{Query: "cached query", MaxResults: 5}
 	if _, _, err := o.Search(context.Background(), req); err != nil {
 		t.Fatalf("first search: %v", err)
 	}
@@ -60,11 +60,11 @@ func TestOrchestratorCacheHitSkipsProvider(t *testing.T) {
 }
 
 func TestOrchestratorEmptyResultsNotCached(t *testing.T) {
-	prov := &scriptedProvider{name: "searxng", resp: SearchResponse{}} // no results
+	prov := &scriptedProvider{name: "searxng", resp: Response{}} // no results
 	cache := newLRUSearchCache(10)
 	o := testOrchestrator(t, []providerEntry{{provider: prov}}, cache)
 
-	req := SearchRequest{Query: "no hits", MaxResults: 5}
+	req := Request{Query: "no hits", MaxResults: 5}
 	if _, _, err := o.Search(context.Background(), req); err != nil {
 		t.Fatalf("first: %v", err)
 	}
