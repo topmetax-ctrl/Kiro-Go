@@ -59,6 +59,12 @@ type Handler struct {
 	// conversationRunner orchestrates multi-round Kiro calls with server-side
 	// web_search execution. Injected so tests can supply fakes.
 	conversationRunner ConversationRunner
+	// memory is the long-term memory provider. It is a noopMemoryProvider when
+	// the feature is disabled (never nil), and is rebuilt on config change via
+	// rebuildMemoryProvider — mirroring the account pool's reload-on-change model.
+	// Guarded by memoryMu so the admin update path can swap it while requests read it.
+	memory   MemoryProvider
+	memoryMu sync.RWMutex
 }
 
 type thinkingStreamSource int
@@ -249,6 +255,7 @@ func NewHandler() *Handler {
 		conversationRunner: NewKiroConversationRunner(),
 		modelInfoByAccount: make(map[string][]ModelInfo),
 		profileSwitchLocks: make(map[string]*sync.Mutex),
+		memory:             newMemoryProviderFromConfig(),
 	}
 	h.tokenManager = NewTokenManager(h.pool, nil, nil)
 	// 恢复转发指标聚合数据 (事件日志与时序为内存态，不持久化)
@@ -262,6 +269,26 @@ func NewHandler() *Handler {
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
 	return h
+}
+
+// getMemory returns the current memory provider under a read lock. It is never
+// nil (a noopMemoryProvider stands in when the feature is disabled), so callers
+// can use the result without a nil check.
+func (h *Handler) getMemory() MemoryProvider {
+	h.memoryMu.RLock()
+	defer h.memoryMu.RUnlock()
+	return h.memory
+}
+
+// rebuildMemoryProvider swaps in a provider freshly built from the current
+// config. Called after the admin memory config changes, mirroring how
+// apiUpdateSettings calls h.pool.Reload() so the change takes effect at runtime
+// without a restart.
+func (h *Handler) rebuildMemoryProvider() {
+	next := newMemoryProviderFromConfig()
+	h.memoryMu.Lock()
+	h.memory = next
+	h.memoryMu.Unlock()
 }
 
 // backgroundRefresh 后台定时刷新账户信息
@@ -1110,9 +1137,34 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// The last genuine user question, captured BEFORE any memory injection mutates
+	// req.Messages. Used as the retrieval query (inject) and the user side of a
+	// captured turn (capture). Empty when the turn carries no new question.
+	userText := lastClaudeUserText(req.Messages)
+
+	// Memory inject (read): retrieve relevant memories for this caller and prepend a
+	// bounded context block to the last user message, so both the forward path (reads
+	// body) and the Kiro path (reads req) see the enriched request. Fail-open: a
+	// backend error/outage returns no memories and leaves the request unchanged. It
+	// deliberately runs BEFORE tryForwardUpstream and re-marshals body so forwarded
+	// requests are enriched too. It does NOT touch the translator.
+	if config.MemoryInjectEnabled() && userText != "" {
+		principal := memoryScopeForRequest(r.Context())
+		mems, _ := h.getMemory().Search(r.Context(), SearchQuery{Scope: MemoryScope{Principal: principal}, Query: userText})
+		if block := buildMemoryContextBlock(mems, config.GetMemoryConfig().MaxInjectTokens); block != "" {
+			if injectMemoryIntoRequest(&req, block) {
+				if b, err := json.Marshal(&req); err == nil {
+					body = b
+				}
+			}
+		}
+	}
+
 	// Forward to an external upstream when the (raw, un-normalized) client model
 	// matches an enabled route. Passthrough bypasses the Kiro pool entirely.
-	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/messages", true) {
+	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/messages", true, userText) {
+		// Capture (write) for the forward path is handled inside tryForwardUpstream
+		// (non-stream only), since only it can tee the upstream response body.
 		return
 	}
 
@@ -1151,9 +1203,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, useRunner, policy)
+		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, useRunner, policy, userText)
 	} else {
-		h.handleClaudeNonStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, useRunner, policy)
+		h.handleClaudeNonStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, useRunner, policy, userText)
 	}
 }
 
@@ -1163,7 +1215,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 // enabled), the ConversationRunner drives the multi-round search loop and only
 // the final round's buffered events are streamed to the client. Otherwise the
 // stream path behaves exactly as before (a single CallKiroAPIContext round).
-func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, useRunner bool, policy WebSearchPolicy) {
+func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, useRunner bool, policy WebSearchPolicy, userText string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1744,6 +1796,11 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 
+		// Capture (write): store this turn's Q&A into memory (async, fail-open,
+		// redaction enforced in the provider). No-op unless capture is enabled
+		// (non-explicit write mode). outputContent is the clean answer text.
+		h.captureTurnAsync(apiKeyID, userText, outputContent)
+
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
 			stopReason = "tool_use"
@@ -1885,7 +1942,7 @@ func (h *Handler) recordFailure() {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, useRunner bool, policy WebSearchPolicy) {
+func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, useRunner bool, policy WebSearchPolicy, userText string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -2008,6 +2065,10 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 
+		// Capture (write) this turn into memory when auto-capture is on. Async +
+		// fail-open + provider-enforced redaction; never blocks or breaks the response.
+		h.captureTurnAsync(memoryScopeForRequest(ctx), userText, finalContent)
+
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
 		if includeEmptyThinkingBlock {
@@ -2117,7 +2178,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	// Forward to an external upstream when the (raw, un-normalized) client model
 	// matches an enabled route. Passthrough bypasses the Kiro pool entirely.
-	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/chat/completions", false) {
+	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/chat/completions", false, "") {
 		return
 	}
 
@@ -2777,6 +2838,16 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetPromptFilter(w, r)
 	case path == "/prompt-filter" && r.Method == "POST":
 		h.apiUpdatePromptFilter(w, r)
+	case path == "/memory/config" && r.Method == "GET":
+		h.apiGetMemoryConfig(w, r)
+	case path == "/memory/config" && r.Method == "POST":
+		h.apiUpdateMemoryConfig(w, r)
+	case path == "/memory/search" && r.Method == "GET":
+		h.apiMemorySearch(w, r)
+	case path == "/memory" && r.Method == "POST":
+		h.apiMemoryAdd(w, r)
+	case path == "/memory" && r.Method == "DELETE":
+		h.apiMemoryDelete(w, r)
 	case path == "/upstreams" && r.Method == "GET":
 		h.apiGetUpstreams(w, r)
 	case path == "/upstreams" && r.Method == "POST":

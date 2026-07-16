@@ -25,7 +25,12 @@ import (
 // subPath is the upstream path appended to the provider BaseURL (e.g.
 // "/messages", "/chat/completions", "/responses"). isClaudeRoute selects the
 // error-response shape (Anthropic vs OpenAI) on failure.
-func (h *Handler) tryForwardUpstream(r *http.Request, w http.ResponseWriter, body []byte, model string, stream bool, subPath string, isClaudeRoute bool) bool {
+//
+// captureUserText, when non-empty AND memory capture is enabled AND this is a
+// non-streaming Claude route, causes the relayed assistant answer to be captured
+// into memory (fire-and-forget). It is "" on paths where capture is out of scope
+// (OpenAI/responses) or unavailable (streaming). Capture never affects the relay.
+func (h *Handler) tryForwardUpstream(r *http.Request, w http.ResponseWriter, body []byte, model string, stream bool, subPath string, isClaudeRoute bool, captureUserText string) bool {
 	route, up := config.FindEnabledRoute(model)
 	if route == nil || up == nil {
 		return false
@@ -129,9 +134,28 @@ func (h *Handler) tryForwardUpstream(r *http.Request, w http.ResponseWriter, bod
 	// A non-200 upstream response is an error body (usually JSON), not an SSE
 	// stream — copy it through verbatim regardless of the client's stream flag.
 	var relayErr error
-	if stream && resp.StatusCode == 200 {
+	switch {
+	case stream && resp.StatusCode == 200:
+		// Stream forward: relay bytes verbatim. Capture is intentionally skipped here
+		// (we do not buffer a whole stream); inject still applied at the call site.
 		relayErr = h.streamUpstreamResponse(w, resp)
-	} else {
+	case ok && captureUserText != "" && config.MemoryCaptureEnabled() && resp.Header.Get("Content-Encoding") == "":
+		// Non-stream success with capture on: buffer the body so we can BOTH relay it
+		// to the client and extract the assistant text for memory capture. Compressed
+		// bodies are excluded (fall to the plain copy) to avoid decompressing here.
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			logger.Warnf("[Forward] response read error: %v", readErr)
+			relayErr = readErr
+			break
+		}
+		relayErr = writeUpstreamResponseBytes(w, resp, bodyBytes)
+		if relayErr == nil {
+			if answer := extractForwardedAssistantText(bodyBytes); answer != "" {
+				h.captureTurnAsync(memoryScopeForRequest(r.Context()), captureUserText, answer)
+			}
+		}
+	default:
 		relayErr = copyUpstreamResponse(w, resp)
 	}
 
@@ -278,4 +302,73 @@ func copyUpstreamResponse(w http.ResponseWriter, resp *http.Response) error {
 		return err
 	}
 	return nil
+}
+
+// writeUpstreamResponseBytes relays an already-buffered non-stream response body,
+// preserving the status code and the same header set as copyUpstreamResponse. Used
+// on the capture path, where the body was read up front so it could be teed.
+func writeUpstreamResponseBytes(w http.ResponseWriter, resp *http.Response, body []byte) error {
+	copyForwardableResponseHeaders(w, resp)
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/json; charset=utf-8"
+	}
+	w.Header().Set("Content-Type", ct)
+	if enc := resp.Header.Get("Content-Encoding"); enc != "" {
+		w.Header().Set("Content-Encoding", enc)
+	}
+	w.WriteHeader(resp.StatusCode)
+	if _, err := w.Write(body); err != nil {
+		logger.Warnf("[Forward] response write error: %v", err)
+		return err
+	}
+	return nil
+}
+
+// extractForwardedAssistantText pulls the assistant's answer text out of a
+// forwarded non-stream response body for memory capture. It tolerates both the
+// Anthropic Messages shape ({"content":[{"type":"text","text":...}]}) and the
+// OpenAI chat shape ({"choices":[{"message":{"content":...}}]}). Returns "" when
+// no text is found (capture then skips). Best-effort: never errors.
+func extractForwardedAssistantText(body []byte) string {
+	var m map[string]interface{}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return ""
+	}
+	// Anthropic Messages: content is an array of blocks.
+	if blocks, ok := m["content"].([]interface{}); ok {
+		var sb strings.Builder
+		for _, b := range blocks {
+			block, ok := b.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if t, _ := block["type"].(string); t != "" && t != "text" {
+				continue
+			}
+			if txt, ok := block["text"].(string); ok {
+				sb.WriteString(txt)
+			}
+		}
+		if s := strings.TrimSpace(sb.String()); s != "" {
+			return s
+		}
+	}
+	// OpenAI chat: choices[].message.content (string).
+	if choices, ok := m["choices"].([]interface{}); ok {
+		for _, c := range choices {
+			choice, ok := c.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			msg, ok := choice["message"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if txt, ok := msg["content"].(string); ok && strings.TrimSpace(txt) != "" {
+				return strings.TrimSpace(txt)
+			}
+		}
+	}
+	return ""
 }

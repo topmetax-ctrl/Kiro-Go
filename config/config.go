@@ -324,6 +324,11 @@ type Config struct {
 	// result back so the model can answer.
 	WebSearch WebSearchConfig `json:"webSearch,omitempty"`
 
+	// Memory configures the optional long-term memory sidecar (Mem0 self-hosted).
+	// Off by default. When enabled, the proxy can store and retrieve memories via
+	// a dedicated admin API; it does NOT inject memory into the LLM request path.
+	Memory MemoryConfig `json:"memory,omitempty"`
+
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
 	// Can be overridden by the LOG_LEVEL environment variable.
@@ -517,6 +522,87 @@ type WebSearchRerankConfig struct {
 	// MaxFinalResults bounds results kept after reranking. 0 means
 	// DefaultWebSearchMaxResults.
 	MaxFinalResults int `json:"maxFinalResults,omitempty"`
+}
+
+// MemoryConfig controls the optional long-term memory sidecar (Mem0 self-hosted).
+// It is off by default (Enabled zero value = false). When enabled, the proxy can
+// store/retrieve memories through a dedicated admin API, and optionally inject
+// retrieved memories into the LLM request (Inject) and auto-capture each turn's
+// Q&A (WriteMode != "explicit"). Injection mutates req.Messages BEFORE translation,
+// never the translated Kiro payload, so the translator's HTTP-400-avoidance logic
+// is untouched. GetMemoryConfig resolves zero-valued fields to their defaults
+// centrally.
+type MemoryConfig struct {
+	// Enabled turns on the memory sidecar. When false, the factory returns a
+	// no-op provider and no calls are made to the backend.
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Provider selects the memory backend. Only "mem0" is implemented. Empty
+	// means DefaultMemoryProvider.
+	Provider string `json:"provider,omitempty"`
+
+	// BaseURL is the self-hosted Mem0 server root, e.g. "http://localhost:8888".
+	// Required when Enabled; MemoryEnabled() is false until it is set.
+	BaseURL string `json:"baseURL,omitempty"`
+
+	// APIKey is the X-Api-Key sent to Mem0. Masked when returned to the admin UI.
+	APIKey string `json:"apiKey,omitempty"`
+
+	// WriteMode governs how memories are captured: "explicit" (only via the
+	// store API — no auto-capture), "curated", or "automatic". Empty means
+	// DefaultMemoryWriteMode ("explicit"). Any mode other than "explicit" enables
+	// auto-capture of each successful turn's Q&A (see MemoryCaptureEnabled).
+	WriteMode string `json:"writeMode,omitempty"`
+
+	// RetrievalLimit bounds how many memories a search returns. 0 means
+	// DefaultMemoryRetrievalLimit.
+	RetrievalLimit int `json:"retrievalLimit,omitempty"`
+
+	// Inject turns on reading memories and injecting them into the LLM request
+	// (into the last user message, before translation). Independent of WriteMode:
+	// a deployment can inject without capturing, or capture without injecting.
+	// Defaults to false when unset — memory never touches the request path until
+	// the operator opts in.
+	Inject *bool `json:"inject,omitempty"`
+
+	// MaxInjectTokens bounds the size of the injected memory context block. 0 means
+	// DefaultMemoryMaxInjectTokens. Keeps the injected block small so it cannot push
+	// the request toward the upstream byte cap.
+	MaxInjectTokens int `json:"maxInjectTokens,omitempty"`
+
+	// Redaction bounds what may be persisted. Applied even in automatic mode.
+	Redaction MemoryRedaction `json:"redaction,omitempty"`
+
+	// Timeouts bounds per-call latency to the backend.
+	Timeouts MemoryTimeouts `json:"timeouts,omitempty"`
+
+	// FailOpen controls whether backend errors degrade silently (recall returns
+	// empty, writes are dropped) instead of surfacing to the caller. Defaults to
+	// true when unset, so a memory outage never breaks a request.
+	FailOpen *bool `json:"failOpen,omitempty"`
+}
+
+// MemoryRedaction bounds what content may be persisted. These guards apply
+// regardless of WriteMode — automatic mode does NOT bypass them.
+type MemoryRedaction struct {
+	// RedactSecrets masks obvious credentials (API keys, bearer tokens) before a
+	// memory is written. Defaults to true when unset.
+	RedactSecrets *bool `json:"redactSecrets,omitempty"`
+
+	// StoreSourceCode allows source-code-looking candidates (large fenced code
+	// blocks, diffs, .env dumps) to be persisted. Defaults to false: coding
+	// sessions routinely contain private source and secrets.
+	StoreSourceCode bool `json:"storeSourceCode,omitempty"`
+}
+
+// MemoryTimeouts bounds per-call latency to the memory backend. Mem0 "add"
+// triggers an LLM extraction call upstream, so the write timeout is larger.
+type MemoryTimeouts struct {
+	// SearchMs bounds a retrieval call. 0 means DefaultMemorySearchTimeoutMs.
+	SearchMs int `json:"searchMs,omitempty"`
+
+	// WriteMs bounds an add call. 0 means DefaultMemoryWriteTimeoutMs.
+	WriteMs int `json:"writeMs,omitempty"`
 }
 
 // AccountInfo contains account metadata retrieved from Kiro API.
@@ -1457,6 +1543,29 @@ const (
 	DefaultWebSearchRerankCandidates = 20
 )
 
+// Memory sidecar defaults, used when the corresponding config field is 0/empty.
+const (
+	DefaultMemoryProvider       = "mem0"
+	DefaultMemoryWriteMode      = "explicit"
+	DefaultMemoryRetrievalLimit = 8
+
+	DefaultMemorySearchTimeoutMs = 2000
+	DefaultMemoryWriteTimeoutMs  = 5000
+
+	// DefaultMemoryMaxInjectTokens bounds the injected memory-context block so a
+	// large recall cannot balloon the request (and trip the translator's payload
+	// cap). Used when MaxInjectTokens is 0.
+	DefaultMemoryMaxInjectTokens = 1200
+)
+
+// Valid memory write modes. "explicit" is the safe default; "automatic" is
+// operator opt-in only (surfaces a security warning in the admin UI).
+const (
+	MemoryWriteModeExplicit  = "explicit"
+	MemoryWriteModeCurated   = "curated"
+	MemoryWriteModeAutomatic = "automatic"
+)
+
 // providerSearXNG / providerTavily are the canonical provider name tokens used
 // in routing config and metrics labels.
 const (
@@ -1663,6 +1772,147 @@ func WebSearchEnabled() bool {
 		return false
 	}
 	return SearXNGProviderEnabled() || TavilyProviderEnabled()
+}
+
+// GetMemoryConfig returns the memory sidecar settings with zero-valued fields
+// resolved to their defaults. The APIKey is returned as-is (mask at the admin
+// boundary, not here). The returned value is a copy; callers cannot mutate
+// shared config state.
+func GetMemoryConfig() MemoryConfig {
+	cfgLock.RLock()
+	var m MemoryConfig
+	if cfg != nil {
+		m = cfg.Memory
+	}
+	cfgLock.RUnlock()
+	return resolveMemoryDefaults(m)
+}
+
+// GetMemoryConfigRaw returns the stored memory settings WITHOUT resolving
+// zero-valued fields to their defaults. Use this as the base for a partial
+// admin patch: reading the resolved copy and saving it would persist the
+// current defaults as explicit values, freezing them against future default
+// changes (default-drift). The returned value is a copy.
+func GetMemoryConfigRaw() MemoryConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return MemoryConfig{}
+	}
+	return cfg.Memory
+}
+
+// resolveMemoryDefaults fills zero-valued fields with their defaults. Applied
+// centrally so resolution is identical whether or not a config is loaded.
+func resolveMemoryDefaults(m MemoryConfig) MemoryConfig {
+	if strings.TrimSpace(m.Provider) == "" {
+		m.Provider = DefaultMemoryProvider
+	}
+	if strings.TrimSpace(m.WriteMode) == "" {
+		m.WriteMode = DefaultMemoryWriteMode
+	}
+	if m.RetrievalLimit <= 0 {
+		m.RetrievalLimit = DefaultMemoryRetrievalLimit
+	}
+	if m.Timeouts.SearchMs <= 0 {
+		m.Timeouts.SearchMs = DefaultMemorySearchTimeoutMs
+	}
+	if m.Timeouts.WriteMs <= 0 {
+		m.Timeouts.WriteMs = DefaultMemoryWriteTimeoutMs
+	}
+	// RedactSecrets defaults to true (nil → on).
+	if m.Redaction.RedactSecrets == nil {
+		t := true
+		m.Redaction.RedactSecrets = &t
+	}
+	// FailOpen defaults to true (nil → on): a memory outage never breaks a request.
+	if m.FailOpen == nil {
+		t := true
+		m.FailOpen = &t
+	}
+	// Inject defaults to false (nil → off): reading/injecting memory into the LLM
+	// request is opt-in, independent of the store/retrieve toggle.
+	if m.Inject == nil {
+		f := false
+		m.Inject = &f
+	}
+	if m.MaxInjectTokens <= 0 {
+		m.MaxInjectTokens = DefaultMemoryMaxInjectTokens
+	}
+	return m
+}
+
+// UpdateMemoryConfig saves the memory sidecar settings atomically.
+func UpdateMemoryConfig(m MemoryConfig) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.Memory = m
+	return Save()
+}
+
+// MemoryEnabled reports whether the memory sidecar should be active: the
+// operator toggle is on AND a backend base URL is configured. Mirrors the
+// WebSearchToggledOn/provider-usable split so a bare toggle without a backend
+// resolves to a no-op provider rather than erroring.
+func MemoryEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.Memory.Enabled && strings.TrimSpace(cfg.Memory.BaseURL) != ""
+}
+
+// MemoryRedactSecrets reports whether secret masking is applied before a write.
+// Defaults to true when unset.
+func MemoryRedactSecrets() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.Memory.Redaction.RedactSecrets == nil {
+		return true
+	}
+	return *cfg.Memory.Redaction.RedactSecrets
+}
+
+// MemoryFailOpen reports whether backend errors degrade silently instead of
+// surfacing to the caller. Defaults to true when unset.
+func MemoryFailOpen() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.Memory.FailOpen == nil {
+		return true
+	}
+	return *cfg.Memory.FailOpen
+}
+
+// MemoryInjectEnabled reports whether relevant memories should be retrieved and
+// injected into the LLM request. Requires the sidecar to be usable (MemoryEnabled)
+// AND the operator to have turned injection on (defaults off when unset), so a
+// bare memory sidecar does not silently start rewriting requests.
+func MemoryInjectEnabled() bool {
+	if !MemoryEnabled() {
+		return false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg.Memory.Inject != nil && *cfg.Memory.Inject
+}
+
+// MemoryCaptureEnabled reports whether a completed turn should be captured into
+// memory. Requires the sidecar to be usable AND a non-explicit write mode
+// ("automatic"/"curated"); "explicit" (the default) means store only via the
+// admin API, never automatically from the request path.
+func MemoryCaptureEnabled() bool {
+	if !MemoryEnabled() {
+		return false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	mode := strings.TrimSpace(cfg.Memory.WriteMode)
+	if mode == "" {
+		mode = DefaultMemoryWriteMode
+	}
+	return mode != MemoryWriteModeExplicit
 }
 
 // GetLogLevel returns the configured log level (debug/info/warn/error). Defaults to "info".

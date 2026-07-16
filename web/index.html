@@ -477,6 +477,87 @@
           </div>
         </div>
 
+        <!-- Memory sidecar (Mem0) -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="memory.title"></span></div>
+          <small class="help-block" data-i18n="memory.intro"></small>
+          <div class="form-group mt-2">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="memoryEnabled" /><span class="slider"></span></span>
+              <span data-i18n="memory.enabled"></span>
+            </label>
+            <small class="field-hint-offset" data-i18n="memory.enabledHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="memory.baseURL"></label>
+            <input type="text" id="memoryBaseURL" class="font-mono" placeholder="http://localhost:8888" />
+            <small data-i18n="memory.baseURLHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="memory.apiKey"></label>
+            <input type="password" id="memoryApiKey" data-i18n-placeholder="memory.apiKeyPlaceholder" autocomplete="off" />
+            <small data-i18n="memory.apiKeyHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="memory.writeMode"></label>
+            <select id="memoryWriteMode">
+              <option value="explicit" data-i18n="memory.writeModeExplicit"></option>
+              <option value="curated" data-i18n="memory.writeModeCurated"></option>
+              <option value="automatic" data-i18n="memory.writeModeAutomatic"></option>
+            </select>
+            <small id="memoryWriteModeWarning" class="hidden" style="color: var(--danger, #d33);"
+              data-i18n="memory.writeModeAutomaticWarning"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="memory.retrievalLimit"></label>
+            <input type="number" id="memoryRetrievalLimit" min="1" max="100" step="1" placeholder="8" />
+          </div>
+          <div class="form-group">
+            <label class="font-semibold pb-2 block" data-i18n="memory.injectSection"></label>
+            <div class="flex flex-col gap-3">
+              <div>
+                <label class="flex items-center gap-2">
+                  <span class="switch"><input type="checkbox" id="memoryInject" /><span class="slider"></span></span>
+                  <span data-i18n="memory.inject"></span>
+                </label>
+                <small class="field-hint-offset" data-i18n="memory.injectHint"></small>
+              </div>
+              <div>
+                <label data-i18n="memory.maxInjectTokens"></label>
+                <input type="number" id="memoryMaxInjectTokens" min="100" max="8000" step="100" placeholder="1200" />
+                <small data-i18n="memory.maxInjectTokensHint"></small>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="font-semibold pb-2 block" data-i18n="memory.security"></label>
+            <div class="flex flex-col gap-3">
+              <div>
+                <label class="flex items-center gap-2">
+                  <span class="switch"><input type="checkbox" id="memoryRedactSecrets" /><span class="slider"></span></span>
+                  <span data-i18n="memory.redactSecrets"></span>
+                </label>
+                <small class="field-hint-offset" data-i18n="memory.redactSecretsHint"></small>
+              </div>
+              <div>
+                <label class="flex items-center gap-2">
+                  <span class="switch"><input type="checkbox" id="memoryStoreSourceCode" /><span class="slider"></span></span>
+                  <span data-i18n="memory.storeSourceCode"></span>
+                </label>
+                <small class="field-hint-offset" data-i18n="memory.storeSourceCodeHint"></small>
+              </div>
+              <div>
+                <label class="flex items-center gap-2">
+                  <span class="switch"><input type="checkbox" id="memoryFailOpen" /><span class="slider"></span></span>
+                  <span data-i18n="memory.failOpen"></span>
+                </label>
+                <small class="field-hint-offset" data-i18n="memory.failOpenHint"></small>
+              </div>
+            </div>
+          </div>
+          <button class="btn btn-primary" id="saveMemoryBtn" data-i18n="memory.save"></button>
+        </div>
+
         <!-- Upstream forwarding -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.upstreamTitle"></span></div>

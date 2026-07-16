@@ -1688,7 +1688,7 @@
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
     $('maxPayloadBytes').value = String(d.maxPayloadBytes || 2000000);
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadUpstreams(), loadSecurityConfig(), loadKiroGoModels()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadMemoryConfig(), loadApiKeys(), loadUpstreams(), loadSecurityConfig(), loadKiroGoModels()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -3032,6 +3032,52 @@
     if (d.success) toast(t('settings.promptFilterSaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
+  async function loadMemoryConfig() {
+    const res = await api('/memory/config');
+    const d = await res.json();
+    $('memoryEnabled').checked = !!d.enabled;
+    $('memoryBaseURL').value = d.baseURL || '';
+    // The key is returned masked; show the mask as a placeholder so the operator
+    // knows a key is stored, and leave the field empty so an unchanged save does
+    // not overwrite it (backend preserves the stored key on a masked/empty value).
+    $('memoryApiKey').value = '';
+    $('memoryApiKey').placeholder = d.apiKeyMasked || '';
+    $('memoryWriteMode').value = d.writeMode || 'explicit';
+    $('memoryRetrievalLimit').value = d.retrievalLimit ? String(d.retrievalLimit) : '';
+    $('memoryInject').checked = !!d.inject;
+    $('memoryMaxInjectTokens').value = d.maxInjectTokens ? String(d.maxInjectTokens) : '';
+    $('memoryRedactSecrets').checked = d.redactSecrets !== false;
+    $('memoryStoreSourceCode').checked = !!d.storeSourceCode;
+    $('memoryFailOpen').checked = d.failOpen !== false;
+    updateMemoryWriteModeWarning();
+    refreshCustomSelects();
+  }
+  function updateMemoryWriteModeWarning() {
+    const warn = $('memoryWriteModeWarning');
+    if (!warn) return;
+    warn.classList.toggle('hidden', $('memoryWriteMode').value !== 'automatic');
+  }
+  async function saveMemoryConfig() {
+    const body = {
+      enabled: $('memoryEnabled').checked,
+      baseURL: $('memoryBaseURL').value.trim(),
+      writeMode: $('memoryWriteMode').value,
+      retrievalLimit: parseInt($('memoryRetrievalLimit').value, 10) || 0,
+      inject: $('memoryInject').checked,
+      maxInjectTokens: parseInt($('memoryMaxInjectTokens').value, 10) || 0,
+      redactSecrets: $('memoryRedactSecrets').checked,
+      storeSourceCode: $('memoryStoreSourceCode').checked,
+      failOpen: $('memoryFailOpen').checked,
+    };
+    // Only send the API key when the operator typed a new one; an empty field
+    // means "keep the stored key" (backend preserves it).
+    const key = $('memoryApiKey').value.trim();
+    if (key) body.apiKey = key;
+    const res = await api('/memory/config', { method: 'POST', body: JSON.stringify(body) });
+    const d = await res.json();
+    if (d.success) { toast(t('memory.saved'), 'success'); loadMemoryConfig(); }
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
   function renderPromptRules() {
     const c = $('promptFilterRules');
     if (!c) return;
@@ -4357,6 +4403,11 @@
     });
   }
 
+  function bindMemoryEvents() {
+    $('saveMemoryBtn').addEventListener('click', saveMemoryConfig);
+    $('memoryWriteMode').addEventListener('change', updateMemoryWriteModeWarning);
+  }
+
   function bindModalEvents() {
     $('addModalClose').addEventListener('click', closeModal);
     $('detailModalClose').addEventListener('click', closeDetailModal);
@@ -4424,6 +4475,7 @@
     bindAccountEvents();
     bindSettingsEvents();
     bindPromptFilterEvents();
+    bindMemoryEvents();
     bindModalEvents();
     bindDetailEvents();
     bindTestEvents();
