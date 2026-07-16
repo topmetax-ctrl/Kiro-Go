@@ -1635,6 +1635,35 @@ func WebSearchToggledOn() bool {
 	return cfg.WebSearch.Enabled
 }
 
+// Usage reporting modes govern only the CLIENT-VISIBLE usage numbers. Internal
+// accounting (per-key TokensUsed, per-account TotalTokens, global counters) is
+// always upstream-accurate regardless of this setting; it never uses context
+// occupancy as an input-token count.
+const (
+	// UsageReportingLegacy preserves the historical client-facing behavior:
+	// input_tokens carries context-window occupancy (contextPct * window) when a
+	// contextUsageEvent arrived. This is the default so existing clients that key
+	// off the old number are not broken.
+	UsageReportingLegacy = "legacy"
+	// UsageReportingAccurate reports the upstream-accurate input token count to the
+	// client (upstream-first, estimator fallback), matching the internal sinks.
+	UsageReportingAccurate = "accurate"
+)
+
+// GetUsageReportingMode returns the client-facing usage reporting mode, read from
+// the KIRO_USAGE_REPORTING environment variable (values "legacy" or "accurate";
+// anything else, including empty, means legacy). It is intentionally env-driven
+// rather than a config-schema field so enabling accurate reporting is a single
+// operator toggle with a trivial rollback (unset the var) and no persisted state.
+func GetUsageReportingMode() string {
+	switch strings.TrimSpace(strings.ToLower(os.Getenv("KIRO_USAGE_REPORTING"))) {
+	case UsageReportingAccurate:
+		return UsageReportingAccurate
+	default:
+		return UsageReportingLegacy
+	}
+}
+
 // SearXNGProviderEnabled reports whether SearXNG is usable: enabled (default
 // true) with a non-empty base URL. No API key is needed — it is the free path.
 func SearXNGProviderEnabled() bool {

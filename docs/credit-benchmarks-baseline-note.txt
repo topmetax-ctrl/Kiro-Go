@@ -1,0 +1,10 @@
+Baseline @ ced9eec (audit/credit-usage-correctness)
+Go 1.26.5 darwin/amd64
+go vet ./...        : clean
+go build ./...      : clean (exit 0)
+git diff --check    : clean
+go test ./...       : PASS (auth, config, pool, proxy)
+go test -race ./... : PASS (0 data races reported)
+Caveat (§4): race-clean does NOT prove race-free unless the relevant
+concurrent call path was exercised by a test. Coverage of the usage
+accounting hot path under concurrency is verified separately in §8 harness.

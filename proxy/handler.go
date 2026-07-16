@@ -1328,21 +1328,29 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 
 		closeActiveBlock()
 
+		// upstreamInput is the value the stream (or runner aggregate) actually
+		// reported, captured before any override so accounted usage never uses
+		// context occupancy. legacyInput reproduces the historical client number.
+		upstreamInput := inputTokens
+		var legacyInput int
 		if usedRunner {
 			// Aggregate totals already summed across rounds; do not overwrite with
 			// the final round's context occupancy (spec: client-visible usage is the
 			// whole logical request). Fall back to the estimate only if unset.
-			if inputTokens <= 0 {
+			legacyInput = upstreamInput
+			if legacyInput <= 0 {
 				if realInputTokens > 0 {
-					inputTokens = realInputTokens
+					legacyInput = realInputTokens
 				} else {
-					inputTokens = estimatedInputTokens
+					legacyInput = estimatedInputTokens
 				}
 			}
 		} else if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+			legacyInput = realInputTokens
+		} else if upstreamInput > 0 {
+			legacyInput = upstreamInput
+		} else {
+			legacyInput = estimatedInputTokens
 		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
@@ -1352,11 +1360,16 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		if !thinking {
 			thinkingOutput = ""
 		}
-		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+		estimatedOutput := estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		// Split internal accounting (upstream-accurate) from the client-visible
+		// number (legacy by default, accurate when the operator opts in).
+		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
+		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
+
+		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 
 		stopReason := "end_turn"
@@ -1365,7 +1378,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		}
 
 		ensureMessageStart()
-		usageMap := buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil)
+		usageMap := buildClaudeUsageMap(clientInput, clientOutput, cacheUsage, cacheProfile != nil)
 		// Report the server-side searches the proxy ran so the client counts them
 		// instead of "Did 0 searches". Gated by the same kill-switch as the blocks.
 		if usedRunner && len(runSearches) > 0 {
@@ -1517,6 +1530,33 @@ func (h *Handler) recordFailure() {
 	atomic.AddInt64(&h.failedRequests, 1)
 }
 
+// usageSplit separates the token count used for INTERNAL accounting from the one
+// reported to the CLIENT, so a single request can charge accurate usage against
+// the pool/key while still emitting the historical (legacy) client number.
+//
+//   - accounted: what the internal sinks (per-key TokensUsed, per-account
+//     TotalTokens, global counters) record. Upstream-reported first, estimator
+//     fallback. It NEVER uses context-window occupancy as a token count.
+//   - client: what the response's usage map reports. In legacy mode (default) it
+//     is the tail's historical value, passed in verbatim as legacyClient — so the
+//     client sees byte-identical numbers to before this change. In accurate mode
+//     it switches to the accounted value.
+//
+// upstream is the upstream-reported count (0 when the stream carried none);
+// estimated is the local estimator fallback; legacyClient is the exact value the
+// tail reported before Phase A (which, for most tails, is context occupancy).
+func usageSplit(upstream, estimated, legacyClient int) (accounted, client int) {
+	accounted = upstream
+	if accounted <= 0 {
+		accounted = estimated
+	}
+	client = legacyClient
+	if config.GetUsageReportingMode() == config.UsageReportingAccurate {
+		client = accounted
+	}
+	return accounted, client
+}
+
 // handleClaudeNonStream Claude 非流式响应
 func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, useRunner bool, policy WebSearchPolicy) {
 	// Non-stream: fully buffered, so the guard is never committed and a late
@@ -1611,12 +1651,23 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			rawThinkingContent = ""
 		}
 
+		// upstreamInput is the value the stream (or runner aggregate) reported,
+		// captured before any override so accounted usage never uses context
+		// occupancy. legacyInput reproduces the historical client number (which,
+		// on this tail, lets context occupancy override even the runner total).
+		upstreamInput := inputTokens
+		var legacyInput int
 		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+			legacyInput = realInputTokens
+		} else if upstreamInput > 0 {
+			legacyInput = upstreamInput
+		} else {
+			legacyInput = estimatedInputTokens
 		}
-		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+		estimatedOutput := estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+
+		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
+		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
 
 		// Append a deterministic Sources list when the runner gathered any and the
 		// feature is configured to do so.
@@ -1624,9 +1675,9 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			finalContent += formatSourcesList(sources)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
 
 		responseThinkingContent := rawThinkingContent
@@ -1647,8 +1698,8 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model, searches)
-		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, clientInput, clientOutput, model, searches)
+		resp.Usage.InputTokens = billedClaudeInputTokens(clientInput, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
 		if len(searches) > 0 {
@@ -2071,10 +2122,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			sendChunk("", 3)
 		}
 
+		upstreamInput := inputTokens
+		var legacyInput int
 		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+			legacyInput = realInputTokens
+		} else if upstreamInput > 0 {
+			legacyInput = upstreamInput
+		} else {
+			legacyInput = estimatedInputTokens
 		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		reasoningOutput := rawReasoningBuilder.String()
@@ -2084,15 +2139,18 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if !thinking {
 			reasoningOutput = ""
 		}
-		outputTokens = estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
+		estimatedOutput := estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
 		for _, tc := range toolCalls {
-			outputTokens += estimateApproxTokens(tc.Function.Name)
-			outputTokens += estimateApproxTokens(tc.Function.Arguments)
+			estimatedOutput += estimateApproxTokens(tc.Function.Name)
+			estimatedOutput += estimateApproxTokens(tc.Function.Arguments)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
+		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
+
+		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
@@ -2110,9 +2168,9 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				"finish_reason": finishReason,
 			}},
 			"usage": map[string]int{
-				"prompt_tokens":     inputTokens,
-				"completion_tokens": outputTokens,
-				"total_tokens":      inputTokens + outputTokens,
+				"prompt_tokens":     clientInput,
+				"completion_tokens": clientOutput,
+				"total_tokens":      clientInput + clientOutput,
 			},
 		}
 		data, _ := json.Marshal(chunk)
@@ -2189,19 +2247,26 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			reasoningContent = ""
 		}
 
+		upstreamInput := inputTokens
+		var legacyInput int
 		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+			legacyInput = realInputTokens
+		} else if upstreamInput > 0 {
+			legacyInput = upstreamInput
+		} else {
+			legacyInput = estimatedInputTokens
 		}
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+		estimatedOutput := estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
+		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
+
+		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, clientInput, clientOutput, model, thinkingFormat)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return attemptHandled()
