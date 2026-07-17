@@ -104,7 +104,7 @@ func TestUsageIntegration_Current_ClaudeRunnerStream_PreservesRunnerInput(t *tes
 	rec := httptest.NewRecorder()
 	before := snapshotStats(env.h, env.accountID, env.apiKeyID)
 	env.h.handleClaudeStream(context.Background(), rec, webSearchPayload(), bigModel, false,
-		claudeThinkingResponseOptions{}, 1, nil, env.apiKeyID, true, testPolicy())
+		claudeThinkingResponseOptions{}, 1, nil, env.apiKeyID, true, testPolicy(), "")
 	after := snapshotStats(env.h, env.accountID, env.apiKeyID)
 	res := diffStats(before, after)
 	res.RawBody = rec.Body.String()
@@ -175,7 +175,7 @@ func TestUsageIntegration_Current_ClaudeRunnerNonStream_ContextOverridesRunnerTo
 	rec := httptest.NewRecorder()
 	before := snapshotStats(env.h, env.accountID, env.apiKeyID)
 	env.h.handleClaudeNonStream(context.Background(), rec, webSearchPayload(), bigModel, false,
-		claudeThinkingResponseOptions{}, 1, nil, env.apiKeyID, true, testPolicy())
+		claudeThinkingResponseOptions{}, 1, nil, env.apiKeyID, true, testPolicy(), "")
 	after := snapshotStats(env.h, env.accountID, env.apiKeyID)
 	res := diffStats(before, after)
 	res.RawBody = rec.Body.String()

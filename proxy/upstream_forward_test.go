@@ -36,7 +36,7 @@ func forwardRequest(t *testing.T, apiKeyID, clientModel string) *httptest.Respon
 		r = r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, apiKeyID))
 	}
 	h := &Handler{}
-	if !h.tryForwardUpstream(r, rec, []byte(`{"model":"`+clientModel+`","messages":[]}`), clientModel, false, "/chat/completions", false) {
+	if !h.tryForwardUpstream(r, rec, []byte(`{"model":"`+clientModel+`","messages":[]}`), clientModel, false, "/chat/completions", false, "") {
 		t.Fatal("expected route to match and forward")
 	}
 	return rec
@@ -121,7 +121,7 @@ func TestForwardCancelledClientDoesNotError(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"gpt-forward","messages":[]}`)).WithContext(ctx)
 	h := &Handler{}
-	if !h.tryForwardUpstream(r, rec, []byte(`{"model":"gpt-forward","messages":[]}`), "gpt-forward", false, "/chat/completions", false) {
+	if !h.tryForwardUpstream(r, rec, []byte(`{"model":"gpt-forward","messages":[]}`), "gpt-forward", false, "/chat/completions", false, "") {
 		t.Fatal("expected route to match")
 	}
 	// A cancelled client should not produce a 502 upstream-failure body.
@@ -147,7 +147,7 @@ func TestForwardHeaderAllowListDropsClientAuthorization(t *testing.T) {
 	r.Header.Set("Anthropic-Beta", "beta-flag")
 	r.Header.Set("Authorization", "Bearer client-key-should-not-forward")
 	h := &Handler{}
-	h.tryForwardUpstream(r, rec, []byte(`{"model":"gpt-forward"}`), "gpt-forward", false, "/chat/completions", false)
+	h.tryForwardUpstream(r, rec, []byte(`{"model":"gpt-forward"}`), "gpt-forward", false, "/chat/completions", false, "")
 
 	if gotAnthropicBeta != "beta-flag" {
 		t.Errorf("expected anthropic-beta forwarded, got %q", gotAnthropicBeta)

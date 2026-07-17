@@ -144,7 +144,7 @@ func TestClaudeStreamByteShapeGolden(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.handleClaudeStream(context.Background(), rec, goldenPayload(), "claude-sonnet-4.5", false,
-		claudeThinkingResponseOptions{}, 1, nil, "", false, WebSearchPolicy{})
+		claudeThinkingResponseOptions{}, 1, nil, "", false, WebSearchPolicy{}, "")
 
 	if *attempts != 1 {
 		t.Fatalf("expected 1 upstream attempt, got %d", *attempts)
@@ -180,7 +180,7 @@ func TestClaudeStreamNoRetryAfterFirstByte(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.handleClaudeStream(context.Background(), rec, goldenPayload(), "claude-sonnet-4.5", false,
-		claudeThinkingResponseOptions{}, 1, nil, "", false, WebSearchPolicy{})
+		claudeThinkingResponseOptions{}, 1, nil, "", false, WebSearchPolicy{}, "")
 
 	if *attempts != 1 {
 		t.Fatalf("retry-after-first-byte occurred: expected 1 attempt, got %d", *attempts)
