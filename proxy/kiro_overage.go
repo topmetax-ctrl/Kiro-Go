@@ -52,6 +52,13 @@ func FetchOverageStatus(account *config.Account) (*OverageSnapshot, error) {
 	if account == nil {
 		return nil, fmt.Errorf("account is nil")
 	}
+	// The profile ARN both selects the region this URL is built for and is a
+	// required query parameter. Resolving it here matches GetUsageLimits and
+	// ListAvailableModelsContext; without it an account whose ARN is not resolved
+	// yet queries us-east-1 with no profileArn at all.
+	if err := ensureRestProfileArn(account); err != nil {
+		return nil, fmt.Errorf("resolve profileArn: %w", err)
+	}
 
 	rawURL := regionalizeURL(kiroQAPIBase+"/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", account)
 	if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {

@@ -18,9 +18,21 @@ func TestGetContextWindowSize(t *testing.T) {
 		{"claude-sonnet-4.6", 1_000_000},
 		{"claude-opus-4.8-thinking", 1_000_000},
 		{"CLAUDE-OPUS-4.8", 1_000_000},
+		// Major-only identifiers: the version regex used to require a minor
+		// component, so these fell through to the 200K default and under-reported
+		// input tokens by 5x.
+		{"claude-opus-5", 1_000_000},
+		{"claude-sonnet-5", 1_000_000},
+		{"claude-haiku-5", 1_000_000},
+		{"claude-opus-5-thinking", 1_000_000},
+		{"claude-opus-5.1", 1_000_000},
+		{"claude-opus-5-1", 1_000_000},
+		{"claude-opus-6", 1_000_000},
+		{"CLAUDE-OPUS-5", 1_000_000},
 		{"claude-opus-4.5", 200_000},
 		{"claude-sonnet-4.5", 200_000},
 		{"claude-sonnet-4", 200_000},
+		{"claude-opus-4", 200_000},
 		{"claude-haiku-4.5", 200_000},
 		{"claude-3-5-sonnet", 200_000},
 		{"unknown-model", 200_000},

@@ -11,37 +11,48 @@ import (
 	"time"
 )
 
-func TestNormalizeChunkBasicProgression(t *testing.T) {
-	prev := ""
-
-	if got := normalizeChunk("abc", &prev); got != "abc" {
-		t.Fatalf("expected first chunk to pass through, got %q", got)
+// TestParseEventStreamPassesRepeatedContentThrough locks the pass-through
+// contract for both text streams. The previous content-based de-duplication
+// guessed that a chunk equal to (or overlapping) the previous one was a replay,
+// which silently ate real output whenever the model's own text repeated:
+// ["666","666","666","6"] arrived as "6666666666" but was delivered as "666".
+func TestParseEventStreamPassesRepeatedContentThrough(t *testing.T) {
+	cases := []struct {
+		name      string
+		eventType string
+		field     string
+		chunks    []string
+		want      string
+	}{
+		{"digits repeat", "assistantResponseEvent", "content", []string{"666", "666", "666", "6"}, "6666666666"},
+		{"pattern repeat", "assistantResponseEvent", "content", []string{"ab", "ab", "ab"}, "ababab"},
+		{"year loses digit", "assistantResponseEvent", "content", []string{"183", "3"}, "1833"},
+		{"overlap not truncated", "assistantResponseEvent", "content", []string{"hello world", "world!!!"}, "hello worldworld!!!"},
+		{"identical chunks", "assistantResponseEvent", "content", []string{"abcde", "abcde"}, "abcdeabcde"},
+		{"reasoning repeat", "reasoningContentEvent", "text", []string{"666", "666", "666", "6"}, "6666666666"},
+		{"reasoning identical", "reasoningContentEvent", "text", []string{"think", "think"}, "thinkthink"},
 	}
-	if got := normalizeChunk("abcde", &prev); got != "de" {
-		t.Fatalf("expected appended delta, got %q", got)
-	}
-}
 
-func TestNormalizeChunkPrefixRewindDoesNotReplay(t *testing.T) {
-	prev := ""
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var frames [][]byte
+			for _, chunk := range c.chunks {
+				frames = append(frames, awsEventStreamFrame(t, c.eventType, map[string]interface{}{
+					c.field: chunk,
+				}))
+			}
 
-	_ = normalizeChunk("abcde", &prev)
-	if got := normalizeChunk("abc", &prev); got != "" {
-		t.Fatalf("expected rewind chunk to be ignored, got %q", got)
-	}
-	if prev != "abcde" {
-		t.Fatalf("expected previous snapshot to remain longest version, got %q", prev)
-	}
-	if got := normalizeChunk("abcdef", &prev); got != "f" {
-		t.Fatalf("expected only unseen suffix after rewind, got %q", got)
-	}
-}
-
-func TestNormalizeChunkOverlapDelta(t *testing.T) {
-	prev := "hello world"
-
-	if got := normalizeChunk("world!!!", &prev); got != "!!!" {
-		t.Fatalf("expected overlap suffix delta, got %q", got)
+			var got string
+			err := parseEventStream(bytes.NewReader(bytes.Join(frames, nil)), &KiroStreamCallback{
+				OnText: func(text string, _ bool) { got += text },
+			})
+			if err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if got != c.want {
+				t.Fatalf("stream delivered %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 
@@ -109,7 +120,7 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 
 func TestHandleToolUseEventGeneratesMissingToolUseID(t *testing.T) {
 	var toolUses []KiroToolUse
-	current := handleToolUseEvent(map[string]interface{}{
+	current, err := handleToolUseEvent(map[string]interface{}{
 		"name":  "mcpIdaProMcpStatus",
 		"input": `{"server":"ida-pro-mcp"}`,
 		"stop":  true,
@@ -118,6 +129,9 @@ func TestHandleToolUseEventGeneratesMissingToolUseID(t *testing.T) {
 			toolUses = append(toolUses, toolUse)
 		},
 	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if current != nil {
 		t.Fatalf("expected stopped tool use to clear current state")
@@ -141,16 +155,24 @@ func TestHandleToolUseEventReplacesGeneratedIDWhenRealIDArrives(t *testing.T) {
 		},
 	}
 
-	current := handleToolUseEvent(map[string]interface{}{
+	current, err := handleToolUseEvent(map[string]interface{}{
 		"name":  "mcpIdaProMcpStatus",
 		"input": `{"server":`,
 	}, nil, callback)
-	current = handleToolUseEvent(map[string]interface{}{
+	if err != nil {
+		t.Fatalf("unexpected error on the first fragment: %v", err)
+	}
+	// The first fragment alone is not valid JSON. It must not be reported as
+	// incomplete here: the block is still open, and the rest arrives below.
+	current, err = handleToolUseEvent(map[string]interface{}{
 		"toolUseId": "toolu_real",
 		"name":      "mcpIdaProMcpStatus",
 		"input":     `"ida-pro-mcp"}`,
 		"stop":      true,
 	}, current, callback)
+	if err != nil {
+		t.Fatalf("unexpected error on the closing fragment: %v", err)
+	}
 
 	if current != nil {
 		t.Fatalf("expected stopped tool use to clear current state")
