@@ -36,7 +36,11 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	if account.AuthMethod == "external_idp" {
 		return RefreshExternalIdpToken(account.RefreshToken, account.IssuerURL, account.IdPTokenEndpoint, account.IdPClientID, account.Scopes, client)
 	}
-	return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.Region, client)
+	// The OIDC token endpoint is an authentication host, so it takes the auth
+	// region, not the data-plane one. account.Region alone ignores an explicitly
+	// configured authRegion (and the global default), which sends the refresh to
+	// the wrong oidc.{region}.amazonaws.com host and fails it.
+	return refreshOIDCToken(account.RefreshToken, account.ClientID, account.ClientSecret, account.EffectiveAuthRegion(), client)
 }
 
 // refreshOIDCToken IdC/Builder ID token 刷新
