@@ -119,8 +119,9 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinking, nameEffort := ParseModelThinkingAndEffort(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
+	applyOpenAIModelNameEffort(openaiReq, nameEffort)
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
@@ -129,12 +130,12 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	respID := generateResponseID()
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+		h.handleResponsesStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 			apiKeyID, ownerPrincipal, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+	h.handleResponsesNonStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 		apiKeyID, ownerPrincipal, respID, &req, storedInputCopy, storeResponse)
 }
 
@@ -153,7 +154,7 @@ func responsesOwnerPrincipal(ctx context.Context, authEnabled bool) string {
 }
 
 func (h *Handler) handleResponsesNonStream(
-	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
+	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, ownerPrincipal, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
@@ -264,7 +265,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 	}
 
-	ex.Run(context.Background(), guard, attempt, nil, onExhausted)
+	ex.Run(ctx, guard, attempt, nil, onExhausted)
 }
 
 func mapResponsesCompletion(reason string) (status, incompleteReason string) {
@@ -343,7 +344,7 @@ func buildResponsesObject(
 }
 
 func (h *Handler) handleResponsesStream(
-	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
+	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, ownerPrincipal, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
@@ -669,5 +670,5 @@ func (h *Handler) handleResponsesStream(
 		sendResponseFailed(lastErr.Error())
 	}
 
-	ex.Run(context.Background(), guard, attempt, onCommitted, onExhausted)
+	ex.Run(ctx, guard, attempt, onCommitted, onExhausted)
 }

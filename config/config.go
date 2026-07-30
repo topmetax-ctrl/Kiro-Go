@@ -281,6 +281,14 @@ type Config struct {
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
+	// DefaultThinkingEffort is the reasoning depth applied when a thinking request
+	// names no level: "low", "medium", "high", "xhigh", "max", or "" / "auto" to
+	// let the model choose. Empty keeps the historical behavior.
+	DefaultThinkingEffort string `json:"defaultThinkingEffort,omitempty"`
+	// AdvertiseEffortModels adds one "(level)" variant per level to /v1/models.
+	// Off by default: it multiplies the list size, and clients that own a level
+	// picker (9router) do not need the variants advertised to use them.
+	AdvertiseEffortModels bool `json:"advertiseEffortModels,omitempty"`
 
 	// Endpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
@@ -1723,12 +1731,29 @@ type ThinkingConfig struct {
 	Suffix       string `json:"suffix"`       // Model name suffix that triggers thinking mode
 	OpenAIFormat string `json:"openaiFormat"` // Output format for OpenAI-compatible responses
 	ClaudeFormat string `json:"claudeFormat"` // Output format for Claude-compatible responses
+	// DefaultEffort is the fallback reasoning depth for thinking requests that
+	// name no level. Empty means "let the model choose" (historical behavior).
+	DefaultEffort string `json:"defaultEffort"`
+	// AdvertiseEffortModels reports whether /v1/models should list "(level)"
+	// variants alongside each base and thinking model.
+	AdvertiseEffortModels bool `json:"advertiseEffortModels"`
 }
 
 // GetThinkingConfig 获取 thinking 配置
 func GetThinkingConfig() ThinkingConfig {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
+
+	// Before Load() runs, cfg is nil. This getter is on the request-translation
+	// path now (it supplies the default reasoning level), not just admin HTTP
+	// handlers, so it has to return usable defaults instead of panicking.
+	if cfg == nil {
+		return ThinkingConfig{
+			Suffix:       "-thinking",
+			OpenAIFormat: "reasoning_content",
+			ClaudeFormat: "thinking",
+		}
+	}
 
 	suffix := cfg.ThinkingSuffix
 	if suffix == "" {
@@ -1744,19 +1769,23 @@ func GetThinkingConfig() ThinkingConfig {
 	}
 
 	return ThinkingConfig{
-		Suffix:       suffix,
-		OpenAIFormat: openaiFormat,
-		ClaudeFormat: claudeFormat,
+		Suffix:                suffix,
+		OpenAIFormat:          openaiFormat,
+		ClaudeFormat:          claudeFormat,
+		DefaultEffort:         cfg.DefaultThinkingEffort,
+		AdvertiseEffortModels: cfg.AdvertiseEffortModels,
 	}
 }
 
 // UpdateThinkingConfig 更新 thinking 配置
-func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
+func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat, defaultEffort string, advertiseEffortModels bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ThinkingSuffix = suffix
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
+	cfg.DefaultThinkingEffort = defaultEffort
+	cfg.AdvertiseEffortModels = advertiseEffortModels
 	return Save()
 }
 

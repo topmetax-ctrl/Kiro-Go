@@ -162,6 +162,9 @@ func validateClaudeRequestShape(req *ClaudeRequest) string {
 	if msg := validateClaudeThinkingConfig(req.Thinking, req.MaxTokens); msg != "" {
 		return msg
 	}
+	if msg := validateClaudeOutputConfig(req.OutputConfig); msg != "" {
+		return msg
+	}
 
 	hasUserContext := false
 	lastRole := ""
@@ -690,11 +693,13 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		cached = h.modelCache.Snapshot()
 	}
 
-	thinkingSuffix := config.GetThinkingConfig().Suffix
+	thinkingCfg := config.GetThinkingConfig()
+	thinkingSuffix := thinkingCfg.Suffix
+	advertiseEffort := thinkingCfg.AdvertiseEffortModels
 
-	models := buildAnthropicModelsResponse(cached, thinkingSuffix)
+	models := buildAnthropicModelsResponse(cached, thinkingSuffix, advertiseEffort)
 	if len(models) == 0 {
-		models = fallbackAnthropicModels(thinkingSuffix)
+		models = fallbackAnthropicModels(thinkingSuffix, advertiseEffort)
 	}
 
 	// 添加别名模型
@@ -811,10 +816,15 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
 	}
+	if msg := validateClaudeOutputConfig(req.OutputConfig); msg != "" {
+		h.sendClaudeError(w, 400, "invalid_request_error", msg)
+		return
+	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	actualModel, thinking, nameEffort := resolveClaudeThinkingModeAndEffort(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
+	applyModelNameEffort(&req, nameEffort)
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 
 	estimatedTokens := estimateClaudeRequestInputTokens(effectiveReq)
@@ -887,8 +897,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	actualModel, thinking, nameEffort := resolveClaudeThinkingModeAndEffort(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
+	applyModelNameEffort(&req, nameEffort)
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
@@ -2110,8 +2121,9 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinking, nameEffort := ParseModelThinkingAndEffort(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
+	applyOpenAIModelNameEffort(&req, nameEffort)
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
@@ -5952,18 +5964,26 @@ func (h *Handler) apiSetLogLevel(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiGetThinkingConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := config.GetThinkingConfig()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"suffix":       cfg.Suffix,
-		"openaiFormat": cfg.OpenAIFormat,
-		"claudeFormat": cfg.ClaudeFormat,
+		"suffix":                cfg.Suffix,
+		"openaiFormat":          cfg.OpenAIFormat,
+		"claudeFormat":          cfg.ClaudeFormat,
+		"defaultEffort":         cfg.DefaultEffort,
+		"advertiseEffortModels": cfg.AdvertiseEffortModels,
 	})
 }
 
 // apiUpdateThinkingConfig 更新 thinking 配置
 func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request) {
+	// The effort fields are pointers so an omitted key keeps its stored value.
+	// The legacy admin page (web/index-legacy.html) still POSTs the original
+	// three-field body, and treating "absent" as "clear it" would silently reset
+	// the default level and the /v1/models toggle whenever that page saved.
 	var req struct {
-		Suffix       string `json:"suffix"`
-		OpenAIFormat string `json:"openaiFormat"`
-		ClaudeFormat string `json:"claudeFormat"`
+		Suffix                string  `json:"suffix"`
+		OpenAIFormat          string  `json:"openaiFormat"`
+		ClaudeFormat          string  `json:"claudeFormat"`
+		DefaultEffort         *string `json:"defaultEffort"`
+		AdvertiseEffortModels *bool   `json:"advertiseEffortModels"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5984,7 +6004,31 @@ func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := config.UpdateThinkingConfig(req.Suffix, req.OpenAIFormat, req.ClaudeFormat); err != nil {
+	current := config.GetThinkingConfig()
+
+	// Store the default effort in canonical form so the request path can compare
+	// it against the enum without re-normalizing on every turn. "" and "auto"
+	// both mean "let the model choose", and both persist as "".
+	defaultEffort := current.DefaultEffort
+	if req.DefaultEffort != nil {
+		level, ok := NormalizeThinkingEffort(*req.DefaultEffort)
+		if !ok {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid defaultEffort, must be one of: auto, " + ThinkingEffortValues()})
+			return
+		}
+		defaultEffort = ""
+		if level != EffortUnset && level != EffortAuto {
+			defaultEffort = string(level)
+		}
+	}
+
+	advertiseEffortModels := current.AdvertiseEffortModels
+	if req.AdvertiseEffortModels != nil {
+		advertiseEffortModels = *req.AdvertiseEffortModels
+	}
+
+	if err := config.UpdateThinkingConfig(req.Suffix, req.OpenAIFormat, req.ClaudeFormat, defaultEffort, advertiseEffortModels); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return

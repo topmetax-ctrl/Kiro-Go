@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -247,6 +248,25 @@ type KiroUserInputMessage struct {
 	Origin                  string                   `json:"origin"`
 	Images                  []KiroImage              `json:"images,omitempty"`
 	UserInputMessageContext *UserInputMessageContext `json:"userInputMessageContext,omitempty"`
+
+	// CachePoint requests an upstream prompt-cache breakpoint after this message.
+	// Wire shape mirrors the official codewhisperer-streaming smithy model:
+	// userInputMessage.cachePoint = {"type":"default"}. Omitted when nil so the
+	// default request shape is unchanged.
+	CachePoint *KiroCachePoint `json:"cachePoint,omitempty"`
+	// ClientCacheConfig carries the upstream client-cache toggle (clientCacheConfig
+	// in the smithy model). Omitted when nil.
+	ClientCacheConfig *KiroClientCacheConfig `json:"clientCacheConfig,omitempty"`
+}
+
+// KiroCachePoint is the upstream cache breakpoint marker. Type is "default".
+type KiroCachePoint struct {
+	Type string `json:"type"`
+}
+
+// KiroClientCacheConfig mirrors the smithy ClientCacheConfig shape.
+type KiroClientCacheConfig struct {
+	UseClientCachingOnly bool `json:"useClientCachingOnly,omitempty"`
 }
 
 type UserInputMessageContext struct {
@@ -499,6 +519,27 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 	endpoints := resolveKiroEndpoints(account)
 	isAPIKey := config.IsAPIKeyAccount(account)
 
+	// Experimental: route to the current-generation Kiro runtime backend
+	// (runtime.{region}.kiro.dev, path "/", the host the current Kiro CLI uses)
+	// instead of the legacy q/codewhisperer hosts. Gated by env, off by default.
+	// Unlike the legacy hosts this backend emits metadataEvent + initial-response
+	// frames; it does NOT emit token-level cache usage, but it does cache repeated
+	// prefixes automatically (visible only as a meteringEvent credit drop). No
+	// fallback on purpose: a runtime failure must surface, not silently divert to
+	// codewhisperer. See docs/kiro-prompt-cache-verification-2026-07-29.md.
+	if os.Getenv("KIRO_RUNTIME_ENDPOINT") == "1" {
+		region := kiroRegion(account)
+		if region == "" {
+			region = "us-east-1"
+		}
+		endpoints = []kiroEndpoint{{
+			URL:       fmt.Sprintf("https://runtime.%s.kiro.dev/", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+			Name:      "KiroRuntime",
+		}}
+	}
+
 	var lastErr error
 endpointLoop:
 	for epIndex, ep := range endpoints {
@@ -520,6 +561,8 @@ endpointLoop:
 		if parsedURL, parseErr := url.Parse(epURL); parseErr == nil {
 			host = parsedURL.Host
 		}
+		// The runtime (kiro.dev) host emulates the current Kiro CLI, which pins
+		// codewhispererruntime headers; the legacy hosts use codewhispererstreaming.
 		headerValues := buildStreamingHeaderValues(account, host)
 		invocationID := uuid.New().String()
 

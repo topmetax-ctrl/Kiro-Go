@@ -153,6 +153,13 @@ func (ex *ChatExecutor) Run(
 	var lastErr error
 
 	for i := 0; i < maxAccountRetryAttempts; i++ {
+		// Client already gone (disconnect/timeout): stop before selecting an
+		// account or spending a token refresh. Nothing to render — the connection
+		// is dead — so skip the exhaustion tail too.
+		if ctx.Err() != nil {
+			return
+		}
+
 		account := ex.pool.GetNextForModelExcluding(ex.model, excluded)
 		if account == nil {
 			break
@@ -167,6 +174,13 @@ func (ex *ChatExecutor) Run(
 		outcome := attempt(ctx, account)
 		if !outcome.accountFailed {
 			// Success, or a terminal error the attempt already surfaced. Stop.
+			return
+		}
+
+		// A cancelled client context surfaces as an upstream error, but it is not
+		// the account's fault: do not blame/cooldown the account, do not retry
+		// onto another one, and do not render a tail into a dead connection.
+		if ctx.Err() != nil {
 			return
 		}
 

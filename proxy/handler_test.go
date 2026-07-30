@@ -515,7 +515,7 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	models := buildAnthropicModelsResponse([]ModelInfo{{
 		ModelId:    "claude-sonnet-4.5",
 		InputTypes: []string{"text", "image"},
-	}}, "-thinking")
+	}}, "-thinking", false)
 
 	if len(models) != 2 {
 		t.Fatalf("expected base model and thinking variant, got %d", len(models))
@@ -528,6 +528,42 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
+	}
+}
+
+// TestBuildAnthropicModelsResponseAdvertisesEffortVariants covers the opt-in
+// listing shape: base + thinking + one entry per level. The ids must round-trip
+// through the request-side parser, otherwise a client could pick a model from
+// /v1/models that the proxy then rejects.
+func TestBuildAnthropicModelsResponseAdvertisesEffortVariants(t *testing.T) {
+	models := buildAnthropicModelsResponse([]ModelInfo{{
+		ModelId:    "claude-sonnet-4.5",
+		InputTypes: []string{"text", "image"},
+	}}, "-thinking", true)
+
+	want := 2 + len(orderedThinkingEfforts)
+	if len(models) != want {
+		t.Fatalf("expected %d entries (base + thinking + levels), got %d", want, len(models))
+	}
+
+	for i, level := range orderedThinkingEfforts {
+		entry := models[2+i]
+		wantID := "claude-sonnet-4.5-thinking(" + string(level) + ")"
+		gotID, _ := entry["id"].(string)
+		if gotID != wantID {
+			t.Fatalf("entry %d: expected id %q, got %q", i, wantID, gotID)
+		}
+
+		actual, thinking, effort := ParseModelThinkingAndEffort(gotID, "-thinking")
+		if actual != "claude-sonnet-4.5" {
+			t.Fatalf("advertised id %q parsed to model %q", gotID, actual)
+		}
+		if !thinking {
+			t.Fatalf("advertised id %q did not parse as a thinking request", gotID)
+		}
+		if effort != level {
+			t.Fatalf("advertised id %q parsed to effort %q, want %q", gotID, effort, level)
+		}
 	}
 }
 

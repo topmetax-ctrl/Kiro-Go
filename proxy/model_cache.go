@@ -352,7 +352,7 @@ func (mc *ModelCache) apiRefreshAllAccountsModels(w http.ResponseWriter, r *http
 
 // --- Pure model-shaping helpers (no receiver) ------------------------------
 
-func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []map[string]interface{} {
+func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string, advertiseEffort bool) []map[string]interface{} {
 	if len(cached) == 0 {
 		return nil
 	}
@@ -363,27 +363,50 @@ func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []m
 		models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
 		// 自动生成 thinking 变体
 		models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
+		models = appendEffortVariants(models, m.ModelId, thinkingSuffix, supportsImage, advertiseEffort)
 	}
 	return models
 }
 
-func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
-	return []map[string]interface{}{
-		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.6", "anthropic", true),
-		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.7", "anthropic", true),
-		buildModelInfo("claude-opus-4.7"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4", "anthropic", true),
-		buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-haiku-4.5", "anthropic", true),
-		buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.5", "anthropic", true),
-		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
+// appendEffortVariants adds one "(level)" entry per reasoning level, so clients
+// that pick a model from /v1/models can select depth without knowing to type the
+// suffix by hand. The variants name the thinking model, since a level is only
+// meaningful when thinking is on.
+//
+// Off by default: this multiplies the listing by the number of levels, and some
+// clients render every entry in a picker. Callers pass advertiseEffort=false to
+// keep the historical two-per-model shape.
+func appendEffortVariants(models []map[string]interface{}, modelID, thinkingSuffix string, supportsImage, advertiseEffort bool) []map[string]interface{} {
+	if !advertiseEffort {
+		return models
 	}
+	for _, level := range orderedThinkingEfforts {
+		id := fmt.Sprintf("%s%s(%s)", modelID, thinkingSuffix, level)
+		models = append(models, buildModelInfo(id, "anthropic", supportsImage))
+	}
+	return models
+}
+
+// fallbackAnthropicModelIDs is the hard-coded listing used when no account has
+// reported its models yet. All of these are vision-capable.
+var fallbackAnthropicModelIDs = []string{
+	"claude-sonnet-4.6",
+	"claude-opus-4.6",
+	"claude-opus-4.7",
+	"claude-sonnet-4.5",
+	"claude-sonnet-4",
+	"claude-haiku-4.5",
+	"claude-opus-4.5",
+}
+
+func fallbackAnthropicModels(thinkingSuffix string, advertiseEffort bool) []map[string]interface{} {
+	models := make([]map[string]interface{}, 0, len(fallbackAnthropicModelIDs)*2)
+	for _, id := range fallbackAnthropicModelIDs {
+		models = append(models, buildModelInfo(id, "anthropic", true))
+		models = append(models, buildModelInfo(id+thinkingSuffix, "anthropic", true))
+		models = appendEffortVariants(models, id, thinkingSuffix, true, advertiseEffort)
+	}
+	return models
 }
 
 func modelSupportsImage(inputTypes []string) bool {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -71,14 +72,37 @@ const truncationPlaceholder = "[Earlier conversation history was truncated to fi
 const minRecentHistoryTurns = 4
 
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
-// and reports whether thinking mode was requested via the configured suffix.
+// and reports whether thinking mode was requested via the configured suffix or a
+// trailing "(level)" reasoning-level suffix.
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
+	actual, thinking, _ := ParseModelThinkingAndEffort(model, thinkingSuffix)
+	return actual, thinking
+}
+
+// ParseModelThinkingAndEffort is ParseModelAndThinking plus the reasoning level
+// carried by a trailing "(level)" suffix on the model name.
+//
+// The suffix is 9router's convention: its provider page appends "(xhigh)" and
+// friends to the model id you copy, and normally strips it from body.model before
+// forwarding. Handling it here keeps the proxy correct when it arrives anyway —
+// otherwise the parenthesized name would reach Kiro and fail model validation.
+// Naming a level implies thinking is wanted, so any recognized level turns
+// thinking on.
+func ParseModelThinkingAndEffort(model string, thinkingSuffix string) (string, bool, ThinkingEffort) {
+	cleaned, level := stripParenLevel(model)
+	actual, suffixThinking := parseModelAndThinkingSuffix(cleaned, thinkingSuffix)
+	return actual, suffixThinking || level != EffortUnset, level
+}
+
+func parseModelAndThinkingSuffix(model string, thinkingSuffix string) (string, bool) {
 	lower := strings.ToLower(model)
 	thinking := false
 
 	// Strip the configured thinking suffix (e.g. "-thinking") if present.
+	// Guard against an empty suffix: strings.HasSuffix always matches "", which
+	// would otherwise mark every model as a thinking request.
 	suffixLower := strings.ToLower(thinkingSuffix)
-	if strings.HasSuffix(lower, suffixLower) {
+	if suffixLower != "" && strings.HasSuffix(lower, suffixLower) {
 		thinking = true
 		model = model[:len(model)-len(thinkingSuffix)]
 		lower = strings.ToLower(model)
@@ -106,8 +130,34 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 }
 
 func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig, thinkingSuffix string) (string, bool) {
-	actualModel, suffixThinking := ParseModelAndThinking(model, thinkingSuffix)
-	return actualModel, suffixThinking || isClaudeThinkingRequested(thinkingCfg)
+	actualModel, thinking, _ := resolveClaudeThinkingModeAndEffort(model, thinkingCfg, thinkingSuffix)
+	return actualModel, thinking
+}
+
+// resolveClaudeThinkingModeAndEffort resolves the Kiro model ID, whether thinking
+// is on, and the reasoning level implied by the model name.
+//
+// Thinking turns on if any of these ask for it: the "-thinking" suffix, a
+// "(level)" suffix, or thinking.type enabled/adaptive. The returned level is only
+// the one carried by the model name; a level in the request body is read
+// separately by claudeRequestEffort, which takes precedence.
+func resolveClaudeThinkingModeAndEffort(model string, thinkingCfg *ClaudeThinkingConfig, thinkingSuffix string) (string, bool, ThinkingEffort) {
+	actualModel, nameThinking, level := ParseModelThinkingAndEffort(model, thinkingSuffix)
+	return actualModel, nameThinking || isClaudeThinkingRequested(thinkingCfg), level
+}
+
+// applyModelNameEffort records a model-name level on the request body so the
+// conversion and token-estimation paths both read the level from one place.
+// A level already present in the body wins, matching the precedence in
+// claudeRequestEffort.
+func applyModelNameEffort(req *ClaudeRequest, level ThinkingEffort) {
+	if req == nil || level == EffortUnset {
+		return
+	}
+	if req.OutputConfig != nil && strings.TrimSpace(req.OutputConfig.Effort) != "" {
+		return
+	}
+	req.OutputConfig = &ClaudeOutputConfig{Effort: string(level)}
 }
 
 func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
@@ -136,12 +186,24 @@ type ClaudeRequest struct {
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
 	Tools       []ClaudeTool          `json:"tools,omitempty"`
 	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+
+	// OutputConfig carries Anthropic's `output_config.effort`, the current way
+	// to control reasoning depth. It supersedes thinking.budget_tokens, which
+	// is deprecated on the 4.6 models and rejected outright by 4.7 and later.
+	OutputConfig *ClaudeOutputConfig `json:"output_config,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
 	Type         string `json:"type,omitempty"`
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 	Display      string `json:"display,omitempty"`
+}
+
+// ClaudeOutputConfig mirrors the Anthropic `output_config` object. Only `effort`
+// is recognized; unknown members are ignored, matching how the proxy treats the
+// rest of the request body.
+type ClaudeOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type ClaudeMessage struct {
@@ -239,8 +301,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
+	// The boolean gates whether thinking happens; the depth comes from the
+	// request body (output_config.effort, else the legacy thinking.budget_tokens).
+	effort := resolveEffortForPayload(thinking, claudeRequestEffort(req))
+
 	// 提取系统提示
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	systemPrompt := buildClaudeSystemPrompt(req.System, effort)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -395,21 +461,37 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
+	applyKiroCachePoint(payload)
 	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
 }
 
-func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+// applyKiroCachePoint sets an upstream prompt-cache breakpoint on the current
+// message when KIRO_CACHEPOINT=1. The smithy model for GenerateAssistantResponse
+// exposes userInputMessage.cachePoint ({"type":"default"}). NOTE: a live causal
+// probe (docs/kiro-prompt-cache-verification-2026-07-29.md) showed the runtime
+// backend caches repeated prefixes AUTOMATICALLY — this marker is inert for cache
+// activation and emits no token usage either way. Kept env-gated for experiments
+// only; do not treat it as load-bearing. Off by default.
+func applyKiroCachePoint(payload *KiroPayload) {
+	if payload == nil || os.Getenv("KIRO_CACHEPOINT") != "1" {
+		return
+	}
+	payload.ConversationState.CurrentMessage.UserInputMessage.CachePoint = &KiroCachePoint{Type: "default"}
+}
+
+func buildClaudeSystemPrompt(system interface{}, effort ThinkingEffort) string {
 	systemPrompt := extractSystemPrompt(system)
 	systemPrompt = applyPromptFilters(systemPrompt)
-	if !thinking {
+	if effort == EffortUnset {
 		return systemPrompt
 	}
+	priming := thinkingModePromptForEffort(effort)
 	if systemPrompt == "" {
-		return ThinkingModePrompt
+		return priming
 	}
-	return ThinkingModePrompt + "\n\n" + systemPrompt
+	return priming + "\n\n" + systemPrompt
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
@@ -587,14 +669,16 @@ func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeReq
 	}
 
 	cloned := *req
-	if thinking {
-		cloned.System = prependThinkingSystem(req.System)
+	// Mirror ClaudeToKiro: derive depth from the request so the estimated input
+	// reflects the priming block that will actually be sent.
+	if effort := resolveEffortForPayload(thinking, claudeRequestEffort(req)); effort != EffortUnset {
+		cloned.System = prependThinkingSystem(req.System, effort)
 	}
 	return &cloned
 }
 
-func prependThinkingSystem(system interface{}) interface{} {
-	thinkingText := ThinkingModePrompt
+func prependThinkingSystem(system interface{}, effort ThinkingEffort) interface{} {
+	thinkingText := thinkingModePromptForEffort(effort)
 	if hasClaudeSystemContent(system) {
 		thinkingText += "\n"
 	}
@@ -1193,6 +1277,10 @@ type OpenAIRequest struct {
 	TopP        float64         `json:"top_p,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
 	Tools       []OpenAITool    `json:"tools,omitempty"`
+
+	// ReasoningEffort is the OpenAI-format spelling of the reasoning-depth
+	// control. Accepts the same level names as Anthropic's output_config.effort.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -1310,8 +1398,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 
 	// 如果启用 thinking 模式，注入 thinking 提示
-	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+	// The boolean gates thinking; reasoning_effort supplies the depth.
+	if effort := resolveEffortForPayload(thinking, openAIRequestEffort(req)); effort != EffortUnset {
+		systemPrompt = thinkingModePromptForEffort(effort) + "\n\n" + systemPrompt
 	}
 
 	// 构建历史消息
@@ -1490,6 +1579,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
+	applyKiroCachePoint(payload)
 	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload

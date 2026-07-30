@@ -137,6 +137,7 @@
       </div>
     </header>
 
+    <div class="app-main">
     <div class="container">
       <!-- Stats summary -->
       <div class="stats-grid">
@@ -313,6 +314,25 @@
               <option value="thinking" data-i18n="settings.formatThinkingClaude"></option>
               <option value="think" data-i18n="settings.formatThinkOpenAI"></option>
             </select>
+          </div>
+          <div class="form-group">
+            <label data-i18n="settings.defaultEffort"></label>
+            <select id="thinkingDefaultEffort">
+              <option value="auto" data-i18n="settings.effortAuto"></option>
+              <option value="low" data-i18n="settings.effortLow"></option>
+              <option value="medium" data-i18n="settings.effortMedium"></option>
+              <option value="high" data-i18n="settings.effortHigh"></option>
+              <option value="xhigh" data-i18n="settings.effortXHigh"></option>
+              <option value="max" data-i18n="settings.effortMax"></option>
+            </select>
+            <small data-i18n="settings.defaultEffortHint"></small>
+          </div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="advertiseEffortModels" /><span class="slider"></span></span>
+              <span data-i18n="settings.advertiseEffortModels"></span>
+            </label>
+            <small data-i18n="settings.advertiseEffortModelsHint"></small>
           </div>
           <button class="btn btn-primary" id="saveThinkingBtn" data-i18n="settings.saveThinking"></button>
         </div>
@@ -562,36 +582,6 @@
           <button class="btn btn-primary" id="saveMemoryBtn" data-i18n="memory.save"></button>
         </div>
 
-        <!-- Upstream forwarding -->
-        <div class="card">
-          <div class="card-header"><span class="card-title" data-i18n="settings.upstreamTitle"></span></div>
-          <small class="help-block" data-i18n="upstreams.intro"></small>
-
-          <div class="form-group" style="margin-top: 1rem;">
-            <div class="flex items-center gap-2" style="justify-content: space-between;">
-              <label class="font-semibold" data-i18n="upstreams.providersTitle"></label>
-              <button class="btn btn-outline btn-sm" id="addUpstreamBtn" type="button">
-                <i class="fa-solid fa-plus"></i>
-                <span data-i18n="upstreams.addProvider"></span>
-              </button>
-            </div>
-            <small data-i18n="upstreams.providersHint"></small>
-          </div>
-          <div id="upstreamsList"></div>
-
-          <div class="form-group" style="margin-top: 1rem;">
-            <div class="flex items-center gap-2" style="justify-content: space-between;">
-              <label class="font-semibold" data-i18n="upstreams.routesTitle"></label>
-              <button class="btn btn-outline btn-sm" id="addRouteBtn" type="button">
-                <i class="fa-solid fa-plus"></i>
-                <span data-i18n="upstreams.addRoute"></span>
-              </button>
-            </div>
-            <small data-i18n="upstreams.routesHint"></small>
-          </div>
-          <div id="modelRoutesList"></div>
-        </div>
-
         <!-- Statistics reset -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.statistics"></span></div>
@@ -693,6 +683,36 @@
 
       <!-- Forwarding dashboard tab -->
       <div id="tabForwarding" class="tab-content hidden">
+        <!-- Upstream forwarding config -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.upstreamTitle"></span></div>
+          <small class="help-block" data-i18n="upstreams.intro"></small>
+
+          <div class="form-group" style="margin-top: 1rem;">
+            <div class="flex items-center gap-2" style="justify-content: space-between;">
+              <label class="font-semibold" data-i18n="upstreams.providersTitle"></label>
+              <button class="btn btn-outline btn-sm" id="addUpstreamBtn" type="button">
+                <i class="fa-solid fa-plus"></i>
+                <span data-i18n="upstreams.addProvider"></span>
+              </button>
+            </div>
+            <small data-i18n="upstreams.providersHint"></small>
+          </div>
+          <div id="upstreamsList"></div>
+
+          <div class="form-group" style="margin-top: 1rem;">
+            <div class="flex items-center gap-2" style="justify-content: space-between;">
+              <label class="font-semibold" data-i18n="upstreams.routesTitle"></label>
+              <button class="btn btn-outline btn-sm" id="addRouteBtn" type="button">
+                <i class="fa-solid fa-plus"></i>
+                <span data-i18n="upstreams.addRoute"></span>
+              </button>
+            </div>
+            <small data-i18n="upstreams.routesHint"></small>
+          </div>
+          <div id="modelRoutesList"></div>
+        </div>
+
         <div class="card">
           <div class="card-header">
             <span class="card-title" data-i18n="forward.title"></span>
@@ -880,6 +900,19 @@
         </div>
       </div>
     </footer>
+    </div>
+
+    <!-- Floating scroll navigation -->
+    <div id="scrollNav" class="scroll-nav" hidden>
+      <button type="button" class="scroll-nav-btn" data-dir="up" aria-label=""
+        data-i18n-aria-label="scroll.top" title="" data-i18n-title="scroll.top">
+        <i class="fa-solid fa-chevron-up" aria-hidden="true"></i>
+      </button>
+      <button type="button" class="scroll-nav-btn" data-dir="down" aria-label=""
+        data-i18n-aria-label="scroll.bottom" title="" data-i18n-title="scroll.bottom">
+        <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
+      </button>
+    </div>
   </div>
 
   <!-- Modals -->

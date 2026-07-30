@@ -321,7 +321,7 @@ func TestResponsesStreamByteShapeGolden(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	h.handleResponsesStream(rec, goldenPayload(), "claude-sonnet-4.5", false, 1, "", "", "resp_test",
+	h.handleResponsesStream(context.Background(), rec, goldenPayload(), "claude-sonnet-4.5", false, 1, "", "", "resp_test",
 		&ResponsesRequest{Model: "claude-sonnet-4.5"}, nil, false)
 
 	if *attempts != 1 {
@@ -343,7 +343,7 @@ func TestResponsesStreamNoRetryAfterFirstByte(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	h.handleResponsesStream(rec, goldenPayload(), "claude-sonnet-4.5", false, 1, "", "", "resp_test",
+	h.handleResponsesStream(context.Background(), rec, goldenPayload(), "claude-sonnet-4.5", false, 1, "", "", "resp_test",
 		&ResponsesRequest{Model: "claude-sonnet-4.5"}, nil, false)
 
 	if *attempts != 1 {

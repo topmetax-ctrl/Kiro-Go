@@ -262,3 +262,78 @@ func TestPromptCacheImplicitBreakpointAtMessageEnd(t *testing.T) {
 		t.Fatalf("expected cache read via implicit message-end breakpoint, got %+v", result)
 	}
 }
+
+func TestMinCacheableTokensForModel(t *testing.T) {
+	cases := []struct {
+		model string
+		want  int
+	}{
+		{"claude-sonnet-4.5", defaultMinCacheableTokens},
+		{"claude-sonnet-4.6", defaultMinCacheableTokens},
+		{"claude-sonnet-4", defaultMinCacheableTokens},
+		{"claude-opus-4.5", highMinCacheableTokens},
+		{"claude-opus-4.8-thinking", highMinCacheableTokens},
+		{"claude-haiku-4.5", highMinCacheableTokens},
+		{"claude-haiku-4.5-thinking", highMinCacheableTokens},
+		{"CLAUDE-HAIKU-4.5", highMinCacheableTokens},
+	}
+	for _, tc := range cases {
+		if got := minCacheableTokensForModel(tc.model); got != tc.want {
+			t.Errorf("minCacheableTokensForModel(%q) = %d, want %d", tc.model, got, tc.want)
+		}
+	}
+}
+
+// TestHaikuPrefixBelowThresholdDoesNotHit locks the Haiku 4.5 = 4096 rule at the
+// behavior level: a prefix that sits between the Sonnet threshold (1024) and the
+// Haiku/Opus threshold (4096) must hit on Sonnet but miss on Haiku, because
+// Anthropic does not cache sub-4096 prefixes for Haiku 4.5. Getting this wrong
+// over-reports Haiku cache hits.
+func TestHaikuPrefixBelowThresholdDoesNotHit(t *testing.T) {
+	// Size the system prompt so its cumulative token estimate lands strictly
+	// between the two thresholds. Assert the assumption so the test fails loudly
+	// (not flakily) if the estimator changes.
+	systemText := strings.Repeat("You are a concise assistant. ", 200)
+	baseSystem := []interface{}{
+		map[string]interface{}{
+			"type": "text",
+			"text": systemText,
+			"cache_control": map[string]interface{}{
+				"type": "ephemeral",
+			},
+		},
+	}
+	newReq := func(model string) *ClaudeRequest {
+		return &ClaudeRequest{
+			Model:    model,
+			System:   baseSystem,
+			Messages: []ClaudeMessage{{Role: "user", Content: "hello"}},
+		}
+	}
+
+	probe := newPromptCacheTracker(time.Hour).BuildClaudeProfile(newReq("claude-sonnet-4.5"), 0)
+	if probe == nil || len(probe.Breakpoints) == 0 {
+		t.Fatalf("probe profile should be built with a breakpoint")
+	}
+	prefixTokens := probe.Breakpoints[len(probe.Breakpoints)-1].CumulativeTokens
+	if prefixTokens < defaultMinCacheableTokens || prefixTokens >= highMinCacheableTokens {
+		t.Fatalf("test setup broken: prefix tokens %d must be in [%d, %d)",
+			prefixTokens, defaultMinCacheableTokens, highMinCacheableTokens)
+	}
+
+	// Sonnet (threshold 1024): the prefix clears the bar, so a repeated request hits.
+	sonnet := newPromptCacheTracker(time.Hour)
+	profS := sonnet.BuildClaudeProfile(newReq("claude-sonnet-4.5"), prefixTokens)
+	sonnet.Update("acct-1", profS)
+	if got := sonnet.Compute("acct-1", profS); got.CacheReadInputTokens == 0 {
+		t.Fatalf("sonnet: prefix of %d tokens should hit, got %+v", prefixTokens, got)
+	}
+
+	// Haiku 4.5 (threshold 4096): the same prefix is below the bar, so it never hits.
+	haiku := newPromptCacheTracker(time.Hour)
+	profH := haiku.BuildClaudeProfile(newReq("claude-haiku-4.5"), prefixTokens)
+	haiku.Update("acct-1", profH)
+	if got := haiku.Compute("acct-1", profH); got.CacheReadInputTokens != 0 {
+		t.Fatalf("haiku: prefix of %d tokens is below 4096 and must not hit, got %+v", prefixTokens, got)
+	}
+}

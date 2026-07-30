@@ -1867,13 +1867,19 @@
     $('thinkingSuffix').value = d.suffix || '-thinking';
     $('openaiThinkingFormat').value = d.openaiFormat || 'reasoning_content';
     $('claudeThinkingFormat').value = d.claudeFormat || 'thinking';
+    // The server stores "let the model choose" as an empty string; the picker
+    // spells that "auto".
+    $('thinkingDefaultEffort').value = d.defaultEffort || 'auto';
+    $('advertiseEffortModels').checked = d.advertiseEffortModels || false;
   }
   async function saveThinkingConfig() {
     const res = await api('/thinking', {
       method: 'POST', body: JSON.stringify({
         suffix: $('thinkingSuffix').value || '-thinking',
         openaiFormat: $('openaiThinkingFormat').value,
-        claudeFormat: $('claudeThinkingFormat').value
+        claudeFormat: $('claudeThinkingFormat').value,
+        defaultEffort: $('thinkingDefaultEffort').value,
+        advertiseEffortModels: $('advertiseEffortModels').checked
       })
     });
     const d = await res.json();
@@ -4799,6 +4805,80 @@
     });
   }
 
+  // Floating scroll navigation — a single pill that scrolls either the window
+  // (normal tabs) or the console output pane (console tab, which scrolls in its
+  // own overflow container rather than the page).
+  let scrollNavTarget = null; // null => page/window scrolling
+  let scrollNavRaf = false;
+  const SCROLL_NAV_THRESHOLD = 24;
+
+  function scrollNavMetrics() {
+    if (scrollNavTarget) {
+      return {
+        top: scrollNavTarget.scrollTop,
+        max: scrollNavTarget.scrollHeight - scrollNavTarget.clientHeight,
+      };
+    }
+    const el = document.scrollingElement || document.documentElement;
+    return {
+      top: window.scrollY || el.scrollTop || 0,
+      max: el.scrollHeight - window.innerHeight,
+    };
+  }
+
+  function scrollNavUpdate() {
+    scrollNavRaf = false;
+    const nav = $('scrollNav');
+    if (!nav) return;
+    if ($('mainPage').classList.contains('hidden')) { nav.hidden = true; return; }
+    const { top, max } = scrollNavMetrics();
+    if (max <= SCROLL_NAV_THRESHOLD) { nav.hidden = true; return; }
+    nav.hidden = false;
+    const upBtn = nav.querySelector('[data-dir="up"]');
+    const downBtn = nav.querySelector('[data-dir="down"]');
+    if (upBtn) upBtn.disabled = top <= SCROLL_NAV_THRESHOLD;
+    if (downBtn) downBtn.disabled = top >= max - SCROLL_NAV_THRESHOLD;
+  }
+
+  function scrollNavSchedule() {
+    if (scrollNavRaf) return;
+    scrollNavRaf = true;
+    requestAnimationFrame(scrollNavUpdate);
+  }
+
+  function scrollNavSetTarget(el) {
+    if (scrollNavTarget) scrollNavTarget.removeEventListener('scroll', scrollNavSchedule);
+    scrollNavTarget = el || null;
+    if (scrollNavTarget) scrollNavTarget.addEventListener('scroll', scrollNavSchedule, { passive: true });
+    scrollNavSchedule();
+  }
+
+  function scrollNavTo(dir) {
+    const { max } = scrollNavMetrics();
+    const top = dir === 'up' ? 0 : max;
+    (scrollNavTarget || window).scrollTo({ top, behavior: 'smooth' });
+  }
+
+  function initScrollNav() {
+    const nav = $('scrollNav');
+    if (!nav) return;
+    nav.querySelectorAll('.scroll-nav-btn').forEach(btn => {
+      btn.addEventListener('click', () => scrollNavTo(btn.dataset.dir));
+    });
+    window.addEventListener('scroll', scrollNavSchedule, { passive: true });
+    window.addEventListener('resize', scrollNavSchedule);
+    // Content height changes (rendering account cards, forwarding rows, console
+    // log lines) don't fire scroll/resize, so observe the panes that grow.
+    if (typeof ResizeObserver === 'function') {
+      const ro = new ResizeObserver(scrollNavSchedule);
+      const container = document.querySelector('.app-main > .container');
+      if (container) ro.observe(container);
+      const out = $('consoleOutput');
+      if (out) ro.observe(out);
+    }
+    scrollNavSchedule();
+  }
+
   // Tabs
   function switchTab(tab) {
     qsa('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
@@ -4809,6 +4889,19 @@
     if (tab === 'forwarding') openForwarding();
     else closeForwarding();
     if (tab === 'logs') loadLogs();
+    setSidebar(false);
+    // Console scrolls in its own overflow pane; every other tab scrolls the page.
+    scrollNavSetTarget(tab === 'console' ? $('consoleOutput') : null);
+  }
+
+  function setSidebar(open) {
+    const page = $('mainPage');
+    if (!page) return;
+    page.classList.toggle('sidebar-open', open);
+    const toggle = $('sidebarToggle');
+    if (toggle) toggle.setAttribute('aria-expanded', String(open));
+    const backdrop = $('sidebarBackdrop');
+    if (backdrop) backdrop.hidden = !open;
   }
 
   // Event wiring
@@ -4850,6 +4943,14 @@
     $('logoutBtn').addEventListener('click', logout);
 
     qsa('#tabBar .tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
+
+    const sidebarToggle = $('sidebarToggle');
+    if (sidebarToggle) sidebarToggle.addEventListener('click', () => {
+      setSidebar(!$('mainPage').classList.contains('sidebar-open'));
+    });
+    const sidebarBackdrop = $('sidebarBackdrop');
+    if (sidebarBackdrop) sidebarBackdrop.addEventListener('click', () => setSidebar(false));
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') setSidebar(false); });
 
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
       const id = btn.dataset.copy;
@@ -5271,6 +5372,7 @@
     initPrivacyMode();
     initRememberMe();
     initApiAddrSelect();
+    initScrollNav();
     const yr = $('footerYear');
     if (yr) yr.textContent = new Date().getFullYear();
     wireEvents();
