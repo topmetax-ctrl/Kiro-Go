@@ -75,7 +75,7 @@ func (e *webSearchExecutor) CanHandle(call KiroToolUse) bool {
 // Execute runs one web_search call. The tool_use ID is echoed on the result so
 // the continuation links result⟺call exactly.
 func (e *webSearchExecutor) Execute(ctx context.Context, call KiroToolUse, policy WebSearchPolicy) (KiroToolResult, ToolExecutionMetadata, error) {
-	query := extractSearchQuery(call.Input)
+	query := extractToolInputQuery(call.Input)
 	meta := ToolExecutionMetadata{Query: query}
 
 	// Invalid input: do not call the provider. Return an error-framed result the

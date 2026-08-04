@@ -283,6 +283,13 @@ func (mc *ModelCache) rebuildAggregateLocked() {
 // were fetched for, so a manual or background refresh cannot clobber a concurrent
 // profile switch.
 func (mc *ModelCache) FetchAndCache(account *config.Account) error {
+	// Every caller fires this as a best-effort background goroutine. A Handler
+	// built without NewHandler (tests, and any future partial construction) has
+	// no cache to fill, so this is a no-op rather than a panic in a goroutine
+	// that nothing can recover.
+	if mc == nil {
+		return nil
+	}
 	if err := mc.ensureToken(account); err != nil {
 		return fmt.Errorf("token refresh failed: %w", err)
 	}

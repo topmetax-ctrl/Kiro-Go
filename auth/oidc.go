@@ -7,6 +7,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,9 @@ var socialTokenURL = func() string {
 // RefreshToken 刷新 access token
 // Returns: accessToken, refreshToken, expiresAt, profileArn, error
 func RefreshToken(account *config.Account) (string, string, int64, string, error) {
+	if config.IsAPIKeyAccount(account) {
+		return "", "", 0, "", fmt.Errorf("API Key credentials do not support token refresh")
+	}
 	// Resolve per-account proxy: account.ProxyURL > global config
 	proxyURL := account.ProxyURL
 	if proxyURL == "" {
@@ -30,6 +34,16 @@ func RefreshToken(account *config.Account) (string, string, int64, string, error
 	}
 	client := GetAuthClientForProxy(proxyURL)
 
+	if strings.EqualFold(strings.TrimSpace(account.AuthMethod), MicrosoftSSOAuthMethod) {
+		return refreshExternalIdpToken(
+			account.RefreshToken,
+			account.ClientID,
+			account.TokenEndpoint,
+			account.IssuerURL,
+			account.Scopes,
+			client,
+		)
+	}
 	if account.AuthMethod == "social" {
 		return refreshSocialToken(account.RefreshToken, client)
 	}

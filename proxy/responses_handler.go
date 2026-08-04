@@ -168,6 +168,7 @@ func (h *Handler) handleResponsesNonStream(
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -183,10 +184,36 @@ func (h *Handler) handleResponsesNonStream(
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		measure := func() (int, int, string, bool) {
+			return len(content), len(toolUses), upstreamStopReason, reasoningContent != ""
+		}
+
+		reset := func() {
+			content = ""
+			reasoningContent = ""
+			toolUses = nil
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+		}
+
+		// Fully buffered path: nothing reaches the client until the response is
+		// encoded, so a retry can never duplicate output — hence a nil canRetry.
+		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
 		if err != nil {
+			if ctx.Err() != nil {
+				return attemptHandled()
+			}
+			// A truncated upstream stream is an upstream hiccup, not the account's
+			// fault: move to the next account without blaming this one.
+			if isStreamIntegrityError(err) {
+				return attemptRotateWithoutBlame(err)
+			}
 			return attemptAccountFailed(err)
 		}
 
@@ -213,7 +240,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, clientInput, clientOutput, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, clientInput, clientOutput, req, upstreamStopReason)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 
@@ -240,9 +267,20 @@ func (h *Handler) handleResponsesNonStream(
 	ex.Run(context.Background(), guard, attempt, nil, onExhausted)
 }
 
+func mapResponsesCompletion(reason string) (status, incompleteReason string) {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "max_tokens", "max_output_tokens", "length", "model_context_window_exceeded", "context_window_exceeded":
+		return "incomplete", "max_output_tokens"
+	case "refusal", "content_filter", "content_filtered", "guardrail_intervened":
+		return "incomplete", "content_filter"
+	default:
+		return "completed", ""
+	}
+}
+
 func buildResponsesObject(
 	id, model, content string, toolUses []KiroToolUse,
-	inputTokens, outputTokens int, req *ResponsesRequest,
+	inputTokens, outputTokens int, req *ResponsesRequest, upstreamStopReason string,
 ) *ResponsesObject {
 	output := make([]ResponseOutputItem, 0, 1+len(toolUses))
 
@@ -284,16 +322,23 @@ func buildResponsesObject(
 		})
 	}
 
+	status, incompleteReason := mapResponsesCompletion(upstreamStopReason)
+	var incompleteDetails *ResponsesIncompleteDetails
+	if incompleteReason != "" {
+		incompleteDetails = &ResponsesIncompleteDetails{Reason: incompleteReason}
+	}
+
 	return &ResponsesObject{
 		ID:                 id,
 		Object:             "response",
 		CreatedAt:          time.Now().Unix(),
-		Status:             "completed",
+		Status:             status,
 		Model:              model,
 		Output:             output,
 		Usage:              ResponsesUsage{InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: inputTokens + outputTokens},
 		PreviousResponseID: req.PreviousResponseID,
 		Metadata:           req.Metadata,
+		IncompleteDetails:  incompleteDetails,
 	}
 }
 
@@ -348,13 +393,14 @@ func (h *Handler) handleResponsesStream(
 		})
 
 		var (
-			fullText        strings.Builder
-			reasoningText   strings.Builder
-			toolUses        []KiroToolUse
-			inputTokens     int
-			outputTokens    int
-			credits         float64
-			realInputTokens int
+			fullText           strings.Builder
+			reasoningText      strings.Builder
+			toolUses           []KiroToolUse
+			inputTokens        int
+			outputTokens       int
+			credits            float64
+			realInputTokens    int
+			upstreamStopReason string
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -481,9 +527,40 @@ func (h *Handler) handleResponsesStream(
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
 		}
 
-		if err := CallKiroAPI(account, payload, callback); err != nil {
+		measure := func() (int, int, string, bool) {
+			return fullText.Len(), len(toolUses), upstreamStopReason, reasoningText.Len() > 0
+		}
+
+		// Only reached while the guard is uncommitted, i.e. before any content or
+		// function-call item was sent, so the output_index / content_index cursors
+		// are still untouched and only the accumulators need clearing.
+		reset := func() {
+			fullText.Reset()
+			reasoningText.Reset()
+			toolUses = nil
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+		}
+
+		// canRetry mirrors the guard: once a client-visible byte is out, a retry
+		// would concatenate two partial answers, so the integrity error is
+		// surfaced instead.
+		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset,
+			func() bool { return !guard.Committed() })
+		if err != nil {
+			if ctx.Err() != nil {
+				return attemptHandled()
+			}
+			// A truncated stream is an upstream fault, not the account's.
+			if isStreamIntegrityError(err) {
+				return attemptRotateWithoutBlame(err)
+			}
 			return attemptAccountFailed(err)
 		}
 
@@ -538,7 +615,7 @@ func (h *Handler) handleResponsesStream(
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, clientInput, clientOutput, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, clientInput, clientOutput, req, upstreamStopReason)
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions

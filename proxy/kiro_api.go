@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"kiro-go/auth"
@@ -10,6 +11,7 @@ import (
 	"kiro-go/logger"
 	"net/http"
 	neturl "net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -18,77 +20,106 @@ import (
 const (
 	kiroRestAPIBase               = "https://codewhisperer.us-east-1.amazonaws.com"
 	profileArnUnsupportedCooldown = 24 * time.Hour
+	maxProfileResponseBytes       = 1 << 20
+	maxProfileErrorBytes          = 64 << 10
 )
 
 var profileArnResolutionCooldowns sync.Map
 
-// kiroProfileRegions lists the AWS regions where Kiro / Amazon Q Developer
-// provisions profiles. ListAvailableProfiles is regional, so when an account's
-// configured region yields no profile we probe these in order. us-east-1
-// (N. Virginia) and eu-central-1 (Frankfurt) are the only regions Amazon Q
-// Developer is generally available in as of 2026; extend this list as AWS adds
-// regions. The SSO/auth region can differ from the profile region — an IdC
-// instance in us-east-1 may own a profile in eu-central-1 (cross-region app).
-var kiroProfileRegions = []string{"us-east-1", "eu-central-1"}
+var (
+	kiroRegionPattern  = regexp.MustCompile(`^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$`)
+	kiroAccountPattern = regexp.MustCompile(`^[0-9]{12}$`)
+	kiroProfilePattern = regexp.MustCompile(`^[A-Za-z0-9+=,.@_-]+$`)
 
-// regionFromProfileArn extracts the AWS region embedded in a CodeWhisperer
-// profile ARN, e.g. "arn:aws:codewhisperer:eu-central-1:123:profile/ABC" →
-// "eu-central-1". Returns "" when the ARN is empty or malformed. The profile
-// ARN is the authoritative source of an account's data-plane region.
-func regionFromProfileArn(profileArn string) string {
-	arn := strings.TrimSpace(profileArn)
-	if arn == "" {
-		return ""
+	// These are the currently known Kiro data-plane regions. Keeping this list
+	// explicit avoids turning persisted auth-region input into an arbitrary
+	// outbound hostname.
+	defaultKiroProfileRegions = []string{"us-east-1", "eu-central-1"}
+)
+
+func parseKiroProfileArn(profileArn string) (canonical, region string, ok bool) {
+	canonical = strings.TrimSpace(profileArn)
+	parts := strings.SplitN(canonical, ":", 6)
+	if len(parts) != 6 ||
+		parts[0] != "arn" ||
+		parts[1] != "aws" ||
+		parts[2] != "codewhisperer" ||
+		!kiroRegionPattern.MatchString(parts[3]) ||
+		!kiroAccountPattern.MatchString(parts[4]) ||
+		!strings.HasPrefix(parts[5], "profile/") {
+		return "", "", false
 	}
-	// arn:aws:codewhisperer:<region>:<account>:profile/<id>
-	parts := strings.Split(arn, ":")
-	if len(parts) < 4 {
-		return ""
+	profileID := strings.TrimPrefix(parts[5], "profile/")
+	if !kiroProfilePattern.MatchString(profileID) {
+		return "", "", false
 	}
-	if parts[0] != "arn" || parts[2] != "codewhisperer" {
-		return ""
-	}
-	return strings.TrimSpace(parts[3])
+	return canonical, parts[3], true
 }
 
-// kiroRegion returns the AWS region the account's Kiro profile lives in,
-// defaulting to us-east-1 when unset. AWS provisions Kiro / Q Developer
-// profiles per region, so a profile such as KiroProfile-eu-central-1 only
-// resolves against its own regional endpoint. Every data-plane call must
-// therefore target the account's region rather than a hardcoded one.
-//
-// Resolution order:
-//  1. the region embedded in the profile ARN (authoritative once resolved),
-//  2. the account's effective API region (account.apiRegion > region > global),
-//  3. us-east-1.
+func regionFromProfileArn(profileArn string) string {
+	_, region, ok := parseKiroProfileArn(profileArn)
+	if !ok {
+		return ""
+	}
+	return region
+}
+
+// kiroRegion returns the AWS data-plane region for Kiro / Q calls.
+// Prefer profileArn because account.Region is the auth/OIDC region and can
+// differ from the profile's region.
 func kiroRegion(account *config.Account) string {
+	return kiroRegionForProfile(account, "")
+}
+
+func kiroRegionForProfile(account *config.Account, profileArn string) string {
+	if r := regionFromProfileArn(profileArn); r != "" {
+		return r
+	}
 	if account != nil {
 		if r := regionFromProfileArn(account.ProfileArn); r != "" {
 			return r
 		}
-		if r := strings.TrimSpace(account.EffectiveApiRegion()); r != "" {
+		// An explicitly configured apiRegion is a deliberate data-plane override,
+		// so it applies to every credential type. Account.Region is deliberately
+		// NOT consulted here for OAuth accounts: it is the auth/OIDC region and
+		// need not host a Q Developer profile.
+		if r := strings.TrimSpace(account.ApiRegion); r != "" {
 			return r
+		}
+		// API Key credentials use Region for the CLI runtime data plane.
+		// OAuth credentials use Region for authentication only.
+		if config.IsAPIKeyAccount(account) {
+			if r := strings.TrimSpace(account.Region); r != "" {
+				return r
+			}
 		}
 	}
 	return "us-east-1"
 }
 
-// regionalizeURL points a hardcoded us-east-1 Kiro endpoint at the account's
-// region. Amazon Q is regional (q.{region}.amazonaws.com), but the CodeWhisperer
+// regionalizeURL points a hardcoded us-east-1 Kiro endpoint at the profile's
+// data-plane region. Amazon Q is regional (q.{region}.amazonaws.com), but the CodeWhisperer
 // REST host only exists in us-east-1 — non-us-east-1 accounts are served by the
-// regional Amazon Q host instead. So for those accounts both us-east-1 hosts map
-// to q.{region}. It is a no-op for us-east-1 accounts.
+// regional Amazon Q host instead. Both us-east-1 hosts map
+// to q.{region}. It is a no-op for us-east-1 profiles.
 func regionalizeURL(rawURL string, account *config.Account) string {
-	return regionalizeURLForRegion(rawURL, kiroRegion(account))
+	return regionalizeURLForProfile(rawURL, account, "")
 }
 
-// regionalizeURLForRegion rewrites the hardcoded us-east-1 Kiro hosts to target
-// an explicit region. It is a no-op for us-east-1 (and empty) regions. Used both
-// by regionalizeURL (account-driven) and by region probing, which must build a
-// URL for a region the account is not yet pinned to.
+func regionalizeURLForProfile(rawURL string, account *config.Account, profileArn string) string {
+	region := kiroRegionForProfile(account, profileArn)
+	return regionalizeURLForRegion(rawURL, region)
+}
+
+// regionalizeURLForRegion targets one explicit Kiro data-plane region. The
+// caller supplies a validated region candidate; Account.Region is never
+// mutated by this operation.
 func regionalizeURLForRegion(rawURL, region string) string {
-	region = strings.TrimSpace(region)
-	if region == "" || region == "us-east-1" {
+	region = strings.TrimSpace(strings.ToLower(region))
+	if region == "us-east-1" {
+		return rawURL
+	}
+	if !kiroRegionPattern.MatchString(region) {
 		return rawURL
 	}
 	regionalHost := "q." + region + ".amazonaws.com"
@@ -98,35 +129,63 @@ func regionalizeURLForRegion(rawURL, region string) string {
 	).Replace(rawURL)
 }
 
-// accountEmailForLog returns a nil-safe string for logging account identity.
-func accountEmailForLog(account *config.Account) string {
-	if account == nil {
-		return "<nil>"
+func kiroProfileRegionCandidates(account *config.Account) []string {
+	seen := make(map[string]struct{})
+	candidates := make([]string, 0, len(defaultKiroProfileRegions)+1)
+	add := func(region string) {
+		region = strings.TrimSpace(strings.ToLower(region))
+		if !kiroRegionPattern.MatchString(region) {
+			return
+		}
+		if _, exists := seen[region]; exists {
+			return
+		}
+		seen[region] = struct{}{}
+		candidates = append(candidates, region)
 	}
-	return account.Email
+
+	if account != nil {
+		// Profile ARN is authoritative. Account.Region is the authentication
+		// region and may not host an Amazon Q Developer profile.
+		add(regionFromProfileArn(account.ProfileArn))
+	}
+	for _, region := range defaultKiroProfileRegions {
+		add(region)
+	}
+	return candidates
 }
 
-// ensureRestProfileArn resolves the account profile ARN before REST calls,
-// softly skipping when resolution is unsupported (e.g. Builder ID accounts).
-// api_key accounts authenticate via API_KEY tokentype and do not need a profileArn.
-func ensureRestProfileArn(account *config.Account) error {
-	if account == nil || strings.TrimSpace(account.ProfileArn) != "" {
-		return nil
-	}
-	// api_key accounts don't need profileArn — they auth with tokentype: API_KEY
-	if account.AuthMethod == "api_key" {
-		return nil
-	}
-	profileArn, err := ResolveProfileArn(account)
-	if err != nil {
-		if isProfileArnResolutionSoftError(err) {
-			logger.Debugf("[ProfileArn] Continuing REST request without profile ARN for %s: %v", accountEmailForLog(account), err)
-			return nil
+// defaultProbeRegion returns the region ResolveProfileArn tries first: the
+// account's effective API region, or us-east-1. EffectiveApiRegion is the
+// explicitly configured data-plane override — Account.Region (the auth/OIDC
+// region) is deliberately not consulted, since an IdC instance in one region
+// may own a profile in another.
+func defaultProbeRegion(account *config.Account) string {
+	if account != nil {
+		if r := strings.TrimSpace(account.ApiRegion); r != "" {
+			return strings.ToLower(r)
 		}
-		return err
+		if r := strings.TrimSpace(regionFromProfileArn(account.ProfileArn)); r != "" {
+			return strings.ToLower(r)
+		}
 	}
-	account.ProfileArn = profileArn
-	return nil
+	return "us-east-1"
+}
+
+// profileProbeRegions returns the ordered, de-duplicated list of regions to
+// probe for an account's profile: its effective API region first, then the
+// other supported Kiro regions.
+func profileProbeRegions(account *config.Account) []string {
+	first := defaultProbeRegion(account)
+	regions := []string{first}
+	seen := map[string]bool{first: true}
+	for _, r := range kiroProfileRegionCandidates(account) {
+		if !seen[r] {
+			regions = append(regions, r)
+			seen[r] = true
+		}
+	}
+	return regions
 }
 
 // GetUsageLimits 获取账户使用量和订阅信息
@@ -145,9 +204,6 @@ func GetUsageLimits(account *config.Account) (*UsageLimitsResponse, error) {
 	}
 
 	setKiroHeaders(req, account)
-	if account.AuthMethod == "external_idp" {
-		req.Header.Set("TokenType", "EXTERNAL_IDP")
-	}
 
 	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 	if err != nil {
@@ -224,9 +280,6 @@ func ListAvailableModelsContext(ctx context.Context, account *config.Account) ([
 	}
 
 	setKiroHeaders(req, account)
-	if account.AuthMethod == "external_idp" {
-		req.Header.Set("TokenType", "EXTERNAL_IDP")
-	}
 
 	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 	if err != nil {
@@ -249,18 +302,15 @@ func ListAvailableModelsContext(ctx context.Context, account *config.Account) ([
 }
 
 // ResolveProfileArn returns the account profile ARN, fetching and caching it
-// when it is missing. It probes ListAvailableProfiles across the regions Kiro
-// supports (starting with the account's configured region), because Q Developer
-// profiles are regional and an account's profile may live in a region other than
-// its SSO/auth region. If no region yields a profile, it falls back to refreshing
-// the token (whose response carries a profileArn). Builder ID "unsupported"
-// errors are cached for 24h to avoid redundant failing calls.
-//
-// On success the resolved ARN and its owning region are persisted together so
-// future data-plane calls target the correct regional endpoint directly.
+// when it is missing. First tries ListAvailableProfiles; if that returns empty,
+// falls back to refreshing the token (which returns profileArn in the response).
 func ResolveProfileArn(account *config.Account) (string, error) {
 	if account == nil {
 		return "", fmt.Errorf("account is nil")
+	}
+	// API Key credentials do not use IDE profile ARNs.
+	if config.IsAPIKeyAccount(account) {
+		return "", nil
 	}
 	if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
 		return profileArn, nil
@@ -271,36 +321,35 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 	var profileUnsupported bool
 
 	if !profileLookupSuppressed {
-		// Probe ListAvailableProfiles across candidate regions. The first region
-		// is the account's configured one; the rest are the remaining supported
-		// Kiro regions, so a profile provisioned outside the SSO region is found.
-		for _, region := range profileProbeRegions(account) {
-			profileArn, err := listAvailableProfilesWithRetry(account, region)
-			if err == nil && profileArn != "" {
-				if updateErr := config.UpdateAccountProfileArnWithRegion(account.ID, profileArn, region); updateErr != nil {
-					logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
-				}
-				account.ProfileArn = profileArn
-				if account.ApiRegion == "" {
-					account.ApiRegion = region
-				}
-				if region != defaultProbeRegion(account) {
-					logger.Infof("[ProfileArn] Resolved profile for %s in region %s (differs from configured region)", accountEmailForLog(account), region)
-				}
-				return profileArn, nil
+		// external_idp accounts have no authoritative AWS home region, so their
+		// candidate data planes are probed without changing Account.Region.
+		profileArn, region, err := resolveProfileArnAcrossRegions(account)
+		if err == nil && profileArn != "" {
+			// Persist the serving region as the account's data-plane override so
+			// subsequent calls go straight there. Account.Region (auth/OIDC) is
+			// deliberately left untouched.
+			if updateErr := config.UpdateAccountProfileArnWithRegion(account.ID, profileArn, region); updateErr != nil {
+				logger.Warnf("[ProfileArn] Failed to cache profile ARN for %s: %v", account.Email, updateErr)
 			}
-			// Builder ID is unsupported regardless of region — stop probing.
-			if isBuilderIDProfileUnsupportedError(account, err) {
-				profileUnsupportedErr = err
-				profileUnsupported = true
-				break
+			account.ProfileArn = profileArn
+			if account.ApiRegion == "" {
+				account.ApiRegion = region
 			}
-			profileUnsupportedErr = err
+			if region != defaultProbeRegion(account) {
+				logger.Infof("[ProfileArn] Resolved profile for %s in region %s (differs from configured region)", accountEmailForLog(account), region)
+			}
+			return profileArn, nil
 		}
+		profileUnsupportedErr = err
+		profileUnsupported = isBuilderIDProfileUnsupportedError(account, err)
 	}
 
-	// Fallback: refresh token to get profileArn from auth response
-	if account.RefreshToken != "" {
+	// AWS refresh responses can include profileArn. Microsoft external_idp
+	// refresh responses do not, and may rotate refresh_token; invoking refresh
+	// here would discard that rotated credential because this resolver only
+	// consumes profileArn.
+	if account.RefreshToken != "" &&
+		!strings.EqualFold(strings.TrimSpace(account.AuthMethod), "external_idp") {
 		_, _, _, refreshedArn, refreshErr := auth.RefreshToken(account)
 		if refreshErr == nil && refreshedArn != "" {
 			region := regionFromProfileArn(refreshedArn)
@@ -314,7 +363,6 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 			return refreshedArn, nil
 		}
 	}
-
 	if profileLookupSuppressed {
 		return "", fmt.Errorf("profile ARN resolution skipped: previous Builder ID profile lookup was unsupported")
 	}
@@ -325,33 +373,6 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 	}
 
 	return "", fmt.Errorf("no available Kiro profile")
-}
-
-// defaultProbeRegion returns the region ResolveProfileArn tries first: the
-// account's effective API region, or us-east-1.
-func defaultProbeRegion(account *config.Account) string {
-	if account != nil {
-		if r := strings.TrimSpace(account.EffectiveApiRegion()); r != "" {
-			return r
-		}
-	}
-	return "us-east-1"
-}
-
-// profileProbeRegions returns the ordered, de-duplicated list of regions to
-// probe for an account's profile: its configured region first, then the other
-// supported Kiro regions.
-func profileProbeRegions(account *config.Account) []string {
-	first := defaultProbeRegion(account)
-	regions := []string{first}
-	seen := map[string]bool{first: true}
-	for _, r := range kiroProfileRegions {
-		if !seen[r] {
-			regions = append(regions, r)
-			seen[r] = true
-		}
-	}
-	return regions
 }
 
 func isBuilderIDProfileUnsupportedError(account *config.Account, err error) bool {
@@ -416,7 +437,62 @@ func isProfileArnResolutionSoftError(err error) bool {
 	return isProfileArnResolutionSkippedError(err) || isProfileArnResolutionUnsupportedError(err)
 }
 
-func listAvailableProfilesWithRetry(account *config.Account, region string) (string, error) {
+func ensureRestProfileArn(account *config.Account) error {
+	if account == nil || strings.TrimSpace(account.ProfileArn) != "" {
+		return nil
+	}
+	// Headless API keys do not use IDE profile ARNs; REST calls proceed without one.
+	if config.IsAPIKeyAccount(account) {
+		return nil
+	}
+	profileArn, err := ResolveProfileArn(account)
+	if err != nil {
+		if isProfileArnResolutionSoftError(err) {
+			logger.Debugf("[ProfileArn] Continuing REST request without profile ARN for %s: %v", accountEmailForLog(account), err)
+			return nil
+		}
+		return err
+	}
+	account.ProfileArn = profileArn
+	return nil
+}
+
+// resolveProfileArnAcrossRegions probes each candidate data-plane region and
+// returns the first profile found along with the region that served it. The
+// region matters to the caller: pinning it onto the account as ApiRegion is what
+// stops every later data-plane call from re-probing, and it must be recorded
+// WITHOUT touching Account.Region (the auth/OIDC region), which may legitimately
+// differ.
+func resolveProfileArnAcrossRegions(account *config.Account) (string, string, error) {
+	var probeErrors []error
+	for _, region := range profileProbeRegions(account) {
+		profiles, err := listKiroProfilesWithRetryInRegion(account, region)
+		if err != nil {
+			if isBuilderIDProfileUnsupportedError(account, err) {
+				return "", "", err
+			}
+			probeErrors = append(probeErrors, fmt.Errorf("%s: %w", region, err))
+			continue
+		}
+		if len(profiles) != 0 {
+			return profiles[0].ARN, region, nil
+		}
+	}
+	if len(probeErrors) != 0 {
+		return "", "", errors.Join(probeErrors...)
+	}
+	return "", "", fmt.Errorf("empty profile list")
+}
+
+func listKiroProfilesWithRetryInRegion(account *config.Account, region string) ([]KiroProfile, error) {
+	return listKiroProfilesWithRetryInRegionContext(context.Background(), account, region)
+}
+
+func listKiroProfilesWithRetryInRegionContext(
+	ctx context.Context,
+	account *config.Account,
+	region string,
+) ([]KiroProfile, error) {
 	// Retry transient failures (network errors, 5xx, 429) with short backoff.
 	// An empty profile list or 4xx (other than 429) is treated as authoritative
 	// and not retried — they reflect account state, not upstream flakiness.
@@ -425,20 +501,31 @@ func listAvailableProfilesWithRetry(account *config.Account, region string) (str
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		profileArn, err := listAvailableProfiles(account, region)
+		profiles, err := listKiroProfilesInRegionContext(ctx, account, region)
 		if err == nil {
-			return profileArn, nil
+			return profiles, nil
 		}
 		lastErr = err
 		if !isTransientProfileFetchError(err) || attempt == maxAttempts {
-			return "", err
+			return nil, err
 		}
 		logger.Debugf("[ProfileArn] ListAvailableProfiles transient failure for %s in %s (attempt %d/%d): %v",
-			account.Email, region, attempt, maxAttempts, err)
-		time.Sleep(backoff)
+			accountEmailForLog(account), region, attempt, maxAttempts, err)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 		backoff *= 2
 	}
-	return "", lastErr
+	return nil, lastErr
 }
 
 // isTransientProfileFetchError reports whether a ListAvailableProfiles error
@@ -459,43 +546,163 @@ func isTransientProfileFetchError(err error) bool {
 	return true
 }
 
-func listAvailableProfiles(account *config.Account, region string) (string, error) {
-	url := regionalizeURLForRegion(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), region)
-	req, err := http.NewRequest("POST", url, strings.NewReader(`{"maxResults":10}`))
-	if err != nil {
-		return "", err
-	}
-	setKiroHeaders(req, account)
-	req.Header.Set("Content-Type", "application/json")
-	if account.AuthMethod == "external_idp" {
-		req.Header.Set("TokenType", "EXTERNAL_IDP")
-	}
+// KiroProfile is one selectable Kiro data-plane profile.
+type KiroProfile struct {
+	ARN    string `json:"arn"`
+	Name   string `json:"name"`
+	Region string `json:"region"`
+}
 
-	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
+func listKiroProfilesInRegion(account *config.Account, region string) ([]KiroProfile, error) {
+	return listKiroProfilesInRegionContext(context.Background(), account, region)
+}
 
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+func listKiroProfilesInRegionContext(
+	ctx context.Context,
+	account *config.Account,
+	region string,
+) ([]KiroProfile, error) {
+	region = strings.TrimSpace(strings.ToLower(region))
+	if !kiroRegionPattern.MatchString(region) {
+		return nil, fmt.Errorf("invalid Kiro profile region %q", region)
 	}
+	endpoint := regionalizeURLForRegion(fmt.Sprintf("%s/ListAvailableProfiles", kiroRestAPIBase), region)
+	client := GetRestClientForProxy(ResolveAccountProxyURL(account))
 
-	var result struct {
-		Profiles []struct {
-			Arn string `json:"arn"`
-		} `json:"profiles"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-	for _, profile := range result.Profiles {
-		if profileArn := strings.TrimSpace(profile.Arn); profileArn != "" {
-			return profileArn, nil
+	profiles := make([]KiroProfile, 0)
+	seen := make(map[string]struct{})
+	invalidCount := 0
+	nextToken := ""
+	// Bound pagination so a misbehaving upstream cannot loop forever. 20 pages
+	// of 50 is far above any realistic Kiro profile count.
+	const maxProfilePages = 20
+	const pageSize = 50
+	for page := 0; page < maxProfilePages; page++ {
+		requestBody := map[string]interface{}{"maxResults": pageSize}
+		if nextToken != "" {
+			requestBody["nextToken"] = nextToken
+		}
+		payload, err := json.Marshal(requestBody)
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(string(payload)))
+		if err != nil {
+			return nil, err
+		}
+		setKiroHeaders(req, account)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProfileErrorBytes))
+			resp.Body.Close()
+			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		}
+
+		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxProfileResponseBytes+1))
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if len(responseBody) > maxProfileResponseBytes {
+			return nil, fmt.Errorf("profile response exceeds %d bytes", maxProfileResponseBytes)
+		}
+
+		var result struct {
+			Profiles []struct {
+				ARN  string `json:"arn"`
+				Name string `json:"profileName"`
+			} `json:"profiles"`
+			NextToken string `json:"nextToken"`
+		}
+		if err := json.Unmarshal(responseBody, &result); err != nil {
+			return nil, err
+		}
+
+		for _, profile := range result.Profiles {
+			profileARN, profileRegion, ok := parseKiroProfileArn(profile.ARN)
+			if !ok {
+				invalidCount++
+				continue
+			}
+			if _, exists := seen[profileARN]; exists {
+				continue
+			}
+			seen[profileARN] = struct{}{}
+			profiles = append(profiles, KiroProfile{
+				ARN:    profileARN,
+				Name:   strings.TrimSpace(profile.Name),
+				Region: profileRegion,
+			})
+		}
+
+		nextToken = strings.TrimSpace(result.NextToken)
+		if nextToken == "" {
+			break
+		}
+		if page == maxProfilePages-1 {
+			return nil, fmt.Errorf("profile list exceeded %d pages", maxProfilePages)
 		}
 	}
-	return "", fmt.Errorf("empty profile list")
+	if len(profiles) == 0 && invalidCount != 0 {
+		return nil, fmt.Errorf("profile response contained no valid Kiro profile ARN")
+	}
+	return profiles, nil
+}
+
+// DiscoverKiroProfiles returns every strictly validated profile found across
+// the account's candidate data-plane regions, de-duplicated by ARN. A failed
+// region does not hide profiles found elsewhere; if no region yields a profile,
+// all probe failures are returned together.
+func DiscoverKiroProfiles(account *config.Account) ([]KiroProfile, error) {
+	return DiscoverKiroProfilesContext(context.Background(), account)
+}
+
+// DiscoverKiroProfilesContext is the cancelable form used by interactive
+// login. Closing the modal can stop outstanding region probes before any
+// credential is persisted.
+func DiscoverKiroProfilesContext(ctx context.Context, account *config.Account) ([]KiroProfile, error) {
+	if account == nil {
+		return nil, fmt.Errorf("account is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	profiles := make([]KiroProfile, 0)
+	seen := make(map[string]struct{})
+	var probeErrors []error
+	for _, region := range kiroProfileRegionCandidates(account) {
+		discovered, err := listKiroProfilesWithRetryInRegionContext(ctx, account, region)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			probeErrors = append(probeErrors, fmt.Errorf("%s: %w", region, err))
+			logger.Warnf("[ProfileArn] Profile discovery failed in %s for %s: %v",
+				region, accountEmailForLog(account), err)
+			continue
+		}
+		for _, profile := range discovered {
+			if _, exists := seen[profile.ARN]; exists {
+				continue
+			}
+			seen[profile.ARN] = struct{}{}
+			profiles = append(profiles, profile)
+		}
+	}
+	if len(profiles) != 0 {
+		return profiles, nil
+	}
+	if len(probeErrors) != 0 {
+		return nil, errors.Join(probeErrors...)
+	}
+	return nil, fmt.Errorf("no available Kiro profile")
 }
 
 func withProfileArnQuery(rawURL string, account *config.Account) string {
@@ -535,15 +742,11 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 			// 账户被暂时封禁，自动禁用并标记封禁状态
 			logger.Warnf("[RefreshAccountInfo] Account %s is temporarily suspended: %v", account.Email, err)
 
-			// 更新账户封禁状态并自动禁用
-			updatedAccount := *account
-			updatedAccount.Enabled = false
-			updatedAccount.BanStatus = "BANNED"
-			updatedAccount.BanReason = "AWS temporarily suspended - unusual user activity detected"
-			updatedAccount.BanTime = time.Now().Unix()
-
-			// 保存更新后的账户状态
-			if updateErr := config.UpdateAccount(account.ID, updatedAccount); updateErr != nil {
+			if updateErr := config.SetAccountBanStatus(
+				account.ID,
+				"BANNED",
+				"AWS temporarily suspended - unusual user activity detected",
+			); updateErr != nil {
 				logger.Errorf("[RefreshAccountInfo] Failed to update account ban status: %v", updateErr)
 			}
 
@@ -551,22 +754,13 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 		} else if strings.Contains(errMsg, "403") || strings.Contains(errMsg, "401") ||
 			strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "expired") {
 			// Token 相关错误，可能需要重新认证
-			// external_idp accounts: Microsoft-issued token may fail usage API but work for chat
-			if account.AuthMethod == "external_idp" {
-				logger.Warnf("[RefreshAccountInfo] Usage API auth error for external_idp account %s (token may not have usage scope): %v", account.Email, err)
-				return nil, fmt.Errorf("GetUsageLimits: %w", err)
-			}
 			logger.Warnf("[RefreshAccountInfo] Authentication error for %s: %v", account.Email, err)
 
-			// 更新账户封禁状态为认证失败并自动禁用
-			updatedAccount := *account
-			updatedAccount.Enabled = false
-			updatedAccount.BanStatus = "BANNED"
-			updatedAccount.BanReason = "Authentication failed - token invalid or expired"
-			updatedAccount.BanTime = time.Now().Unix()
-
-			// 保存更新后的账户状态
-			if updateErr := config.UpdateAccount(account.ID, updatedAccount); updateErr != nil {
+			if updateErr := config.SetAccountBanStatus(
+				account.ID,
+				"BANNED",
+				"Authentication failed - token invalid or expired",
+			); updateErr != nil {
 				logger.Errorf("[RefreshAccountInfo] Failed to update account ban status: %v", updateErr)
 			}
 		}
@@ -578,13 +772,7 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 	if account.BanStatus != "" && account.BanStatus != "ACTIVE" {
 		logger.Infof("[RefreshAccountInfo] Account %s is now active, clearing ban status", account.Email)
 
-		updatedAccount := *account
-		updatedAccount.BanStatus = "ACTIVE"
-		updatedAccount.BanReason = ""
-		updatedAccount.BanTime = 0
-
-		// 保存更新后的账户状态
-		if updateErr := config.UpdateAccount(account.ID, updatedAccount); updateErr != nil {
+		if updateErr := config.ClearAccountBanStatus(account.ID); updateErr != nil {
 			logger.Errorf("[RefreshAccountInfo] Failed to clear account ban status: %v", updateErr)
 		}
 	}

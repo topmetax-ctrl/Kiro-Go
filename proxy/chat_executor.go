@@ -49,6 +49,12 @@ type attemptOutcome struct {
 	// err is the upstream error, retained for the exhaustion 500 tail. Only
 	// meaningful when accountFailed is true.
 	err error
+	// blameless marks a failure that should rotate onto another account WITHOUT
+	// recording it against this one. Set for upstream-side faults such as a
+	// truncated event stream: the account answered and its credentials are fine,
+	// so cooling it down would drain a healthy pool over an upstream hiccup.
+	// Only meaningful when accountFailed is true.
+	blameless bool
 }
 
 // attemptHandled reports that the attempt fully rendered its outcome (success, or
@@ -60,6 +66,15 @@ func attemptHandled() attemptOutcome { return attemptOutcome{} }
 // committed-failure surface (after commit).
 func attemptAccountFailed(err error) attemptOutcome {
 	return attemptOutcome{accountFailed: true, err: err}
+}
+
+// attemptRotateWithoutBlame reports a failure that is the upstream's fault, not
+// the account's. The executor excludes the account for the rest of THIS request
+// (so the retry lands elsewhere) but does not call onFailure, leaving the
+// account's health untouched. Used for stream-integrity failures, where the
+// account authenticated and answered but the event stream ended truncated.
+func attemptRotateWithoutBlame(err error) attemptOutcome {
+	return attemptOutcome{accountFailed: true, err: err, blameless: true}
 }
 
 // attemptFunc runs ONE upstream attempt against account, rendering the protocol's
@@ -155,13 +170,16 @@ func (ex *ChatExecutor) Run(
 			return
 		}
 
-		// The upstream call failed and it is the account's fault.
+		// The upstream call failed.
 		if !guard.Committed() {
-			// Nothing client-visible has been flushed yet: exclude this account,
-			// record the failure, and retry onto the next account.
+			// Nothing client-visible has been flushed yet: exclude this account and
+			// retry onto the next one. A blameless outcome still rotates but leaves
+			// the account's health untouched — the fault was upstream, not here.
 			lastErr = outcome.err
 			excluded[account.ID] = true
-			ex.onFailure(account, outcome.err)
+			if !outcome.blameless {
+				ex.onFailure(account, outcome.err)
+			}
 			continue
 		}
 

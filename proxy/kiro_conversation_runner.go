@@ -347,7 +347,7 @@ func (r *kiroConversationRunner) runSearches(ctx context.Context, items []search
 
 // cacheKey is the normalized query for per-request dedup. Empty when no query.
 func cacheKey(call KiroToolUse) string {
-	return extractSearchQuery(call.Input)
+	return extractToolInputQuery(call.Input)
 }
 
 // partitionToolUses splits a round's tool uses into those the executor handles

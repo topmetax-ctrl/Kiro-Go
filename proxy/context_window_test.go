@@ -4,8 +4,8 @@ import "testing"
 
 // TestGetContextWindowSize verifies models are classified into the correct
 // context window. This drives the input-token count that clients use to decide
-// when to compact; misclassifying opus-4.8 (1M) as 200K under-reports tokens by
-// 5x and prevents timely compaction.
+// when to compact; misclassifying opus-4.8 or opus-5 (1M) as 200K under-reports
+// tokens by 5x and prevents timely compaction.
 func TestGetContextWindowSize(t *testing.T) {
 	cases := []struct {
 		model string

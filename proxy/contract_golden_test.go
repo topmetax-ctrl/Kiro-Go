@@ -104,12 +104,19 @@ func goldenPayload() *KiroPayload {
 // least one text delta and mark the stream started.
 const longContent = "This is a deliberately long assistant answer used so the streaming buffer flushes at least one visible delta."
 
-// writeContentFrame emits a single valid assistantResponseEvent frame and flushes.
+// writeContentFrame emits a single valid assistantResponseEvent frame followed
+// by the terminal metadataEvent a real upstream sends, then flushes. The
+// metadataEvent is required: classifyStreamIntegrity reads a stop-reason-less
+// stream as truncated, so a happy-path fixture without it fails as
+// errUpstreamTruncatedResponse instead of asserting its SSE shape.
 func writeContentFrame(t *testing.T, w http.ResponseWriter, content string) {
 	t.Helper()
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 		"content": content,
+	}))
+	_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+		"stopReason": "end_turn",
 	}))
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
@@ -211,7 +218,7 @@ func TestOpenAIStreamByteShapeGolden(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	h.handleOpenAIStream(rec, goldenPayload(), "gpt-4", false, 1, "")
+	h.handleOpenAIStream(context.Background(), rec, goldenPayload(), "gpt-4", false, 1, "")
 
 	if *attempts != 1 {
 		t.Fatalf("expected 1 upstream attempt, got %d", *attempts)
@@ -237,7 +244,7 @@ func TestOpenAIStreamRetryBeforeFirstByte(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	h.handleOpenAIStream(rec, goldenPayload(), "gpt-4", false, 1, "")
+	h.handleOpenAIStream(context.Background(), rec, goldenPayload(), "gpt-4", false, 1, "")
 
 	if *attempts != 2 {
 		t.Fatalf("expected retry onto second account (2 attempts), got %d", *attempts)
@@ -258,7 +265,7 @@ func TestOpenAIStreamNoRetryAfterFirstByte(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	h.handleOpenAIStream(rec, goldenPayload(), "gpt-4", false, 1, "")
+	h.handleOpenAIStream(context.Background(), rec, goldenPayload(), "gpt-4", false, 1, "")
 
 	if *attempts != 1 {
 		t.Fatalf("retry-after-first-byte occurred: expected 1 attempt, got %d", *attempts)
@@ -267,13 +274,15 @@ func TestOpenAIStreamNoRetryAfterFirstByte(t *testing.T) {
 	if !strings.Contains(body, `"object":"chat.completion.chunk"`) {
 		t.Fatalf("expected a chunk to have been flushed before the failure, got %q", body)
 	}
-	// OpenAI's contract on a post-first-byte failure is to go silent: no error
-	// object, no [DONE]. This is the behaviour the ChatExecutor refactor must keep.
+	// OpenAI's contract on a post-first-byte failure: surface an error chunk and
+	// never [DONE]. Emitting [DONE] would claim the turn completed; going fully
+	// silent (the pre-upstream-merge behaviour) is indistinguishable to a client
+	// from a stream that is merely slow.
 	if strings.Contains(body, "[DONE]") {
 		t.Fatalf("OpenAI stream must not emit [DONE] after a mid-stream failure, got %q", body)
 	}
-	if strings.Contains(body, `"error"`) {
-		t.Fatalf("OpenAI stream stays silent on mid-stream failure (no error object), got %q", body)
+	if !strings.Contains(body, `"error"`) {
+		t.Fatalf("OpenAI stream must surface an error chunk on mid-stream failure, got %q", body)
 	}
 }
 
@@ -283,7 +292,7 @@ func TestOpenAINonStreamExhaustionTail(t *testing.T) {
 			t.Fatalf("upstream must not be called when no account is available")
 		})
 		rec := httptest.NewRecorder()
-		h.handleOpenAINonStream(rec, goldenPayload(), "gpt-4", false, 1, "")
+		h.handleOpenAINonStream(context.Background(), rec, goldenPayload(), "gpt-4", false, 1, "")
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("expected 503 when no account was ever usable, got %d body=%s", rec.Code, rec.Body.String())
 		}
@@ -294,7 +303,7 @@ func TestOpenAINonStreamExhaustionTail(t *testing.T) {
 			http.Error(w, "temporary upstream failure", http.StatusInternalServerError)
 		})
 		rec := httptest.NewRecorder()
-		h.handleOpenAINonStream(rec, goldenPayload(), "gpt-4", false, 1, "")
+		h.handleOpenAINonStream(context.Background(), rec, goldenPayload(), "gpt-4", false, 1, "")
 		if *attempts < 1 {
 			t.Fatalf("expected the single account to be attempted at least once")
 		}

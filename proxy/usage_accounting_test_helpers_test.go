@@ -64,12 +64,26 @@ func newFakeKiroBackend(t *testing.T, frames ...kiroFrame) *fakeKiroBackend {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+		hasStopReason := false
 		for _, f := range fb.frames {
+			if f.eventType == "metadataEvent" {
+				hasStopReason = true
+			}
 			_, _ = w.Write(awsEventStreamFrame(t, f.eventType, f.payload))
 		}
 		// A truncated stream is simulated by NOT writing a clean trailing frame;
 		// the httptest server closes the connection when this handler returns.
 		// parseEventStream sees the frames it got, then EOF.
+		//
+		// Otherwise close the turn with the terminal metadataEvent a real upstream
+		// sends. classifyStreamIntegrity reads a stop-reason-less stream as
+		// truncated, so a fixture that omits it fails as
+		// errUpstreamTruncatedResponse regardless of what it meant to assert.
+		if !fb.truncate && !hasStopReason {
+			_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+				"stopReason": "end_turn",
+			}))
+		}
 	}))
 	t.Cleanup(fb.server.Close)
 	return fb

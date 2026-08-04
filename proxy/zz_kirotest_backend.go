@@ -30,6 +30,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"strings"
@@ -72,6 +73,12 @@ func (ktRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		buf.Write(ktEventFrame("contextUsageEvent", map[string]interface{}{
 			"contextUsagePercentage": 4.0,
 		}))
+		// Terminal metadataEvent. Without it the stream-integrity classifier
+		// (classifyStreamIntegrity) reads a stop-reason-less stream as truncated
+		// and every fixture-backed turn fails as errUpstreamTruncatedResponse.
+		buf.Write(ktEventFrame("metadataEvent", map[string]interface{}{
+			"stopReason": "end_turn",
+		}))
 		return &http.Response{
 			StatusCode: 200,
 			Status:     "200 OK",
@@ -111,9 +118,13 @@ const ktRestBody = `{
 }`
 
 // ktEventFrame builds one AWS event-stream frame the same way the test helper
-// awsEventStreamFrame does (prelude + one :event-type string header + JSON
-// payload + trailing 4-byte message-CRC slot, both CRCs left zero because
-// parseEventStream does not validate them).
+// awsEventStreamFrame does: prelude + one :event-type string header + JSON
+// payload + trailing message CRC.
+//
+// Both CRCs must be real. parseEventStreamTracked validates the prelude CRC and
+// the message CRC and rejects a mismatch as errInvalidKiroEventStream, so a
+// zero-filled checksum would make every scripted frame look like a corrupt
+// stream instead of exercising the decode path.
 func ktEventFrame(eventType string, payload map[string]interface{}) []byte {
 	payloadBytes, _ := json.Marshal(payload)
 
@@ -130,9 +141,10 @@ func ktEventFrame(eventType string, payload map[string]interface{}) []byte {
 	frame := make([]byte, 12, totalLength)
 	binary.BigEndian.PutUint32(frame[0:4], uint32(totalLength))
 	binary.BigEndian.PutUint32(frame[4:8], uint32(len(headers)))
-	// frame[8:12] prelude CRC left zero (unvalidated by parseEventStream).
+	binary.BigEndian.PutUint32(frame[8:12], crc32.ChecksumIEEE(frame[:8]))
 	frame = append(frame, headers...)
 	frame = append(frame, payloadBytes...)
-	frame = append(frame, 0, 0, 0, 0) // message CRC (unvalidated).
+	frame = append(frame, 0, 0, 0, 0)
+	binary.BigEndian.PutUint32(frame[len(frame)-4:], crc32.ChecksumIEEE(frame[:len(frame)-4]))
 	return frame
 }
