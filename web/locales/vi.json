@@ -25,6 +25,8 @@
   "tabs.accounts": "Tài khoản",
   "tabs.settings": "Cài đặt",
   "tabs.api": "API",
+  "tabs.forwarding": "Chuyển tiếp",
+  "tabs.console": "Bảng điều khiển",
   "accounts.title": "Danh sách tài khoản",
   "accounts.add": "Thêm tài khoản",
   "accounts.empty": "Chưa có tài khoản",
