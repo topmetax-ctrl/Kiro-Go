@@ -10,7 +10,7 @@ import (
 // time-series buckets are intentionally in-memory only — they are realtime
 // views that start fresh each run, keeping the on-disk file small.
 type persistedState struct {
-	Overall    persistedCounter            `json:"overall"`
+	Overall    persistedCounter             `json:"overall"`
 	ByProvider map[string]persistedProvider `json:"byProvider"`
 	ByRoute    map[string]persistedRoute    `json:"byRoute"`
 }

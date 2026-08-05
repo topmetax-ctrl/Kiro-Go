@@ -23,8 +23,8 @@ func (s stubMemoryProvider) Search(context.Context, SearchQuery) ([]Memory, erro
 }
 func (s stubMemoryProvider) Add(context.Context, AddMemoryInput) error { return s.addErr }
 func (s stubMemoryProvider) Delete(context.Context, MemoryScope) error { return s.deleteErr }
-func (s stubMemoryProvider) Health(context.Context) error             { return s.healthErr }
-func (s stubMemoryProvider) Name() string                             { return "stub" }
+func (s stubMemoryProvider) Health(context.Context) error              { return s.healthErr }
+func (s stubMemoryProvider) Name() string                              { return "stub" }
 
 func TestFailOpenSearchSwallowsBackendError(t *testing.T) {
 	f := failOpenMemoryProvider{inner: stubMemoryProvider{searchErr: errors.New("backend down")}}

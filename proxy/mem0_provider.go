@@ -26,7 +26,7 @@ const mem0MaxResponseBytes = 1 << 20
 // honest and testable.
 type Mem0HTTPProvider struct {
 	baseURL         string
-	apiKey          func() string      // indirection so key rotation is picked up per call
+	apiKey          func() string // indirection so key rotation is picked up per call
 	client          func() *http.Client
 	searchTimeout   time.Duration
 	writeTimeout    time.Duration

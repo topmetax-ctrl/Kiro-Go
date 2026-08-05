@@ -60,5 +60,5 @@ type noopMemoryProvider struct{}
 func (noopMemoryProvider) Search(context.Context, SearchQuery) ([]Memory, error) { return nil, nil }
 func (noopMemoryProvider) Add(context.Context, AddMemoryInput) error             { return nil }
 func (noopMemoryProvider) Delete(context.Context, MemoryScope) error             { return nil }
-func (noopMemoryProvider) Health(context.Context) error                         { return nil }
-func (noopMemoryProvider) Name() string                                         { return "noop" }
+func (noopMemoryProvider) Health(context.Context) error                          { return nil }
+func (noopMemoryProvider) Name() string                                          { return "noop" }

@@ -51,7 +51,8 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 // handleLoad loads an export from a live server or an uploaded file path.
 // Body: {"source":"http","baseUrl":"...","password":"..."} or
-//       {"source":"file","path":"/abs/path.json"}
+//
+//	{"source":"file","path":"/abs/path.json"}
 func (s *Server) handleLoad(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Source   string `json:"source"`

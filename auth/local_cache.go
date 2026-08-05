@@ -82,21 +82,21 @@ type rawClientFile struct {
 // carries the secret material so the caller can import without re-reading disk;
 // use Masked* helpers for any value shown to a user.
 type LocalCredential struct {
-	SourceFile   string `json:"sourceFile"`   // token file name (e.g. kiro-auth-token.json)
-	AccessToken  string `json:"-"`            // never serialized
-	RefreshToken string `json:"-"`            // never serialized
-	ClientID     string `json:"-"`            // never serialized
-	ClientSecret string `json:"-"`            // never serialized
-	AuthMethod   string `json:"authMethod"`   // idc | social | external_idp
-	Provider     string `json:"provider"`     // BuilderId | Enterprise | Google | ...
-	Region       string `json:"region"`       // auth region from the token file
+	SourceFile   string `json:"sourceFile"` // token file name (e.g. kiro-auth-token.json)
+	AccessToken  string `json:"-"`          // never serialized
+	RefreshToken string `json:"-"`          // never serialized
+	ClientID     string `json:"-"`          // never serialized
+	ClientSecret string `json:"-"`          // never serialized
+	AuthMethod   string `json:"authMethod"` // idc | social | external_idp
+	Provider     string `json:"provider"`   // BuilderId | Enterprise | Google | ...
+	Region       string `json:"region"`     // auth region from the token file
 	IssuerURL    string `json:"issuerUrl,omitempty"`
 	IdPClientID  string `json:"idpClientId,omitempty"`
 	Scopes       string `json:"scopes,omitempty"`
 	LoginHint    string `json:"loginHint,omitempty"`
-	HasClient    bool   `json:"hasClient"`    // whether clientId/secret were resolved
-	HasRefresh   bool   `json:"hasRefresh"`   // whether a refresh token is present
-	Fingerprint  string `json:"fingerprint"`  // short, non-secret id for de-dup/selection
+	HasClient    bool   `json:"hasClient"`   // whether clientId/secret were resolved
+	HasRefresh   bool   `json:"hasRefresh"`  // whether a refresh token is present
+	Fingerprint  string `json:"fingerprint"` // short, non-secret id for de-dup/selection
 }
 
 // normalizeAuthMethod maps the token file's authMethod/provider onto the values

@@ -37,7 +37,7 @@ func (r *recordingMemoryProvider) Add(_ context.Context, in AddMemoryInput) erro
 }
 func (r *recordingMemoryProvider) Delete(context.Context, MemoryScope) error { return nil }
 func (r *recordingMemoryProvider) Health(context.Context) error              { return nil }
-func (r *recordingMemoryProvider) Name() string                             { return "recording" }
+func (r *recordingMemoryProvider) Name() string                              { return "recording" }
 
 func (r *recordingMemoryProvider) count() int {
 	r.mu.Lock()

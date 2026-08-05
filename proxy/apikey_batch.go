@@ -80,16 +80,16 @@ func (h *Handler) ImportApiKeys(rawText, region, authRegion, apiRegion string) [
 		seenInBatch[key] = true
 
 		account := config.Account{
-			ID:         auth.GenerateAccountID(),
-			KiroApiKey: key,
+			ID:          auth.GenerateAccountID(),
+			KiroApiKey:  key,
 			AccessToken: key, // mirror for pool compatibility
-			AuthMethod: "api_key",
-			Region:     region,
-			AuthRegion: authRegion,
-			ApiRegion:  apiRegion,
-			ExpiresAt:  0,
-			Enabled:    true,
-			MachineId:  config.GenerateMachineId(),
+			AuthMethod:  "api_key",
+			Region:      region,
+			AuthRegion:  authRegion,
+			ApiRegion:   apiRegion,
+			ExpiresAt:   0,
+			Enabled:     true,
+			MachineId:   config.GenerateMachineId(),
 		}
 
 		// Best-effort: fetch usage/credit + email before persisting.
