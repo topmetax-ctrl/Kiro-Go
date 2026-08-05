@@ -608,6 +608,9 @@ endpointLoop:
 		// The runtime (kiro.dev) host emulates the current Kiro CLI, which pins
 		// codewhispererruntime headers; the legacy hosts use codewhispererstreaming.
 		headerValues := buildStreamingHeaderValues(account, host)
+		if ep.Name == "KiroRuntime" {
+			headerValues = buildRuntimeHeaderValues(account, host)
+		}
 		invocationID := uuid.New().String()
 
 		for streamAttempt := 1; streamAttempt <= maxStreamAttemptsPerEndpoint; streamAttempt++ {
@@ -620,7 +623,12 @@ endpointLoop:
 				lastErr = err
 				continue endpointLoop
 			}
-			if isAPIKey {
+			// runtime.kiro.dev is an AWS Coral service that dispatches the operation by
+			// the Content-Type + X-Amz-Target pair. Plain application/json yields
+			// UnknownOperationException; the current Kiro CLI sends x-amz-json-1.0.
+			// API-key accounts reach that same runtime via cliRuntimeURL, so both
+			// arms of this condition target Coral hosts.
+			if isAPIKey || ep.Name == "KiroRuntime" {
 				req.Header.Set("Content-Type", "application/x-amz-json-1.0")
 			} else {
 				req.Header.Set("Content-Type", "application/json")
