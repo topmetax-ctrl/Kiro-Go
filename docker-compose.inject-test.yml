@@ -1,0 +1,21 @@
+# Isolated test stack for the account-injector feature.
+# Runs a SECOND Kiro-Go on different ports + project name so the live
+# `kiro-go` stack (port 8080) is never touched. Bind-mounts throwaway dirs
+# under /tmp so the host's real ~/.aws/sso/cache is never written.
+#
+#   docker compose -p kiro-inject-test -f docker-compose.inject-test.yml up -d --build
+#   open http://localhost:18080/admin
+#   docker compose -p kiro-inject-test -f docker-compose.inject-test.yml down
+services:
+  kiro-go-inject-test:
+    build: .
+    ports:
+      - "18080:8080"
+    volumes:
+      - /tmp/kiro-inject-test/data:/app/data
+      - /tmp/kiro-inject-test/cache:/host-kiro-cache
+    environment:
+      - CONFIG_PATH=/app/data/config.json
+      - LOOPBACK_HOST=0.0.0.0
+      - KIRO_INJECT_CACHE_DIR=/host-kiro-cache
+    restart: "no"

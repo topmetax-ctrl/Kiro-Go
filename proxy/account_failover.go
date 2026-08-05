@@ -85,7 +85,19 @@ func isStreamIntegrityError(err error) bool {
 
 func isQuotaErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
+	// Only match genuine quota exhaustion, not anti-abuse "suspicious activity" flags.
+	if strings.Contains(msg, "suspicious activity") {
+		return false
+	}
 	return strings.Contains(msg, "429") || strings.Contains(msg, "quota")
+}
+
+// isAntiAbuseMessage reports whether the error indicates an AWS anti-abuse
+// temporary limit (429 with "suspicious activity"). These should NOT be treated
+// as quota exhaustion — the account is not out of credits, it's being throttled.
+func isAntiAbuseMessage(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "429") && strings.Contains(msg, "suspicious activity")
 }
 
 func isOverageErrorMessage(msg string) bool {
@@ -179,6 +191,10 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	switch {
 	case isOverageErrorMessage(errMsg):
 		h.applyFailureCategory(account, KiroErrOverage)
+	// Must precede the quota arm: an anti-abuse throttle is also a 429, but it
+	// needs exponential backoff rather than the quota cooldown.
+	case isAntiAbuseMessage(errMsg):
+		h.applyFailureCategory(account, KiroErrAntiAbuse)
 	case isQuotaErrorMessage(errMsg):
 		h.applyFailureCategory(account, KiroErrQuota)
 	case isSuspensionErrorMessage(errMsg):
@@ -199,6 +215,12 @@ func (h *Handler) applyFailureCategory(account *config.Account, cat KiroErrorCat
 	case KiroErrOverage:
 		h.disableAccountOverage(account)
 		h.pool.RecordError(account.ID, false)
+	case KiroErrAntiAbuse:
+		// AWS anti-abuse temporary limit ("suspicious activity").
+		// Exponential backoff (5→10→20→40→80 min) avoids renewing
+		// the AWS-side investigation timer with rapid retries.
+		h.pool.RecordAntiAbuse(account.ID)
+		logger.Warnf("[AccountFailover] Anti-abuse throttle for %s", account.Email)
 	case KiroErrQuota:
 		h.pool.RecordError(account.ID, true)
 	case KiroErrSuspension:

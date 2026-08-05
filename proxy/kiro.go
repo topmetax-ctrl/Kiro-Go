@@ -12,6 +12,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -89,6 +90,18 @@ var kiroRestHttpStore atomic.Pointer[http.Client]
 // proxyClientCache caches http.Client instances keyed by proxy URL for per-account proxy support.
 var proxyClientCache sync.Map
 
+// NOTE: the account-injector branch shipped a utls browser-TLS fingerprint here
+// (Safari/Chrome ClientHello via DialTLSContext) to dodge AWS anti-abuse. It is
+// deliberately NOT carried over: installing a custom TLS dialer replaces the
+// transport's Dial/TLSHandshake/ResponseHeader timeouts, which are what keep a
+// long-lived SSE stream from either hanging on connection setup or being capped
+// by a blanket client timeout, and it forces HTTP/1.1 because Go cannot detect
+// ALPN-negotiated h2 from an external dialer. The branch's own history also shows
+// utls added, reverted ("accounts are subscription-revoked, not TLS-blocked"),
+// then re-applied. The inter-request jitter from the same effort IS kept — it is
+// independent of the TLS layer. kiro_tls_terminator.py remains in the repo as a
+// standalone alternative for anyone who needs a real browser TLS stack.
+
 func init() {
 	InitKiroHttpClient("")
 }
@@ -157,6 +170,20 @@ func ResolveAccountProxyURL(account *config.Account) string {
 	return config.GetProxyURL()
 }
 
+// maybeUseTerminator rewrites an HTTPS URL to HTTP when a TLS terminator proxy
+// is configured. The terminator handles TLS (Chrome BoringSSL) so the Go proxy
+// sends plain HTTP. Used for Kiro API calls only.
+func maybeUseTerminator(rawURL string, account *config.Account) string {
+	proxyURL := ResolveAccountProxyURL(account)
+	if proxyURL == "" {
+		return rawURL
+	}
+	if strings.HasPrefix(rawURL, "https://") {
+		return "http://" + strings.TrimPrefix(rawURL, "https://")
+	}
+	return rawURL
+}
+
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
 //
 // The dial / TLS-handshake / response-header timeouts bound connection setup and
@@ -165,6 +192,7 @@ func ResolveAccountProxyURL(account *config.Account) string {
 // only limits how long we wait for the response headers, not the body. This is the
 // streaming-safe alternative to a blanket http.Client.Timeout.
 func buildKiroTransport(proxyURL string) *http.Transport {
+	logger.Debugf("[TLS] buildKiroTransport proxyURL=%q", proxyURL)
 	t := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
@@ -181,8 +209,15 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
-			t.Proxy = http.ProxyURL(u)
-			// Proxied connections cannot negotiate HTTP/2.
+			// Only route Kiro/AWS API hosts through the terminator.
+			// Microsoft login, token refresh, etc. go direct with uTLS.
+			t.Proxy = func(req *http.Request) (*url.URL, error) {
+				host := req.URL.Hostname()
+				if strings.HasSuffix(host, ".amazonaws.com") || strings.HasSuffix(host, ".amazonaws.com.cn") {
+					return u, nil
+				}
+				return nil, nil // direct connection
+			}
 			t.ForceAttemptHTTP2 = false
 		}
 	} else {
@@ -539,6 +574,15 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 			Name:      "KiroRuntime",
 		}}
 	}
+
+	// Inter-request jitter: add 200-800ms random delay before first attempt
+	// to avoid machine-like timing patterns that trigger anti-abuse detection.
+	jitterBase := 200
+	if len(endpoints) > 1 {
+		// More endpoints = more attempts = more jitter needed
+		jitterBase = 400
+	}
+	time.Sleep(time.Duration(jitterBase+randIntn(600)) * time.Millisecond)
 
 	var lastErr error
 endpointLoop:
@@ -1257,4 +1301,9 @@ func parseEventStreamHeaders(data []byte) (map[string]string, error) {
 		offset += valueLength
 	}
 	return headers, nil
+}
+
+// randIntn returns a random integer in [0, n).
+func randIntn(n int) int {
+	return rand.Intn(n)
 }

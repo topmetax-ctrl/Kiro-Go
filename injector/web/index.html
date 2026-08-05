@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kiro Account Injector</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --bd:#2a2f3a; --fg:#e6e9ef; --mut:#9aa4b2; --acc:#4c8bf5; --ok:#2ecc71; --warn:#f1c40f; --err:#e74c3c; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:18px 24px; border-bottom:1px solid var(--bd); }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; color:var(--mut); font-size:13px; }
+  main { max-width:920px; margin:0 auto; padding:24px; }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:10px; padding:18px; margin-bottom:18px; }
+  .card h2 { margin:0 0 12px; font-size:14px; text-transform:uppercase; letter-spacing:.04em; color:var(--mut); }
+  label { display:block; font-size:13px; margin:8px 0 4px; color:var(--mut); }
+  input[type=text], input[type=password] { width:100%; padding:9px 11px; background:#0f1115; border:1px solid var(--bd); border-radius:7px; color:var(--fg); font-size:14px; }
+  .row { display:flex; gap:12px; }
+  .row > div { flex:1; }
+  button { background:var(--acc); color:#fff; border:none; padding:9px 16px; border-radius:7px; font-size:14px; cursor:pointer; }
+  button.secondary { background:#262b35; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .seg { display:flex; gap:8px; margin-bottom:12px; }
+  .seg button { flex:1; background:#262b35; }
+  .seg button.active { background:var(--acc); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--bd); }
+  th { color:var(--mut); font-weight:600; }
+  .badge { display:inline-block; padding:2px 7px; border-radius:5px; font-size:11px; }
+  .badge.ok { background:rgba(46,204,113,.15); color:var(--ok); }
+  .badge.no { background:rgba(231,76,60,.15); color:var(--err); }
+  .badge.warn { background:rgba(241,196,15,.15); color:var(--warn); }
+  .note { font-size:11px; color:var(--mut); }
+  .opts { display:flex; gap:18px; align-items:center; margin:12px 0; flex-wrap:wrap; }
+  .opts label { display:flex; align-items:center; gap:6px; margin:0; color:var(--fg); font-size:13px; cursor:pointer; }
+  #msg { font-size:13px; padding:10px 12px; border-radius:7px; margin-bottom:12px; display:none; white-space:pre-wrap; }
+  #msg.show { display:block; }
+  #msg.ok { background:rgba(46,204,113,.12); color:var(--ok); }
+  #msg.err { background:rgba(231,76,60,.12); color:var(--err); }
+  pre { background:#0f1115; border:1px solid var(--bd); border-radius:7px; padding:12px; overflow:auto; font-size:12px; }
+  .hidden { display:none; }
+  tr.sel { background:rgba(76,139,245,.12); }
+  td.pick { cursor:pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kiro Account Injector</h1>
+  <p>Local tool — nạp account từ Kiro-Go rồi inject vào Kiro IDE / kiro-cli để auto-login.</p>
+</header>
+<main>
+  <div id="msg"></div>
+
+  <div class="card">
+    <h2>1. Nguồn dữ liệu</h2>
+    <div class="seg">
+      <button id="tab-http" class="active" onclick="setSource('http')">Live API (Kiro-Go)</button>
+      <button id="tab-file" onclick="setSource('file')">File JSON</button>
+    </div>
+    <div id="src-http">
+      <div class="row">
+        <div>
+          <label>Base URL</label>
+          <input type="text" id="baseUrl" value="http://localhost:8080" placeholder="http://localhost:8080">
+        </div>
+        <div>
+          <label>Admin password</label>
+          <input type="password" id="password" placeholder="X-Admin-Password">
+        </div>
+      </div>
+    </div>
+    <div id="src-file" class="hidden">
+      <label>Đường dẫn file export (.json) trên máy này</label>
+      <input type="text" id="filePath" placeholder="/Users/you/Downloads/kiro-export.json">
+    </div>
+    <div style="margin-top:14px"><button onclick="loadAccounts()">Nạp danh sách account</button></div>
+  </div>
+
+  <div class="card hidden" id="card-accounts">
+    <h2>2. Chọn account</h2>
+    <table>
+      <thead><tr><th></th><th>Email</th><th>Auth</th><th>Provider</th><th>Refresh</th><th>IDE</th><th>CLI</th></tr></thead>
+      <tbody id="acctBody"></tbody>
+    </table>
+  </div>
+
+  <div class="card hidden" id="card-inject">
+    <h2>3. Inject &amp; Login</h2>
+    <div class="opts">
+      <label><input type="checkbox" id="t-ide" checked> Kiro IDE</label>
+      <label><input type="checkbox" id="t-cli"> kiro-cli</label>
+      <label><input type="checkbox" id="dryRun" checked> Dry-run (ghi ra thư mục tạm, không đụng app)</label>
+      <label><input type="checkbox" id="relaunch"> Kill &amp; relaunch Kiro IDE</label>
+    </div>
+    <button id="injectBtn" onclick="doInject()" disabled>Inject account đã chọn</button>
+    <div id="result" class="hidden"><h2 style="margin-top:18px">Kết quả</h2><pre id="resultPre"></pre></div>
+  </div>
+</main>
+
+<script>
+let source = 'http';
+let selectedId = null;
+
+function setSource(s) {
+  source = s;
+  document.getElementById('tab-http').classList.toggle('active', s === 'http');
+  document.getElementById('tab-file').classList.toggle('active', s === 'file');
+  document.getElementById('src-http').classList.toggle('hidden', s !== 'http');
+  document.getElementById('src-file').classList.toggle('hidden', s !== 'file');
+}
+
+function showMsg(text, kind) {
+  const m = document.getElementById('msg');
+  m.textContent = text;
+  m.className = 'show ' + (kind || '');
+}
+
+async function loadAccounts() {
+  const body = source === 'http'
+    ? { source:'http', baseUrl: val('baseUrl'), password: val('password') }
+    : { source:'file', path: val('filePath') };
+  showMsg('Đang nạp...', '');
+  try {
+    const res = await fetch('/api/load', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const data = await res.json();
+    if (!res.ok) { showMsg('Lỗi: ' + (data.error || res.status), 'err'); return; }
+    renderAccounts(data.accounts || []);
+    showMsg('Đã nạp ' + (data.accounts||[]).length + ' account (export v' + (data.version||'?') + ')', 'ok');
+  } catch (e) { showMsg('Lỗi mạng: ' + e.message, 'err'); }
+}
+
+function val(id) { return document.getElementById(id).value.trim(); }
+
+function renderAccounts(accts) {
+  const tb = document.getElementById('acctBody');
+  tb.innerHTML = '';
+  selectedId = null;
+  document.getElementById('injectBtn').disabled = true;
+  for (const a of accts) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="pick"><input type="radio" name="acct" value="${a.id}"></td>
+      <td class="pick">${esc(a.email)}</td>
+      <td>${esc(a.authMethod)}</td>
+      <td>${esc(a.provider||'')}</td>
+      <td>${a.hasRefresh ? '<span class="badge ok">yes</span>' : '<span class="badge no">no</span>'}</td>
+      <td>${a.ideOk ? '<span class="badge ok">OK</span>' : '<span class="badge no">no</span>'}</td>
+      <td>${cliBadge(a)}</td>`;
+    const pick = () => { tr.querySelector('input').checked = true; selectAcct(a.id, tr); };
+    tr.querySelectorAll('.pick').forEach(td => td.onclick = pick);
+    tr.querySelector('input').onchange = () => selectAcct(a.id, tr);
+    tb.appendChild(tr);
+  }
+  document.getElementById('card-accounts').classList.remove('hidden');
+  document.getElementById('card-inject').classList.remove('hidden');
+}
+
+function cliBadge(a) {
+  if (a.cliOk && a.cliNote) return `<span class="badge warn" title="${esc(a.cliNote)}">⚠</span> <span class="note">${esc(a.cliNote)}</span>`;
+  if (a.cliOk) return '<span class="badge ok">OK</span>';
+  return `<span class="badge no">no</span> <span class="note">${esc(a.cliNote||'')}</span>`;
+}
+
+function selectAcct(id, tr) {
+  selectedId = id;
+  document.querySelectorAll('#acctBody tr').forEach(r => r.classList.remove('sel'));
+  tr.classList.add('sel');
+  document.getElementById('injectBtn').disabled = false;
+}
+
+async function doInject() {
+  if (!selectedId) return;
+  const targets = [];
+  if (document.getElementById('t-ide').checked) targets.push('ide');
+  if (document.getElementById('t-cli').checked) targets.push('cli');
+  if (targets.length === 0) { showMsg('Chọn ít nhất một target.', 'err'); return; }
+  const body = {
+    id: selectedId, targets,
+    dryRun: document.getElementById('dryRun').checked,
+    relaunch: document.getElementById('relaunch').checked,
+  };
+  showMsg('Đang inject...', '');
+  try {
+    const res = await fetch('/api/inject', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const data = await res.json();
+    document.getElementById('result').classList.remove('hidden');
+    document.getElementById('resultPre').textContent = JSON.stringify(data.results || data, null, 2);
+    showMsg(res.ok ? 'Xong.' : ('Lỗi: ' + (data.error||res.status)), res.ok ? 'ok' : 'err');
+  } catch (e) { showMsg('Lỗi mạng: ' + e.message, 'err'); }
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+</script>
+</body>
+</html>

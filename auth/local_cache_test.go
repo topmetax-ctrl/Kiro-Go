@@ -58,6 +58,63 @@ func TestScanLocalKiroCredentialsIdC(t *testing.T) {
 	}
 }
 
+func TestScanExternalIdPReadsClientIdField(t *testing.T) {
+	dir := t.TempDir()
+	SetLocalCacheDirForTest(dir)
+	t.Cleanup(func() { SetLocalCacheDirForTest("") })
+
+	// The Kiro IDE writes the external-IdP client id under "clientId".
+	writeFile(t, dir, "kiro-auth-token.json", `{
+		"refreshToken": "rt-idp-clientId-111",
+		"authMethod": "external_idp",
+		"provider": "ExternalIdp",
+		"issuerUrl": "https://login.microsoftonline.com/tenant/v2.0",
+		"clientId": "idp-client-from-ide",
+		"scopes": "offline_access",
+		"loginHint": "u@example.com"
+	}`)
+
+	creds, err := ScanLocalKiroCredentials()
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(creds) != 1 {
+		t.Fatalf("expected 1 credential, got %d", len(creds))
+	}
+	if creds[0].AuthMethod != "external_idp" {
+		t.Fatalf("authMethod = %q, want external_idp", creds[0].AuthMethod)
+	}
+	if creds[0].IdPClientID != "idp-client-from-ide" {
+		t.Fatalf("IdPClientID = %q, want idp-client-from-ide (must read the IDE's clientId key)", creds[0].IdPClientID)
+	}
+}
+
+func TestScanExternalIdPReadsLegacyIdpClientIdField(t *testing.T) {
+	dir := t.TempDir()
+	SetLocalCacheDirForTest(dir)
+	t.Cleanup(func() { SetLocalCacheDirForTest("") })
+
+	// Older kiro-go injects wrote "idpClientId"; still accept it as a fallback.
+	writeFile(t, dir, "kiro-auth-token.json", `{
+		"refreshToken": "rt-idp-legacy-222",
+		"authMethod": "external_idp",
+		"provider": "ExternalIdp",
+		"issuerUrl": "https://login.microsoftonline.com/tenant/v2.0",
+		"idpClientId": "idp-client-legacy"
+	}`)
+
+	creds, err := ScanLocalKiroCredentials()
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(creds) != 1 {
+		t.Fatalf("expected 1 credential, got %d", len(creds))
+	}
+	if creds[0].IdPClientID != "idp-client-legacy" {
+		t.Fatalf("IdPClientID = %q, want idp-client-legacy (legacy fallback)", creds[0].IdPClientID)
+	}
+}
+
 func TestScanMissingClientFile(t *testing.T) {
 	dir := t.TempDir()
 	SetLocalCacheDirForTest(dir)

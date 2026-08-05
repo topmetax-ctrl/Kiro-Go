@@ -13,8 +13,13 @@ import (
 type KiroErrorCategory string
 
 const (
-	KiroErrUnknown        KiroErrorCategory = "unknown"
-	KiroErrQuota          KiroErrorCategory = "quota"
+	KiroErrUnknown KiroErrorCategory = "unknown"
+	KiroErrQuota   KiroErrorCategory = "quota"
+	// KiroErrAntiAbuse is a 429 whose body names AWS's anti-abuse investigation
+	// ("suspicious activity"). The account is NOT out of credits — it is being
+	// throttled, and each rapid retry renews the investigation timer, so it needs
+	// exponential backoff rather than the quota path's fixed cooldown.
+	KiroErrAntiAbuse      KiroErrorCategory = "anti_abuse"
 	KiroErrOverage        KiroErrorCategory = "overage"
 	KiroErrSuspension     KiroErrorCategory = "suspension"
 	KiroErrAuth           KiroErrorCategory = "auth"
@@ -65,6 +70,9 @@ func categorizeUpstream(statusCode int, body string) KiroErrorCategory {
 	case 401, 403:
 		return KiroErrAuth
 	case 429:
+		if strings.Contains(lower, "suspicious activity") {
+			return KiroErrAntiAbuse
+		}
 		return KiroErrQuota
 	}
 

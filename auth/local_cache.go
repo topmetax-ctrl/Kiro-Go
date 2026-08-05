@@ -50,11 +50,25 @@ type rawTokenFile struct {
 	Provider     string `json:"provider"`
 	Region       string `json:"region"`
 	// External IdP fields, present only for Kiro Hosted SSO (Microsoft Entra etc.)
-	IssuerURL   string `json:"issuerUrl"`
+	IssuerURL string `json:"issuerUrl"`
+	// The Kiro IDE writes the external-IdP client id under "clientId" (verified:
+	// "idpClientId" occurs 0 times in the 0.12.263/0.12.333 bundle). Older kiro-go
+	// injects wrote "idpClientId", so both names appear on disk in practice; read
+	// both and prefer the IDE's "clientId". idPClientID() resolves the precedence.
+	ClientID    string `json:"clientId"`
 	IdPClientID string `json:"idpClientId"`
 	Scopes      string `json:"scopes"`
 	LoginHint   string `json:"loginHint"`
 	StartURL    string `json:"startUrl"`
+}
+
+// idPClientID returns the external-IdP client id, preferring the field name the
+// Kiro IDE actually writes ("clientId") over the legacy kiro-go name.
+func (t rawTokenFile) idPClientID() string {
+	if v := strings.TrimSpace(t.ClientID); v != "" {
+		return v
+	}
+	return t.IdPClientID
 }
 
 // rawClientFile mirrors the on-disk shape of a {hash}.json OIDC client file.
@@ -169,7 +183,7 @@ func ScanLocalKiroCredentials() ([]LocalCredential, error) {
 			Provider:     tok.Provider,
 			Region:       strings.TrimSpace(tok.Region),
 			IssuerURL:    tok.IssuerURL,
-			IdPClientID:  tok.IdPClientID,
+			IdPClientID:  tok.idPClientID(),
 			Scopes:       tok.Scopes,
 			LoginHint:    tok.LoginHint,
 			HasRefresh:   true,
