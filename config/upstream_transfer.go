@@ -46,7 +46,13 @@ const (
 	// UpstreamBundleKind is the required "kind" value for a forwarding bundle.
 	UpstreamBundleKind = "kiro-go-upstreams"
 	// UpstreamBundleSchema is the highest schema version this build understands.
-	UpstreamBundleSchema = 1
+	//
+	// 1: routes carry a single upstreamId/targetModel pair.
+	// 2: routes carry a ranked `targets` list. Legacy fields are still emitted, so
+	//    a v2 bundle also imports into a v1 build (it reads upstreamId and ignores
+	//    targets, losing only the backup targets). Bumping the constant is what
+	//    makes a v1 build reject a *future* v3 bundle rather than misread it.
+	UpstreamBundleSchema = 2
 
 	maxBundleProviders = 200
 	maxBundleRoutes    = 2000
@@ -131,6 +137,19 @@ func ExportUpstreamBundle() UpstreamBundle {
 	if routes == nil {
 		routes = []ModelRoute{}
 	}
+	// Backfill the legacy 1:1 fields from the top target on the way out. A route
+	// created in this build has Targets but no upstreamId, and a v1 importer
+	// requires upstreamId on every route — it would reject the entire file rather
+	// than degrade. Emitting both keeps the export readable by older builds, which
+	// then see the preferred target and ignore the backups.
+	for i := range routes {
+		if len(routes[i].Targets) == 0 || strings.TrimSpace(routes[i].UpstreamID) != "" {
+			continue
+		}
+		top := routes[i].Targets[0]
+		routes[i].UpstreamID = top.UpstreamID
+		routes[i].TargetModel = top.TargetModel
+	}
 	return UpstreamBundle{
 		Version:    Version,
 		Kind:       UpstreamBundleKind,
@@ -195,17 +214,36 @@ func ValidateUpstreamBundle(b *UpstreamBundle) error {
 	}
 
 	for i, r := range b.Routes {
-		if strings.TrimSpace(r.Model) == "" {
+		label := strings.TrimSpace(r.Model)
+		if label == "" {
 			return fmt.Errorf("%w: route %d: model is required", ErrInvalidUpstreamBundle, i+1)
 		}
-		upID := strings.TrimSpace(r.UpstreamID)
-		if upID == "" {
-			return fmt.Errorf("%w: route %q: upstreamId is required",
-				ErrInvalidUpstreamBundle, strings.TrimSpace(r.Model))
+		// A route may describe its destination either way: `targets` (schema 2) or
+		// the legacy `upstreamId` (schema 1). Requiring the legacy field would
+		// reject a hand-written v2 bundle, and requiring targets would reject every
+		// existing v1 file, so accept either and validate whichever is present.
+		if len(r.Targets) == 0 {
+			upID := strings.TrimSpace(r.UpstreamID)
+			if upID == "" {
+				return fmt.Errorf("%w: route %q: needs either targets or upstreamId",
+					ErrInvalidUpstreamBundle, label)
+			}
+			if !inBundle[upID] {
+				return fmt.Errorf("%w: route %q: upstreamId %q does not match any provider in this file",
+					ErrInvalidUpstreamBundle, label, upID)
+			}
+			continue
 		}
-		if !inBundle[upID] {
-			return fmt.Errorf("%w: route %q: upstreamId %q does not match any provider in this file",
-				ErrInvalidUpstreamBundle, strings.TrimSpace(r.Model), upID)
+		for j, tg := range r.Targets {
+			upID := strings.TrimSpace(tg.UpstreamID)
+			if upID == "" {
+				return fmt.Errorf("%w: route %q target %d: upstreamId is required",
+					ErrInvalidUpstreamBundle, label, j+1)
+			}
+			if !inBundle[upID] {
+				return fmt.Errorf("%w: route %q target %d: upstreamId %q does not match any provider in this file",
+					ErrInvalidUpstreamBundle, label, j+1, upID)
+			}
 		}
 	}
 	return nil
@@ -325,8 +363,37 @@ func MergeUpstreamBundle(
 			})
 			continue
 		}
-		target, ok := idMap[strings.TrimSpace(r.UpstreamID)]
-		if !ok || target == "" {
+		// Remap every provider reference through idMap. Targets carry their own
+		// provider IDs, so without this a bundle exported from another host lands
+		// pointing at the SOURCE host's provider IDs. A target whose provider did
+		// not survive the merge is dropped rather than left dangling.
+		if len(r.Targets) > 0 {
+			kept := make([]RouteTarget, 0, len(r.Targets))
+			for _, tg := range r.Targets {
+				mapped, ok := idMap[strings.TrimSpace(tg.UpstreamID)]
+				if !ok || mapped == "" {
+					continue
+				}
+				tg.UpstreamID = mapped
+				kept = append(kept, tg)
+			}
+			r.Targets = kept
+		}
+		// The legacy field is remapped too when present, so a v1 build importing
+		// this route later still resolves it. It is optional in schema 2, so an
+		// unresolvable one is only fatal when there is no surviving target either.
+		if legacy := strings.TrimSpace(r.UpstreamID); legacy != "" {
+			if mapped, ok := idMap[legacy]; ok && mapped != "" {
+				r.UpstreamID = mapped
+			} else {
+				r.UpstreamID = ""
+			}
+		}
+		// Nothing usable left: every provider this route named was skipped or
+		// unknown. Defense in depth — ValidateUpstreamBundle rejects the case where
+		// the bundle itself is inconsistent; this catches references that died
+		// during the merge.
+		if len(r.Targets) == 0 && r.UpstreamID == "" {
 			res.RoutesSkipped++
 			res.SkippedRoutes = append(res.SkippedRoutes, SkippedItem{
 				Label:  key,
@@ -334,7 +401,11 @@ func MergeUpstreamBundle(
 			})
 			continue
 		}
-		r.UpstreamID = target
+		// A v1 bundle (legacy 1:1 schema, no Targets) must get Targets populated,
+		// or ResolveRoute — which reads Targets exclusively — never matches it.
+		routesToMigrate := []ModelRoute{r}
+		migrateModelRoutes(routesToMigrate)
+		r = routesToMigrate[0]
 		r.ID = freshID(r.ID, routeIDs)
 		routeKeys[key] = true
 		res.Routes = append(res.Routes, r)

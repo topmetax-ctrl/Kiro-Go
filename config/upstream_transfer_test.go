@@ -303,13 +303,13 @@ func TestValidateUpstreamBundleRejects(t *testing.T) {
 		want   string
 	}{
 		{"wrong kind", UpstreamBundle{Kind: "kiro-go-accounts", Providers: []UpstreamProvider{okProv}}, "unexpected kind"},
-		{"future schema", UpstreamBundle{Kind: UpstreamBundleKind, Schema: 2, Providers: []UpstreamProvider{okProv}}, "unsupported schema"},
+		{"future schema", UpstreamBundle{Kind: UpstreamBundleKind, Schema: UpstreamBundleSchema + 1, Providers: []UpstreamProvider{okProv}}, "unsupported schema"},
 		{"empty", bundle(nil, nil), "no providers or routes"},
 		{"empty baseUrl", bundle([]UpstreamProvider{prov("p1", "p", "", "k")}, nil), "baseUrl is required"},
 		{"not a url", bundle([]UpstreamProvider{prov("p1", "p", "not a url", "k")}, nil), "absolute http(s) URL"},
 		{"wrong scheme", bundle([]UpstreamProvider{prov("p1", "p", "ftp://h/v1", "k")}, nil), "absolute http(s) URL"},
 		{"blank model", bundle([]UpstreamProvider{okProv}, []ModelRoute{route("r1", "   ", "p1")}), "model is required"},
-		{"blank upstreamId", bundle([]UpstreamProvider{okProv}, []ModelRoute{route("r1", "coding", "")}), "upstreamId is required"},
+		{"no destination at all", bundle([]UpstreamProvider{okProv}, []ModelRoute{route("r1", "coding", "")}), "needs either targets or upstreamId"},
 		{"dangling upstreamId", bundle([]UpstreamProvider{okProv}, []ModelRoute{route("r1", "coding", "nope")}), "does not match any provider"},
 	}
 

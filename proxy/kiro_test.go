@@ -11,6 +11,7 @@ import (
 	"kiro-go/config"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -298,19 +299,34 @@ func TestBuildKiroTransportUsesExplicitProxyURL(t *testing.T) {
 	assertProxyURL(t, got, "http://proxy.local:8080")
 }
 
+// With no explicit proxy, the transport must defer to the environment.
+//
+// This asserts the WIRING (Proxy is http.ProxyFromEnvironment) rather than
+// calling transport.Proxy and checking the resolved URL, because net/http caches
+// the environment ONCE per process: ProxyFromEnvironment resolves
+// HTTPS_PROXY/NO_PROXY inside an envProxyOnce sync.Once (net/http/transport.go).
+// Whichever test first sends a real request through an env-proxied transport
+// freezes that result for every later test, so t.Setenv here has no effect
+// afterwards. The old assertion passed only because this test happened to run
+// before any test that forwards a live request — and Go runs test files in
+// filename order, so a new file sorting before kiro_test.go silently broke it.
+//
+// What buildKiroTransport actually owns is the choice of proxy func; resolving
+// env vars is stdlib behavior and not this repo's to re-test. Asserting the
+// choice is both order-independent and the real contract.
 func TestBuildKiroTransportFallsBackToEnvironmentProxy(t *testing.T) {
-	t.Setenv("HTTPS_PROXY", "http://env-proxy.local:2323")
-	t.Setenv("NO_PROXY", "")
-	t.Setenv("no_proxy", "")
-
 	transport := buildKiroTransport("")
-	req := &http.Request{URL: mustParseURL(t, "https://q.us-east-1.amazonaws.com")}
-
-	got, err := transport.Proxy(req)
-	if err != nil {
-		t.Fatalf("unexpected proxy error: %v", err)
+	if transport.Proxy == nil {
+		t.Fatal("expected a Proxy func when no explicit proxy URL is configured")
 	}
-	assertProxyURL(t, got, "http://env-proxy.local:2323")
+	if reflect.ValueOf(transport.Proxy).Pointer() != reflect.ValueOf(http.ProxyFromEnvironment).Pointer() {
+		t.Fatal("expected Proxy to be http.ProxyFromEnvironment so the environment is honored")
+	}
+	// HTTP/2 stays enabled on the env path: only an explicit terminator proxy
+	// disables it (see buildKiroTransport).
+	if !transport.ForceAttemptHTTP2 {
+		t.Fatal("expected ForceAttemptHTTP2 to stay true without an explicit proxy")
+	}
 }
 
 func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {

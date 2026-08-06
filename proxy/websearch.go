@@ -552,7 +552,7 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, 0)
 	}
 	h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, 0)
-	h.recordSuccessLog("claude", req.Model, accountID, inputTokens+outputTokens, 0, time.Since(reqStart).Milliseconds())
+	h.recordSuccessLogSplit("claude", req.Model, accountID, inputTokens, outputTokens, 0, time.Since(reqStart).Milliseconds())
 
 	if req.Stream {
 		h.streamWebSearchSSE(w, req.Model, query, toolUseID, results, inputTokens, outputTokens)

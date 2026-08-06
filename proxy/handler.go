@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"kiro-go/search"
 	"net"
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1568,7 +1571,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogSplit("claude", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		// Capture (write): store this turn's Q&A into memory (async, fail-open,
 		// redaction enforced in the provider). No-op unless capture is enabled
@@ -1758,22 +1761,42 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 	}
 
 	h.appendRequestLog(entry)
+	recordKiroMetric(kiroMetric{
+		Endpoint:  endpoint,
+		Model:     model,
+		AccountID: accountID,
+		ErrorMsg:  errMsg,
+		ErrorType: errType,
+	})
 }
 
-// recordSuccessLog records a successful request in the request logs.
-func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int, credits float64, durationMs int64) {
+// recordSuccessLogSplit records a successful request in the request logs and in
+// the metrics store. RequestLog keeps only the combined input+output total; the
+// split is preserved for the per-provider token breakdown in the dashboard,
+// which would otherwise render every Kiro response as "out 0".
+func (h *Handler) recordSuccessLogSplit(endpoint, model, accountID string, inputTokens, outputTokens int, credits float64, durationMs int64) {
 	entry := RequestLog{
 		Time:      time.Now().Unix(),
 		Endpoint:  endpoint,
 		Model:     model,
 		AccountID: accountID,
 		Status:    "success",
-		Tokens:    tokens,
+		Tokens:    inputTokens + outputTokens,
 		Credits:   credits,
 		Duration:  durationMs,
 	}
 
 	h.appendRequestLog(entry)
+	recordKiroMetric(kiroMetric{
+		Endpoint:     endpoint,
+		Model:        model,
+		AccountID:    accountID,
+		Ok:           true,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		Credits:      credits,
+		DurationMs:   durationMs,
+	})
 }
 
 func (h *Handler) appendRequestLog(entry RequestLog) {
@@ -1997,7 +2020,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLog("claude", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogSplit("claude", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		// Capture (write) this turn into memory when auto-capture is on. Async +
 		// fail-open + provider-enforced redaction; never blocks or breaks the response.
@@ -2515,7 +2538,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogSplit("openai", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds())
 		finishReason := mapOpenAIFinishReason(upstreamStopReason, len(toolCalls))
 
 		chunk := map[string]interface{}{
@@ -2670,7 +2693,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
-		h.recordSuccessLog("openai", model, account.ID, inputTokens+outputTokens, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogSplit("openai", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, clientInput, clientOutput, model, thinkingFormat, upstreamStopReason)
@@ -3001,6 +3024,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpstreamTest(w, r)
 	case path == "/forward-stats" && r.Method == "GET":
 		h.apiGetForwardStats(w, r)
+	case path == "/provider-stats" && r.Method == "GET":
+		h.apiGetProviderDetail(w, r)
+	case path == "/forward-history" && r.Method == "GET":
+		h.apiGetForwardHistory(w, r)
+	case path == "/forward-events/export" && r.Method == "GET":
+		h.apiExportForwardEvents(w, r)
+	case path == "/forward-stats/reset-provider" && r.Method == "POST":
+		h.apiResetProviderStats(w, r)
 	case path == "/forward-stats/reset" && r.Method == "POST":
 		h.apiResetForwardStats(w, r)
 	case path == "/forward-events" && r.Method == "GET":
@@ -5418,9 +5449,12 @@ func (h *Handler) apiGetPublicIP(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "ip": ip, "port": config.GetPort()})
 }
 
-// apiGetForwardStats returns aggregate forward metrics: overall totals,
-// per-provider and per-route breakdowns, the rolling time-series, and latency
-// percentiles.
+// apiGetForwardStats returns aggregate metrics: overall totals, per-provider and
+// per-route breakdowns, the rolling time-series, and latency percentiles.
+//
+// Providers are joined against the upstream config so the response also carries
+// the configured display name, base URL and prices for providers that exist but
+// have no traffic yet, plus the synthetic Kiro-pool entry.
 func (h *Handler) apiGetForwardStats(w http.ResponseWriter, r *http.Request) {
 	minutes := 60
 	if v := strings.TrimSpace(r.URL.Query().Get("minutes")); v != "" {
@@ -5430,11 +5464,262 @@ func (h *Handler) apiGetForwardStats(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"overall":     metrics.Overall(),
-		"providers":   metrics.ProviderStats(),
+		"providers":   mergedProviderStats(),
 		"routes":      metrics.RouteStats(),
 		"timeseries":  metrics.TimeSeries(minutes),
 		"percentiles": metrics.LatencyPercentiles(),
 	})
+}
+
+// providerRow is a provider's recorded stats plus the configuration context the
+// dashboard needs to render and label it.
+type providerRow struct {
+	metrics.ProviderStat
+	BaseURL      string  `json:"baseUrl,omitempty"`
+	Enabled      bool    `json:"enabled"`
+	Configured   bool    `json:"configured"`
+	IsPool       bool    `json:"isPool"`
+	PriceInPerM  float64 `json:"priceInPerM,omitempty"`
+	PriceOutPerM float64 `json:"priceOutPerM,omitempty"`
+}
+
+// mergedProviderStats joins recorded metrics with the configured upstreams so
+// the comparison table lists every provider — including ones configured but not
+// yet used (which would otherwise be invisible) and ones whose config was
+// deleted but whose history remains.
+func mergedProviderStats() []providerRow {
+	stats := metrics.ProviderStats()
+	byID := make(map[string]metrics.ProviderStat, len(stats))
+	for _, p := range stats {
+		byID[p.ProviderID] = p
+	}
+
+	providers, _ := config.GetUpstreamConfig()
+	rows := make([]providerRow, 0, len(stats)+len(providers))
+	seen := make(map[string]bool, len(stats))
+
+	for _, up := range providers {
+		st, ok := byID[up.ID]
+		if !ok {
+			st = metrics.ProviderStat{ProviderID: up.ID, SuccessRate: -1}
+		}
+		// The configured name wins: renaming a provider should retitle its history
+		// rather than leave the old label attached to past traffic.
+		st.ProviderName = up.Name
+		rows = append(rows, providerRow{
+			ProviderStat: st,
+			BaseURL:      up.BaseURL,
+			Enabled:      up.Enabled,
+			Configured:   true,
+			PriceInPerM:  up.PriceInPerM,
+			PriceOutPerM: up.PriceOutPerM,
+		})
+		seen[up.ID] = true
+	}
+
+	for _, p := range stats {
+		if seen[p.ProviderID] {
+			continue
+		}
+		rows = append(rows, providerRow{
+			ProviderStat: p,
+			// The pool is always "configured" in the sense that it cannot be
+			// deleted; anything else here is orphaned history.
+			Configured: p.ProviderID == metrics.KiroPoolID,
+			Enabled:    p.ProviderID == metrics.KiroPoolID,
+			IsPool:     p.ProviderID == metrics.KiroPoolID,
+		})
+	}
+
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Requests > rows[j].Requests })
+	return rows
+}
+
+// apiGetProviderDetail returns the full drill-down for one provider:
+// per-model and per-account breakdowns, the status histogram, recent errors,
+// percentiles and the per-minute series.
+func (h *Handler) apiGetProviderDetail(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "id is required"})
+		return
+	}
+	minutes := 60
+	if v := strings.TrimSpace(r.URL.Query().Get("minutes")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			minutes = n
+		}
+	}
+
+	detail, ok := metrics.ProviderDetailFor(id, minutes)
+	if !ok {
+		// A configured provider with no traffic yet is a valid, empty detail —
+		// not a 404 — so the panel renders zeros instead of an error.
+		detail = metrics.ProviderDetail{
+			ProviderStat: metrics.ProviderStat{ProviderID: id, SuccessRate: -1},
+			Minutes:      []metrics.Bucket{},
+		}
+	}
+
+	resp := map[string]interface{}{"detail": detail}
+	if id == metrics.KiroPoolID {
+		resp["isPool"] = true
+		resp["name"] = metrics.KiroPoolName
+	} else if providers, _ := config.GetUpstreamConfig(); providers != nil {
+		for _, up := range providers {
+			if up.ID != id {
+				continue
+			}
+			resp["name"] = up.Name
+			resp["baseUrl"] = up.BaseURL
+			resp["enabled"] = up.Enabled
+			resp["priceInPerM"] = up.PriceInPerM
+			resp["priceOutPerM"] = up.PriceOutPerM
+			break
+		}
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+// apiGetForwardHistory returns rollups for the trend chart. An empty id
+// aggregates across all providers.
+//
+// Granularity follows the requested range: hours=1 would produce a single hourly
+// bar, so sub-day ranges are served from the per-minute buckets instead and the
+// response reports which unit was used.
+func (h *Handler) apiGetForwardHistory(w http.ResponseWriter, r *http.Request) {
+	hours := 24
+	if v := strings.TrimSpace(r.URL.Query().Get("hours")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hours = n
+		}
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+
+	if hours <= 1 {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"providerId": id,
+			"hours":      hours,
+			"unit":       "minute",
+			"buckets":    metrics.MinuteHistoryFor(id, 60),
+		})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"providerId": id,
+		"hours":      hours,
+		"unit":       "hour",
+		"buckets":    metrics.HistoryFor(id, hours),
+	})
+}
+
+// apiResetProviderStats clears the counters and history for a single provider,
+// leaving every other provider untouched, then persists the new state.
+func (h *Handler) apiResetProviderStats(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "id is required"})
+		return
+	}
+	if !metrics.ResetProvider(id) {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "no stats for that provider"})
+		return
+	}
+	if err := metrics.Save(forwardMetricsPath()); err != nil {
+		logger.Warnf("[Metrics] failed to save after provider reset: %v", err)
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+// apiExportForwardEvents streams the filtered event log as CSV or JSON for
+// offline analysis. It accepts the same filters as apiGetForwardEvents but
+// ignores pagination, exporting every match up to exportEventsMax.
+func (h *Handler) apiExportForwardEvents(w http.ResponseWriter, r *http.Request) {
+	const exportEventsMax = 5000
+
+	q := r.URL.Query()
+	items, total := metrics.Events(eventFilterFromQuery(q, 0, exportEventsMax))
+
+	format := strings.ToLower(strings.TrimSpace(q.Get("format")))
+	if format == "json" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="forward-events.json"`)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"exportedAt": time.Now().UnixMilli(),
+			"total":      total,
+			"exported":   len(items),
+			"items":      items,
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="forward-events.csv"`)
+	cw := csv.NewWriter(w)
+	defer cw.Flush()
+	_ = cw.Write([]string{
+		"time", "provider", "account", "endpoint", "clientModel", "targetModel",
+		"status", "ok", "canceled", "stream", "latencyMs", "ttfbMs",
+		"inputTokens", "outputTokens", "costUsd", "error",
+	})
+	for _, e := range items {
+		_ = cw.Write([]string{
+			time.UnixMilli(e.TimeMs).UTC().Format(time.RFC3339),
+			e.ProviderName,
+			e.AccountLabel,
+			e.Endpoint,
+			e.ClientModel,
+			e.TargetModel,
+			strconv.Itoa(e.Status),
+			strconv.FormatBool(e.Ok),
+			strconv.FormatBool(e.Canceled),
+			strconv.FormatBool(e.Stream),
+			strconv.FormatInt(e.LatencyMs, 10),
+			strconv.FormatInt(e.TTFBMs, 10),
+			strconv.FormatInt(e.InputTokens, 10),
+			strconv.FormatInt(e.OutputTokens, 10),
+			strconv.FormatFloat(e.CostUSD, 'f', -1, 64),
+			e.ErrorMsg,
+		})
+	}
+}
+
+// eventFilterFromQuery builds an EventFilter from admin query parameters,
+// shared by the paged log view and the export endpoint.
+func eventFilterFromQuery(q url.Values, offset, limit int) metrics.EventFilter {
+	atoi64 := func(s string) int64 {
+		n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+		if err != nil {
+			return 0
+		}
+		return n
+	}
+	code := 0
+	if n, err := strconv.Atoi(strings.TrimSpace(q.Get("code"))); err == nil {
+		code = n
+	}
+	return metrics.EventFilter{
+		ProviderID: strings.TrimSpace(q.Get("provider")),
+		AccountID:  strings.TrimSpace(q.Get("account")),
+		Status:     strings.TrimSpace(q.Get("status")),
+		StatusCode: code,
+		Model:      strings.TrimSpace(q.Get("model")),
+		SinceMs:    atoi64(q.Get("since")),
+		UntilMs:    atoi64(q.Get("until")),
+		Offset:     offset,
+		Limit:      limit,
+	}
 }
 
 // apiResetForwardStats clears all forward metrics and persists the empty state.
@@ -5446,8 +5731,9 @@ func (h *Handler) apiResetForwardStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
-// apiGetForwardEvents returns forward events newest-first with optional
-// provider/status/model filters and offset/limit pagination.
+// apiGetForwardEvents returns events newest-first with optional
+// provider/account/status/code/model/time-range filters and offset/limit
+// pagination.
 func (h *Handler) apiGetForwardEvents(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	offset := 0
@@ -5458,13 +5744,7 @@ func (h *Handler) apiGetForwardEvents(w http.ResponseWriter, r *http.Request) {
 	if n, err := strconv.Atoi(strings.TrimSpace(q.Get("limit"))); err == nil && n > 0 {
 		limit = n
 	}
-	items, total := metrics.Events(metrics.EventFilter{
-		ProviderID: strings.TrimSpace(q.Get("provider")),
-		Status:     strings.TrimSpace(q.Get("status")),
-		Model:      strings.TrimSpace(q.Get("model")),
-		Offset:     offset,
-		Limit:      limit,
-	})
+	items, total := metrics.Events(eventFilterFromQuery(q, offset, limit))
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"items":  items,
 		"total":  total,

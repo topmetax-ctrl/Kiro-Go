@@ -224,21 +224,99 @@ type UpstreamProvider struct {
 	ApiKey   string `json:"apiKey"`             // Bearer token sent to the upstream
 	ProxyURL string `json:"proxyURL,omitempty"` // Optional per-provider outbound proxy (falls back to global)
 	Enabled  bool   `json:"enabled"`            // Whether this provider may receive forwards
+
+	// Operator-supplied prices in USD per 1M tokens, used only to estimate the
+	// cost shown in the stats dashboard. Zero means "unpriced": no cost is
+	// attributed, and the UI shows "—" rather than a misleading $0.00. Nothing
+	// here is billed or sent upstream.
+	PriceInPerM  float64 `json:"priceInPerM,omitempty"`
+	PriceOutPerM float64 `json:"priceOutPerM,omitempty"`
 }
 
-// ModelRoute maps a client-supplied model name to an upstream provider. Matching is
-// exact on Model. When TargetModel is non-empty the request's "model" field is
-// rewritten to it before forwarding; otherwise the original name is preserved.
+// CostUSD estimates the cost of a request from the provider's configured
+// per-1M-token prices. It returns 0 when the provider is unpriced, so callers
+// can distinguish "free" from "unknown" by checking the prices themselves.
+func (p UpstreamProvider) CostUSD(inputTokens, outputTokens int64) float64 {
+	if p.PriceInPerM <= 0 && p.PriceOutPerM <= 0 {
+		return 0
+	}
+	return (float64(inputTokens)*p.PriceInPerM + float64(outputTokens)*p.PriceOutPerM) / 1e6
+}
+
+// RouteTarget is one upstream candidate for a ModelRoute. A route may list
+// several, which is what makes "switch provider" a reordering rather than a
+// destructive edit, and what allows failover when a provider is down.
+//
+// Selection (see ResolveRoute): eligible targets are ordered by Priority
+// ascending; targets sharing a Priority form one tier and are picked from by
+// Weight. Tiers are tried in order, so a route degrades from its preferred
+// provider to its backups instead of failing outright.
+//
+// This mirrors established gateway designs: Priority is LiteLLM's deployment
+// `order` (each tier exhausted before the next), Weight is Envoy's
+// weighted_clusters (proportional split among equals).
+type RouteTarget struct {
+	UpstreamID  string `json:"upstreamId"`            // Target UpstreamProvider.ID
+	TargetModel string `json:"targetModel,omitempty"` // Optional model name to rewrite to; empty = keep original
+	Priority    int    `json:"priority"`              // Lower is preferred; 0 is the top tier
+	Weight      int    `json:"weight,omitempty"`      // Share within its tier; <=0 is treated as 1
+	Enabled     bool   `json:"enabled"`               // Whether this target may be selected
+}
+
+// ModelRoute maps a client-supplied model name to one or more upstream targets.
+// Matching is exact on Model; only the choice of destination is ranked.
 //
 // Loop-safety note: the set of routed model names MUST be disjoint from the model
 // names the upstream forwards back to this proxy. A back-referenced Kiro model with
 // no matching enabled route falls through to the default Kiro pool, breaking the loop.
+// Multi-target changes nothing here — a route with zero eligible targets resolves to
+// nothing and falls through exactly as an unrouted model does.
 type ModelRoute struct {
-	ID          string `json:"id"`                    // Unique identifier (UUID)
-	Model       string `json:"model"`                 // Client model name to match (exact)
-	UpstreamID  string `json:"upstreamId"`            // Target UpstreamProvider.ID
-	TargetModel string `json:"targetModel,omitempty"` // Optional model name to rewrite to; empty = keep original
-	Enabled     bool   `json:"enabled"`               // Whether this route is active
+	ID      string        `json:"id"`                // Unique identifier (UUID)
+	Model   string        `json:"model"`             // Client model name to match (exact)
+	Targets []RouteTarget `json:"targets,omitempty"` // Ranked upstream candidates
+	Enabled bool          `json:"enabled"`           // Whether this route is active
+
+	// UpstreamID and TargetModel are the pre-multi-target 1:1 schema.
+	//
+	// Deprecated: migrated into Targets on load (see migrateModelRoutes). Kept so
+	// older config files and exported bundles still read, and so a downgrade to a
+	// build without Targets keeps working. Do not read these at request time —
+	// use Targets.
+	UpstreamID  string `json:"upstreamId,omitempty"`
+	TargetModel string `json:"targetModel,omitempty"`
+}
+
+// migrateModelRoutes promotes the legacy 1:1 route schema into Targets, and
+// reports whether anything changed so the caller can decide to persist.
+//
+// It is idempotent (a route that already has Targets is left alone) and
+// non-destructive (the legacy fields are preserved rather than cleared, unlike
+// the AllowOverage migration, because exported bundles are read by other hosts
+// that may still be on the old build).
+//
+// Called from both Load and MergeUpstreamBundle: a v1 bundle imported into this
+// build must get Targets populated too, or its routes would silently never match.
+func migrateModelRoutes(routes []ModelRoute) bool {
+	changed := false
+	for i := range routes {
+		r := &routes[i]
+		if len(r.Targets) > 0 || strings.TrimSpace(r.UpstreamID) == "" {
+			continue
+		}
+		r.Targets = []RouteTarget{{
+			UpstreamID:  r.UpstreamID,
+			TargetModel: r.TargetModel,
+			Priority:    0,
+			Weight:      1,
+			// The legacy schema had no per-target enable — the route's own
+			// Enabled flag was the only switch. Enable the target so the
+			// route's effective behavior is unchanged by this migration.
+			Enabled: true,
+		}}
+		changed = true
+	}
+	return changed
 }
 
 // ApiKeyEntry represents a single API key with optional usage limits and counters.
@@ -659,7 +737,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.2.5"
+const Version = "1.2.6"
 
 var (
 	cfg     *Config
@@ -764,6 +842,14 @@ migrations:
 		}
 	}
 	if overageMigrated {
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
+
+	// Migration: legacy 1:1 model routes → ranked Targets. Idempotent; only
+	// persists when a route was actually rewritten.
+	if migrateModelRoutes(cfg.ModelRoutes) {
 		if err := saveLocked(); err != nil {
 			return err
 		}
@@ -960,6 +1046,11 @@ func GetAccounts() []Account {
 func GetAccountByID(id string) *Account {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
+	// cfg is nil before Init runs. Callers on the request path (e.g. metrics
+	// labeling) must get a nil result rather than a panic.
+	if cfg == nil {
+		return nil
+	}
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].ID == id {
 			a := cfg.Accounts[i]
@@ -2394,43 +2485,16 @@ func GetUpstreamConfig() ([]UpstreamProvider, []ModelRoute) {
 
 // UpdateUpstreamConfig replaces the upstream providers and model routes atomically
 // and persists the change. Passing nil for either slice clears it.
+//
+// Legacy 1:1 routes are migrated into Targets here, not just on Load: the admin
+// UI and the bundle importer both write routes carrying only UpstreamID, and
+// ResolveRoute reads Targets exclusively. Without this the saved route resolves
+// to nothing until the next restart re-runs the Load-time migration.
 func UpdateUpstreamConfig(providers []UpstreamProvider, routes []ModelRoute) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	migrateModelRoutes(routes)
 	cfg.Upstreams = providers
 	cfg.ModelRoutes = routes
 	return Save()
-}
-
-// FindEnabledRoute looks up an enabled ModelRoute whose Model matches the given
-// client model name (exact match after trimming surrounding whitespace) and returns
-// it together with its enabled UpstreamProvider. Returns (nil, nil) when there is no
-// match or the target provider is missing/disabled — callers then fall through to the
-// default Kiro pool. This exact-match-only behavior is what keeps forward loops from
-// forming: a model name the upstream sends back that has no route dispatches normally.
-func FindEnabledRoute(model string) (*ModelRoute, *UpstreamProvider) {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return nil, nil
-	}
-	target := strings.TrimSpace(model)
-	if target == "" {
-		return nil, nil
-	}
-	for i := range cfg.ModelRoutes {
-		r := cfg.ModelRoutes[i]
-		if !r.Enabled || strings.TrimSpace(r.Model) != target {
-			continue
-		}
-		for j := range cfg.Upstreams {
-			up := cfg.Upstreams[j]
-			if up.ID == r.UpstreamID && up.Enabled {
-				routeCopy := r
-				upCopy := up
-				return &routeCopy, &upCopy
-			}
-		}
-	}
-	return nil, nil
 }

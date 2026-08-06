@@ -160,6 +160,7 @@ func (h *Handler) handleResponsesNonStream(
 ) {
 	// Non-stream: fully buffered, so the guard is never committed and a late
 	// upstream error can still retry (invariant #7). No committed-failure branch.
+	reqStart := time.Now()
 	guard := &streamGuard{}
 	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
@@ -240,6 +241,18 @@ func (h *Handler) handleResponsesNonStream(
 		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
+		// The responses path keeps no RequestLog entry (it predates that ring),
+		// but it must still reach the metrics dashboard like every other endpoint.
+		recordKiroMetric(kiroMetric{
+			Endpoint:     "responses",
+			Model:        model,
+			AccountID:    account.ID,
+			Ok:           true,
+			InputTokens:  accountedInput,
+			OutputTokens: accountedOutput,
+			Credits:      credits,
+			DurationMs:   time.Since(reqStart).Milliseconds(),
+		})
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, clientInput, clientOutput, req, upstreamStopReason)
 		respObj.StoredInput = storedInput
@@ -348,6 +361,7 @@ func (h *Handler) handleResponsesStream(
 	estimatedInputTokens int, apiKeyID, ownerPrincipal, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
+	reqStart := time.Now()
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -615,6 +629,18 @@ func (h *Handler) handleResponsesStream(
 		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
+		// The responses path keeps no RequestLog entry (it predates that ring),
+		// but it must still reach the metrics dashboard like every other endpoint.
+		recordKiroMetric(kiroMetric{
+			Endpoint:     "responses",
+			Model:        model,
+			AccountID:    account.ID,
+			Ok:           true,
+			InputTokens:  accountedInput,
+			OutputTokens: accountedOutput,
+			Credits:      credits,
+			DurationMs:   time.Since(reqStart).Milliseconds(),
+		})
 
 		respObj := buildResponsesObject(respID, model, finalContent, toolUses, clientInput, clientOutput, req, upstreamStopReason)
 		respObj.CreatedAt = createdAt
