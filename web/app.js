@@ -163,6 +163,18 @@
     buildApiAddrOptions();
     renderSecurityWarnings();
     renderLogs(logsCache);
+    renderStatsTable();
+    renderStatsCompare();
+    renderStatsTrend(statsTrendLast.buckets, statsTrendLast.unit);
+    // Inline stats and any expanded detail panels are innerHTML-built, so they
+    // need an explicit re-render to pick up the new locale.
+    renderProviderInlineStats();
+    Object.keys(openProviderDetails).forEach(pid => {
+      if (!providerDetailCache[pid]) return;
+      qsa('[data-provider-detail="' + cssEscape(pid) + '"]').forEach(el => {
+        el.innerHTML = renderProviderDetailHTML(providerDetailCache[pid]);
+      });
+    });
   }
   function updateLangButtons() {
     qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
@@ -2157,6 +2169,9 @@
   let upstreamCache = { providers: [], routes: [] };
   let upstreamEditingId = '';
   let routeEditingId = '';
+  // Working copy of the route modal's target list. Held apart from upstreamCache
+  // so Cancel discards edits; only submitRouteModal writes it back.
+  let routeTargetDraft = [];
   // Models fetched per provider (keyed by provider id) for the browse/copy/test UI.
   let providerModels = {};
   let providerModelsLoading = {};
@@ -2498,12 +2513,14 @@
               '<input type="checkbox" data-upstream-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
               '<span class="slider"></span>' +
             '</label>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="details" data-id="' + id + '" aria-expanded="false">' + escapeHtml(t('stats.details')) + '</button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="load" data-id="' + id + '">' + escapeHtml(t('upstreams.loadModels')) + '</button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="edit" data-id="' + id + '">' + escapeHtml(t('upstreams.actionEdit')) + '</button>' +
             '<button class="btn btn-danger btn-sm" type="button" data-upstream-action="delete" data-id="' + id + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
           '</div>' +
         '</div>' +
         '<div class="text-xs muted-text font-mono" data-fwd-inline-for="' + id + '" style="margin-top:0.35rem;"></div>' +
+        '<div class="provider-detail hidden" data-provider-detail="' + id + '"></div>' +
       '</div>';
     }).join('');
   }
@@ -2548,20 +2565,35 @@
     list.innerHTML = upstreamCache.routes.map(item => {
       const id = escapeAttr(item.id || '');
       const model = escapeHtml(item.model || '');
-      const target = item.targetModel
-        ? '<span class="text-xs muted-text">&rarr; ' + escapeHtml(item.targetModel) + '</span>'
-        : '';
-      const prov = '<span class="text-xs muted-text font-mono">' + escapeHtml(providerName(item.upstreamId)) + '</span>';
       const disabled = !item.enabled
         ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('upstreams.disabled')) + '</span>'
+        : '';
+      // The target chain in try-order. The first is what a request normally uses;
+      // the rest are failover, so they are dimmed and arrow-chained rather than
+      // listed as equals.
+      const targets = routeTargets(item);
+      const chain = targets.length
+        ? targets.map((tg, i) => {
+            const nm = escapeHtml(providerName(tg.upstreamId));
+            const rewrite = tg.targetModel ? '<span class="muted-text">:' + escapeHtml(tg.targetModel) + '</span>' : '';
+            const off = tg.enabled === false
+              ? ' style="text-decoration:line-through;opacity:0.5;"'
+              : (i === 0 ? ' style="font-weight:600;"' : ' style="opacity:0.65;"');
+            return (i > 0 ? '<span class="muted-text text-xs">&rsaquo;</span>' : '') +
+              '<span class="text-xs font-mono"' + off + '>' + nm + rewrite + '</span>';
+          }).join(' ')
+        : '<span class="text-xs" style="color:#ef4444;">' + escapeHtml(t('upstreams.routeNoTargets')) + '</span>';
+      const count = targets.length > 1
+        ? '<span class="text-xs muted-text" title="' + escapeAttr(t('upstreams.routeFailoverHint')) + '">(' + targets.length + ')</span>'
         : '';
       return '<div class="card" data-route-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
             '<span class="font-semibold font-mono">' + model + '</span>' +
-            target +
+            '<span class="muted-text text-xs">&rarr;</span>' +
+            chain +
+            count +
             disabled +
-            prov +
           '</div>' +
           '<div class="flex items-center gap-2">' +
             '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
@@ -2574,6 +2606,20 @@
         '</div>' +
       '</div>';
     }).join('');
+  }
+
+  // routeTargets normalizes a route to its target list. A route saved by an older
+  // build (or hand-edited into config.json) carries only upstreamId/targetModel,
+  // and the server migrates those on load — but the UI can be looking at a
+  // response produced before that, so it degrades the same way rather than
+  // rendering the route as broken.
+  function routeTargets(route) {
+    if (!route) return [];
+    if (Array.isArray(route.targets) && route.targets.length) return route.targets;
+    if (route.upstreamId) {
+      return [{ upstreamId: route.upstreamId, targetModel: route.targetModel || '', priority: 0, weight: 1, enabled: true }];
+    }
+    return [];
   }
 
   async function persistUpstreams() {
@@ -2592,6 +2638,10 @@
     $('upstreamForm_baseUrl').value = entry ? (entry.baseUrl || '') : '';
     $('upstreamForm_apiKey').value = entry ? (entry.apiKey || '') : '';
     $('upstreamForm_proxyUrl').value = entry ? (entry.proxyURL || '') : '';
+    // Prices are omitted from JSON when zero, and an empty input is what "not
+    // priced" should look like — so 0 renders as blank rather than "0".
+    $('upstreamForm_priceIn').value = entry && entry.priceInPerM ? String(entry.priceInPerM) : '';
+    $('upstreamForm_priceOut').value = entry && entry.priceOutPerM ? String(entry.priceOutPerM) : '';
     $('upstreamForm_enabled').checked = entry ? !!entry.enabled : true;
     openDialog('upstreamModal');
   }
@@ -2606,17 +2656,22 @@
     const baseUrl = $('upstreamForm_baseUrl').value.trim();
     const apiKey = $('upstreamForm_apiKey').value.trim();
     const proxyURL = $('upstreamForm_proxyUrl').value.trim();
+    // parseFloat of "" is NaN; normalize to 0 so the field means "unpriced".
+    const priceInPerM = parseFloat($('upstreamForm_priceIn').value) || 0;
+    const priceOutPerM = parseFloat($('upstreamForm_priceOut').value) || 0;
     const enabled = $('upstreamForm_enabled').checked;
     if (!baseUrl) { toast(t('upstreams.baseUrlRequired'), 'error'); return; }
+    if (priceInPerM < 0 || priceOutPerM < 0) { toast(t('upstreams.priceInvalid'), 'error'); return; }
     const prev = JSON.parse(JSON.stringify(upstreamCache));
     try {
       if (upstreamEditingId) {
         const p = upstreamCache.providers.find(x => x.id === upstreamEditingId);
         if (p) {
           p.name = name; p.baseUrl = baseUrl; p.apiKey = apiKey; p.proxyURL = proxyURL; p.enabled = enabled;
+          p.priceInPerM = priceInPerM; p.priceOutPerM = priceOutPerM;
         }
       } else {
-        upstreamCache.providers.push({ id: '', name, baseUrl, apiKey, proxyURL, enabled });
+        upstreamCache.providers.push({ id: '', name, baseUrl, apiKey, proxyURL, enabled, priceInPerM, priceOutPerM });
       }
       await persistUpstreams();
       toast(t('common.saved'), 'success');
@@ -2735,26 +2790,18 @@
   }
 
   // Open the route modal prefilled from a fetched model (one-click route creation).
+  // The browsed provider becomes the primary target, and the model name is used
+  // on both sides: it is what the client will send and what that provider expects.
   function makeRouteFromModel(pid, model) {
     closeModelsModal();
     routeEditingId = '';
     $('modelRouteModalTitle').textContent = t('upstreams.routeModalCreate');
     $('routeForm_model').value = model;
-    $('routeForm_targetModel').value = '';
     $('routeForm_enabled').checked = true;
-    populateRouteProviderSelect(pid);
+    routeTargetDraft = [{ upstreamId: pid, targetModel: '', priority: 0, weight: 1, enabled: true }];
+    renderRouteTargets();
     populateClientModelDatalist();
-    populateTargetModelDatalist(pid);
     openDialog('modelRouteModal');
-  }
-
-  function populateRouteProviderSelect(selectedId) {
-    const sel = $('routeForm_upstreamId');
-    if (!sel) return;
-    sel.innerHTML = upstreamCache.providers.map(p =>
-      '<option value="' + escapeAttr(p.id || '') + '"' + (p.id === selectedId ? ' selected' : '') + '>' +
-        escapeHtml(p.name || p.baseUrl || p.id || '') + '</option>'
-    ).join('');
   }
 
   // Fetch the model names this kiro-go instance serves (public /v1/models, no auth).
@@ -2818,33 +2865,115 @@
     routeEditingId = entry ? (entry.id || '') : '';
     $('modelRouteModalTitle').textContent = t(routeEditingId ? 'upstreams.routeModalEdit' : 'upstreams.routeModalCreate');
     $('routeForm_model').value = entry ? (entry.model || '') : '';
-    $('routeForm_targetModel').value = entry ? (entry.targetModel || '') : '';
     $('routeForm_enabled').checked = entry ? !!entry.enabled : true;
-    populateRouteProviderSelect(entry ? entry.upstreamId : (upstreamCache.providers[0] && upstreamCache.providers[0].id));
+    // Deep-copy so Cancel discards target edits; the cache is only touched on save.
+    routeTargetDraft = entry
+      ? JSON.parse(JSON.stringify(routeTargets(entry)))
+      : [newRouteTarget()];
+    if (!routeTargetDraft.length) routeTargetDraft = [newRouteTarget()];
+    renderRouteTargets();
     populateClientModelDatalist();
-    populateTargetModelDatalist($('routeForm_upstreamId').value);
     openDialog('modelRouteModal');
+  }
+
+  // newRouteTarget defaults to the first provider: with one configured provider
+  // (the common case) the operator never has to touch the select.
+  function newRouteTarget() {
+    const first = upstreamCache.providers[0];
+    return {
+      upstreamId: (first && first.id) || '',
+      targetModel: '', priority: 0, weight: 1, enabled: true
+    };
+  }
+
+  // Renders the draft target list. Priority is positional — index 0 is the
+  // preferred provider — so reordering is the whole "switch provider" gesture and
+  // no priority number is exposed. Weight stays explicit because it only matters
+  // for the less common split-traffic case.
+  function renderRouteTargets() {
+    const box = $('routeTargetsList');
+    if (!box) return;
+    if (!upstreamCache.providers.length) {
+      box.innerHTML = '<div class="muted-text text-xs">' + escapeHtml(t('upstreams.routeNoProviders')) + '</div>';
+      return;
+    }
+    box.innerHTML = routeTargetDraft.map((tg, i) => {
+      const opts = upstreamCache.providers.map(p =>
+        '<option value="' + escapeAttr(p.id || '') + '"' + (p.id === tg.upstreamId ? ' selected' : '') + '>' +
+          escapeHtml(p.name || p.baseUrl || p.id || '') + '</option>'
+      ).join('');
+      const badge = i === 0
+        ? '<span class="text-xs" style="background:rgba(34,197,94,0.15);color:#16a34a;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('upstreams.routeTargetPrimary')) + '</span>'
+        : '<span class="text-xs muted-text">' + escapeHtml(t('upstreams.routeTargetFallback')) + ' ' + i + '</span>';
+      return '<div class="card" data-target-index="' + i + '" style="margin-top:0.5rem;padding:0.5rem;">' +
+        '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
+          badge +
+          '<div class="flex items-center gap-1">' +
+            '<button class="btn btn-outline btn-sm" type="button" data-target-action="up" data-index="' + i + '"' +
+              (i === 0 ? ' disabled' : '') + ' title="' + escapeAttr(t('upstreams.routeTargetUp')) + '">&uarr;</button>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-target-action="down" data-index="' + i + '"' +
+              (i === routeTargetDraft.length - 1 ? ' disabled' : '') + ' title="' + escapeAttr(t('upstreams.routeTargetDown')) + '">&darr;</button>' +
+            '<button class="btn btn-danger btn-sm" type="button" data-target-action="remove" data-index="' + i + '"' +
+              (routeTargetDraft.length <= 1 ? ' disabled' : '') + '>&times;</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="flex items-center gap-2" style="flex-wrap:wrap;margin-top:0.35rem;">' +
+          '<select data-target-field="upstreamId" data-index="' + i + '" style="flex:1;min-width:9rem;">' + opts + '</select>' +
+          '<input type="text" data-target-field="targetModel" data-index="' + i + '" list="routeTargetModelList" autocomplete="off"' +
+            ' value="' + escapeAttr(tg.targetModel || '') + '" style="flex:1;min-width:9rem;"' +
+            ' placeholder="' + escapeAttr(t('upstreams.targetModelPlaceholder')) + '" />' +
+          '<input type="number" min="1" data-target-field="weight" data-index="' + i + '"' +
+            ' value="' + escapeAttr(String(tg.weight > 0 ? tg.weight : 1)) + '" style="width:4.5rem;"' +
+            ' title="' + escapeAttr(t('upstreams.routeTargetWeightHint')) + '" />' +
+          '<label class="switch" title="' + escapeAttr(t('upstreams.formEnabled')) + '">' +
+            '<input type="checkbox" data-target-field="enabled" data-index="' + i + '"' + (tg.enabled === false ? '' : ' checked') + ' />' +
+            '<span class="slider"></span>' +
+          '</label>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+    // Target-model suggestions follow the primary target's provider.
+    populateTargetModelDatalist(routeTargetDraft[0] && routeTargetDraft[0].upstreamId);
   }
 
   function closeRouteModal() {
     closeDialog('modelRouteModal');
     routeEditingId = '';
+    routeTargetDraft = [];
   }
 
   async function submitRouteModal() {
     const model = $('routeForm_model').value.trim();
-    const upstreamId = $('routeForm_upstreamId').value;
-    const targetModel = $('routeForm_targetModel').value.trim();
     const enabled = $('routeForm_enabled').checked;
     if (!model) { toast(t('upstreams.routeModelRequired'), 'error'); return; }
-    if (!upstreamId) { toast(t('upstreams.providerRequired'), 'error'); return; }
+    // Priority is assigned from list position here, so the stored data always
+    // matches what the operator saw; the server never reorders.
+    const targets = routeTargetDraft
+      .filter(tg => tg.upstreamId)
+      .map((tg, i) => ({
+        upstreamId: tg.upstreamId,
+        targetModel: (tg.targetModel || '').trim(),
+        priority: i,
+        weight: tg.weight > 0 ? tg.weight : 1,
+        enabled: tg.enabled !== false
+      }));
+    if (!targets.length) { toast(t('upstreams.providerRequired'), 'error'); return; }
     const prev = JSON.parse(JSON.stringify(upstreamCache));
     try {
       if (routeEditingId) {
         const r = upstreamCache.routes.find(x => x.id === routeEditingId);
-        if (r) { r.model = model; r.upstreamId = upstreamId; r.targetModel = targetModel; r.enabled = enabled; }
+        if (r) {
+          r.model = model;
+          r.targets = targets;
+          r.enabled = enabled;
+          // Clear the legacy 1:1 fields so they cannot contradict targets. The
+          // server re-derives them for export; keeping a stale value here would
+          // make an old build resolve a provider the operator already replaced.
+          r.upstreamId = '';
+          r.targetModel = '';
+        }
       } else {
-        upstreamCache.routes.push({ id: '', model, upstreamId, targetModel, enabled });
+        upstreamCache.routes.push({ id: '', model, targets, enabled });
       }
       await persistUpstreams();
       toast(t('common.saved'), 'success');
@@ -2999,6 +3128,18 @@
         if (action === 'edit') openUpstreamModal(entry);
         else if (action === 'delete') deleteProvider(id, entry ? entry.name : '');
         else if (action === 'load') loadProviderModels(id);
+        else if (action === 'details') toggleProviderDetail(id, btn, provList);
+      });
+      // Actions rendered inside an expanded detail panel.
+      provList.addEventListener('click', e => {
+        const btn = e.target.closest('[data-pd-action]');
+        if (!btn) return;
+        const id = btn.dataset.id;
+        if (!id) return;
+        const action = btn.dataset.pdAction;
+        if (action === 'reset') resetProviderStats(id);
+        else if (action === 'export') exportProviderEvents(id);
+        else if (action === 'events') filterEventsByProvider(id);
       });
       provList.addEventListener('change', e => {
         const cb = e.target.closest('input[data-upstream-action="toggle"]');
@@ -3070,8 +3211,56 @@
     if (rtCancel) rtCancel.addEventListener('click', closeRouteModal);
     const rtClose = $('modelRouteModalClose');
     if (rtClose) rtClose.addEventListener('click', closeRouteModal);
-    const rtProvSel = $('routeForm_upstreamId');
-    if (rtProvSel) rtProvSel.addEventListener('change', () => populateTargetModelDatalist(rtProvSel.value));
+    // Target rows are re-rendered on every structural change, so both listeners
+    // are delegated from the stable container rather than bound per row.
+    const rtTargets = $('routeTargetsList');
+    if (rtTargets) {
+      rtTargets.addEventListener('click', e => {
+        const btn = e.target.closest('[data-target-action]');
+        if (!btn || btn.disabled) return;
+        const i = parseInt(btn.dataset.index, 10);
+        if (isNaN(i) || !routeTargetDraft[i]) return;
+        const action = btn.dataset.targetAction;
+        if (action === 'remove') {
+          if (routeTargetDraft.length <= 1) return;
+          routeTargetDraft.splice(i, 1);
+        } else if (action === 'up' && i > 0) {
+          const tmp = routeTargetDraft[i - 1];
+          routeTargetDraft[i - 1] = routeTargetDraft[i];
+          routeTargetDraft[i] = tmp;
+        } else if (action === 'down' && i < routeTargetDraft.length - 1) {
+          const tmp = routeTargetDraft[i + 1];
+          routeTargetDraft[i + 1] = routeTargetDraft[i];
+          routeTargetDraft[i] = tmp;
+        } else {
+          return;
+        }
+        renderRouteTargets();
+      });
+      // Field edits write straight into the draft. Text inputs use 'input' so a
+      // half-typed model name is not lost when the row re-renders for another
+      // reason; selects and checkboxes only emit 'change'.
+      const applyField = e => {
+        const el = e.target.closest('[data-target-field]');
+        if (!el) return;
+        const i = parseInt(el.dataset.index, 10);
+        if (isNaN(i) || !routeTargetDraft[i]) return;
+        const field = el.dataset.targetField;
+        if (field === 'enabled') routeTargetDraft[i].enabled = el.checked;
+        else if (field === 'weight') routeTargetDraft[i].weight = Math.max(1, parseInt(el.value, 10) || 1);
+        else routeTargetDraft[i][field] = el.value;
+        // Changing the primary provider changes which model names to suggest.
+        if (field === 'upstreamId' && i === 0) populateTargetModelDatalist(el.value);
+      };
+      rtTargets.addEventListener('change', applyField);
+      rtTargets.addEventListener('input', applyField);
+    }
+    const rtAddTarget = $('routeAddTargetBtn');
+    if (rtAddTarget) rtAddTarget.addEventListener('click', () => {
+      if (!upstreamCache.providers.length) { toast(t('upstreams.needProviderFirst'), 'warning'); return; }
+      routeTargetDraft.push(newRouteTarget());
+      renderRouteTargets();
+    });
     const upExport = $('upstreamExportBtn');
     if (upExport) upExport.addEventListener('click', exportUpstreamsConfig);
     const upImport = $('upstreamImportBtn');
@@ -3134,6 +3323,9 @@
       renderForwardChart(d.timeseries || [], d.percentiles || {});
       populateForwardProviderFilter();
       renderProviderInlineStats();
+      renderStatsTable();
+      renderStatsCompare();
+      refreshOpenProviderDetails();
     } catch (e) {
       // Non-fatal: dashboard just shows zeros.
     }
@@ -3195,15 +3387,840 @@
     sel.value = cur;
   }
 
-  // Inline mini-stat line on each provider card (Phase 0).
+  // Inline mini-stat line on each provider card.
   function renderProviderInlineStats() {
     const byId = {};
     forwardStats.providers.forEach(p => { byId[p.providerId] = p; });
     qsa('#upstreamsList [data-fwd-inline-for]').forEach(el => {
       const p = byId[el.dataset.fwdInlineFor];
       if (!p || !p.requests) { el.textContent = ''; return; }
-      el.textContent = t('forward.inlineStat', String(p.requests), String(p.success), String(p.failed), fwdFmtLatency(p.avgLatencyMs));
+      let line = t('forward.inlineStat', String(p.requests), String(p.success), String(p.failed), fwdFmtLatency(p.avgLatencyMs));
+      const tokens = (p.inputTokens || 0) + (p.outputTokens || 0);
+      if (tokens) line += ' · ' + t('stats.inlineTokens', formatNum(tokens));
+      if (p.rpm) line += ' · ' + t('stats.inlineRpm', fwdFmtRate(p.rpm));
+      el.textContent = line;
     });
+  }
+
+  // ===== Per-provider detail panel =====
+  // Shared by the expandable cards on the Forwarding tab and the drill-down on
+  // the Stats tab, so both surfaces always show the same figures.
+
+  const providerDetailCache = {}; // providerId -> last loaded detail payload
+  const openProviderDetails = {}; // providerId -> true while expanded
+
+  function fwdFmtRate(n) {
+    if (!n) return '0';
+    return n >= 10 ? Math.round(n).toString() : n.toFixed(1);
+  }
+
+  // fwdFmtPct renders a success rate. The API sends -1 for "no traffic yet",
+  // which must read as unknown rather than 0%.
+  function fwdFmtPct(v) {
+    if (v == null || v < 0) return '—';
+    return v.toFixed(1) + '%';
+  }
+
+  function fwdFmtCost(v, isPool) {
+    if (!v) return '—';
+    const n = v >= 1 ? v.toFixed(2) : v.toFixed(4);
+    return isPool ? t('stats.creditsValue', n) : '$' + n;
+  }
+
+  function fwdFmtWhen(ms) {
+    if (!ms) return '—';
+    return new Date(ms).toLocaleString();
+  }
+
+  // statusClass buckets an HTTP status into the badge colors already used by the
+  // event table.
+  function statusClass(code) {
+    if (code >= 200 && code < 300) return 'fwd-badge--ok';
+    if (code === 499) return 'fwd-badge--warn';
+    return 'fwd-badge--err';
+  }
+
+  // sparkline draws a compact SVG bar chart of per-minute buckets, matching the
+  // main forwarding chart's stacked success/failure encoding.
+  function sparkline(buckets) {
+    if (!buckets || !buckets.length) return '';
+    const w = 100, h = 24, n = buckets.length, bw = w / n;
+    const max = Math.max(1, ...buckets.map(b => b.requests || 0));
+    let bars = '';
+    buckets.forEach((b, i) => {
+      const total = b.requests || 0;
+      if (!total) return;
+      const th = (total / max) * h;
+      const fh = ((b.failed || 0) / max) * h;
+      const sh = th - fh;
+      const x = (i * bw).toFixed(2);
+      const fw = (bw * 0.8).toFixed(2);
+      if (sh > 0) bars += '<rect x="' + x + '" y="' + (h - th).toFixed(2) + '" width="' + fw + '" height="' + sh.toFixed(2) + '" class="spark-ok"></rect>';
+      if (fh > 0) bars += '<rect x="' + x + '" y="' + (h - fh).toFixed(2) + '" width="' + fw + '" height="' + fh.toFixed(2) + '" class="spark-err"></rect>';
+    });
+    return '<svg class="provider-spark" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' + bars + '</svg>';
+  }
+
+  function metricTile(label, value, sub) {
+    return '<div class="pd-tile">' +
+      '<div class="pd-tile-label">' + escapeHtml(label) + '</div>' +
+      '<div class="pd-tile-value">' + escapeHtml(value) + '</div>' +
+      (sub ? '<div class="pd-tile-sub">' + escapeHtml(sub) + '</div>' : '') +
+      '</div>';
+  }
+
+  function pdSection(title, inner) {
+    if (!inner) return '';
+    return '<div class="pd-section">' +
+      '<div class="pd-section-title">' + escapeHtml(title) + '</div>' + inner + '</div>';
+  }
+
+  // renderProviderDetailHTML builds the whole panel from a /provider-stats
+  // payload. isPool switches the cost column to credits, which is the pool's
+  // real unit of spend.
+  function renderProviderDetailHTML(payload) {
+    const d = payload.detail || {};
+    const isPool = !!payload.isPool;
+    const pct = d.percentiles || {};
+
+    const tiles =
+      metricTile(t('stats.tileRequests'), formatNum(d.requests || 0),
+        // Cancellations are counted in neither ok nor failed, so show them
+        // explicitly — otherwise the two numbers silently fail to add up.
+        d.canceled
+          ? t('stats.tileOkFailCanceled', String(d.success || 0), String(d.failed || 0), String(d.canceled))
+          : t('stats.tileOkFail', String(d.success || 0), String(d.failed || 0))) +
+      metricTile(t('stats.tileSuccessRate'), fwdFmtPct(d.successRate),
+        d.failStreak ? t('stats.tileStreak', String(d.failStreak)) : '') +
+      metricTile(t('stats.tileTokens'), formatNum((d.inputTokens || 0) + (d.outputTokens || 0)),
+        t('stats.tileTokenSplit', formatNum(d.inputTokens || 0), formatNum(d.outputTokens || 0))) +
+      metricTile(t('stats.tileCost'), fwdFmtCost(d.costUsd, isPool), '') +
+      metricTile(t('stats.tileRpm'), fwdFmtRate(d.rpm),
+        t('stats.tileTpm', fwdFmtRate(d.tpm))) +
+      metricTile(t('stats.tileLatency'), fwdFmtLatency(d.avgLatencyMs || 0),
+        pct.count ? 'p50 ' + fwdFmtLatency(pct.p50) + ' · p95 ' + fwdFmtLatency(pct.p95) + ' · p99 ' + fwdFmtLatency(pct.p99) : '') +
+      metricTile(t('stats.tileTtfb'), d.avgTtfbMs ? fwdFmtLatency(d.avgTtfbMs) : '—',
+        d.tokensPerSec ? t('stats.tileTokensPerSec', fwdFmtRate(d.tokensPerSec)) : '') +
+      metricTile(t('stats.tileConcurrency'), String(d.inFlight || 0),
+        t('stats.tilePeak', String(d.peakInFlight || 0))) +
+      metricTile(t('stats.tileStream'), formatNum(d.streamed || 0),
+        t('stats.tileCanceled', String(d.canceled || 0))) +
+      metricTile(t('stats.tileLastOk'), fwdFmtWhen(d.lastOk), '');
+
+    let html = '<div class="pd-tiles">' + tiles + '</div>';
+
+    const spark = sparkline(d.minutes);
+    if (spark) html += pdSection(t('stats.sectionActivity'), spark);
+
+    if (d.statuses && d.statuses.length) {
+      html += pdSection(t('stats.sectionStatus'),
+        '<div class="pd-badges">' + d.statuses.map(s =>
+          '<span class="fwd-badge ' + statusClass(s.status) + '">' +
+          escapeHtml(String(s.status)) + ' × ' + escapeHtml(formatNum(s.count)) +
+          '</span>').join('') + '</div>');
+    }
+
+    if (d.models && d.models.length) {
+      html += pdSection(t('stats.sectionModels'),
+        '<div class="pd-table-scroll"><table class="pd-table"><thead><tr>' +
+        '<th>' + escapeHtml(t('stats.colModel')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colRequests')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colOkPct')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colTokens')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colAvg')) + '</th>' +
+        '</tr></thead><tbody>' +
+        d.models.map(m => '<tr>' +
+          '<td class="font-mono">' + escapeHtml(m.model) + '</td>' +
+          '<td>' + escapeHtml(formatNum(m.requests)) + '</td>' +
+          '<td>' + escapeHtml(fwdFmtPct(m.successRate)) + '</td>' +
+          '<td>' + escapeHtml(formatNum((m.inputTokens || 0) + (m.outputTokens || 0))) + '</td>' +
+          '<td>' + escapeHtml(fwdFmtLatency(m.avgLatencyMs)) + '</td>' +
+          '</tr>').join('') +
+        '</tbody></table></div>');
+    }
+
+    if (d.accounts && d.accounts.length) {
+      html += pdSection(t('stats.sectionAccounts'),
+        '<div class="pd-table-scroll"><table class="pd-table"><thead><tr>' +
+        '<th>' + escapeHtml(t('stats.colAccount')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colRequests')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colOkPct')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colTokens')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colAvg')) + '</th>' +
+        '</tr></thead><tbody>' +
+        d.accounts.map(a => {
+          const label = a.accountLabel || a.accountId || '';
+          return '<tr>' +
+            '<td>' + escapeHtml(privacyModeEnabled ? maskEmail(label) : label) + '</td>' +
+            '<td>' + escapeHtml(formatNum(a.requests)) + '</td>' +
+            '<td>' + escapeHtml(fwdFmtPct(a.successRate)) + '</td>' +
+            '<td>' + escapeHtml(formatNum((a.inputTokens || 0) + (a.outputTokens || 0))) + '</td>' +
+            '<td>' + escapeHtml(fwdFmtLatency(a.avgLatencyMs)) + '</td>' +
+            '</tr>';
+        }).join('') +
+        '</tbody></table></div>');
+    }
+
+    if (d.recentErrors && d.recentErrors.length) {
+      html += pdSection(t('stats.sectionErrors'),
+        '<div class="pd-errors">' + d.recentErrors.map(e =>
+          '<div class="pd-error">' +
+          '<span class="fwd-badge ' + statusClass(e.status) + '">' + escapeHtml(String(e.status || '-')) + '</span>' +
+          '<span class="pd-error-time">' + escapeHtml(fwdFmtWhen(e.time)) + '</span>' +
+          '<span class="pd-error-msg" title="' + escapeAttr(e.message || '') + '">' + escapeHtml(e.message || '') + '</span>' +
+          '</div>').join('') + '</div>');
+    }
+
+    // Per-provider actions: a scoped event log and a scoped reset, so an
+    // operator can investigate or clear one provider without touching the rest.
+    const pid = escapeAttr(payload.providerId || (d.providerId || ''));
+    html += '<div class="pd-actions">' +
+      '<button class="btn btn-outline btn-sm" type="button" data-pd-action="events" data-id="' + pid + '">' +
+      escapeHtml(t('stats.viewEvents')) + '</button>' +
+      '<button class="btn btn-outline btn-sm" type="button" data-pd-action="export" data-id="' + pid + '">' +
+      escapeHtml(t('stats.exportCsv')) + '</button>' +
+      '<button class="btn btn-danger btn-sm" type="button" data-pd-action="reset" data-id="' + pid + '">' +
+      escapeHtml(t('stats.resetProvider')) + '</button>' +
+      '</div>';
+
+    return html;
+  }
+
+  // loadProviderDetail fetches and renders one provider's panel into every host
+  // element currently showing it (a card on Forwarding, a row on Stats).
+  async function loadProviderDetail(providerId) {
+    const hosts = qsa('[data-provider-detail="' + cssEscape(providerId) + '"]');
+    if (!hosts.length) return;
+    try {
+      const res = await api('/provider-stats?id=' + encodeURIComponent(providerId));
+      if (!res.ok) throw new Error('http ' + res.status);
+      const payload = await res.json();
+      payload.providerId = providerId;
+      providerDetailCache[providerId] = payload;
+      const html = renderProviderDetailHTML(payload);
+      hosts.forEach(el => { el.innerHTML = html; });
+    } catch (e) {
+      hosts.forEach(el => {
+        el.innerHTML = '<div class="muted-text text-xs" style="padding:0.75rem 0;">' +
+          escapeHtml(t('stats.loadFailed')) + '</div>';
+      });
+    }
+  }
+
+  // cssEscape quotes an id for use inside an attribute selector. Provider ids are
+  // UUIDs today, but a hand-imported bundle can carry anything.
+  function cssEscape(s) {
+    if (window.CSS && CSS.escape) return CSS.escape(s);
+    return String(s).replace(/["\\]/g, '\\$&');
+  }
+
+  // toggleProviderDetail expands or collapses one provider's panel.
+  //
+  // scope matters: the same providerId has a detail host on BOTH the Forwarding
+  // tab and the Stats table, so the host must be resolved within the container
+  // the click came from. Resolving globally would toggle whichever surface
+  // happens to appear first in the document.
+  function toggleProviderDetail(providerId, btn, scope) {
+    const sel = '[data-provider-detail="' + cssEscape(providerId) + '"]';
+    const root = scope || document;
+    const host = root.querySelector(sel);
+    if (!host) return;
+    const open = !host.classList.contains('hidden');
+    if (open) {
+      host.classList.add('hidden');
+      delete openProviderDetails[providerId];
+      if (btn) btn.setAttribute('aria-expanded', 'false');
+      return;
+    }
+    host.classList.remove('hidden');
+    openProviderDetails[providerId] = true;
+    if (btn) btn.setAttribute('aria-expanded', 'true');
+    if (!host.innerHTML) {
+      host.innerHTML = '<div class="muted-text text-xs" style="padding:0.75rem 0;">' +
+        escapeHtml(t('stats.loading')) + '</div>';
+    }
+    loadProviderDetail(providerId);
+  }
+
+  // refreshOpenProviderDetails re-fetches every expanded panel, so an open panel
+  // tracks live traffic instead of freezing at its opening snapshot.
+  function refreshOpenProviderDetails() {
+    Object.keys(openProviderDetails).forEach(id => {
+      if (document.querySelector('[data-provider-detail="' + cssEscape(id) + '"]')) {
+        loadProviderDetail(id);
+      }
+    });
+  }
+
+  // resetProviderStats clears one provider's counters after confirmation.
+  async function resetProviderStats(providerId) {
+    const label = (providerDetailCache[providerId] && providerDetailCache[providerId].name) || providerId;
+    if (!confirm(t('stats.confirmResetProvider', label))) return;
+    try {
+      const res = await api('/forward-stats/reset-provider', {
+        method: 'POST',
+        body: JSON.stringify({ id: providerId })
+      });
+      if (!res.ok) throw new Error('http ' + res.status);
+      toast(t('stats.resetProviderDone'), 'success');
+      loadForwardStats();
+      loadProviderDetail(providerId);
+    } catch (e) {
+      toastError(t('stats.resetProviderFailed'));
+    }
+  }
+
+  // exportProviderEvents downloads this provider's event log as CSV. The admin
+  // password rides in a cookie (as for SSE), so a plain navigation authenticates.
+  function exportProviderEvents(providerId) {
+    setAdminCookie(password);
+    const url = '/admin/api/forward-events/export?format=csv&provider=' + encodeURIComponent(providerId);
+    window.open(url, '_blank');
+  }
+
+  // filterEventsByProvider scopes the shared event log to one provider and
+  // scrolls to it, rather than duplicating a second log widget per panel.
+  function filterEventsByProvider(providerId) {
+    const sel = $('fwdFilterProvider');
+    if (sel) {
+      sel.value = providerId;
+      // The custom-select wrapper mirrors the native value into its own label.
+      if (typeof syncCustomSelect === 'function') syncCustomSelect(sel);
+    }
+    fwdEventsOffset = 0;
+    loadForwardEvents();
+    // The events table now lives in the activity pane; without this the scroll
+    // below would target a hidden element and appear to do nothing.
+    switchForwardPane('activity');
+    const table = $('fwdEventsBody');
+    if (table && table.closest('.card')) {
+      table.closest('.card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }
+
+  // switchForwardPane toggles the Forwarding tab between config and activity.
+  function switchForwardPane(pane) {
+    const target = pane === 'activity' ? 'activity' : 'config';
+    const cfg = $('fwdPaneConfig');
+    const act = $('fwdPaneActivity');
+    if (cfg) cfg.classList.toggle('hidden', target !== 'config');
+    if (act) act.classList.toggle('hidden', target !== 'activity');
+    const bar = $('fwdSubtabs');
+    if (bar) {
+      bar.querySelectorAll('[data-fwd-pane]').forEach(b => {
+        const on = b.dataset.fwdPane === target;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+    }
+  }
+
+  // ===== Stats tab: cross-provider comparison =====
+  // Reads the same /forward-stats payload the Forwarding tab loads, so the two
+  // views cannot disagree, and reuses the shared provider detail panel for
+  // drill-down.
+
+  let statsSortKey = 'requests';
+  let statsSortDesc = true;
+  let statsHistoryHours = 24;
+  // Last trend payload, kept so a language switch can re-render the chart
+  // heading and note (both are built in JS, not via data-i18n).
+  let statsTrendLast = { buckets: [], unit: 'hour' };
+
+  // statsSortValue projects a provider row onto its sort key. tokens is derived
+  // rather than stored, and lastUsed sorts unused providers last regardless of
+  // direction (a never-used provider is not "oldest").
+  function statsSortValue(row, key) {
+    if (key === 'tokens') return (row.inputTokens || 0) + (row.outputTokens || 0);
+    if (key === 'providerName') return (row.providerName || '').toLowerCase();
+    return row[key] || 0;
+  }
+
+  function sortedStatsRows() {
+    const rows = (forwardStats.providers || []).slice();
+    rows.sort((a, b) => {
+      const av = statsSortValue(a, statsSortKey);
+      const bv = statsSortValue(b, statsSortKey);
+      let cmp;
+      if (typeof av === 'string' || typeof bv === 'string') {
+        cmp = String(av).localeCompare(String(bv));
+      } else {
+        cmp = av - bv;
+      }
+      return statsSortDesc ? -cmp : cmp;
+    });
+    return rows;
+  }
+
+  // ---- At-a-glance comparison ----
+  // The numeric table is exact but demands that the reader do the ranking. This
+  // block does the ranking for them: one "who wins" card per dimension, then a
+  // normalised bar per provider so the size of the gap is visible too.
+  //
+  // Only providers with traffic take part. A provider with zero requests has no
+  // latency and no success rate, and including it would either invent a 0 or
+  // hand it a bogus win.
+
+  function statsCompareRows() {
+    return (forwardStats.providers || []).filter(p => (p.requests || 0) > 0);
+  }
+
+  // costPer1M normalises spend so a low-volume provider is not flattered by a
+  // small total bill. Returns null when the provider has no price configured or
+  // no tokens yet — an unpriced provider is unknown, not free.
+  function costPer1M(p) {
+    const tokens = (p.inputTokens || 0) + (p.outputTokens || 0);
+    if (!p.costUsd || !tokens) return null;
+    return p.costUsd / tokens * 1e6;
+  }
+
+  function statsProviderLabel(p) {
+    return p.providerName || p.providerId || t('upstreams.unnamed');
+  }
+
+  // compareMetric describes one comparable dimension: how to read the value off
+  // a row, which direction is better, and how to format it.
+  //
+  // sortHint names the sort order rather than saying "lower is better". Since the
+  // bars encode raw magnitude, the ranking is communicated by position and colour,
+  // and the heading should tell the reader how the list is ordered.
+  //
+  // Cost is USD-only on purpose. The Kiro pool is metered in credits, so the two
+  // units cannot share a scale or a winner; the pool still appears in the
+  // latency, reliability and volume comparisons, where the units do match.
+  function statsCompareMetrics() {
+    return [
+      {
+        key: 'latency',
+        label: t('stats.cmpLatency'),
+        sortHint: t('stats.cmpSortFastest'),
+        lowerBetter: true,
+        value: p => p.avgLatencyMs || 0,
+        format: v => fwdFmtLatency(v),
+        champion: t('stats.cmpFastest')
+      },
+      {
+        key: 'success',
+        label: t('stats.cmpSuccess'),
+        sortHint: t('stats.cmpSortReliable'),
+        lowerBetter: false,
+        // -1 means "no decided requests" (e.g. everything was canceled); such a
+        // provider is excluded from this dimension rather than scored as 0%.
+        value: p => (p.successRate == null || p.successRate < 0 ? null : p.successRate),
+        format: v => fwdFmtPct(v),
+        champion: t('stats.cmpMostReliable')
+      },
+      {
+        key: 'cost',
+        label: t('stats.cmpCost'),
+        sortHint: t('stats.cmpSortCheapest'),
+        lowerBetter: true,
+        value: p => (p.isPool ? null : costPer1M(p)),
+        format: v => '$' + (v >= 1 ? v.toFixed(2) : v.toFixed(4)),
+        champion: t('stats.cmpCheapest'),
+        note: t('stats.cmpCostNote')
+      },
+      {
+        key: 'volume',
+        label: t('stats.cmpVolume'),
+        sortHint: t('stats.cmpSortBusiest'),
+        lowerBetter: false,
+        value: p => p.requests || 0,
+        format: v => formatNum(v),
+        champion: t('stats.cmpBusiest')
+      }
+    ];
+  }
+
+  // metricEntries pairs each eligible provider with its value for one metric,
+  // best first.
+  function metricEntries(metric, rows) {
+    const out = [];
+    rows.forEach(p => {
+      const v = metric.value(p);
+      if (v == null || !isFinite(v)) return;
+      out.push({ provider: p, value: v });
+    });
+    out.sort((a, b) => metric.lowerBetter ? a.value - b.value : b.value - a.value);
+    return out;
+  }
+
+  // barPct scales a value to bar width.
+  //
+  // The bar always encodes the RAW magnitude: a longer bar means a bigger number,
+  // never "better". An earlier version inverted the scale for lower-is-better
+  // metrics so the winner had the longest bar; that read backwards, because a
+  // 364ms provider drawn as a full-width bar looks like the slowest one no matter
+  // what the caption says. Direction is carried by sort order and colour instead.
+  //
+  // Skewed distributions get a log scale. With one provider at 13.1K requests and
+  // the rest in the hundreds, a linear scale collapses everything below the leader
+  // into an indistinguishable dot, so 347 and 140 look identical.
+  function barPct(value, entries, useLog) {
+    const vals = entries.map(e => e.value).filter(v => isFinite(v));
+    const max = Math.max(...vals);
+    if (!isFinite(max) || max <= 0) return 0;
+    if (!useLog) return (value / max) * 100;
+    // log1p keeps zero at zero and is defined for all non-negative values.
+    return (Math.log1p(Math.max(0, value)) / Math.log1p(max)) * 100;
+  }
+
+  // shouldLogScale reports whether a metric's spread is wide enough that a linear
+  // bar chart would hide the differences among the smaller entries. The threshold
+  // is the ratio between the largest value and the median.
+  function shouldLogScale(entries) {
+    const vals = entries.map(e => e.value).filter(v => isFinite(v) && v > 0).sort((a, b) => a - b);
+    if (vals.length < 3) return false;
+    const median = vals[Math.floor(vals.length / 2)];
+    const max = vals[vals.length - 1];
+    return median > 0 && max / median >= 20;
+  }
+
+  // How many rows each bar group shows before "show all". The top of the ranking
+  // is what an operator acts on; 12th versus 13th place changes no decision.
+  const STATS_BAR_COLLAPSED = 5;
+  const statsBarExpanded = {}; // metric key -> true while fully expanded
+
+  function statsChampionCard(metric, entries) {
+    // A "winner" chosen from a field of one is not a comparison. This happens in
+    // practice on the cost metric, where usually only a provider or two has
+    // pricing configured.
+    if (entries.length < 2) {
+      const only = entries.length === 1
+        ? t('stats.cmpOnlyOne', statsProviderLabel(entries[0].provider), metric.format(entries[0].value))
+        : t('stats.cmpNoData');
+      return '<div class="stats-champ stats-champ--empty">' +
+        '<div class="stats-champ-title">' + escapeHtml(metric.champion) + '</div>' +
+        '<div class="stats-champ-name muted-text">' + escapeHtml(only) + '</div>' +
+        '</div>';
+    }
+    const best = entries[0];
+    // The runner-up gap is the actionable part: "fastest" matters much less when
+    // the second place is 2% behind than when it is twice as slow.
+    let gap = '';
+    const next = entries[1];
+    const a = best.value, b = next.value;
+    if (a > 0 && b > 0) {
+      const pct = metric.lowerBetter ? (b - a) / b * 100 : (a - b) / a * 100;
+      if (pct >= 1) gap = t('stats.cmpGap', pct.toFixed(0), statsProviderLabel(next.provider));
+    }
+    return '<div class="stats-champ">' +
+      '<div class="stats-champ-title">' + escapeHtml(metric.champion) + '</div>' +
+      '<div class="stats-champ-name" title="' + escapeAttr(statsProviderLabel(best.provider)) + '">' +
+        escapeHtml(statsProviderLabel(best.provider)) + '</div>' +
+      '<div class="stats-champ-value">' + escapeHtml(metric.format(best.value)) + '</div>' +
+      (gap ? '<div class="stats-champ-gap">' + escapeHtml(gap) + '</div>' : '') +
+      '</div>';
+  }
+
+  // rankTone buckets a row's rank into a colour tier. Colour now carries rank
+  // information for every row rather than marking only first and last, which left
+  // the middle of the field as a wall of identical bars.
+  function rankTone(i, n) {
+    if (i === 0) return 'best';
+    if (n > 2 && i === n - 1) return 'worst';
+    // Top third / middle / bottom third.
+    if (i < n / 3) return 'good';
+    if (i < (n * 2) / 3) return 'mid';
+    return 'poor';
+  }
+
+  function statsCompareBars(metric, entries) {
+    // With fewer than two participants there is no comparison to draw; the
+    // champion card already states the single value.
+    if (entries.length < 2) return '';
+
+    const useLog = shouldLogScale(entries);
+    const expanded = !!statsBarExpanded[metric.key];
+    const hidden = Math.max(0, entries.length - STATS_BAR_COLLAPSED);
+    const shown = expanded ? entries : entries.slice(0, STATS_BAR_COLLAPSED);
+
+    const rowsHtml = shown.map((e, i) => {
+      const pct = Math.max(1.5, Math.min(100, barPct(e.value, entries, useLog)));
+      const label = statsProviderLabel(e.provider);
+      return '<div class="stats-bar-row">' +
+        '<span class="stats-bar-rank">' + (i + 1) + '</span>' +
+        '<span class="stats-bar-label" title="' + escapeAttr(label) + '">' +
+          escapeHtml(label) +
+          (e.provider.isPool ? ' <span class="stats-tag stats-tag--pool">' + escapeHtml(t('stats.poolTag')) + '</span>' : '') +
+        '</span>' +
+        '<span class="stats-bar-track">' +
+          '<span class="stats-bar-fill stats-bar-fill--' + rankTone(i, entries.length) + '" style="width:' + pct.toFixed(1) + '%"></span>' +
+        '</span>' +
+        '<span class="stats-bar-value">' + escapeHtml(metric.format(e.value)) + '</span>' +
+        '</div>';
+    }).join('');
+
+    const toggle = hidden
+      ? '<button type="button" class="stats-bar-more" data-cmp-toggle="' + escapeAttr(metric.key) + '">' +
+          escapeHtml(expanded ? t('stats.cmpShowLess') : t('stats.cmpShowAll', String(entries.length))) +
+        '</button>'
+      : '';
+
+    return '<div class="stats-cmp-group">' +
+      '<div class="stats-cmp-head">' +
+        '<span class="stats-cmp-title">' + escapeHtml(metric.label) + '</span>' +
+        '<span class="stats-cmp-hint">' + escapeHtml(metric.sortHint) + '</span>' +
+      '</div>' +
+      (metric.note ? '<div class="stats-cmp-note">' + escapeHtml(metric.note) + '</div>' : '') +
+      (useLog ? '<div class="stats-cmp-note">' + escapeHtml(t('stats.cmpLogNote')) + '</div>' : '') +
+      rowsHtml +
+      toggle +
+      '</div>';
+  }
+
+  function renderStatsCompare() {
+    const host = $('statsCompare');
+    if (!host) return;
+    const rows = statsCompareRows();
+    // With a single active provider there is nothing to compare against, so the
+    // block would be pure decoration.
+    if (rows.length < 2) {
+      host.innerHTML = rows.length
+        ? '<p class="muted-text text-xs stats-cmp-empty">' + escapeHtml(t('stats.cmpNeedTwo')) + '</p>'
+        : '';
+      return;
+    }
+
+    const metrics = statsCompareMetrics();
+    const entriesByKey = {};
+    metrics.forEach(m => { entriesByKey[m.key] = metricEntries(m, rows); });
+
+    host.innerHTML =
+      '<div class="stats-champ-grid">' +
+        metrics.map(m => statsChampionCard(m, entriesByKey[m.key])).join('') +
+      '</div>' +
+      '<div class="stats-cmp-bars">' +
+        metrics.map(m => statsCompareBars(m, entriesByKey[m.key])).join('') +
+      '</div>';
+  }
+
+  // ---- Table heatmap ----
+  // Tints the best and worst cell of each comparable column. Only columns with a
+  // meaningful direction are tinted: total tokens and total cost measure how
+  // much a provider was used, not how well it performed, so tinting them would
+  // punish the provider carrying the most traffic.
+  const STATS_HEAT_COLS = {
+    requests: { lowerBetter: false },
+    successRate: { lowerBetter: false },
+    avgLatencyMs: { lowerBetter: true },
+    rpm: { lowerBetter: false }
+  };
+
+  // statsHeatClasses maps providerId -> column key -> 'best' | 'worst'.
+  function statsHeatClasses(rows) {
+    const out = {};
+    if (rows.length < 2) return out;
+    Object.keys(STATS_HEAT_COLS).forEach(key => {
+      const lower = STATS_HEAT_COLS[key].lowerBetter;
+      const vals = [];
+      rows.forEach(p => {
+        let v = key === 'successRate'
+          ? (p.successRate == null || p.successRate < 0 ? null : p.successRate)
+          : p[key];
+        if (v == null || !isFinite(v)) return;
+        vals.push({ id: p.providerId, v: v });
+      });
+      if (vals.length < 2) return;
+      vals.sort((a, b) => lower ? a.v - b.v : b.v - a.v);
+      const bestV = vals[0].v, worstV = vals[vals.length - 1].v;
+      // An all-equal column has no winner to highlight.
+      if (bestV === worstV) return;
+      vals.forEach(e => {
+        if (e.v !== bestV && e.v !== worstV) return;
+        out[e.id] = out[e.id] || {};
+        out[e.id][key] = e.v === bestV ? 'best' : 'worst';
+      });
+    });
+    return out;
+  }
+
+  function heatCls(heat, id, key) {
+    const v = heat[id] && heat[id][key];
+    return v ? ' stats-heat--' + v : '';
+  }
+
+  function renderStatsTable() {
+    const body = $('statsTableBody');
+    if (!body) return;
+    const rows = sortedStatsRows();
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="8" class="muted-text" style="padding:1rem;text-align:center;">' +
+        escapeHtml(t('stats.noProviders')) + '</td></tr>';
+      return;
+    }
+
+    // Heatmap ranks only providers with traffic, matching the comparison block.
+    const heat = statsHeatClasses(rows.filter(p => (p.requests || 0) > 0));
+
+    body.innerHTML = rows.map(p => {
+      const id = escapeAttr(p.providerId || '');
+      const tokens = (p.inputTokens || 0) + (p.outputTokens || 0);
+      const name = p.providerName || p.providerId || t('upstreams.unnamed');
+      // Health dot: a provider on a failure streak is called out here, because
+      // this table is where an operator decides which provider to stop using.
+      const dotClass = p.requests === 0 ? 'idle' : (p.healthy ? 'ok' : 'bad');
+      const badges =
+        (p.isPool ? '<span class="stats-tag stats-tag--pool">' + escapeHtml(t('stats.poolTag')) + '</span>' : '') +
+        (p.configured && !p.enabled && !p.isPool ? '<span class="stats-tag stats-tag--off">' + escapeHtml(t('upstreams.disabled')) + '</span>' : '') +
+        (!p.configured ? '<span class="stats-tag stats-tag--orphan" title="' + escapeAttr(t('stats.orphanHint')) + '">' + escapeHtml(t('stats.orphanTag')) + '</span>' : '');
+      const pid = p.providerId || '';
+
+      return '<tr class="stats-row" data-stats-provider="' + id + '" tabindex="0">' +
+        '<td><span class="stats-dot stats-dot--' + dotClass + '"></span>' +
+          '<span class="stats-name">' + escapeHtml(name) + '</span>' + badges + '</td>' +
+        '<td class="num' + heatCls(heat, pid, 'requests') + '">' + escapeHtml(formatNum(p.requests || 0)) + '</td>' +
+        '<td class="num' + heatCls(heat, pid, 'successRate') + '">' + escapeHtml(fwdFmtPct(p.successRate)) + '</td>' +
+        '<td class="num">' + escapeHtml(tokens ? formatNum(tokens) : '—') + '</td>' +
+        '<td class="num">' + escapeHtml(fwdFmtCost(p.costUsd, p.isPool)) + '</td>' +
+        '<td class="num' + heatCls(heat, pid, 'avgLatencyMs') + '">' + escapeHtml(p.requests ? fwdFmtLatency(p.avgLatencyMs) : '—') + '</td>' +
+        '<td class="num' + heatCls(heat, pid, 'rpm') + '">' + escapeHtml(fwdFmtRate(p.rpm)) + '</td>' +
+        '<td class="num">' + escapeHtml(p.lastUsed ? fwdFmtWhen(p.lastUsed) : '—') + '</td>' +
+        '</tr>' +
+        '<tr class="stats-detail-row"><td colspan="8">' +
+          '<div class="provider-detail hidden" data-provider-detail="' + id + '"></div>' +
+        '</td></tr>';
+    }).join('');
+
+    // Reflect the active sort in the header.
+    qsa('#statsTable th[data-stats-sort]').forEach(th => {
+      const active = th.dataset.statsSort === statsSortKey;
+      th.classList.toggle('sorted', active);
+      th.classList.toggle('desc', active && statsSortDesc);
+      th.setAttribute('aria-sort', active ? (statsSortDesc ? 'descending' : 'ascending') : 'none');
+    });
+
+    // Re-expand whatever was open before the re-render.
+    Object.keys(openProviderDetails).forEach(pid => {
+      const host = document.querySelector('#statsTableBody [data-provider-detail="' + cssEscape(pid) + '"]');
+      if (host) {
+        host.classList.remove('hidden');
+        if (providerDetailCache[pid]) host.innerHTML = renderProviderDetailHTML(providerDetailCache[pid]);
+      }
+    });
+  }
+
+  // renderStatsTrend draws the history chart. The bucket unit follows the
+  // selected range (per-minute for the 1-hour view, hourly beyond that), so the
+  // heading names the unit rather than assuming hours.
+  function renderStatsTrend(buckets, unit) {
+    statsTrendLast = { buckets: buckets || [], unit: unit };
+    const host = $('statsTrendChart');
+    const isMinute = unit === 'minute';
+    const title = $('statsTrendTitle');
+    if (title) title.textContent = t(isMinute ? 'stats.trendTitleMinute' : 'stats.trendTitle');
+    const note = $('statsTrendNote');
+    // Per-minute buckets live only in memory, so say so instead of letting an
+    // empty 1-hour chart read as "no traffic" after a restart.
+    if (note) note.textContent = isMinute ? t('stats.trendMinuteNote') : '';
+    if (!host) return;
+    const series = buckets || [];
+    const total = series.reduce((n, b) => n + (b.requests || 0), 0);
+    if (!total) {
+      host.innerHTML = '<div class="muted-text text-xs" style="padding:1rem 0;">' +
+        escapeHtml(t('forward.noData')) + '</div>';
+    } else {
+      const w = 100, h = 40, n = series.length, bw = w / n;
+      const max = Math.max(1, ...series.map(b => b.requests || 0));
+      let bars = '';
+      series.forEach((b, i) => {
+        const reqs = b.requests || 0;
+        if (!reqs) return;
+        const th = (reqs / max) * h;
+        const fh = ((b.failed || 0) / max) * h;
+        const sh = th - fh;
+        const x = (i * bw).toFixed(2);
+        const fw = (bw * 0.8).toFixed(2);
+        if (sh > 0) bars += '<rect x="' + x + '" y="' + (h - th).toFixed(2) + '" width="' + fw + '" height="' + sh.toFixed(2) + '" class="spark-ok"></rect>';
+        if (fh > 0) bars += '<rect x="' + x + '" y="' + (h - fh).toFixed(2) + '" width="' + fw + '" height="' + fh.toFixed(2) + '" class="spark-err"></rect>';
+      });
+      host.innerHTML = '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" style="width:100%;height:60px;">' + bars + '</svg>';
+    }
+
+    const summary = $('statsTrendSummary');
+    if (summary) {
+      const failed = series.reduce((n, b) => n + (b.failed || 0), 0);
+      const tokens = series.reduce((n, b) => n + (b.inputTokens || 0) + (b.outputTokens || 0), 0);
+      summary.textContent = total
+        ? t('stats.trendSummary', formatNum(total), formatNum(failed), formatNum(tokens))
+        : '';
+    }
+  }
+
+  async function loadStatsHistory() {
+    try {
+      const res = await api('/forward-history?hours=' + encodeURIComponent(statsHistoryHours));
+      if (!res.ok) throw new Error('http ' + res.status);
+      const d = await res.json();
+      renderStatsTrend(d.buckets || [], d.unit);
+    } catch (e) {
+      renderStatsTrend([], statsHistoryHours <= 1 ? 'minute' : 'hour');
+    }
+  }
+
+  function openStats() {
+    loadForwardStats();
+    loadStatsHistory();
+  }
+
+  function bindStatsEvents() {
+    // Delegated so the per-group "show all" buttons survive every re-render.
+    const cmp = $('statsCompare');
+    if (cmp) {
+      cmp.addEventListener('click', e => {
+        const btn = e.target.closest('[data-cmp-toggle]');
+        if (!btn) return;
+        const key = btn.dataset.cmpToggle;
+        statsBarExpanded[key] = !statsBarExpanded[key];
+        renderStatsCompare();
+      });
+    }
+
+    const table = $('statsTable');
+    if (table) {
+      table.addEventListener('click', e => {
+        const th = e.target.closest('th[data-stats-sort]');
+        if (th) {
+          const key = th.dataset.statsSort;
+          if (key === statsSortKey) {
+            statsSortDesc = !statsSortDesc;
+          } else {
+            statsSortKey = key;
+            // Names read best A→Z; every numeric column reads best largest-first.
+            statsSortDesc = key !== 'providerName';
+          }
+          renderStatsTable();
+          return;
+        }
+        const row = e.target.closest('tr[data-stats-provider]');
+        if (row) toggleProviderDetail(row.dataset.statsProvider, null, $('statsTableBody'));
+      });
+      // Keyboard parity for row expansion.
+      table.addEventListener('keydown', e => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const row = e.target.closest('tr[data-stats-provider]');
+        if (!row) return;
+        e.preventDefault();
+        toggleProviderDetail(row.dataset.statsProvider, null, $('statsTableBody'));
+      });
+    }
+
+    const range = $('statsRangeSelect');
+    if (range) {
+      range.addEventListener('change', () => {
+        statsHistoryHours = parseInt(range.value, 10) || 24;
+        loadStatsHistory();
+      });
+    }
+    const refresh = $('statsRefreshBtn');
+    if (refresh) refresh.addEventListener('click', openStats);
+    const exportBtn = $('statsExportBtn');
+    if (exportBtn) {
+      exportBtn.addEventListener('click', () => {
+        setAdminCookie(password);
+        window.open('/admin/api/forward-events/export?format=csv', '_blank');
+      });
+    }
   }
 
   async function loadForwardEvents() {
@@ -3225,7 +4242,7 @@
       fwdEventsTotal = d.total || 0;
       renderForwardEvents(Array.isArray(d.items) ? d.items : []);
     } catch (e) {
-      body.innerHTML = '<tr><td colspan="5" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('common.failed')) + '</td></tr>';
+      body.innerHTML = '<tr class="fwd-empty-row"><td colspan="6" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('common.failed')) + '</td></tr>';
     }
   }
 
@@ -3233,8 +4250,11 @@
     const body = $('fwdEventsBody');
     if (!body) return;
     if (!items.length) {
-      body.innerHTML = '<tr><td colspan="5" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('forward.noEvents')) + '</td></tr>';
+      body.innerHTML = '<tr class="fwd-empty-row"><td colspan="6" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('forward.noEvents')) + '</td></tr>';
     } else {
+      // A fresh page invalidates every retained event: uids are never reused, so
+      // stale entries would otherwise accumulate for the life of the tab.
+      fwdEventStore = {};
       body.innerHTML = items.map(fwdEventRow).join('');
     }
     const countEl = $('fwdEventsCount');
@@ -3242,7 +4262,14 @@
     updateForwardPagination();
   }
 
+  // Events carry no server-side id, so rows get a client-side uid and the event
+  // object is retained to render its detail panel (and copy its JSON) on demand.
+  let fwdEventSeq = 0;
+  let fwdEventStore = {};
+
   function fwdEventRow(e) {
+    const uid = 'ev' + (++fwdEventSeq);
+    fwdEventStore[uid] = e;
     const model = e.targetModel && e.targetModel !== e.clientModel
       ? escapeHtml(e.clientModel) + ' <span class="muted-text">&rarr;</span> ' + escapeHtml(e.targetModel)
       : escapeHtml(e.clientModel || '');
@@ -3250,13 +4277,92 @@
     const badge = e.ok
       ? '<span class="fwd-badge fwd-badge--ok">' + (e.status || 200) + '</span>'
       : '<span class="fwd-badge fwd-badge--err">' + (e.status || 'ERR') + '</span>';
-    return '<tr>' +
+    // Failures are the reason to open a row, so surface a truncated reason inline
+    // and keep the full text for the panel.
+    const hint = !e.ok && e.errorMsg
+      ? ' <span class="fwd-err-hint" title="' + escapeHtml(e.errorMsg) + '">' + escapeHtml(fwdTruncate(e.errorMsg, 48)) + '</span>'
+      : '';
+    return '<tr class="fwd-event-row" data-fwd-event="' + uid + '" tabindex="0" role="button" aria-expanded="false">' +
       '<td class="font-mono text-xs">' + escapeHtml(fwdFmtTime(e.time)) + '</td>' +
       '<td class="font-mono text-xs">' + model + '</td>' +
       '<td class="text-xs">' + prov + '</td>' +
-      '<td>' + badge + '</td>' +
+      '<td>' + badge + hint + '</td>' +
       '<td class="font-mono text-xs">' + escapeHtml(fwdFmtLatency(e.latencyMs)) + '</td>' +
-      '</tr>';
+      '<td class="fwd-chev"><i class="fa-solid fa-chevron-down" aria-hidden="true"></i></td>' +
+      '</tr>' +
+      '<tr class="fwd-detail-row hidden" data-fwd-detail="' + uid + '"><td colspan="6"></td></tr>';
+  }
+
+  function fwdTruncate(s, n) {
+    s = String(s).replace(/\s+/g, ' ').trim();
+    return s.length > n ? s.slice(0, n - 1) + '…' : s;
+  }
+
+  // toggleForwardEventDetail expands one event row, rendering its panel lazily.
+  function toggleForwardEventDetail(uid) {
+    const body = $('fwdEventsBody');
+    if (!body) return;
+    const row = body.querySelector('tr[data-fwd-event="' + cssEscape(uid) + '"]');
+    const detail = body.querySelector('tr[data-fwd-detail="' + cssEscape(uid) + '"]');
+    if (!row || !detail) return;
+    const open = !detail.classList.contains('hidden');
+    if (open) {
+      detail.classList.add('hidden');
+      row.setAttribute('aria-expanded', 'false');
+      row.classList.remove('fwd-event-row--open');
+      return;
+    }
+    const e = fwdEventStore[uid];
+    if (!e) return;
+    detail.querySelector('td').innerHTML = fwdEventDetailHtml(e, uid);
+    detail.classList.remove('hidden');
+    row.setAttribute('aria-expanded', 'true');
+    row.classList.add('fwd-event-row--open');
+  }
+
+  // fwdEventDetailHtml renders the fields the table has no room for. ErrorMsg is
+  // the upstream's own reason: it is deliberately withheld from API clients (it
+  // can leak upstream host/proxy topology) but this page is behind admin auth.
+  function fwdEventDetailHtml(e, uid) {
+    const isPool = e.providerId === '__kiro_pool__';
+    const rows = [];
+    const add = (label, value) => {
+      if (value === '' || value == null) return;
+      rows.push('<div class="fwd-detail-item"><span class="fwd-detail-label">' + escapeHtml(label) +
+        '</span><span class="fwd-detail-value">' + value + '</span></div>');
+    };
+    add(t('forward.detailWhen'), escapeHtml(fwdFmtWhen(e.time)));
+    add(t('forward.detailEndpoint'), escapeHtml(e.endpoint || '—'));
+    add(t('forward.detailClientModel'), escapeHtml(e.clientModel || '—'));
+    if (e.targetModel) add(t('forward.detailTargetModel'), escapeHtml(e.targetModel));
+    add(t('forward.detailProvider'), escapeHtml(e.providerName || fwdProviderNames[e.providerId] || e.providerId || '—'));
+    if (e.accountLabel || e.accountId) add(t('forward.detailAccount'), escapeHtml(e.accountLabel || e.accountId));
+    if (e.routeId) add(t('forward.detailRoute'), '<span class="font-mono">' + escapeHtml(e.routeId) + '</span>');
+    add(t('forward.detailStatus'), String(e.status || '—'));
+    add(t('forward.detailLatency'), escapeHtml(fwdFmtLatency(e.latencyMs)));
+    add(t('forward.detailTtfb'), e.ttfbMs ? escapeHtml(fwdFmtLatency(e.ttfbMs)) : '—');
+    add(t('forward.detailTokensIn'), String(e.inputTokens || 0));
+    add(t('forward.detailTokensOut'), String(e.outputTokens || 0));
+    add(t('forward.detailCost'), escapeHtml(fwdFmtCost(e.costUsd, isPool)));
+    add(t('forward.detailStream'), e.stream ? t('forward.detailYes') : t('forward.detailNo'));
+    if (e.canceled) add(t('forward.detailCanceled'), t('forward.detailYes'));
+
+    let err = '';
+    if (e.errorMsg) {
+      err = '<div class="fwd-detail-error"><div class="fwd-detail-label">' +
+        escapeHtml(t('forward.detailError')) + '</div><pre class="fwd-detail-errtext">' +
+        escapeHtml(e.errorMsg) + '</pre></div>';
+    } else if (!e.ok) {
+      err = '<div class="fwd-detail-error"><div class="fwd-detail-label">' +
+        escapeHtml(t('forward.detailError')) + '</div><p class="muted-text text-xs">' +
+        escapeHtml(t('forward.detailNoError')) + '</p></div>';
+    }
+
+    return '<div class="fwd-detail-panel">' + err +
+      '<div class="fwd-detail-grid">' + rows.join('') + '</div>' +
+      '<div class="fwd-detail-actions"><button type="button" class="btn btn-outline btn-sm" ' +
+      'data-fwd-copy="' + escapeHtml(uid) + '"><i class="fa-solid fa-copy" aria-hidden="true"></i>' +
+      '<span class="btn-text">' + escapeHtml(t('forward.detailCopy')) + '</span></button></div></div>';
   }
 
   function updateForwardPagination() {
@@ -3285,17 +4391,36 @@
       if (fwdEventsOffset === 0 && !fwdFilterActive()) {
         const bodyEl = $('fwdEventsBody');
         if (bodyEl) {
-          const empty = bodyEl.querySelector('td[colspan]');
+          const empty = bodyEl.querySelector('tr.fwd-empty-row');
           if (empty) bodyEl.innerHTML = '';
           bodyEl.insertAdjacentHTML('afterbegin', fwdEventRow(e));
-          const rows = bodyEl.querySelectorAll('tr');
-          for (let i = rows.length - 1; i >= fwdEventsLimit; i--) rows[i].remove();
+          // Each event is a pair of rows (summary + its detail row), so trim by
+          // event rather than by <tr> or a detail row would outlive its parent.
+          const evRows = bodyEl.querySelectorAll('tr[data-fwd-event]');
+          for (let i = evRows.length - 1; i >= fwdEventsLimit; i--) {
+            const uid = evRows[i].dataset.fwdEvent;
+            const det = bodyEl.querySelector('tr[data-fwd-detail="' + cssEscape(uid) + '"]');
+            if (det) det.remove();
+            evRows[i].remove();
+            delete fwdEventStore[uid];
+          }
         }
       }
-      // Refresh aggregate cards/chart lazily.
-      loadForwardStats();
+      // Refresh aggregate cards/chart lazily. Coalesced: a busy proxy can emit
+      // hundreds of events per second, and one refetch each would flood the
+      // admin API (and now the open detail panels too).
+      scheduleForwardStatsRefresh();
     };
     src.onerror = () => { if (dot) dot.textContent = ''; };
+  }
+
+  let fwdStatsRefreshTimer = null;
+  function scheduleForwardStatsRefresh() {
+    if (fwdStatsRefreshTimer) return;
+    fwdStatsRefreshTimer = setTimeout(() => {
+      fwdStatsRefreshTimer = null;
+      loadForwardStats();
+    }, 2000);
   }
 
   function fwdFilterActive() {
@@ -3307,6 +4432,7 @@
 
   function closeForwardStream() {
     if (fwdSource) { fwdSource.close(); fwdSource = null; }
+    if (fwdStatsRefreshTimer) { clearTimeout(fwdStatsRefreshTimer); fwdStatsRefreshTimer = null; }
     const dot = $('forwardLiveDot');
     if (dot) dot.textContent = '';
   }
@@ -3324,6 +4450,38 @@
 
   let fwdModelSearchTimer = null;
   function bindForwardEvents() {
+    // Sub-tab switching between the config pane and the live activity pane.
+    const subtabs = $('fwdSubtabs');
+    if (subtabs) {
+      subtabs.addEventListener('click', e => {
+        const btn = e.target.closest('[data-fwd-pane]');
+        if (btn) switchForwardPane(btn.dataset.fwdPane);
+      });
+    }
+
+    // Row expansion: delegated, so it survives the table being re-rendered on
+    // every page load and on each live SSE event.
+    const eventsBody = $('fwdEventsBody');
+    if (eventsBody) {
+      eventsBody.addEventListener('click', e => {
+        const copyBtn = e.target.closest('[data-fwd-copy]');
+        if (copyBtn) {
+          const ev = fwdEventStore[copyBtn.dataset.fwdCopy];
+          if (ev) copyText(JSON.stringify(ev, null, 2)).then(() => toast(t('common.copied'), 'success'));
+          return;
+        }
+        const row = e.target.closest('tr[data-fwd-event]');
+        if (row) toggleForwardEventDetail(row.dataset.fwdEvent);
+      });
+      eventsBody.addEventListener('keydown', e => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const row = e.target.closest('tr[data-fwd-event]');
+        if (!row) return;
+        e.preventDefault();
+        toggleForwardEventDetail(row.dataset.fwdEvent);
+      });
+    }
+
     const prov = $('fwdFilterProvider');
     if (prov) prov.addEventListener('change', () => { fwdEventsOffset = 0; loadForwardEvents(); });
     const status = $('fwdFilterStatus');
@@ -5057,6 +6215,7 @@
     else closeConsole();
     if (tab === 'forwarding') openForwarding();
     else closeForwarding();
+    if (tab === 'stats') openStats();
     if (tab === 'logs') loadLogs();
     setSidebar(false);
     // Console scrolls in its own overflow pane; every other tab scrolls the page.
@@ -5530,6 +6689,7 @@
     bindTestEvents();
     bindConsoleEvents();
     bindForwardEvents();
+    bindStatsEvents();
   }
 
   // Init

@@ -114,6 +114,8 @@
               data-i18n="tabs.api"></span></button>
           <button type="button" class="tab" data-tab="forwarding"><i class="fa-solid fa-diagram-project tab-icon"></i><span
               data-i18n="tabs.forwarding"></span></button>
+          <button type="button" class="tab" data-tab="stats"><i class="fa-solid fa-chart-column tab-icon"></i><span
+              data-i18n="tabs.stats"></span></button>
           <button type="button" class="tab" data-tab="console"><i class="fa-solid fa-terminal tab-icon"></i><span
               data-i18n="tabs.console"></span></button>
           <button type="button" class="tab" data-tab="logs"><i class="fa-solid fa-list tab-icon"></i><span
@@ -685,6 +687,19 @@
 
       <!-- Forwarding dashboard tab -->
       <div id="tabForwarding" class="tab-content hidden">
+        <!-- Config and live activity are different jobs: one is write-mostly and
+             rarely touched, the other is read-mostly and watched. Splitting them
+             keeps a long provider/route list from burying the events table. -->
+        <div class="subtabs" id="fwdSubtabs" role="tablist" data-i18n-aria-label="forward.sections">
+          <button type="button" class="subtab active" data-fwd-pane="config" role="tab" aria-selected="true"
+            aria-controls="fwdPaneConfig"><i class="fa-solid fa-sliders" aria-hidden="true"></i><span
+              data-i18n="forward.paneConfig"></span></button>
+          <button type="button" class="subtab" data-fwd-pane="activity" role="tab" aria-selected="false"
+            aria-controls="fwdPaneActivity"><i class="fa-solid fa-wave-square" aria-hidden="true"></i><span
+              data-i18n="forward.paneActivity"></span></button>
+        </div>
+
+        <div id="fwdPaneConfig" class="fwd-pane" role="tabpanel">
         <!-- Upstream forwarding config -->
         <div class="card">
           <div class="card-header">
@@ -724,7 +739,9 @@
           </div>
           <div id="modelRoutesList"></div>
         </div>
+        </div>
 
+        <div id="fwdPaneActivity" class="fwd-pane hidden" role="tabpanel">
         <div class="card">
           <div class="card-header">
             <span class="card-title" data-i18n="forward.title"></span>
@@ -802,6 +819,7 @@
                   <th data-i18n="forward.colProvider"></th>
                   <th data-i18n="forward.colStatus"></th>
                   <th data-i18n="forward.colLatency"></th>
+                  <th><span class="sr-only" data-i18n="forward.colDetail"></span></th>
                 </tr>
               </thead>
               <tbody id="fwdEventsBody"></tbody>
@@ -811,6 +829,67 @@
             <button class="btn btn-outline btn-sm" id="fwdPrevBtn" type="button" data-i18n="forward.prev"></button>
             <span class="text-xs muted-text" id="fwdPageInfo"></span>
             <button class="btn btn-outline btn-sm" id="fwdNextBtn" type="button" data-i18n="forward.next"></button>
+          </div>
+        </div>
+        </div>
+      </div>
+
+      <!-- Stats tab: cross-provider comparison and drill-down -->
+      <div id="tabStats" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="stats.title"></span>
+            <div class="card-actions">
+              <select id="statsRangeSelect" class="w-32!" data-i18n-aria-label="stats.rangeLabel">
+                <option value="1" data-i18n="stats.range1h"></option>
+                <option value="6" data-i18n="stats.range6h"></option>
+                <option value="24" selected data-i18n="stats.range24h"></option>
+                <option value="168" data-i18n="stats.range7d"></option>
+                <option value="720" data-i18n="stats.range30d"></option>
+              </select>
+              <button class="btn btn-outline btn-sm" id="statsExportBtn" type="button">
+                <i class="fa-solid fa-download" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="stats.exportCsv"></span>
+              </button>
+              <button class="btn btn-outline btn-sm" id="statsRefreshBtn" type="button">
+                <i class="fa-solid fa-rotate" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="stats.refresh"></span>
+              </button>
+            </div>
+          </div>
+          <p class="muted-text text-xs" data-i18n="stats.intro"></p>
+
+          <!-- At-a-glance comparison: champion cards plus normalised bars, so an
+               operator can rank providers without reading the numeric table. -->
+          <div id="statsCompare" class="stats-compare"></div>
+
+          <div class="fwd-chart-card">
+            <div class="flex items-center justify-between" style="flex-wrap:wrap;gap:0.5rem;">
+              <!-- Title is set from JS because it names the bucket unit, which
+                   depends on the selected range (minutes vs hours). -->
+              <span class="text-xs font-semibold" id="statsTrendTitle"></span>
+              <span class="text-xs muted-text font-mono" id="statsTrendSummary"></span>
+            </div>
+            <div id="statsTrendChart" class="fwd-chart"></div>
+            <div id="statsTrendNote" class="muted-text text-xs"></div>
+          </div>
+
+          <div class="stats-table-scroll">
+            <table class="stats-table" id="statsTable">
+              <thead>
+                <tr>
+                  <th data-stats-sort="providerName" data-i18n="stats.colProvider"></th>
+                  <th data-stats-sort="requests" class="num" data-i18n="stats.colRequests"></th>
+                  <th data-stats-sort="successRate" class="num" data-i18n="stats.colOkPct"></th>
+                  <th data-stats-sort="tokens" class="num" data-i18n="stats.colTokens"></th>
+                  <th data-stats-sort="costUsd" class="num" data-i18n="stats.colCost"></th>
+                  <th data-stats-sort="avgLatencyMs" class="num" data-i18n="stats.colAvg"></th>
+                  <th data-stats-sort="rpm" class="num" data-i18n="stats.colRpm"></th>
+                  <th data-stats-sort="lastUsed" class="num" data-i18n="stats.colLastUsed"></th>
+                </tr>
+              </thead>
+              <tbody id="statsTableBody"></tbody>
+            </table>
           </div>
         </div>
       </div>
@@ -1046,6 +1125,16 @@
           <small data-i18n="upstreams.proxyUrlHint"></small>
         </div>
         <div class="form-group">
+          <label data-i18n="upstreams.pricing"></label>
+          <div class="flex items-center gap-2">
+            <input type="number" id="upstreamForm_priceIn" min="0" step="0.01" class="w-32!"
+              data-i18n-placeholder="upstreams.priceInPlaceholder" />
+            <input type="number" id="upstreamForm_priceOut" min="0" step="0.01" class="w-32!"
+              data-i18n-placeholder="upstreams.priceOutPlaceholder" />
+          </div>
+          <small data-i18n="upstreams.pricingHint"></small>
+        </div>
+        <div class="form-group">
           <label class="flex items-center gap-2">
             <span class="switch"><input type="checkbox" id="upstreamForm_enabled" checked /><span class="slider"></span></span>
             <span data-i18n="upstreams.formEnabled"></span>
@@ -1103,14 +1192,13 @@
           <small data-i18n="upstreams.routeModelHint"></small>
         </div>
         <div class="form-group">
-          <label data-i18n="upstreams.provider"></label>
-          <select id="routeForm_upstreamId"></select>
-        </div>
-        <div class="form-group">
-          <label data-i18n="upstreams.targetModel"></label>
-          <input type="text" id="routeForm_targetModel" list="routeTargetModelList" autocomplete="off" data-i18n-placeholder="upstreams.targetModelPlaceholder" />
+          <label data-i18n="upstreams.routeTargets"></label>
+          <div id="routeTargetsList"></div>
+          <button class="btn btn-outline btn-sm" id="routeAddTargetBtn" type="button" style="margin-top:0.5rem;">
+            + <span data-i18n="upstreams.routeAddTarget"></span>
+          </button>
           <datalist id="routeTargetModelList"></datalist>
-          <small data-i18n="upstreams.targetModelHint"></small>
+          <small data-i18n="upstreams.routeTargetsHint"></small>
         </div>
         <div class="form-group">
           <label class="flex items-center gap-2">
