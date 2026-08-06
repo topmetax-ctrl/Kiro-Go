@@ -59,6 +59,20 @@
   function escapeAttr(s) {
     return escapeHtml(s).replace(/"/g, '&quot;');
   }
+  // Trigger a browser download of `data` serialized as pretty JSON.
+  function downloadJson(filename, data) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  // Today as YYYY-MM-DD, for download filenames.
+  function todayStamp() {
+    return new Date().toISOString().slice(0, 10);
+  }
   async function copyText(input) {
     const isPromise = input && typeof input.then === 'function';
     if (isPromise && typeof ClipboardItem !== 'undefined' && navigator.clipboard && navigator.clipboard.write) {
@@ -2873,6 +2887,105 @@
     }
   }
 
+  // ===== Forwarding config export / import =====
+  // Export hits the dedicated endpoint rather than serializing upstreamCache:
+  // the cache holds MASKED api keys (apiGetUpstreams masks them), which would
+  // produce a file that imports but cannot authenticate.
+  async function exportUpstreamsConfig() {
+    const btn = $('upstreamExportBtn');
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api('/upstreams/export');
+      if (!res.ok) throw new Error('http ' + res.status);
+      const data = await res.json();
+      downloadJson('kiro-forwarding-' + todayStamp() + '.json', data);
+    } catch (e) {
+      toastError(t('upstreams.exportFailed'));
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function openUpstreamImportModal() {
+    const txt = $('upstreamImportText');
+    if (txt) txt.value = '';
+    const file = $('upstreamImportFile');
+    if (file) file.value = '';
+    const results = $('upstreamImportResults');
+    if (results) results.innerHTML = '';
+    openDialog('upstreamImportModal');
+  }
+
+  function closeUpstreamImportModal() {
+    closeDialog('upstreamImportModal');
+  }
+
+  async function submitUpstreamImport() {
+    const txt = $('upstreamImportText');
+    const raw = txt ? txt.value.trim() : '';
+    if (!raw) { toastWarning(t('upstreams.importEmpty')); return; }
+    // Parse client-side so a typo never reaches the network.
+    let bundle;
+    try {
+      bundle = JSON.parse(raw);
+    } catch (e) {
+      toastError(t('upstreams.importInvalidJson'));
+      return;
+    }
+
+    const btn = $('upstreamImportConfirmBtn');
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api('/upstreams/import', { method: 'POST', body: JSON.stringify(bundle) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) {
+        // Leave the modal open with the pasted text intact so the user can fix it.
+        toastError(t('upstreams.importFailed') + (d.error ? ': ' + d.error : ''));
+        return;
+      }
+      renderUpstreamImportResult(d);
+      const skipped = (d.providersSkipped || 0) + (d.routesSkipped || 0);
+      toast(t('upstreams.importSummary',
+        d.providersAdded || 0, d.providersSkipped || 0,
+        d.routesAdded || 0, d.routesSkipped || 0),
+        skipped ? 'warning' : 'success');
+      await loadUpstreams();
+      // Nothing was skipped, so there is nothing left to read: close. When
+      // entries WERE skipped, stay open so the user can see which and why.
+      if (!skipped) closeUpstreamImportModal();
+    } catch (e) {
+      toastError(t('upstreams.importFailed'));
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // Renders import counts and skip lists. Every label comes from an untrusted
+  // imported file and lands in innerHTML, so it MUST be escaped.
+  function renderUpstreamImportResult(d) {
+    const box = $('upstreamImportResults');
+    if (!box) return;
+    const reasonText = (reason) => {
+      if (reason === 'duplicate') return t('upstreams.importReasonDuplicate');
+      if (reason === 'unknownProvider') return t('upstreams.importReasonUnknownProvider');
+      return reason || '';
+    };
+    const skipList = (titleKey, items) => {
+      if (!items || !items.length) return '';
+      return '<div class="mt-2"><strong class="text-xs">' + escapeHtml(t(titleKey)) + '</strong>' +
+        items.map(it => '<div class="text-xs muted-text">· ' + escapeHtml(it.label || '') +
+          ' <span class="warning-text">(' + escapeHtml(reasonText(it.reason)) + ')</span></div>').join('') +
+        '</div>';
+    };
+    box.innerHTML = '<div class="text-sm">' +
+      escapeHtml(t('upstreams.importSummary',
+        d.providersAdded || 0, d.providersSkipped || 0,
+        d.routesAdded || 0, d.routesSkipped || 0)) +
+      '</div>' +
+      skipList('upstreams.importSkippedProviders', d.skippedProviders) +
+      skipList('upstreams.importSkippedRoutes', d.skippedRoutes);
+  }
+
   function bindUpstreamEvents() {
     const provList = $('upstreamsList');
     if (provList) {
@@ -2959,9 +3072,29 @@
     if (rtClose) rtClose.addEventListener('click', closeRouteModal);
     const rtProvSel = $('routeForm_upstreamId');
     if (rtProvSel) rtProvSel.addEventListener('change', () => populateTargetModelDatalist(rtProvSel.value));
+    const upExport = $('upstreamExportBtn');
+    if (upExport) upExport.addEventListener('click', exportUpstreamsConfig);
+    const upImport = $('upstreamImportBtn');
+    if (upImport) upImport.addEventListener('click', openUpstreamImportModal);
+    const upImpConfirm = $('upstreamImportConfirmBtn');
+    if (upImpConfirm) upImpConfirm.addEventListener('click', submitUpstreamImport);
+    const upImpCancel = $('upstreamImportCancelBtn');
+    if (upImpCancel) upImpCancel.addEventListener('click', closeUpstreamImportModal);
+    const upImpClose = $('upstreamImportModalClose');
+    if (upImpClose) upImpClose.addEventListener('click', closeUpstreamImportModal);
+    const upImpFile = $('upstreamImportFile');
+    if (upImpFile) upImpFile.addEventListener('change', e => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      f.text().then(txt => {
+        const box = $('upstreamImportText');
+        if (box) box.value = txt;
+      }).catch(() => toastError(t('upstreams.importFailed')));
+    });
     bindDialogBackdropClose('upstreamModal', closeUpstreamModal);
     bindDialogBackdropClose('modelRouteModal', closeRouteModal);
     bindDialogBackdropClose('upstreamModelsModal', closeModelsModal);
+    bindDialogBackdropClose('upstreamImportModal', closeUpstreamImportModal);
   }
 
   // ===== Forwarding dashboard =====
@@ -4566,13 +4699,7 @@
   async function exportDownloadJson() {
     const data = await getExportData();
     if (!data) return;
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'kiro-accounts-' + new Date().toISOString().slice(0, 10) + '.json';
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadJson('kiro-accounts-' + todayStamp() + '.json', data);
   }
 
   // Version and update

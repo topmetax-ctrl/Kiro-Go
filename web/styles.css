@@ -404,6 +404,32 @@ textarea {
   resize: none;
   line-height: 1.5;
 }
+/* File inputs are not part of the shared input selector above: the native
+   control has its own intrinsic height and a browser-drawn button, so the fixed
+   height/padding there would clip it. Style the shell only. */
+input[type="file"] {
+  font-family: inherit;
+  font-size: 0.875rem;
+  color: var(--foreground);
+  background: var(--background);
+  border: 1px solid var(--input);
+  border-radius: var(--radius-md);
+  padding: 0.4rem 0.5rem;
+  width: 100%;
+  outline: none;
+  transition: border-color 0.15s;
+}
+input[type="file"]::file-selector-button {
+  font-family: inherit;
+  font-size: 0.8125rem;
+  color: var(--foreground);
+  background: var(--secondary, transparent);
+  border: 1px solid var(--input);
+  border-radius: var(--radius-sm, 4px);
+  padding: 0.2rem 0.6rem;
+  margin-right: 0.6rem;
+  cursor: pointer;
+}
 .input:focus,
 input:not([type="checkbox"]):not([type="radio"]):focus,
 textarea:focus,

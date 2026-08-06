@@ -2987,6 +2987,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiMemoryAdd(w, r)
 	case path == "/memory" && r.Method == "DELETE":
 		h.apiMemoryDelete(w, r)
+	case path == "/upstreams/export" && r.Method == "GET":
+		h.apiExportUpstreams(w, r)
+	case path == "/upstreams/import" && r.Method == "POST":
+		h.apiImportUpstreams(w, r)
 	case path == "/upstreams" && r.Method == "GET":
 		h.apiGetUpstreams(w, r)
 	case path == "/upstreams" && r.Method == "POST":
@@ -5102,6 +5106,70 @@ func (h *Handler) apiUpdateUpstreams(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiExportUpstreams handles GET /admin/api/upstreams/export.
+//
+// Unlike apiGetUpstreams, provider API keys are returned UNMASKED, so the file
+// can be imported on another host and work immediately. This is only safe
+// because every /admin/ path is password-gated (handleAdminAPI) and optionally
+// IP-allowlisted (ServeHTTP) before dispatch reaches here — never expose this
+// route outside that gate.
+func (h *Handler) apiExportUpstreams(w http.ResponseWriter, r *http.Request) {
+	bundle := config.ExportUpstreamBundle()
+	// The body is plaintext secret material: keep it out of browser and
+	// intermediary caches.
+	w.Header().Set("Cache-Control", "no-store")
+	filename := "kiro-forwarding-" + time.Now().Format("2006-01-02") + ".json"
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	json.NewEncoder(w).Encode(bundle)
+}
+
+// apiImportUpstreams handles POST /admin/api/upstreams/import. The body is an
+// export bundle produced by apiExportUpstreams.
+//
+// Merge semantics: existing entries are never overwritten. Duplicate providers
+// (matched on baseUrl+name) and duplicate routes (matched on client model) are
+// skipped and reported back with a machine-readable reason the UI localizes.
+// Returns 400 for a malformed or unrecognized bundle.
+func (h *Handler) apiImportUpstreams(w http.ResponseWriter, r *http.Request) {
+	var bundle config.UpstreamBundle
+	if err := json.NewDecoder(r.Body).Decode(&bundle); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	res, err := config.ImportUpstreamBundle(bundle)
+	if err != nil {
+		status := 500
+		if errors.Is(err, config.ErrInvalidUpstreamBundle) {
+			status = 400
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Marshal empty skip lists as [] rather than null.
+	skippedProviders := res.SkippedProviders
+	if skippedProviders == nil {
+		skippedProviders = []config.SkippedItem{}
+	}
+	skippedRoutes := res.SkippedRoutes
+	if skippedRoutes == nil {
+		skippedRoutes = []config.SkippedItem{}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":          true,
+		"providersAdded":   res.ProvidersAdded,
+		"providersSkipped": res.ProvidersSkipped,
+		"routesAdded":      res.RoutesAdded,
+		"routesSkipped":    res.RoutesSkipped,
+		"skippedProviders": skippedProviders,
+		"skippedRoutes":    skippedRoutes,
+	})
 }
 
 // resolveUpstreamCreds resolves the base URL, API key and proxy for an upstream
