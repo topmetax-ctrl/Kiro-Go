@@ -1119,10 +1119,10 @@ label:has(> .switch) > span {
 .sidebar-actions #logoutBtn {
   margin-left: auto;
 }
-/* The vertical sidebar was replaced by the horizontal .header-nav, so there is
-   no fixed 15rem column left to indent past — the old margin-left just pushed
-   every page 240px right of its own header. */
+/* Clears the fixed 15rem .app-sidebar column; the media query below zeroes
+   this out when the sidebar collapses to an off-canvas drawer. */
 .app-main {
+  margin-left: 15rem;
   min-height: 100vh;
   display: flex;
   flex-direction: column;

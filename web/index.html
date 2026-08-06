@@ -92,50 +92,52 @@
 
   <!-- Main app -->
   <div id="mainPage" class="hidden">
-    <header class="app-header">
-      <div class="app-header-inner">
-        <div class="brand-wrap">
-          <div class="brand">
-            <img class="brand-icon" src="/admin/icon.png?v=20260724" alt="" />
-            <span class="brand-text">Kiro-Go</span>
-          </div>
-        </div>
-        <nav class="header-nav" aria-label="" data-i18n-aria-label="aria.sections">
-          <div class="tabs" id="tabBar">
-            <button type="button" class="tab active" data-tab="accounts"><i class="fa-solid fa-users tab-icon"></i><span
-                data-i18n="tabs.accounts"></span></button>
-            <button type="button" class="tab" data-tab="settings"><i class="fa-solid fa-sliders tab-icon"></i><span
-                data-i18n="tabs.settings"></span></button>
-            <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
-                data-i18n="tabs.api"></span></button>
-            <button type="button" class="tab" data-tab="forwarding"><i class="fa-solid fa-diagram-project tab-icon"></i><span
-                data-i18n="tabs.forwarding"></span></button>
-            <button type="button" class="tab" data-tab="console"><i class="fa-solid fa-terminal tab-icon"></i><span
-                data-i18n="tabs.console"></span></button>
-            <button type="button" class="tab" data-tab="logs"><i class="fa-solid fa-list tab-icon"></i><span
-                data-i18n="tabs.logs"></span></button>
-          </div>
-        </nav>
-        <div class="topbar-actions flex-wrap justify-end">
-          <div class="lang-switch" id="mainLangSwitch" role="group" aria-label="" data-i18n-aria-label="lang.label">
-            <button class="lang-btn" data-lang="zh" type="button" data-i18n="lang.zh"></button>
-            <button class="lang-btn" data-lang="en" type="button" data-i18n="lang.en"></button>
-            <button class="lang-btn" data-lang="vi" type="button" data-i18n="lang.vi"></button>
-          </div>
-          <button id="mainThemeToggle" class="icon-btn theme-toggle" type="button" aria-label=""
-            data-i18n-title="theme.toggle" data-i18n-aria-label="theme.toggle" data-theme="system">
-            <i class="fa-solid fa-circle-half-stroke theme-ico-system"></i>
-            <i class="fa-solid fa-sun theme-ico-light"></i>
-            <i class="fa-solid fa-moon theme-ico-dark"></i>
-          </button>
-          <span class="divider" aria-hidden="true"></span>
-          <button class="btn btn-outline btn-sm" id="logoutBtn">
-            <i class="fa-solid fa-right-from-bracket"></i>
-            <span data-i18n="common.logout"></span>
-          </button>
+    <button id="sidebarToggle" class="sidebar-toggle" type="button" aria-label=""
+      data-i18n-aria-label="aria.sections" aria-controls="appSidebar" aria-expanded="false">
+      <i class="fa-solid fa-bars"></i>
+    </button>
+    <div id="sidebarBackdrop" class="sidebar-backdrop" hidden></div>
+    <aside id="appSidebar" class="app-sidebar">
+      <div class="sidebar-brand">
+        <div class="brand">
+          <img class="brand-icon" src="/admin/icon.png?v=20260724" alt="" />
+          <span class="brand-text">Kiro-Go</span>
         </div>
       </div>
-    </header>
+      <nav class="header-nav sidebar-nav" aria-label="" data-i18n-aria-label="aria.sections">
+        <div class="tabs" id="tabBar">
+          <button type="button" class="tab active" data-tab="accounts"><i class="fa-solid fa-users tab-icon"></i><span
+              data-i18n="tabs.accounts"></span></button>
+          <button type="button" class="tab" data-tab="settings"><i class="fa-solid fa-sliders tab-icon"></i><span
+              data-i18n="tabs.settings"></span></button>
+          <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
+              data-i18n="tabs.api"></span></button>
+          <button type="button" class="tab" data-tab="forwarding"><i class="fa-solid fa-diagram-project tab-icon"></i><span
+              data-i18n="tabs.forwarding"></span></button>
+          <button type="button" class="tab" data-tab="console"><i class="fa-solid fa-terminal tab-icon"></i><span
+              data-i18n="tabs.console"></span></button>
+          <button type="button" class="tab" data-tab="logs"><i class="fa-solid fa-list tab-icon"></i><span
+              data-i18n="tabs.logs"></span></button>
+        </div>
+      </nav>
+      <div class="sidebar-actions topbar-actions">
+        <div class="lang-switch" id="mainLangSwitch" role="group" aria-label="" data-i18n-aria-label="lang.label">
+          <button class="lang-btn" data-lang="zh" type="button" data-i18n="lang.zh"></button>
+          <button class="lang-btn" data-lang="en" type="button" data-i18n="lang.en"></button>
+          <button class="lang-btn" data-lang="vi" type="button" data-i18n="lang.vi"></button>
+        </div>
+        <button id="mainThemeToggle" class="icon-btn theme-toggle" type="button" aria-label=""
+          data-i18n-title="theme.toggle" data-i18n-aria-label="theme.toggle" data-theme="system">
+          <i class="fa-solid fa-circle-half-stroke theme-ico-system"></i>
+          <i class="fa-solid fa-sun theme-ico-light"></i>
+          <i class="fa-solid fa-moon theme-ico-dark"></i>
+        </button>
+        <button class="btn btn-outline btn-sm" id="logoutBtn">
+          <i class="fa-solid fa-right-from-bracket"></i>
+          <span data-i18n="common.logout"></span>
+        </button>
+      </div>
+    </aside>
 
     <div class="app-main">
     <div class="container">
