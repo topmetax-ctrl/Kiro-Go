@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -71,14 +72,37 @@ const truncationPlaceholder = "[Earlier conversation history was truncated to fi
 const minRecentHistoryTurns = 4
 
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
-// and reports whether thinking mode was requested via the configured suffix.
+// and reports whether thinking mode was requested via the configured suffix or a
+// trailing "(level)" reasoning-level suffix.
 func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
+	actual, thinking, _ := ParseModelThinkingAndEffort(model, thinkingSuffix)
+	return actual, thinking
+}
+
+// ParseModelThinkingAndEffort is ParseModelAndThinking plus the reasoning level
+// carried by a trailing "(level)" suffix on the model name.
+//
+// The suffix is 9router's convention: its provider page appends "(xhigh)" and
+// friends to the model id you copy, and normally strips it from body.model before
+// forwarding. Handling it here keeps the proxy correct when it arrives anyway —
+// otherwise the parenthesized name would reach Kiro and fail model validation.
+// Naming a level implies thinking is wanted, so any recognized level turns
+// thinking on.
+func ParseModelThinkingAndEffort(model string, thinkingSuffix string) (string, bool, ThinkingEffort) {
+	cleaned, level := stripParenLevel(model)
+	actual, suffixThinking := parseModelAndThinkingSuffix(cleaned, thinkingSuffix)
+	return actual, suffixThinking || level != EffortUnset, level
+}
+
+func parseModelAndThinkingSuffix(model string, thinkingSuffix string) (string, bool) {
 	lower := strings.ToLower(model)
 	thinking := false
 
 	// Strip the configured thinking suffix (e.g. "-thinking") if present.
+	// Guard against an empty suffix: strings.HasSuffix always matches "", which
+	// would otherwise mark every model as a thinking request.
 	suffixLower := strings.ToLower(thinkingSuffix)
-	if strings.HasSuffix(lower, suffixLower) {
+	if suffixLower != "" && strings.HasSuffix(lower, suffixLower) {
 		thinking = true
 		model = model[:len(model)-len(thinkingSuffix)]
 		lower = strings.ToLower(model)
@@ -106,8 +130,34 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 }
 
 func resolveClaudeThinkingMode(model string, thinkingCfg *ClaudeThinkingConfig, thinkingSuffix string) (string, bool) {
-	actualModel, suffixThinking := ParseModelAndThinking(model, thinkingSuffix)
-	return actualModel, suffixThinking || isClaudeThinkingRequested(thinkingCfg)
+	actualModel, thinking, _ := resolveClaudeThinkingModeAndEffort(model, thinkingCfg, thinkingSuffix)
+	return actualModel, thinking
+}
+
+// resolveClaudeThinkingModeAndEffort resolves the Kiro model ID, whether thinking
+// is on, and the reasoning level implied by the model name.
+//
+// Thinking turns on if any of these ask for it: the "-thinking" suffix, a
+// "(level)" suffix, or thinking.type enabled/adaptive. The returned level is only
+// the one carried by the model name; a level in the request body is read
+// separately by claudeRequestEffort, which takes precedence.
+func resolveClaudeThinkingModeAndEffort(model string, thinkingCfg *ClaudeThinkingConfig, thinkingSuffix string) (string, bool, ThinkingEffort) {
+	actualModel, nameThinking, level := ParseModelThinkingAndEffort(model, thinkingSuffix)
+	return actualModel, nameThinking || isClaudeThinkingRequested(thinkingCfg), level
+}
+
+// applyModelNameEffort records a model-name level on the request body so the
+// conversion and token-estimation paths both read the level from one place.
+// A level already present in the body wins, matching the precedence in
+// claudeRequestEffort.
+func applyModelNameEffort(req *ClaudeRequest, level ThinkingEffort) {
+	if req == nil || level == EffortUnset {
+		return
+	}
+	if req.OutputConfig != nil && strings.TrimSpace(req.OutputConfig.Effort) != "" {
+		return
+	}
+	req.OutputConfig = &ClaudeOutputConfig{Effort: string(level)}
 }
 
 func isClaudeThinkingRequested(thinkingCfg *ClaudeThinkingConfig) bool {
@@ -136,12 +186,24 @@ type ClaudeRequest struct {
 	Thinking    *ClaudeThinkingConfig `json:"thinking,omitempty"`
 	Tools       []ClaudeTool          `json:"tools,omitempty"`
 	ToolChoice  interface{}           `json:"tool_choice,omitempty"`
+
+	// OutputConfig carries Anthropic's `output_config.effort`, the current way
+	// to control reasoning depth. It supersedes thinking.budget_tokens, which
+	// is deprecated on the 4.6 models and rejected outright by 4.7 and later.
+	OutputConfig *ClaudeOutputConfig `json:"output_config,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {
 	Type         string `json:"type,omitempty"`
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
 	Display      string `json:"display,omitempty"`
+}
+
+// ClaudeOutputConfig mirrors the Anthropic `output_config` object. Only `effort`
+// is recognized; unknown members are ignored, matching how the proxy treats the
+// rest of the request body.
+type ClaudeOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type ClaudeMessage struct {
@@ -179,6 +241,9 @@ type ClaudeTool struct {
 	// Native web_search server-tool metadata. Anthropic sends these instead of an
 	// input_schema; Kiro does not understand them, so they are parsed into a
 	// WebSearchPolicy and never forwarded in the tool spec.
+	//
+	// MaxUses is a pointer so an explicit max_uses: 0 ("never search") stays
+	// distinguishable from an absent field, which the policy validator relies on.
 	MaxUses        *int                   `json:"max_uses,omitempty"`
 	AllowedDomains []string               `json:"allowed_domains,omitempty"`
 	BlockedDomains []string               `json:"blocked_domains,omitempty"`
@@ -236,8 +301,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	modelID := MapModel(req.Model)
 	origin := "AI_EDITOR"
 
+	// The boolean gates whether thinking happens; the depth comes from the
+	// request body (output_config.effort, else the legacy thinking.budget_tokens).
+	effort := resolveEffortForPayload(thinking, claudeRequestEffort(req))
+
 	// 提取系统提示
-	systemPrompt := buildClaudeSystemPrompt(req.System, thinking)
+	systemPrompt := buildClaudeSystemPrompt(req.System, effort)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -308,15 +377,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		history = append(priming, history...)
 	}
 
-	// Decide whether the current tool results form a valid "active" tool turn:
-	// the last history assistant must carry matching structured toolUses. If not
-	// (orphaned tool results, e.g. after context compaction), flatten them into
-	// the current message text so the upstream does not reject the request.
+	// Keep structured tool results only while they answer the final assistant
+	// tool turn. Older tool cycles are flattened by sanitizeKiroHistory because
+	// Kiro rejects structured tool calls and results in history.
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
 	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
 
-	// Flatten structured tool calls/results that live in history; upstream only
-	// accepts a single active tool turn (last assistant toolUses ⟺ current toolResults).
 	if keepCurrentToolResults {
 		history = sanitizeKiroHistory(history, currentToolResultIDs)
 	} else {
@@ -324,19 +390,33 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 
 	// 构建最终内容
+	//
+	// Tool-result text is folded into the message whenever the results are NOT
+	// attached structurally, and also when the turn carries no real text of its
+	// own. Both cases would otherwise ship an image placeholder (or the minimal
+	// fallback) over a tool result that had readable text in it.
 	finalContent := ""
 	switch {
 	case currentHasRealText:
 		finalContent = currentContent
-	case !keepCurrentToolResults && len(currentToolResults) > 0:
-		// Orphaned tool results are not attached structurally (that would trip an
-		// upstream 400). Fold their text into the message so a mixed text+image
-		// tool result does not silently lose its text when an image is present.
+		if !keepCurrentToolResults && len(currentToolResults) > 0 {
+			// Orphaned results are not attached structurally (that would trip an
+			// upstream 400), so their text has to ride along with the message.
+			finalContent = joinHistoryText(finalContent, buildToolResultsContinuation(currentToolResults))
+		}
+	case len(currentToolResults) > 0:
 		finalContent = buildToolResultsContinuation(currentToolResults)
 	case len(currentImages) > 0:
 		finalContent = normalizeUserContent("", true)
 	default:
 		finalContent = minimalFallbackUserContent
+	}
+	if finalContent == "" {
+		if len(currentImages) > 0 {
+			finalContent = normalizeUserContent("", true)
+		} else {
+			finalContent = minimalFallbackUserContent
+		}
 	}
 
 	// 转换工具
@@ -381,21 +461,37 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		}
 	}
 
+	applyKiroCachePoint(payload)
 	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
 }
 
-func buildClaudeSystemPrompt(system interface{}, thinking bool) string {
+// applyKiroCachePoint sets an upstream prompt-cache breakpoint on the current
+// message when KIRO_CACHEPOINT=1. The smithy model for GenerateAssistantResponse
+// exposes userInputMessage.cachePoint ({"type":"default"}). NOTE: a live causal
+// probe (docs/kiro-prompt-cache-verification-2026-07-29.md) showed the runtime
+// backend caches repeated prefixes AUTOMATICALLY — this marker is inert for cache
+// activation and emits no token usage either way. Kept env-gated for experiments
+// only; do not treat it as load-bearing. Off by default.
+func applyKiroCachePoint(payload *KiroPayload) {
+	if payload == nil || os.Getenv("KIRO_CACHEPOINT") != "1" {
+		return
+	}
+	payload.ConversationState.CurrentMessage.UserInputMessage.CachePoint = &KiroCachePoint{Type: "default"}
+}
+
+func buildClaudeSystemPrompt(system interface{}, effort ThinkingEffort) string {
 	systemPrompt := extractSystemPrompt(system)
 	systemPrompt = applyPromptFilters(systemPrompt)
-	if !thinking {
+	if effort == EffortUnset {
 		return systemPrompt
 	}
+	priming := thinkingModePromptForEffort(effort)
 	if systemPrompt == "" {
-		return ThinkingModePrompt
+		return priming
 	}
-	return ThinkingModePrompt + "\n\n" + systemPrompt
+	return priming + "\n\n" + systemPrompt
 }
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
@@ -573,14 +669,16 @@ func cloneClaudeRequestForThinking(req *ClaudeRequest, thinking bool) *ClaudeReq
 	}
 
 	cloned := *req
-	if thinking {
-		cloned.System = prependThinkingSystem(req.System)
+	// Mirror ClaudeToKiro: derive depth from the request so the estimated input
+	// reflects the priming block that will actually be sent.
+	if effort := resolveEffortForPayload(thinking, claudeRequestEffort(req)); effort != EffortUnset {
+		cloned.System = prependThinkingSystem(req.System, effort)
 	}
 	return &cloned
 }
 
-func prependThinkingSystem(system interface{}) interface{} {
-	thinkingText := ThinkingModePrompt
+func prependThinkingSystem(system interface{}, effort ThinkingEffort) interface{} {
+	thinkingText := thinkingModePromptForEffort(effort)
 	if hasClaudeSystemContent(system) {
 		thinkingText += "\n"
 	}
@@ -668,42 +766,58 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 		return s, nil, nil
 	}
 
-	if blocks, ok := content.([]interface{}); ok {
-		for _, b := range blocks {
-			block, ok := b.(map[string]interface{})
-			if !ok {
-				continue
+	// Accept both JSON-decoded []interface{} and in-memory []map[string]interface{}
+	// (agentic loops append the latter without a JSON round-trip).
+	for _, block := range contentBlocksAsMaps(content) {
+		blockType, _ := block["type"].(string)
+		switch blockType {
+		case "text", "input_text":
+			if t, ok := block["text"].(string); ok {
+				text += t
 			}
-
-			blockType, _ := block["type"].(string)
-			switch blockType {
-			case "text", "input_text":
-				if t, ok := block["text"].(string); ok {
-					text += t
-				}
-			case "image", "image_url", "input_image":
-				if img := extractImageFromClaudeBlock(block); img != nil {
-					images = append(images, *img)
-				}
-			case "tool_result":
-				toolUseID, _ := block["tool_use_id"].(string)
-				resultContent, resultImages := extractToolResultContent(block["content"])
-				if len(resultImages) > 0 {
-					images = append(images, resultImages...)
-					if strings.TrimSpace(resultContent) == "" {
-						resultContent = toolResultImagePlaceholder
-					}
-				}
-				toolResults = append(toolResults, KiroToolResult{
-					ToolUseID: toolUseID,
-					Content:   []KiroResultContent{{Text: resultContent}},
-					Status:    "success",
-				})
+		case "image", "image_url", "input_image":
+			if img := extractImageFromClaudeBlock(block); img != nil {
+				images = append(images, *img)
 			}
+		case "tool_result":
+			toolUseID, _ := block["tool_use_id"].(string)
+			resultContent, resultImages := extractToolResultContent(block["content"])
+			if len(resultImages) > 0 {
+				images = append(images, resultImages...)
+				if strings.TrimSpace(resultContent) == "" {
+					resultContent = toolResultImagePlaceholder
+				}
+			}
+			toolResults = append(toolResults, KiroToolResult{
+				ToolUseID: toolUseID,
+				Content:   []KiroResultContent{{Text: resultContent}},
+				Status:    "success",
+			})
 		}
 	}
 
 	return text, images, toolResults
+}
+
+// contentBlocksAsMaps normalizes Claude content arrays for extraction.
+// JSON unmarshaling yields []interface{}; in-process builders often use
+// []map[string]interface{}. Both must be accepted so tool_use/tool_result
+// feedback from agentic loops is not dropped.
+func contentBlocksAsMaps(content interface{}) []map[string]interface{} {
+	switch c := content.(type) {
+	case []interface{}:
+		out := make([]map[string]interface{}, 0, len(c))
+		for _, b := range c {
+			if block, ok := b.(map[string]interface{}); ok {
+				out = append(out, block)
+			}
+		}
+		return out
+	case []map[string]interface{}:
+		return c
+	default:
+		return nil
+	}
 }
 
 func extractImageFromClaudeBlock(block map[string]interface{}) *KiroImage {
@@ -785,32 +899,27 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 		return s, nil
 	}
 
-	if blocks, ok := content.([]interface{}); ok {
-		for _, b := range blocks {
-			block, ok := b.(map[string]interface{})
-			if !ok {
-				continue
+	// Same dual-shape support as extractClaudeUserContent (JSON []interface{}
+	// and in-memory []map[string]interface{} from agentic loop feedback).
+	for _, block := range contentBlocksAsMaps(content) {
+		blockType, _ := block["type"].(string)
+		switch blockType {
+		case "text":
+			if t, ok := block["text"].(string); ok {
+				text += t
 			}
-
-			blockType, _ := block["type"].(string)
-			switch blockType {
-			case "text":
-				if t, ok := block["text"].(string); ok {
-					text += t
-				}
-			case "tool_use":
-				id, _ := block["id"].(string)
-				name, _ := block["name"].(string)
-				input, _ := block["input"].(map[string]interface{})
-				if input == nil {
-					input = make(map[string]interface{})
-				}
-				toolUses = append(toolUses, KiroToolUse{
-					ToolUseID: id,
-					Name:      name,
-					Input:     input,
-				})
+		case "tool_use":
+			id, _ := block["id"].(string)
+			name, _ := block["name"].(string)
+			input, _ := block["input"].(map[string]interface{})
+			if input == nil {
+				input = make(map[string]interface{})
 			}
+			toolUses = append(toolUses, KiroToolUse{
+				ToolUseID: id,
+				Name:      name,
+				Input:     input,
+			})
 		}
 	}
 
@@ -825,6 +934,15 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	result := make([]KiroToolWrapper, 0, len(tools))
 	nameMap := make(map[string]string)
 	for _, tool := range tools {
+		// Anthropic native server tools (web_search_*) are executed by this proxy
+		// via the MCP endpoint, not by generateAssistantResponse. Do not forward
+		// them as Kiro tool specifications — the model would otherwise emit a
+		// client-side tool_use that hosts like Claude Desktop cannot execute.
+		// When mixed with other tools, the agentic loop still injects a real
+		// web_search schema below if the client only sent the native form.
+		if isNativeWebSearchTool(tool) {
+			continue
+		}
 		desc := tool.Description
 		if len(desc) > maxToolDescLen {
 			desc = desc[:maxToolDescLen] + "..."
@@ -846,7 +964,48 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 		}
 		result = append(result, w)
 	}
+
+	// Mixed-tools path: if the client declared native web_search alongside other
+	// tools, inject a Kiro-compatible web_search function schema so the model can
+	// still request searches (handled internally by the agentic loop). Pure
+	// web_search-only requests never reach convertClaudeTools (fast path); do not
+	// inject when no client tools remain after filtering.
+	if hasNativeWebSearchInTools(tools) && len(result) > 0 && !hasKiroWebSearchTool(result) {
+		w := KiroToolWrapper{}
+		w.ToolSpecification.Name = webSearchToolName
+		w.ToolSpecification.Description = "Search the web for up-to-date information."
+		w.ToolSpecification.InputSchema = InputSchema{JSON: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "Search query.",
+				},
+			},
+			"required": []interface{}{"query"},
+		}}
+		result = append(result, w)
+	}
+
 	return result, nameMap
+}
+
+func hasNativeWebSearchInTools(tools []ClaudeTool) bool {
+	for _, t := range tools {
+		if isNativeWebSearchTool(t) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasKiroWebSearchTool(tools []KiroToolWrapper) bool {
+	for _, t := range tools {
+		if t.ToolSpecification.Name == webSearchToolName {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureObjectSchema 确保工具 schema 顶层是 object，并清理 Kiro 不接受的字段。
@@ -1020,7 +1179,33 @@ func buildWebSearchNativeBlocks(searches []WebSearchInvocation) []ClaudeContentB
 	return blocks
 }
 
-func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string, searches []WebSearchInvocation) *ClaudeResponse {
+func mapClaudeStopReason(reason string, toolCount int) string {
+	if toolCount > 0 {
+		return "tool_use"
+	}
+
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "max_tokens", "max_output_tokens", "length":
+		return "max_tokens"
+	case "model_context_window_exceeded", "context_window_exceeded":
+		return "model_context_window_exceeded"
+	case "refusal", "content_filter", "content_filtered", "guardrail_intervened":
+		return "refusal"
+	case "stop_sequence":
+		return "stop_sequence"
+	case "pause_turn":
+		return "pause_turn"
+	default:
+		return "end_turn"
+	}
+}
+
+// KiroToClaudeResponse renders a finished Kiro turn as an Anthropic response.
+//
+// searches carries the web searches the proxy executed itself (nil on the plain
+// path); upstreamStopReason is the stopReason Kiro reported, which decides the
+// response's stop_reason instead of always claiming "end_turn".
+func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingBlock bool, toolUses []KiroToolUse, inputTokens, outputTokens int, model string, searches []WebSearchInvocation, upstreamStopReason string) *ClaudeResponse {
 	blocks := make([]ClaudeContentBlock, 0)
 
 	if thinkingContent != "" || includeEmptyThinkingBlock {
@@ -1051,10 +1236,7 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 		})
 	}
 
-	stopReason := "end_turn"
-	if len(toolUses) > 0 {
-		stopReason = "tool_use"
-	}
+	stopReason := mapClaudeStopReason(upstreamStopReason, len(toolUses))
 
 	return &ClaudeResponse{
 		ID:         "msg_" + uuid.New().String(),
@@ -1070,6 +1252,21 @@ func KiroToClaudeResponse(content, thinkingContent string, includeEmptyThinkingB
 	}
 }
 
+func mapOpenAIFinishReason(reason string, toolCount int) string {
+	if toolCount > 0 {
+		return "tool_calls"
+	}
+
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "max_tokens", "max_output_tokens", "length", "model_context_window_exceeded", "context_window_exceeded":
+		return "length"
+	case "refusal", "content_filter", "content_filtered", "guardrail_intervened":
+		return "content_filter"
+	default:
+		return "stop"
+	}
+}
+
 // ==================== OpenAI API 类型 ====================
 
 type OpenAIRequest struct {
@@ -1080,6 +1277,10 @@ type OpenAIRequest struct {
 	TopP        float64         `json:"top_p,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
 	Tools       []OpenAITool    `json:"tools,omitempty"`
+
+	// ReasoningEffort is the OpenAI-format spelling of the reasoning-depth
+	// control. Accepts the same level names as Anthropic's output_config.effort.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -1197,8 +1398,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 
 	// 如果启用 thinking 模式，注入 thinking 提示
-	if thinking {
-		systemPrompt = ThinkingModePrompt + "\n\n" + systemPrompt
+	// The boolean gates thinking; reasoning_effort supplies the depth.
+	if effort := resolveEffortForPayload(thinking, openAIRequestEffort(req)); effort != EffortUnset {
+		systemPrompt = thinkingModePromptForEffort(effort) + "\n\n" + systemPrompt
 	}
 
 	// 构建历史消息
@@ -1315,8 +1517,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		history = append(priming, history...)
 	}
 
-	// Decide whether current tool results form a valid active tool turn; if not,
-	// flatten them into the current message text (see ClaudeToKiro for rationale).
+	// Keep structured tool results only while they answer the final assistant
+	// tool turn. Older tool cycles are flattened by sanitizeKiroHistory because
+	// Kiro rejects structured tool calls and results in history.
 	currentToolResultIDs := collectToolResultIDs(currentToolResults)
 	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
 
@@ -1325,14 +1528,15 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	} else {
 		history = sanitizeKiroHistory(history, nil)
 	}
-
-	// 构建最终内容
+	// 构建最终内容。工具结果既保留结构化配对，也携带可读文本；
+	// 同一消息带有图片时，图片占位文本不能覆盖工具结果内容。
 	finalContent := currentContent
+	if len(currentToolResults) > 0 {
+		finalContent = joinHistoryText(finalContent, buildToolResultsContinuation(currentToolResults))
+	}
 	if finalContent == "" {
 		if len(currentImages) > 0 {
 			finalContent = normalizeUserContent("", true)
-		} else if len(currentToolResults) > 0 {
-			finalContent = buildToolResultsContinuation(currentToolResults)
 		} else {
 			finalContent = minimalFallbackUserContent
 		}
@@ -1375,6 +1579,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		}
 	}
 
+	applyKiroCachePoint(payload)
 	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
@@ -1483,17 +1688,22 @@ func collectToolResultIDs(toolResults []KiroToolResult) map[string]bool {
 
 // currentToolResultsMatchLastAssistant reports whether the current message's
 // tool results answer the structured tool calls of the final history assistant
-// message. Only in that case may the current toolResults stay structured.
+// message.
 func currentToolResultsMatchLastAssistant(history []KiroHistoryMessage, currentToolResultIDs map[string]bool) bool {
-	if len(currentToolResultIDs) == 0 || len(history) == 0 {
+	if len(history) == 0 {
 		return false
 	}
 	last := history[len(history)-1]
-	if last.AssistantResponseMessage == nil || len(last.AssistantResponseMessage.ToolUses) == 0 {
+	return last.AssistantResponseMessage != nil &&
+		toolResultsAnswerToolUses(last.AssistantResponseMessage.ToolUses, currentToolResultIDs)
+}
+
+func toolResultsAnswerToolUses(toolUses []KiroToolUse, toolResultIDs map[string]bool) bool {
+	if len(toolUses) == 0 || len(toolResultIDs) == 0 {
 		return false
 	}
-	for _, tu := range last.AssistantResponseMessage.ToolUses {
-		if !currentToolResultIDs[tu.ToolUseID] {
+	for _, tu := range toolUses {
+		if !toolResultIDs[tu.ToolUseID] {
 			return false
 		}
 	}
@@ -2189,8 +2399,8 @@ func extractThinkingFromContent(content string) (string, string) {
 }
 
 // KiroToOpenAIResponseWithReasoning 带 reasoning_content 的 OpenAI 响应
-func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat string) map[string]interface{} {
-	finishReason := "stop"
+func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUses []KiroToolUse, inputTokens, outputTokens int, model, thinkingFormat, upstreamStopReason string) map[string]interface{} {
+	finishReason := mapOpenAIFinishReason(upstreamStopReason, len(toolUses))
 
 	message := map[string]interface{}{
 		"role": "assistant",
@@ -2211,7 +2421,6 @@ func KiroToOpenAIResponseWithReasoning(content, reasoningContent string, toolUse
 			}
 		}
 		message["tool_calls"] = toolCalls
-		finishReason = "tool_calls"
 	} else {
 		// 根据配置格式化 thinking 输出
 		if reasoningContent != "" {

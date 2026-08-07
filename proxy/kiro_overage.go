@@ -52,6 +52,13 @@ func FetchOverageStatus(account *config.Account) (*OverageSnapshot, error) {
 	if account == nil {
 		return nil, fmt.Errorf("account is nil")
 	}
+	// The profile ARN both selects the region this URL is built for and is a
+	// required query parameter. Resolving it here matches GetUsageLimits and
+	// ListAvailableModelsContext; without it an account whose ARN is not resolved
+	// yet queries us-east-1 with no profileArn at all.
+	if err := ensureRestProfileArn(account); err != nil {
+		return nil, fmt.Errorf("resolve profileArn: %w", err)
+	}
 
 	rawURL := regionalizeURL(kiroQAPIBase+"/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true", account)
 	if profileArn := strings.TrimSpace(account.ProfileArn); profileArn != "" {
@@ -63,6 +70,9 @@ func FetchOverageStatus(account *config.Account) (*OverageSnapshot, error) {
 		return nil, err
 	}
 	setKiroHeaders(req, account)
+	if account.AuthMethod == "external_idp" {
+		req.Header.Set("TokenType", "EXTERNAL_IDP")
+	}
 
 	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 	if err != nil {
@@ -108,6 +118,13 @@ func FetchOverageStatus(account *config.Account) (*OverageSnapshot, error) {
 // SetOverageStatus calls AWS Q `POST /setUserPreference` to flip the user-level
 // Overages switch, then re-fetches the snapshot for cache write-through.
 //
+// NOTE: Microsoft Entra (external_idp) accounts receive HTTP 403 from this
+// endpoint — the Kiro backend does not allow external IdP accounts to toggle
+// overages via the REST/Q API. The Kiro IDE uses a different internal mechanism
+// (CodeWhispererRuntimeClient.UpdateProfileCommand) that bypasses this restriction.
+// Users with external_idp accounts must enable overages through the Kiro IDE:
+// profile icon → Overages → toggle ON.
+//
 // `enabled=true`  → overageStatus="ENABLED"
 // `enabled=false` → overageStatus="DISABLED"
 func SetOverageStatus(account *config.Account, enabled bool) (*OverageSnapshot, error) {
@@ -132,11 +149,16 @@ func SetOverageStatus(account *config.Account, enabled bool) (*OverageSnapshot, 
 	}
 	body, _ := json.Marshal(payload)
 
-	req, err := http.NewRequest("POST", regionalizeURL(kiroQAPIBase+"/setUserPreference", account), bytes.NewReader(body))
+	rawURL := regionalizeURL(kiroQAPIBase+"/setUserPreference", account)
+
+	req, err := http.NewRequest("POST", rawURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	setKiroHeaders(req, account)
+	if account.AuthMethod == "external_idp" {
+		req.Header.Set("TokenType", "EXTERNAL_IDP")
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := GetRestClientForProxy(ResolveAccountProxyURL(account)).Do(req)
@@ -147,7 +169,11 @@ func SetOverageStatus(account *config.Account, enabled bool) (*OverageSnapshot, 
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("setUserPreference HTTP %d: %s", resp.StatusCode, string(respBody))
+		msg := fmt.Sprintf("setUserPreference HTTP %d: %s", resp.StatusCode, string(respBody))
+		if resp.StatusCode == 403 && account.AuthMethod == "external_idp" {
+			msg = fmt.Sprintf("Kiro backend denied overage toggle for Microsoft Entra account %s — the REST API does not permit external IdP accounts to modify overages. Enable overages via Kiro IDE: profile icon → Overages → toggle ON. (HTTP 403)", account.Email)
+		}
+		return nil, fmt.Errorf("%s", msg)
 	}
 
 	logger.Infof("[Overage] account=%s flipped overageStatus=%s upstream", account.Email, status)

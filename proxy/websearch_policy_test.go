@@ -3,6 +3,8 @@ package proxy
 import (
 	"encoding/json"
 	"testing"
+
+	"kiro-go/search"
 )
 
 func intPtr(i int) *int { return &i }
@@ -50,8 +52,8 @@ func TestExtractWebSearchPolicyDomainsMutuallyExclusive(t *testing.T) {
 	if !ok {
 		t.Fatal("expected ok=true (tool present)")
 	}
-	if _, isCfg := err.(*SearchConfigError); !isCfg {
-		t.Fatalf("expected SearchConfigError, got %T (%v)", err, err)
+	if _, isCfg := err.(*search.ConfigError); !isCfg {
+		t.Fatalf("expected search.ConfigError, got %T (%v)", err, err)
 	}
 }
 
@@ -60,8 +62,8 @@ func TestExtractWebSearchPolicyNegativeMaxUses(t *testing.T) {
 		Name:    "web_search",
 		MaxUses: intPtr(-1),
 	}})
-	if _, isCfg := err.(*SearchConfigError); !isCfg {
-		t.Fatalf("expected SearchConfigError for negative max_uses, got %T (%v)", err, err)
+	if _, isCfg := err.(*search.ConfigError); !isCfg {
+		t.Fatalf("expected search.ConfigError for negative max_uses, got %T (%v)", err, err)
 	}
 }
 
@@ -94,14 +96,29 @@ func TestNormalizeDomains(t *testing.T) {
 }
 
 func TestWebSearchSchemaInjection(t *testing.T) {
-	// Native spec with no input_schema must produce an explicit query schema,
-	// not the collapsed {"type":"object"}.
-	tools := []ClaudeTool{{Type: "web_search_20250305", Name: "web_search"}}
-	kiro, _ := convertClaudeTools(tools)
-	if len(kiro) != 1 {
-		t.Fatalf("expected 1 kiro tool, got %d", len(kiro))
+	// A native web_search spec is never forwarded as a Kiro tool — the proxy
+	// executes it server-side, and forwarding would make the model emit a
+	// client-side tool_use no host can run. Declared ALONGSIDE a client tool it
+	// is replaced by an injected function schema, which must name {query}
+	// explicitly rather than collapse to a bare {"type":"object"}.
+	tools := []ClaudeTool{
+		{Type: "web_search_20250305", Name: "web_search"},
+		{Name: "bash"},
 	}
-	raw, _ := json.Marshal(kiro[0].ToolSpecification.InputSchema.JSON)
+	kiro, _ := convertClaudeTools(tools)
+	if len(kiro) != 2 {
+		t.Fatalf("expected client tool + injected web_search, got %d", len(kiro))
+	}
+	var injected *KiroToolWrapper
+	for i := range kiro {
+		if kiro[i].ToolSpecification.Name == webSearchToolName {
+			injected = &kiro[i]
+		}
+	}
+	if injected == nil {
+		t.Fatalf("no injected web_search tool in %+v", kiro)
+	}
+	raw, _ := json.Marshal(injected.ToolSpecification.InputSchema.JSON)
 	var schema map[string]interface{}
 	json.Unmarshal(raw, &schema)
 	props, ok := schema["properties"].(map[string]interface{})

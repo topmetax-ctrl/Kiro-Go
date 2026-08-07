@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"kiro-go/config"
@@ -69,6 +70,9 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
 			"content": "retried successfully",
 		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "end_turn",
+		}))
 	}))
 	defer server.Close()
 
@@ -99,7 +103,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 
 	rec := httptest.NewRecorder()
-	h.handleClaudeNonStream(context.Background(), rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "", false, WebSearchPolicy{})
+	h.handleClaudeNonStream(context.Background(), rec, payload, "claude-sonnet-4.5", false, claudeThinkingResponseOptions{}, 1, nil, "", false, WebSearchPolicy{}, "")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected retry to succeed, status=%d body=%s", rec.Code, rec.Body.String())
@@ -121,6 +125,51 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 	if len(resp.Content) == 0 || resp.Content[0].Text != "retried successfully" {
 		t.Fatalf("expected retried response content, got %#v", resp.Content)
+	}
+}
+
+func TestOpenAIHandlerPropagatesClientCancellation(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), "request-id", "client-cancel"))
+	defer cancel()
+	if err := config.AddAccount(config.Account{
+		ID: "cancel-test", Enabled: true, AuthMethod: "api_key", KiroApiKey: "ksk_test", ProxyURL: kiroRetryTestProxyURL,
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+
+	var calls int
+	oldClient, hadOldClient := proxyClientCache.Load(kiroRetryTestProxyURL)
+	proxyClientCache.Store(kiroRetryTestProxyURL, &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if got := req.Context().Value("request-id"); got != "client-cancel" {
+			t.Fatalf("upstream request context value = %v, want client-cancel", got)
+		}
+		cancel()
+		return kiroStreamTestResponse(bytes.NewReader(nil)), nil
+	})})
+	t.Cleanup(func() {
+		if hadOldClient {
+			proxyClientCache.Store(kiroRetryTestProxyURL, oldClient)
+		} else {
+			proxyClientCache.Delete(kiroRetryTestProxyURL)
+		}
+	})
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{pool: p, promptCache: newPromptCacheTracker(defaultPromptCacheTTL)}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"claude-sonnet-4.5","messages":[{"role":"user","content":"hello"}]}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	h.handleOpenAIChat(rec, req)
+	if calls != 1 {
+		t.Fatalf("upstream calls=%d, want 1 after cancellation", calls)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("canceled request must not write a proxy response, got %s", rec.Body.String())
 	}
 }
 
@@ -466,7 +515,7 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	models := buildAnthropicModelsResponse([]ModelInfo{{
 		ModelId:    "claude-sonnet-4.5",
 		InputTypes: []string{"text", "image"},
-	}}, "-thinking")
+	}}, "-thinking", false)
 
 	if len(models) != 2 {
 		t.Fatalf("expected base model and thinking variant, got %d", len(models))
@@ -479,5 +528,215 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
+	}
+}
+
+// TestBuildAnthropicModelsResponseAdvertisesEffortVariants covers the opt-in
+// listing shape: base + thinking + one entry per level. The ids must round-trip
+// through the request-side parser, otherwise a client could pick a model from
+// /v1/models that the proxy then rejects.
+func TestBuildAnthropicModelsResponseAdvertisesEffortVariants(t *testing.T) {
+	models := buildAnthropicModelsResponse([]ModelInfo{{
+		ModelId:    "claude-sonnet-4.5",
+		InputTypes: []string{"text", "image"},
+	}}, "-thinking", true)
+
+	want := 2 + len(orderedThinkingEfforts)
+	if len(models) != want {
+		t.Fatalf("expected %d entries (base + thinking + levels), got %d", want, len(models))
+	}
+
+	for i, level := range orderedThinkingEfforts {
+		entry := models[2+i]
+		wantID := "claude-sonnet-4.5-thinking(" + string(level) + ")"
+		gotID, _ := entry["id"].(string)
+		if gotID != wantID {
+			t.Fatalf("entry %d: expected id %q, got %q", i, wantID, gotID)
+		}
+
+		actual, thinking, effort := ParseModelThinkingAndEffort(gotID, "-thinking")
+		if actual != "claude-sonnet-4.5" {
+			t.Fatalf("advertised id %q parsed to model %q", gotID, actual)
+		}
+		if !thinking {
+			t.Fatalf("advertised id %q did not parse as a thinking request", gotID)
+		}
+		if effort != level {
+			t.Fatalf("advertised id %q parsed to effort %q, want %q", gotID, effort, level)
+		}
+	}
+}
+
+func TestOpenAIStreamReportsPostOutputUpstreamFailure(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "test-account",
+		Enabled:     true,
+		AccessToken: "token-test",
+		ProfileArn:  "arn:aws:codewhisperer:profile/test",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": strings.Repeat("partial answer ", 8),
+		}))
+		_, _ = w.Write([]byte{0, 0, 1})
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIChat(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected stream status 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "partial answer") {
+		t.Fatalf("expected partial content before failure, got %s", body)
+	}
+	if !strings.Contains(body, `"error"`) || !strings.Contains(body, `"message"`) {
+		t.Fatalf("expected an SSE error after partial content, got %s", body)
+	}
+	if strings.Contains(body, "[DONE]") {
+		t.Fatalf("a failed stream must not report completion, got %s", body)
+	}
+}
+
+func TestClaudeResponsePreservesUpstreamMaxTokensStopReason(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "test-account",
+		Enabled:     true,
+		AccessToken: "token-test",
+		ProfileArn:  "arn:aws:codewhisperer:profile/test",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "partial answer",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "MAX_TOKENS",
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"max_tokens":100,
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleClaudeMessages(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var response ClaudeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, rec.Body.String())
+	}
+	if response.StopReason != "max_tokens" {
+		t.Fatalf("stop_reason=%q, want max_tokens", response.StopReason)
+	}
+}
+
+func TestOpenAIStreamPreservesUpstreamMaxTokensFinishReason(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{
+		ID:          "test-account",
+		Enabled:     true,
+		AccessToken: "token-test",
+		ProfileArn:  "arn:aws:codewhisperer:profile/test",
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+	if err := config.UpdatePreferredEndpoint("kiro"); err != nil {
+		t.Fatalf("set preferred endpoint: %v", err)
+	}
+	if err := config.UpdateEndpointFallback(false); err != nil {
+		t.Fatalf("disable endpoint fallback: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{
+			"content": "partial answer",
+		}))
+		_, _ = w.Write(awsEventStreamFrame(t, "metadataEvent", map[string]interface{}{
+			"stopReason": "MAX_TOKENS",
+		}))
+	}))
+	defer server.Close()
+	defer swapKiroEndpointsForTest(t, server)()
+
+	p := accountpool.GetPool()
+	p.Reload()
+	h := &Handler{
+		pool:        p,
+		promptCache: newPromptCacheTracker(defaultPromptCacheTTL),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"claude-sonnet-4.5",
+		"messages":[{"role":"user","content":"hello"}],
+		"stream":true
+	}`))
+	rec := httptest.NewRecorder()
+	h.handleOpenAIChat(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected stream status 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"finish_reason":"length"`) {
+		t.Fatalf("expected finish_reason=length, got %s", rec.Body.String())
 	}
 }

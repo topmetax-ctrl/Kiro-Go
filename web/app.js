@@ -11,8 +11,10 @@
     localStorage.removeItem('admin_login_time');
   }
   let password = sessionStorage.getItem('admin_password') || localStorage.getItem('admin_password') || '';
+  const supportedLangs = ['zh', 'en', 'vi'];
   let currentLang = localStorage.getItem('kiro_lang') || 'zh';
-  const dict = { en: null, zh: null };
+  if (!supportedLangs.includes(currentLang)) currentLang = 'zh';
+  const dict = { en: null, zh: null, vi: null };
   let accountsData = [];
   const selectedAccounts = new Set();
   let filterKeyword = '';
@@ -22,6 +24,14 @@
   let builderIdSession = '';
   let builderIdPollTimer = null;
   let iamSession = '';
+  let microsoftSession = '';
+  let microsoftSelectionId = '';
+  let microsoftStage = 'kiro';
+  let microsoftAuthorizeUrl = '';
+  let microsoftProfiles = [];
+  let microsoftSelectedProfileArn = '';
+  let microsoftBusy = false;
+  let microsoftGeneration = 0;
   let exportSelectedIds = new Set();
   let currentVersion = '';
   let testLogs = [];
@@ -33,9 +43,14 @@
   let customSelectUid = 0;
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
+  // A dropdown this long is faster to type into than to scroll, so selects at or
+  // above this many options grow a filter box. data-search="true"/"false" on the
+  // <select> overrides the guess either way.
+  const CUSTOM_SELECT_SEARCH_MIN = 8;
   let netInterfacesData = null;
   let customApiAddr = localStorage.getItem('kiro_api_custom_addr') || '';
   let securityWarnings = [];
+  let injectFeatureAvailable = false;
 
   // DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -47,6 +62,20 @@
   }
   function escapeAttr(s) {
     return escapeHtml(s).replace(/"/g, '&quot;');
+  }
+  // Trigger a browser download of `data` serialized as pretty JSON.
+  function downloadJson(filename, data) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  // Today as YYYY-MM-DD, for download filenames.
+  function todayStamp() {
+    return new Date().toISOString().slice(0, 10);
   }
   async function copyText(input) {
     const isPromise = input && typeof input.then === 'function';
@@ -120,11 +149,12 @@
     qsa('[data-i18n-aria-label]').forEach(el => { el.setAttribute('aria-label', t(el.dataset.i18nAriaLabel)); });
     document.title = t('app.title');
     document.documentElement.lang = currentLang;
-    updateLangButtons();
+    updateLangSelects();
     applyTheme(getThemePref());
     refreshCustomSelects();
   }
   async function setLang(lang) {
+    if (!supportedLangs.includes(lang)) lang = 'zh';
     currentLang = lang;
     localStorage.setItem('kiro_lang', lang);
     await loadLocale(lang);
@@ -136,16 +166,27 @@
     renderModelRoutes();
     buildApiAddrOptions();
     renderSecurityWarnings();
-  }
-  function updateLangButtons() {
-    qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
-    qsa('.lang-toggle').forEach(btn => {
-      const label = btn.querySelector('.lang-toggle-label');
-      if (label) label.textContent = currentLang === 'zh' ? t('lang.zh') : t('lang.en');
+    renderLogs(logsCache);
+    renderStatsTable();
+    renderStatsCompare();
+    renderStatsTrend(statsTrendLast.buckets, statsTrendLast.unit);
+    // Inline stats and any expanded detail panels are innerHTML-built, so they
+    // need an explicit re-render to pick up the new locale.
+    renderProviderInlineStats();
+    Object.keys(openProviderDetails).forEach(pid => {
+      if (!providerDetailCache[pid]) return;
+      qsa('[data-provider-detail="' + cssEscape(pid) + '"]').forEach(el => {
+        el.innerHTML = renderProviderDetailHTML(providerDetailCache[pid]);
+      });
     });
   }
-  function toggleLang() {
-    setLang(currentLang === 'zh' ? 'en' : 'zh');
+  function updateLangSelects() {
+    qsa('.lang-select').forEach(sel => {
+      if (sel.value !== currentLang) sel.value = currentLang;
+      // The custom-select overlay caches the trigger label, so it needs a nudge
+      // whenever the value or the option text changes underneath it.
+      syncCustomSelect(sel);
+    });
   }
 
   // Custom select
@@ -167,6 +208,15 @@
       option.setAttribute('aria-selected', String(selected));
     });
   }
+  // A select is searchable when it opts in explicitly, or when it simply has too
+  // many options to scan by eye. Deciding per-select (rather than globally) keeps
+  // two-item toggles free of a pointless filter box.
+  function customSelectSearchable(select) {
+    const flag = select.dataset.search;
+    if (flag === 'true') return true;
+    if (flag === 'false') return false;
+    return select.options.length >= CUSTOM_SELECT_SEARCH_MIN;
+  }
   function renderCustomSelectOptions(select) {
     const wrap = select && select.__customSelect;
     if (!wrap) return;
@@ -174,17 +224,40 @@
     const trigger = wrap.querySelector('.custom-select-trigger');
     if (!content) return;
     if (trigger) labelCustomSelect(select, trigger, content, select.id);
-    content.innerHTML = '';
+    // Options live in their own box so re-rendering the list never destroys the
+    // search input the user is typing into.
+    const box = wrap.querySelector('.custom-select-options') || content;
+    const searchWrap = wrap.querySelector('.custom-select-search');
+    const input = wrap.querySelector('.custom-select-search-input');
+    const searchable = customSelectSearchable(select);
+    if (searchWrap) searchWrap.hidden = !searchable;
+    if (input) {
+      input.placeholder = t('common.searchPlaceholder');
+      input.setAttribute('aria-label', t('common.searchPlaceholder'));
+      if (!searchable) input.value = '';
+    }
+    const kw = (searchable && input ? input.value : '').trim().toLowerCase();
+    box.innerHTML = '';
+    let shown = 0;
     Array.from(select.options).forEach((option, index) => {
+      const label = (option.textContent || option.value || '').trim();
+      if (kw && !label.toLowerCase().includes(kw)) return;
       const item = document.createElement('button');
       item.type = 'button';
       item.className = 'custom-select-option';
       item.setAttribute('role', 'option');
       item.dataset.index = String(index);
       item.disabled = option.disabled;
-      item.textContent = (option.textContent || option.value || '').trim();
-      content.appendChild(item);
+      item.textContent = label;
+      box.appendChild(item);
+      shown++;
     });
+    if (!shown) {
+      const empty = document.createElement('div');
+      empty.className = 'custom-select-empty muted-text text-xs';
+      empty.textContent = t('common.noMatch');
+      box.appendChild(empty);
+    }
     syncCustomSelect(select);
   }
   function placeCustomSelectContent(select) {
@@ -220,8 +293,18 @@
       content.hidden = false;
       placeCustomSelectContent(select);
       requestAnimationFrame(() => placeCustomSelectContent(select));
-      const selected = content.querySelector('.custom-select-option.is-selected:not(:disabled)') || content.querySelector('.custom-select-option:not(:disabled)');
-      if (selected) selected.focus({ preventScroll: true });
+      // On a searchable select the point of opening is usually to type, so focus
+      // goes to the filter box; otherwise it lands on the current option so the
+      // arrow keys work straight away.
+      const input = wrap.querySelector('.custom-select-search-input');
+      if (customSelectSearchable(select) && input) {
+        input.value = '';
+        renderCustomSelectOptions(select);
+        input.focus({ preventScroll: true });
+      } else {
+        const selected = content.querySelector('.custom-select-option.is-selected:not(:disabled)') || content.querySelector('.custom-select-option:not(:disabled)');
+        if (selected) selected.focus({ preventScroll: true });
+      }
     } else {
       wrap.classList.remove('is-open');
       trigger.setAttribute('aria-expanded', 'false');
@@ -298,6 +381,21 @@
     content.className = 'custom-select-content';
     content.setAttribute('role', 'listbox');
     content.hidden = true;
+
+    // The filter box is built for every select but stays hidden unless the
+    // select is searchable, so option-count changes only have to flip `hidden`
+    // rather than rebuild the popover.
+    const searchWrap = document.createElement('div');
+    searchWrap.className = 'custom-select-search';
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.className = 'custom-select-search-input';
+    searchInput.autocomplete = 'off';
+    searchWrap.appendChild(searchInput);
+    const optionsBox = document.createElement('div');
+    optionsBox.className = 'custom-select-options';
+    content.appendChild(searchWrap);
+    content.appendChild(optionsBox);
     labelCustomSelect(select, trigger, content, id);
 
     wrap.appendChild(trigger);
@@ -316,6 +414,36 @@
         setCustomSelectOpen(select, true);
       }
     });
+    // Typing refilters in place. Re-rendering only touches the options box, so
+    // the input keeps both its value and focus.
+    searchInput.addEventListener('input', () => {
+      renderCustomSelectOptions(select);
+      placeCustomSelectContent(select);
+    });
+    searchInput.addEventListener('keydown', e => {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        // Step into the list; from the box itself, Down starts at the top and Up
+        // wraps to the bottom.
+        const options = qsa('.custom-select-option:not(:disabled)', optionsBox);
+        if (!options.length) return;
+        e.preventDefault();
+        (e.key === 'ArrowDown' ? options[0] : options[options.length - 1]).focus({ preventScroll: true });
+      } else if (e.key === 'Enter') {
+        // Enter on a filtered-to-one list is the fast path: pick it without
+        // making the user arrow down first.
+        const first = optionsBox.querySelector('.custom-select-option:not(:disabled)');
+        if (!first) return;
+        e.preventDefault();
+        chooseCustomSelectOption(select, parseInt(first.dataset.index, 10));
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        setCustomSelectOpen(select, false);
+        trigger.focus({ preventScroll: true });
+      }
+    });
+    // Clicks inside the filter box must not reach the document-level
+    // outside-click handler that closes every open select.
+    searchWrap.addEventListener('click', e => e.stopPropagation());
     content.addEventListener('click', e => {
       const option = e.target.closest('.custom-select-option');
       if (!option) return;
@@ -677,7 +805,9 @@
 
   // Data loaders
   async function loadData() {
-    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
+    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion(), loadInjectStatus()]);
+    // renderApiEndpoints() supersedes the per-endpoint renderEndpointCode calls:
+    // it renders the same set from the selected base address.
     renderApiEndpoints();
     loadNetInterfaces();
     setTimeout(checkUpdate, 2000);
@@ -836,10 +966,138 @@
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
     $('statCredits').textContent = (d.totalCredits || 0).toFixed(1);
   }
+
+  // ===== Logs =====
+  let logsFilter = 'all';
+  let logsAutoTimer = null;
+  let logsCache = [];
+
+  function errorTypeLabel(type) {
+    if (!type) return '';
+    const key = 'errors.type' + type.charAt(0).toUpperCase() + type.slice(1);
+    return t(key) || type;
+  }
+
+  function formatLogTime(ts) {
+    const d = new Date(ts * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    return pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
+      pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+
+  function accountLabel(id) {
+    if (!id) return '-';
+    const acc = accountsData.find(a => a.id === id);
+    if (acc && acc.email) {
+      return privacyModeEnabled ? maskEmail(acc.email) : acc.email;
+    }
+    return id.slice(0, 8);
+  }
+
+  async function loadLogs() {
+    try {
+      const res = await api('/logs');
+      const d = await res.json();
+      const logs = d.logs || [];
+      renderLogs(logs);
+    } catch (e) {
+      // silent
+    }
+  }
+
+  function renderLogs(logs) {
+    logsCache = logs;
+    const list = $('logsList');
+    const summary = $('logsSummary');
+    if (!list) return;
+
+    const total = logs.length;
+    const okCount = logs.filter(l => l.status === 'success').length;
+    const errCount = total - okCount;
+    summary.innerHTML =
+      '<span>' + escapeHtml(t('logs.total')) + ': <strong>' + total + '</strong></span>' +
+      '<span>' + escapeHtml(t('logs.success')) + ': <strong>' + okCount + '</strong></span>' +
+      '<span>' + escapeHtml(t('logs.errors')) + ': <strong>' + errCount + '</strong></span>';
+
+    const filtered = logs.filter(l => logsFilter === 'all' || l.status === logsFilter);
+
+    if (!filtered.length) {
+      list.innerHTML = '<p class="text-muted">' + escapeHtml(t('logs.empty')) + '</p>';
+      return;
+    }
+
+    let html = '<table class="logs-table"><thead><tr>' +
+      '<th>' + escapeHtml(t('logs.time')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.status')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.endpoint')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.model')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.account')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.tokens')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.duration')) + '</th>' +
+      '<th>' + escapeHtml(t('logs.detail')) + '</th>' +
+      '</tr></thead><tbody>';
+    for (const l of filtered) {
+      const isErr = l.status === 'error';
+      const statusCell = '<span class="log-status log-status--' + escapeAttr(l.status) + '">' +
+        escapeHtml(isErr ? t('logs.statusError') : t('logs.statusSuccess')) + '</span>';
+      let detailCell;
+      if (isErr) {
+        detailCell = '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
+          escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span> ' +
+          '<span class="log-msg" title="' + escapeAttr(l.error) + '">' + escapeHtml(l.error) + '</span>';
+      } else {
+        detailCell = '<span class="text-muted">' + (l.credits ? (l.credits.toFixed(3) + ' cr') : '-') + '</span>';
+      }
+      html += '<tr>' +
+        '<td>' + escapeHtml(formatLogTime(l.time)) + '</td>' +
+        '<td>' + statusCell + '</td>' +
+        '<td>' + escapeHtml(l.endpoint) + '</td>' +
+        '<td>' + escapeHtml(l.model || '-') + '</td>' +
+        '<td>' + escapeHtml(accountLabel(l.accountId)) + '</td>' +
+        '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
+        '<td>' + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
+        '<td>' + detailCell + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table>';
+    list.innerHTML = html;
+  }
+
+  async function clearLogs() {
+    if (!confirm(t('logs.clearConfirm'))) return;
+    await api('/logs', { method: 'DELETE' });
+    renderLogs([]);
+    toast(t('logs.cleared'), 'success');
+  }
+
+  function toggleLogsAutoRefresh() {
+    const on = $('logsAutoRefresh').checked;
+    if (logsAutoTimer) { clearInterval(logsAutoTimer); logsAutoTimer = null; }
+    if (on) {
+      logsAutoTimer = setInterval(() => {
+        if (!$('tabLogs').classList.contains('hidden')) loadLogs();
+      }, 5000);
+    }
+  }
+
   async function loadAccounts() {
     const res = await api('/accounts');
     accountsData = await res.json();
     renderAccounts();
+  }
+  async function loadInjectStatus() {
+    const prev = injectFeatureAvailable;
+    try {
+      const res = await api('/inject/status', { method: 'GET' });
+      const d = await res.json();
+      injectFeatureAvailable = !!(d && d.available);
+    } catch (e) {
+      injectFeatureAvailable = false;
+    }
+    // loadData() runs this in parallel with loadAccounts(); if the account list
+    // rendered before this flag resolved, the Inject buttons are missing. Re-render
+    // once the flag becomes known so the buttons appear regardless of request order.
+    if (injectFeatureAvailable !== prev && accountsData.length) renderAccounts();
   }
 
   // Account list
@@ -923,8 +1181,10 @@
   function formatAuthMethod(method) {
     if (!method) return '-';
     const normalized = String(method).toLowerCase();
+    if (normalized === 'external_idp' || normalized === 'azuread') return t('auth.microsoft');
     if (normalized === 'idc') return t('auth.enterprise');
     if (normalized === 'social') return t('auth.social');
+    if (normalized === 'api_key' || normalized === 'apikey') return t('auth.apiKey');
     if (normalized === 'builderid') return 'BuilderID';
     if (normalized === 'github') return t('local.providerGithub');
     if (normalized === 'google') return t('local.providerGoogle');
@@ -1049,6 +1309,8 @@
           escapeHtml(a.enabled ? t('accounts.disable') : t('accounts.enable')) +
           '</button>') +
         '<button class="btn btn-sm btn-secondary" data-action="test" data-id="' + idAttr + '" id="test-' + idAttr + '">' + escapeHtml(t('accounts.test')) + '</button>' +
+        (injectFeatureAvailable ?
+          '<button class="btn btn-sm btn-outline" data-action="inject" data-id="' + idAttr + '" id="inject-' + idAttr + '" title="Ghi credential vào Kiro IDE để đăng nhập account này">Inject</button>' : '') +
         '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '">' + escapeHtml(t('accounts.delete')) + '</button>' +
         '</div>' +
         '</div>' +
@@ -1090,6 +1352,29 @@
     }
     if (card) card.classList.remove('loading');
   }
+  async function injectAccount(id, btn) {
+    const acc = accountsData.find(a => a.id === id);
+    const email = acc ? getDisplayEmail(acc.email, acc.id) : id;
+    const ok = await confirmAction(
+      'Ghi credential của "' + email + '" vào Kiro IDE trên máy này? File đăng nhập hiện tại sẽ bị ghi đè. Sau khi xong, hãy khởi động lại Kiro IDE.',
+      { title: 'Inject vào Kiro IDE', confirmText: 'Inject' }
+    );
+    if (!ok) return;
+    if (btn) btn.setAttribute('aria-busy', 'true');
+    try {
+      const res = await api('/inject', { method: 'POST', body: JSON.stringify({ id }) });
+      const d = await res.json();
+      if (res.ok && d.success) {
+        toast(d.message || 'Đã ghi credential. Khởi động lại Kiro IDE để đăng nhập.', 'success', { duration: 8000 });
+        if (d.cliNote) toastWarning(d.cliNote, { duration: 8000 });
+      } else {
+        toastError('Inject thất bại: ' + (d.error || t('common.failed')));
+      }
+    } catch (e) {
+      toastError((e && e.message) || t('common.failed'));
+    }
+    if (btn) btn.removeAttribute('aria-busy');
+  }
   async function toggleAccount(id, enabled) {
     await api('/accounts/' + id, { method: 'PUT', body: JSON.stringify({ enabled }) });
     loadAccounts();
@@ -1111,15 +1396,56 @@
       toast((e && e.message) || t('common.failed'), 'error');
     }
   }
+  function credentialImportPayloadFromFullAccount(a) {
+    const payload = {
+      clientId: a.clientId || '',
+      clientSecret: a.clientSecret || '',
+      accessToken: a.accessToken || '',
+      refreshToken: a.refreshToken || ''
+    };
+    if (a.authMethod) payload.authMethod = a.authMethod;
+    if (a.provider) payload.provider = a.provider;
+    if (a.tokenEndpoint) payload.tokenEndpoint = a.tokenEndpoint;
+    if (a.issuerUrl) payload.issuerUrl = a.issuerUrl;
+    if (a.scopes) payload.scopes = a.scopes;
+    if (a.userId) payload.userId = a.userId;
+    if (a.profileArn) payload.profileArn = a.profileArn;
+    if (a.region) payload.region = a.region;
+    // Kiro Hosted SSO metadata: copied JSON must keep these or the account
+    // re-imports as social and fails auth.
+    if (a.idpClientId) payload.idpClientId = a.idpClientId;
+    if (a.loginHint) payload.loginHint = a.loginHint;
+    if (a.idpTokenEndpoint) payload.idpTokenEndpoint = a.idpTokenEndpoint;
+    if (a.expiresAt) payload.expiresAt = a.expiresAt;
+    return payload;
+  }
+  function credentialImportPayloadFromExportAccount(a) {
+    const credentials = a.credentials || {};
+    return credentialImportPayloadFromFullAccount({
+      clientId: credentials.clientId,
+      clientSecret: credentials.clientSecret,
+      accessToken: credentials.accessToken,
+      refreshToken: credentials.refreshToken,
+      authMethod: credentials.authMethod || a.authMethod,
+      provider: credentials.provider || a.provider || a.idp,
+      tokenEndpoint: credentials.tokenEndpoint,
+      issuerUrl: credentials.issuerUrl,
+      scopes: credentials.scopes,
+      idpClientId: credentials.idpClientId || a.idpClientId,
+      loginHint: credentials.loginHint || a.loginHint,
+      idpTokenEndpoint: credentials.idpTokenEndpoint || a.idpTokenEndpoint,
+      expiresAt: credentials.expiresAt || a.expiresAt,
+      userId: a.userId,
+      profileArn: a.profileArn,
+      region: credentials.region || a.region
+    });
+  }
   async function copyAccountJSON(id, btn) {
     try {
       const jsonPromise = api('/accounts/' + id + '/full').then(async res => {
         if (!res.ok) throw new Error('Failed');
         const a = await res.json();
-        const { clientId, clientSecret, accessToken, refreshToken,
-          authMethod, provider, issuerUrl, idpClientId, scopes, loginHint, region, expiresAt } = a;
-        return JSON.stringify({ clientId, clientSecret, accessToken, refreshToken,
-          authMethod, provider, issuerUrl, idpClientId, scopes, loginHint, region, expiresAt }, null, 2);
+        return JSON.stringify(credentialImportPayloadFromFullAccount(a), null, 2);
       });
       await copyText(jsonPromise);
       flashCopySuccess(btn);
@@ -1688,7 +2014,7 @@
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
     $('maxPayloadBytes').value = String(d.maxPayloadBytes || 2000000);
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys(), loadUpstreams(), loadSecurityConfig(), loadKiroGoModels()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadMemoryConfig(), loadApiKeys(), loadUpstreams(), loadSecurityConfig(), loadKiroGoModels()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -1697,13 +2023,19 @@
     $('thinkingSuffix').value = d.suffix || '-thinking';
     $('openaiThinkingFormat').value = d.openaiFormat || 'reasoning_content';
     $('claudeThinkingFormat').value = d.claudeFormat || 'thinking';
+    // The server stores "let the model choose" as an empty string; the picker
+    // spells that "auto".
+    $('thinkingDefaultEffort').value = d.defaultEffort || 'auto';
+    $('advertiseEffortModels').checked = d.advertiseEffortModels || false;
   }
   async function saveThinkingConfig() {
     const res = await api('/thinking', {
       method: 'POST', body: JSON.stringify({
         suffix: $('thinkingSuffix').value || '-thinking',
         openaiFormat: $('openaiThinkingFormat').value,
-        claudeFormat: $('claudeThinkingFormat').value
+        claudeFormat: $('claudeThinkingFormat').value,
+        defaultEffort: $('thinkingDefaultEffort').value,
+        advertiseEffortModels: $('advertiseEffortModels').checked
       })
     });
     const d = await res.json();
@@ -1925,11 +2257,19 @@
   let upstreamCache = { providers: [], routes: [] };
   let upstreamEditingId = '';
   let routeEditingId = '';
+  // Working copy of the route modal's target list. Held apart from upstreamCache
+  // so Cancel discards edits; only submitRouteModal writes it back.
+  let routeTargetDraft = [];
   // Models fetched per provider (keyed by provider id) for the browse/copy/test UI.
   let providerModels = {};
   let providerModelsLoading = {};
   let modelsModalPid = '';
   let modelsModalSearch = '';
+  // Hidden providers are collapsed behind a "show hidden" disclosure rather than
+  // dropped, so an operator can always get back to one. The expanded/collapsed
+  // choice is a view preference, so it lives in localStorage; which providers are
+  // hidden is config, and lives on the server.
+  let showHiddenProviders = localStorage.getItem('kiro_show_hidden_providers') === '1';
   // Model names served by this kiro-go instance (from /v1/models), used to
   // suggest Target Model values in the route modal. Still free-text + optional.
   let kiroGoModels = [];
@@ -2240,6 +2580,58 @@
     renderModelRoutes();
   }
 
+  // providerCard renders one provider row. Hidden providers get the same markup —
+  // every action stays reachable — plus a marker class and a badge, so the only
+  // difference between hidden and visible is where the row is placed and how it
+  // looks, never what the operator can do to it.
+  function providerCard(item) {
+    const id = escapeAttr(item.id || '');
+    const name = item.name ? escapeHtml(item.name) : '<span class="muted-text">' + escapeHtml(t('upstreams.unnamed')) + '</span>';
+    const baseUrl = escapeHtml(item.baseUrl || '');
+    const disabled = !item.enabled
+      ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('upstreams.disabled')) + '</span>'
+      : '';
+    // A hidden provider that is still enabled keeps forwarding, which is easy to
+    // forget once it is out of sight. The badge says so explicitly rather than
+    // letting "hidden" read as "off".
+    const hiddenBadge = item.hidden
+      ? '<span class="text-xs" style="background:rgba(148,163,184,0.18);color:var(--muted-foreground);padding:1px 6px;border-radius:4px;"' +
+          ' title="' + escapeAttr(t(item.enabled ? 'upstreams.hiddenStillLive' : 'upstreams.hiddenHint')) + '">' +
+          escapeHtml(t('upstreams.hidden')) + '</span>'
+      : '';
+    const hideIcon = item.hidden ? 'fa-eye' : 'fa-eye-slash';
+    const hideTitle = item.hidden ? t('upstreams.actionUnhide') : t('upstreams.actionHide');
+    return '<div class="card provider-card' + (item.hidden ? ' is-hidden-provider' : '') + '" data-upstream-id="' + id + '"' +
+      ' style="margin-top:0.5rem;padding:0.75rem;">' +
+      '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
+        '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
+          '<span class="font-semibold">' + name + '</span>' +
+          disabled +
+          hiddenBadge +
+          '<span class="text-xs muted-text font-mono">' + baseUrl + '</span>' +
+        '</div>' +
+        '<div class="flex items-center gap-2">' +
+          '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
+            '<input type="checkbox" data-upstream-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
+            '<span class="slider"></span>' +
+          '</label>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="hide" data-id="' + id + '"' +
+            ' title="' + escapeAttr(hideTitle) + '" aria-label="' + escapeAttr(hideTitle) + '">' +
+            '<i class="fa-solid ' + hideIcon + '" aria-hidden="true"></i></button>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="details" data-id="' + id + '" aria-expanded="false">' + escapeHtml(t('stats.details')) + '</button>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="load" data-id="' + id + '">' + escapeHtml(t('upstreams.loadModels')) + '</button>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="edit" data-id="' + id + '">' + escapeHtml(t('upstreams.actionEdit')) + '</button>' +
+          '<button class="btn btn-danger btn-sm" type="button" data-upstream-action="delete" data-id="' + id + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="text-xs muted-text font-mono" data-fwd-inline-for="' + id + '" style="margin-top:0.35rem;"></div>' +
+      '<div class="provider-detail hidden" data-provider-detail="' + id + '"></div>' +
+    '</div>';
+  }
+
+  // Hidden providers are moved below a disclosure row instead of being dropped
+  // from the DOM: the point of Hide is decluttering a long list, and a provider
+  // you cannot see at all is one you cannot unhide.
   function renderProviders() {
     const list = $('upstreamsList');
     if (!list) return;
@@ -2247,33 +2639,25 @@
       list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('upstreams.providersEmpty')) + '</div>';
       return;
     }
-    list.innerHTML = upstreamCache.providers.map(item => {
-      const id = escapeAttr(item.id || '');
-      const name = item.name ? escapeHtml(item.name) : '<span class="muted-text">' + escapeHtml(t('upstreams.unnamed')) + '</span>';
-      const baseUrl = escapeHtml(item.baseUrl || '');
-      const disabled = !item.enabled
-        ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('upstreams.disabled')) + '</span>'
-        : '';
-      return '<div class="card" data-upstream-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
-        '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
-          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
-            '<span class="font-semibold">' + name + '</span>' +
-            disabled +
-            '<span class="text-xs muted-text font-mono">' + baseUrl + '</span>' +
-          '</div>' +
-          '<div class="flex items-center gap-2">' +
-            '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
-              '<input type="checkbox" data-upstream-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
-              '<span class="slider"></span>' +
-            '</label>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="load" data-id="' + id + '">' + escapeHtml(t('upstreams.loadModels')) + '</button>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="edit" data-id="' + id + '">' + escapeHtml(t('upstreams.actionEdit')) + '</button>' +
-            '<button class="btn btn-danger btn-sm" type="button" data-upstream-action="delete" data-id="' + id + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
-          '</div>' +
-        '</div>' +
-        '<div class="text-xs muted-text font-mono" data-fwd-inline-for="' + id + '" style="margin-top:0.35rem;"></div>' +
-      '</div>';
-    }).join('');
+    const shown = upstreamCache.providers.filter(p => !p.hidden);
+    const hiddenOnes = upstreamCache.providers.filter(p => p.hidden);
+    let html = shown.map(providerCard).join('');
+    // Hiding every provider would otherwise leave a blank panel that looks like a
+    // load failure, so say what happened.
+    if (!shown.length) {
+      html += '<div class="muted-text text-xs" style="padding:0.5rem 0;">' +
+        escapeHtml(t('upstreams.allHidden')) + '</div>';
+    }
+    if (hiddenOnes.length) {
+      const caret = showHiddenProviders ? 'fa-chevron-down' : 'fa-chevron-right';
+      html += '<button class="btn btn-ghost btn-sm provider-hidden-toggle" type="button"' +
+        ' data-upstream-toggle-hidden="1" aria-expanded="' + (showHiddenProviders ? 'true' : 'false') + '">' +
+        '<i class="fa-solid ' + caret + '" aria-hidden="true"></i>' +
+        escapeHtml(t('upstreams.hiddenCount', String(hiddenOnes.length))) +
+        '</button>';
+      if (showHiddenProviders) html += hiddenOnes.map(providerCard).join('');
+    }
+    list.innerHTML = html;
   }
 
   // Render the fetched-model list into the models modal, filtered by the search box.
@@ -2316,20 +2700,35 @@
     list.innerHTML = upstreamCache.routes.map(item => {
       const id = escapeAttr(item.id || '');
       const model = escapeHtml(item.model || '');
-      const target = item.targetModel
-        ? '<span class="text-xs muted-text">&rarr; ' + escapeHtml(item.targetModel) + '</span>'
-        : '';
-      const prov = '<span class="text-xs muted-text font-mono">' + escapeHtml(providerName(item.upstreamId)) + '</span>';
       const disabled = !item.enabled
         ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('upstreams.disabled')) + '</span>'
+        : '';
+      // The target chain in try-order. The first is what a request normally uses;
+      // the rest are failover, so they are dimmed and arrow-chained rather than
+      // listed as equals.
+      const targets = routeTargets(item);
+      const chain = targets.length
+        ? targets.map((tg, i) => {
+            const nm = escapeHtml(providerName(tg.upstreamId));
+            const rewrite = tg.targetModel ? '<span class="muted-text">:' + escapeHtml(tg.targetModel) + '</span>' : '';
+            const off = tg.enabled === false
+              ? ' style="text-decoration:line-through;opacity:0.5;"'
+              : (i === 0 ? ' style="font-weight:600;"' : ' style="opacity:0.65;"');
+            return (i > 0 ? '<span class="muted-text text-xs">&rsaquo;</span>' : '') +
+              '<span class="text-xs font-mono"' + off + '>' + nm + rewrite + '</span>';
+          }).join(' ')
+        : '<span class="text-xs" style="color:#ef4444;">' + escapeHtml(t('upstreams.routeNoTargets')) + '</span>';
+      const count = targets.length > 1
+        ? '<span class="text-xs muted-text" title="' + escapeAttr(t('upstreams.routeFailoverHint')) + '">(' + targets.length + ')</span>'
         : '';
       return '<div class="card" data-route-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
             '<span class="font-semibold font-mono">' + model + '</span>' +
-            target +
+            '<span class="muted-text text-xs">&rarr;</span>' +
+            chain +
+            count +
             disabled +
-            prov +
           '</div>' +
           '<div class="flex items-center gap-2">' +
             '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
@@ -2342,6 +2741,20 @@
         '</div>' +
       '</div>';
     }).join('');
+  }
+
+  // routeTargets normalizes a route to its target list. A route saved by an older
+  // build (or hand-edited into config.json) carries only upstreamId/targetModel,
+  // and the server migrates those on load — but the UI can be looking at a
+  // response produced before that, so it degrades the same way rather than
+  // rendering the route as broken.
+  function routeTargets(route) {
+    if (!route) return [];
+    if (Array.isArray(route.targets) && route.targets.length) return route.targets;
+    if (route.upstreamId) {
+      return [{ upstreamId: route.upstreamId, targetModel: route.targetModel || '', priority: 0, weight: 1, enabled: true }];
+    }
+    return [];
   }
 
   async function persistUpstreams() {
@@ -2360,6 +2773,10 @@
     $('upstreamForm_baseUrl').value = entry ? (entry.baseUrl || '') : '';
     $('upstreamForm_apiKey').value = entry ? (entry.apiKey || '') : '';
     $('upstreamForm_proxyUrl').value = entry ? (entry.proxyURL || '') : '';
+    // Prices are omitted from JSON when zero, and an empty input is what "not
+    // priced" should look like — so 0 renders as blank rather than "0".
+    $('upstreamForm_priceIn').value = entry && entry.priceInPerM ? String(entry.priceInPerM) : '';
+    $('upstreamForm_priceOut').value = entry && entry.priceOutPerM ? String(entry.priceOutPerM) : '';
     $('upstreamForm_enabled').checked = entry ? !!entry.enabled : true;
     openDialog('upstreamModal');
   }
@@ -2374,17 +2791,22 @@
     const baseUrl = $('upstreamForm_baseUrl').value.trim();
     const apiKey = $('upstreamForm_apiKey').value.trim();
     const proxyURL = $('upstreamForm_proxyUrl').value.trim();
+    // parseFloat of "" is NaN; normalize to 0 so the field means "unpriced".
+    const priceInPerM = parseFloat($('upstreamForm_priceIn').value) || 0;
+    const priceOutPerM = parseFloat($('upstreamForm_priceOut').value) || 0;
     const enabled = $('upstreamForm_enabled').checked;
     if (!baseUrl) { toast(t('upstreams.baseUrlRequired'), 'error'); return; }
+    if (priceInPerM < 0 || priceOutPerM < 0) { toast(t('upstreams.priceInvalid'), 'error'); return; }
     const prev = JSON.parse(JSON.stringify(upstreamCache));
     try {
       if (upstreamEditingId) {
         const p = upstreamCache.providers.find(x => x.id === upstreamEditingId);
         if (p) {
           p.name = name; p.baseUrl = baseUrl; p.apiKey = apiKey; p.proxyURL = proxyURL; p.enabled = enabled;
+          p.priceInPerM = priceInPerM; p.priceOutPerM = priceOutPerM;
         }
       } else {
-        upstreamCache.providers.push({ id: '', name, baseUrl, apiKey, proxyURL, enabled });
+        upstreamCache.providers.push({ id: '', name, baseUrl, apiKey, proxyURL, enabled, priceInPerM, priceOutPerM });
       }
       await persistUpstreams();
       toast(t('common.saved'), 'success');
@@ -2402,6 +2824,33 @@
     if (p) p.enabled = enabled;
     try {
       await persistUpstreams();
+      renderUpstreams();
+    } catch (e) {
+      upstreamCache = prev;
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+      renderUpstreams();
+    }
+  }
+
+  // Hiding is presentation-only: it never touches `enabled`, so a hidden provider
+  // keeps receiving forwards exactly as before. The flag is stored server-side
+  // rather than in localStorage so it follows the config across browsers and
+  // rides along with export/import.
+  async function setProviderHidden(id, hidden) {
+    const prev = JSON.parse(JSON.stringify(upstreamCache));
+    const p = upstreamCache.providers.find(x => x.id === id);
+    if (!p) return;
+    p.hidden = hidden;
+    // Unhiding from inside the collapsed group would otherwise move the row out
+    // of a section the operator can no longer see.
+    if (!hidden) showHiddenProviders = true;
+    try {
+      await persistUpstreams();
+      // A hidden-but-enabled provider is the case worth naming out loud, since
+      // the row vanishing could otherwise read as "turned off". The same two
+      // strings back the badge tooltip, so the two surfaces cannot drift apart.
+      toast(t(hidden ? (p.enabled ? 'upstreams.hiddenStillLive' : 'upstreams.hiddenHint') : 'upstreams.unhidden'),
+        hidden && p.enabled ? 'warning' : 'success');
       renderUpstreams();
     } catch (e) {
       upstreamCache = prev;
@@ -2503,26 +2952,18 @@
   }
 
   // Open the route modal prefilled from a fetched model (one-click route creation).
+  // The browsed provider becomes the primary target, and the model name is used
+  // on both sides: it is what the client will send and what that provider expects.
   function makeRouteFromModel(pid, model) {
     closeModelsModal();
     routeEditingId = '';
     $('modelRouteModalTitle').textContent = t('upstreams.routeModalCreate');
     $('routeForm_model').value = model;
-    $('routeForm_targetModel').value = '';
     $('routeForm_enabled').checked = true;
-    populateRouteProviderSelect(pid);
+    routeTargetDraft = [{ upstreamId: pid, targetModel: '', priority: 0, weight: 1, enabled: true }];
+    renderRouteTargets();
     populateClientModelDatalist();
-    populateTargetModelDatalist(pid);
     openDialog('modelRouteModal');
-  }
-
-  function populateRouteProviderSelect(selectedId) {
-    const sel = $('routeForm_upstreamId');
-    if (!sel) return;
-    sel.innerHTML = upstreamCache.providers.map(p =>
-      '<option value="' + escapeAttr(p.id || '') + '"' + (p.id === selectedId ? ' selected' : '') + '>' +
-        escapeHtml(p.name || p.baseUrl || p.id || '') + '</option>'
-    ).join('');
   }
 
   // Fetch the model names this kiro-go instance serves (public /v1/models, no auth).
@@ -2586,33 +3027,220 @@
     routeEditingId = entry ? (entry.id || '') : '';
     $('modelRouteModalTitle').textContent = t(routeEditingId ? 'upstreams.routeModalEdit' : 'upstreams.routeModalCreate');
     $('routeForm_model').value = entry ? (entry.model || '') : '';
-    $('routeForm_targetModel').value = entry ? (entry.targetModel || '') : '';
     $('routeForm_enabled').checked = entry ? !!entry.enabled : true;
-    populateRouteProviderSelect(entry ? entry.upstreamId : (upstreamCache.providers[0] && upstreamCache.providers[0].id));
+    // draftFromTargets copies as it derives sameTier, so Cancel discards target
+    // edits; the cache is only touched on save.
+    routeTargetDraft = entry ? draftFromTargets(routeTargets(entry)) : [newRouteTarget()];
+    if (!routeTargetDraft.length) routeTargetDraft = [newRouteTarget()];
+    renderRouteTargets();
     populateClientModelDatalist();
-    populateTargetModelDatalist($('routeForm_upstreamId').value);
     openDialog('modelRouteModal');
+  }
+
+  // newRouteTarget defaults to the first provider: with one configured provider
+  // (the common case) the operator never has to touch the select.
+  function newRouteTarget() {
+    const first = upstreamCache.providers[0];
+    return {
+      upstreamId: (first && first.id) || '',
+      targetModel: '', priority: 0, weight: 1, enabled: true, sameTier: false
+    };
+  }
+
+  // draftFromTargets rebuilds the editable draft from stored targets, deriving
+  // each row's sameTier flag from whether it repeats the previous row's priority.
+  // Storage keeps explicit priority numbers; the UI shows tier membership. This is
+  // the inverse of the numbering done in submitRouteModal, so an edit round-trip
+  // preserves tiers instead of flattening them.
+  function draftFromTargets(targets) {
+    return targets.map((tg, i) => {
+      const prev = targets[i - 1];
+      return {
+        upstreamId: tg.upstreamId || '',
+        targetModel: tg.targetModel || '',
+        priority: tg.priority || 0,
+        weight: tg.weight > 0 ? tg.weight : 1,
+        enabled: tg.enabled !== false,
+        sameTier: !!prev && (prev.priority || 0) === (tg.priority || 0)
+      };
+    });
+  }
+
+  // Tier membership belongs to the SLOT, not to the target that happens to sit in
+  // it. Reordering is the documented "switch provider without losing the old
+  // setup" gesture, so moving a target into the primary slot must not drag its
+  // old sameTier flag along and collapse a shared tier. These two helpers let a
+  // reorder restore the flags by position after the rows have moved.
+  function draftTierFlags() {
+    return routeTargetDraft.map(tg => !!tg.sameTier);
+  }
+  function applyPositionalTiers(flags) {
+    routeTargetDraft.forEach((tg, i) => { tg.sameTier = !!flags[i]; });
+    normalizeDraftTiers();
+  }
+
+  // The first row opens the first tier by definition. A stale sameTier there
+  // would make draftTierNumbers start counting at 1 and mislabel every badge, so
+  // every structural change funnels through this.
+  function normalizeDraftTiers() {
+    if (routeTargetDraft.length) routeTargetDraft[0].sameTier = false;
+  }
+
+  // swapDraftRows backs the ↑/↓ buttons, which are also the keyboard-accessible
+  // path to what dragging does.
+  function swapDraftRows(a, b) {
+    if (!routeTargetDraft[a] || !routeTargetDraft[b]) return;
+    const flags = draftTierFlags();
+    const tmp = routeTargetDraft[a];
+    routeTargetDraft[a] = routeTargetDraft[b];
+    routeTargetDraft[b] = tmp;
+    applyPositionalTiers(flags);
+  }
+
+  // moveDraftRow relocates one row to an insertion slot, as produced by a drop.
+  // insertAt is a gap index (0 == above the first row), so dropping either side
+  // of the row's own position is a no-op. Returns whether anything moved.
+  function moveDraftRow(from, insertAt) {
+    if (!routeTargetDraft[from]) return false;
+    if (insertAt === from || insertAt === from + 1) return false;
+    const flags = draftTierFlags();
+    const row = routeTargetDraft.splice(from, 1)[0];
+    routeTargetDraft.splice(insertAt > from ? insertAt - 1 : insertAt, 0, row);
+    applyPositionalTiers(flags);
+    return true;
+  }
+
+  // draftTierNumbers returns each draft row's tier index, using the same rule as
+  // submitRouteModal so the badges always describe what will actually be saved.
+  function draftTierNumbers() {
+    let tier = -1;
+    return routeTargetDraft.map((tg, i) => {
+      if (i === 0 || !tg.sameTier) tier++;
+      return tier;
+    });
+  }
+
+  // Renders the draft target list. Tiers, not raw positions, carry the meaning:
+  // consecutive rows can share a tier, and rows in the same tier split traffic by
+  // weight instead of acting as each other's fallback. Reordering is still the
+  // "switch provider" gesture; the tier toggle is what makes weight usable.
+  function renderRouteTargets() {
+    const box = $('routeTargetsList');
+    if (!box) return;
+    if (!upstreamCache.providers.length) {
+      box.innerHTML = '<div class="muted-text text-xs">' + escapeHtml(t('upstreams.routeNoProviders')) + '</div>';
+      return;
+    }
+    const tiers = draftTierNumbers();
+    // A tier with more than one member is the only case where weight does
+    // anything, so the weight input is enabled exactly there.
+    const tierSizes = {};
+    tiers.forEach(n => { tierSizes[n] = (tierSizes[n] || 0) + 1; });
+    box.innerHTML = routeTargetDraft.map((tg, i) => {
+      const opts = upstreamCache.providers.map(p =>
+        '<option value="' + escapeAttr(p.id || '') + '"' + (p.id === tg.upstreamId ? ' selected' : '') + '>' +
+          escapeHtml(p.name || p.baseUrl || p.id || '') + '</option>'
+      ).join('');
+      const tier = tiers[i];
+      const shares = tierSizes[tier] > 1;
+      const badge = tier === 0
+        ? '<span class="text-xs" style="background:rgba(34,197,94,0.15);color:#16a34a;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('upstreams.routeTargetPrimary')) + '</span>'
+        : '<span class="text-xs muted-text">' + escapeHtml(t('upstreams.routeTargetFallback')) + ' ' + tier + '</span>';
+      // Rows after the first can join the tier above; joining is what puts two
+      // targets at equal priority so their weights become meaningful.
+      const tierToggle = i === 0
+        ? ''
+        : '<label class="text-xs muted-text flex items-center gap-1" title="' + escapeAttr(t('upstreams.routeTargetSameTierHint')) + '">' +
+            '<input type="checkbox" data-target-field="sameTier" data-index="' + i + '"' + (tg.sameTier ? ' checked' : '') + ' />' +
+            escapeHtml(t('upstreams.routeTargetSameTier')) +
+          '</label>';
+      const shareLabel = shares
+        ? '<span class="text-xs muted-text">' + escapeHtml(t('upstreams.routeTargetSplitting')) + '</span>'
+        : '';
+      // The row is only made draggable on mousedown over the handle (see the
+      // dragstart wiring), so dragging never starts from the text inputs and
+      // ordinary text selection inside them keeps working.
+      const handle = '<span class="route-target-handle" data-target-handle="1" aria-hidden="true"' +
+        ' title="' + escapeAttr(t('common.dragToReorder')) + '">' +
+        '<i class="fa-solid fa-grip-vertical"></i></span>';
+      return '<div class="card route-target-row" draggable="false" data-target-index="' + i + '" style="margin-top:0.5rem;padding:0.5rem;">' +
+        '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
+          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' + handle + badge + tierToggle + shareLabel + '</div>' +
+          '<div class="flex items-center gap-1">' +
+            '<button class="btn btn-outline btn-sm" type="button" data-target-action="up" data-index="' + i + '"' +
+              (i === 0 ? ' disabled' : '') + ' title="' + escapeAttr(t('upstreams.routeTargetUp')) + '">&uarr;</button>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-target-action="down" data-index="' + i + '"' +
+              (i === routeTargetDraft.length - 1 ? ' disabled' : '') + ' title="' + escapeAttr(t('upstreams.routeTargetDown')) + '">&darr;</button>' +
+            '<button class="btn btn-danger btn-sm" type="button" data-target-action="remove" data-index="' + i + '"' +
+              (routeTargetDraft.length <= 1 ? ' disabled' : '') + '>&times;</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="flex items-center gap-2" style="flex-wrap:wrap;margin-top:0.35rem;">' +
+          '<select data-target-field="upstreamId" data-index="' + i + '" style="flex:1;min-width:9rem;">' + opts + '</select>' +
+          '<input type="text" data-target-field="targetModel" data-index="' + i + '" list="routeTargetModelList" autocomplete="off"' +
+            ' value="' + escapeAttr(tg.targetModel || '') + '" style="flex:1;min-width:9rem;"' +
+            ' placeholder="' + escapeAttr(t('upstreams.targetModelPlaceholder')) + '" />' +
+          '<input type="number" min="1" data-target-field="weight" data-index="' + i + '"' +
+            ' value="' + escapeAttr(String(tg.weight > 0 ? tg.weight : 1)) + '" style="width:4.5rem;"' +
+            (shares ? '' : ' disabled') +
+            ' title="' + escapeAttr(t(shares ? 'upstreams.routeTargetWeightHint' : 'upstreams.routeTargetWeightInert')) + '" />' +
+          '<label class="switch" title="' + escapeAttr(t('upstreams.formEnabled')) + '">' +
+            '<input type="checkbox" data-target-field="enabled" data-index="' + i + '"' + (tg.enabled === false ? '' : ' checked') + ' />' +
+            '<span class="slider"></span>' +
+          '</label>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+    // Target-model suggestions follow the primary target's provider.
+    populateTargetModelDatalist(routeTargetDraft[0] && routeTargetDraft[0].upstreamId);
   }
 
   function closeRouteModal() {
     closeDialog('modelRouteModal');
     routeEditingId = '';
+    routeTargetDraft = [];
   }
 
   async function submitRouteModal() {
     const model = $('routeForm_model').value.trim();
-    const upstreamId = $('routeForm_upstreamId').value;
-    const targetModel = $('routeForm_targetModel').value.trim();
     const enabled = $('routeForm_enabled').checked;
     if (!model) { toast(t('upstreams.routeModelRequired'), 'error'); return; }
-    if (!upstreamId) { toast(t('upstreams.providerRequired'), 'error'); return; }
+    // Priority comes from list position, but rows flagged sameTier share the tier
+    // of the row above instead of starting a new one. That distinction is what
+    // makes weight reachable at all: the resolver only splits traffic by weight
+    // among targets of EQUAL priority (config/route_resolve.go), so numbering
+    // every row 0,1,2,... — as this did before — left every tier with a single
+    // member and the weight field permanently inert.
+    const kept = routeTargetDraft.filter(tg => tg.upstreamId);
+    let tier = -1;
+    const targets = kept.map((tg, i) => {
+      // The first row always opens a tier; sameTier is meaningless there.
+      if (i === 0 || !tg.sameTier) tier++;
+      return {
+        upstreamId: tg.upstreamId,
+        targetModel: (tg.targetModel || '').trim(),
+        priority: tier,
+        weight: tg.weight > 0 ? tg.weight : 1,
+        enabled: tg.enabled !== false
+      };
+    });
+    if (!targets.length) { toast(t('upstreams.providerRequired'), 'error'); return; }
     const prev = JSON.parse(JSON.stringify(upstreamCache));
     try {
       if (routeEditingId) {
         const r = upstreamCache.routes.find(x => x.id === routeEditingId);
-        if (r) { r.model = model; r.upstreamId = upstreamId; r.targetModel = targetModel; r.enabled = enabled; }
+        if (r) {
+          r.model = model;
+          r.targets = targets;
+          r.enabled = enabled;
+          // Clear the legacy 1:1 fields so they cannot contradict targets. The
+          // server re-derives them for export; keeping a stale value here would
+          // make an old build resolve a provider the operator already replaced.
+          r.upstreamId = '';
+          r.targetModel = '';
+        }
       } else {
-        upstreamCache.routes.push({ id: '', model, upstreamId, targetModel, enabled });
+        upstreamCache.routes.push({ id: '', model, targets, enabled });
       }
       await persistUpstreams();
       toast(t('common.saved'), 'success');
@@ -2655,6 +3283,105 @@
     }
   }
 
+  // ===== Forwarding config export / import =====
+  // Export hits the dedicated endpoint rather than serializing upstreamCache:
+  // the cache holds MASKED api keys (apiGetUpstreams masks them), which would
+  // produce a file that imports but cannot authenticate.
+  async function exportUpstreamsConfig() {
+    const btn = $('upstreamExportBtn');
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api('/upstreams/export');
+      if (!res.ok) throw new Error('http ' + res.status);
+      const data = await res.json();
+      downloadJson('kiro-forwarding-' + todayStamp() + '.json', data);
+    } catch (e) {
+      toastError(t('upstreams.exportFailed'));
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function openUpstreamImportModal() {
+    const txt = $('upstreamImportText');
+    if (txt) txt.value = '';
+    const file = $('upstreamImportFile');
+    if (file) file.value = '';
+    const results = $('upstreamImportResults');
+    if (results) results.innerHTML = '';
+    openDialog('upstreamImportModal');
+  }
+
+  function closeUpstreamImportModal() {
+    closeDialog('upstreamImportModal');
+  }
+
+  async function submitUpstreamImport() {
+    const txt = $('upstreamImportText');
+    const raw = txt ? txt.value.trim() : '';
+    if (!raw) { toastWarning(t('upstreams.importEmpty')); return; }
+    // Parse client-side so a typo never reaches the network.
+    let bundle;
+    try {
+      bundle = JSON.parse(raw);
+    } catch (e) {
+      toastError(t('upstreams.importInvalidJson'));
+      return;
+    }
+
+    const btn = $('upstreamImportConfirmBtn');
+    if (btn) btn.disabled = true;
+    try {
+      const res = await api('/upstreams/import', { method: 'POST', body: JSON.stringify(bundle) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) {
+        // Leave the modal open with the pasted text intact so the user can fix it.
+        toastError(t('upstreams.importFailed') + (d.error ? ': ' + d.error : ''));
+        return;
+      }
+      renderUpstreamImportResult(d);
+      const skipped = (d.providersSkipped || 0) + (d.routesSkipped || 0);
+      toast(t('upstreams.importSummary',
+        d.providersAdded || 0, d.providersSkipped || 0,
+        d.routesAdded || 0, d.routesSkipped || 0),
+        skipped ? 'warning' : 'success');
+      await loadUpstreams();
+      // Nothing was skipped, so there is nothing left to read: close. When
+      // entries WERE skipped, stay open so the user can see which and why.
+      if (!skipped) closeUpstreamImportModal();
+    } catch (e) {
+      toastError(t('upstreams.importFailed'));
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // Renders import counts and skip lists. Every label comes from an untrusted
+  // imported file and lands in innerHTML, so it MUST be escaped.
+  function renderUpstreamImportResult(d) {
+    const box = $('upstreamImportResults');
+    if (!box) return;
+    const reasonText = (reason) => {
+      if (reason === 'duplicate') return t('upstreams.importReasonDuplicate');
+      if (reason === 'unknownProvider') return t('upstreams.importReasonUnknownProvider');
+      return reason || '';
+    };
+    const skipList = (titleKey, items) => {
+      if (!items || !items.length) return '';
+      return '<div class="mt-2"><strong class="text-xs">' + escapeHtml(t(titleKey)) + '</strong>' +
+        items.map(it => '<div class="text-xs muted-text">· ' + escapeHtml(it.label || '') +
+          ' <span class="warning-text">(' + escapeHtml(reasonText(it.reason)) + ')</span></div>').join('') +
+        '</div>';
+    };
+    box.innerHTML = '<div class="text-sm">' +
+      escapeHtml(t('upstreams.importSummary',
+        d.providersAdded || 0, d.providersSkipped || 0,
+        d.routesAdded || 0, d.routesSkipped || 0)) +
+      '</div>' +
+      skipList('upstreams.importSkippedProviders', d.skippedProviders) +
+      skipList('upstreams.importSkippedRoutes', d.skippedRoutes);
+  }
+
   function bindUpstreamEvents() {
     const provList = $('upstreamsList');
     if (provList) {
@@ -2668,6 +3395,30 @@
         if (action === 'edit') openUpstreamModal(entry);
         else if (action === 'delete') deleteProvider(id, entry ? entry.name : '');
         else if (action === 'load') loadProviderModels(id);
+        else if (action === 'details') toggleProviderDetail(id, btn, provList);
+        else if (action === 'hide') setProviderHidden(id, !(entry && entry.hidden));
+      });
+      // The hidden-group disclosure. Bound here rather than on the button itself
+      // because the button is re-rendered on every list change.
+      provList.addEventListener('click', e => {
+        if (!e.target.closest('[data-upstream-toggle-hidden]')) return;
+        showHiddenProviders = !showHiddenProviders;
+        localStorage.setItem('kiro_show_hidden_providers', showHiddenProviders ? '1' : '0');
+        renderProviders();
+        // Newly rendered rows start with an empty stat line; fill it from the
+        // stats already in memory instead of waiting for the next poll.
+        renderProviderInlineStats();
+      });
+      // Actions rendered inside an expanded detail panel.
+      provList.addEventListener('click', e => {
+        const btn = e.target.closest('[data-pd-action]');
+        if (!btn) return;
+        const id = btn.dataset.id;
+        if (!id) return;
+        const action = btn.dataset.pdAction;
+        if (action === 'reset') resetProviderStats(id);
+        else if (action === 'export') exportProviderEvents(id);
+        else if (action === 'events') filterEventsByProvider(id);
       });
       provList.addEventListener('change', e => {
         const cb = e.target.closest('input[data-upstream-action="toggle"]');
@@ -2739,15 +3490,158 @@
     if (rtCancel) rtCancel.addEventListener('click', closeRouteModal);
     const rtClose = $('modelRouteModalClose');
     if (rtClose) rtClose.addEventListener('click', closeRouteModal);
-    const rtProvSel = $('routeForm_upstreamId');
-    if (rtProvSel) rtProvSel.addEventListener('change', () => populateTargetModelDatalist(rtProvSel.value));
+    // Target rows are re-rendered on every structural change, so both listeners
+    // are delegated from the stable container rather than bound per row.
+    const rtTargets = $('routeTargetsList');
+    if (rtTargets) {
+      rtTargets.addEventListener('click', e => {
+        const btn = e.target.closest('[data-target-action]');
+        if (!btn || btn.disabled) return;
+        const i = parseInt(btn.dataset.index, 10);
+        if (isNaN(i) || !routeTargetDraft[i]) return;
+        const action = btn.dataset.targetAction;
+        if (action === 'remove') {
+          if (routeTargetDraft.length <= 1) return;
+          routeTargetDraft.splice(i, 1);
+        } else if (action === 'up' && i > 0) {
+          swapDraftRows(i, i - 1);
+        } else if (action === 'down' && i < routeTargetDraft.length - 1) {
+          swapDraftRows(i, i + 1);
+        } else {
+          return;
+        }
+        normalizeDraftTiers();
+        renderRouteTargets();
+      });
+      // Field edits write straight into the draft. Text inputs use 'input' so a
+      // half-typed model name is not lost when the row re-renders for another
+      // reason; selects and checkboxes only emit 'change'.
+      const applyField = e => {
+        const el = e.target.closest('[data-target-field]');
+        if (!el) return;
+        const i = parseInt(el.dataset.index, 10);
+        if (isNaN(i) || !routeTargetDraft[i]) return;
+        const field = el.dataset.targetField;
+        if (field === 'enabled') routeTargetDraft[i].enabled = el.checked;
+        else if (field === 'weight') routeTargetDraft[i].weight = Math.max(1, parseInt(el.value, 10) || 1);
+        else if (field === 'sameTier') {
+          // Both checkbox fields must read .checked, not .value: the generic
+          // branch below would store the string "on" and never clear the flag.
+          routeTargetDraft[i].sameTier = el.checked;
+          // Tier membership decides the badges and whether weight is editable, so
+          // the whole list has to re-render — unlike the other fields, which only
+          // affect the row being typed into.
+          renderRouteTargets();
+          return;
+        }
+        else routeTargetDraft[i][field] = el.value;
+        // Changing the primary provider changes which model names to suggest.
+        if (field === 'upstreamId' && i === 0) populateTargetModelDatalist(el.value);
+      };
+      rtTargets.addEventListener('change', applyField);
+      rtTargets.addEventListener('input', applyField);
+
+      // Drag to reorder. The row carries draggable=false in the markup and is
+      // only armed while the pointer is held on the grip: HTML5 drag on a
+      // container would otherwise swallow text selection and caret placement in
+      // the target-model input.
+      let dragFrom = -1;
+      rtTargets.addEventListener('mousedown', e => {
+        const row = e.target.closest('.route-target-row');
+        if (!row) return;
+        row.draggable = !!e.target.closest('[data-target-handle]');
+      });
+      // Disarm on release so a later drag attempt from an input cannot inherit
+      // the armed state left by an earlier grip press.
+      rtTargets.addEventListener('mouseup', () => {
+        qsa('.route-target-row', rtTargets).forEach(r => { r.draggable = false; });
+      });
+      rtTargets.addEventListener('dragstart', e => {
+        const row = e.target.closest('.route-target-row');
+        if (!row || !row.draggable) return;
+        dragFrom = parseInt(row.dataset.targetIndex, 10);
+        row.classList.add('is-dragging');
+        if (e.dataTransfer) {
+          e.dataTransfer.effectAllowed = 'move';
+          // Firefox refuses to start a drag unless some payload is set.
+          e.dataTransfer.setData('text/plain', String(dragFrom));
+        }
+      });
+      // dragover fires continuously; the marker class is recomputed from the
+      // pointer's position relative to each row's midpoint, which is what makes
+      // the insertion point follow the cursor.
+      rtTargets.addEventListener('dragover', e => {
+        if (dragFrom < 0) return;
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+        const row = e.target.closest('.route-target-row');
+        qsa('.route-target-row', rtTargets).forEach(r => r.classList.remove('drop-above', 'drop-below'));
+        if (!row) return;
+        const rect = row.getBoundingClientRect();
+        row.classList.add(e.clientY < rect.top + rect.height / 2 ? 'drop-above' : 'drop-below');
+      });
+      rtTargets.addEventListener('drop', e => {
+        if (dragFrom < 0) return;
+        e.preventDefault();
+        const row = e.target.closest('.route-target-row');
+        const from = dragFrom;
+        dragFrom = -1;
+        if (!row) { renderRouteTargets(); return; }
+        const to = parseInt(row.dataset.targetIndex, 10);
+        const rect = row.getBoundingClientRect();
+        // Convert "which row, which half" into a gap index so dropping below the
+        // last row appends rather than landing on it.
+        const insertAt = e.clientY < rect.top + rect.height / 2 ? to : to + 1;
+        moveDraftRow(from, insertAt);
+        renderRouteTargets();
+      });
+      // dragend also covers the cancelled drag (Esc, or a drop outside the
+      // list), where no drop event ever arrives.
+      rtTargets.addEventListener('dragend', () => {
+        dragFrom = -1;
+        qsa('.route-target-row', rtTargets).forEach(r => {
+          r.draggable = false;
+          r.classList.remove('is-dragging', 'drop-above', 'drop-below');
+        });
+      });
+    }
+    const rtAddTarget = $('routeAddTargetBtn');
+    if (rtAddTarget) rtAddTarget.addEventListener('click', () => {
+      if (!upstreamCache.providers.length) { toast(t('upstreams.needProviderFirst'), 'warning'); return; }
+      routeTargetDraft.push(newRouteTarget());
+      renderRouteTargets();
+    });
+    const upExport = $('upstreamExportBtn');
+    if (upExport) upExport.addEventListener('click', exportUpstreamsConfig);
+    const upImport = $('upstreamImportBtn');
+    if (upImport) upImport.addEventListener('click', openUpstreamImportModal);
+    const upImpConfirm = $('upstreamImportConfirmBtn');
+    if (upImpConfirm) upImpConfirm.addEventListener('click', submitUpstreamImport);
+    const upImpCancel = $('upstreamImportCancelBtn');
+    if (upImpCancel) upImpCancel.addEventListener('click', closeUpstreamImportModal);
+    const upImpClose = $('upstreamImportModalClose');
+    if (upImpClose) upImpClose.addEventListener('click', closeUpstreamImportModal);
+    const upImpFile = $('upstreamImportFile');
+    if (upImpFile) upImpFile.addEventListener('change', e => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      f.text().then(txt => {
+        const box = $('upstreamImportText');
+        if (box) box.value = txt;
+      }).catch(() => toastError(t('upstreams.importFailed')));
+    });
     bindDialogBackdropClose('upstreamModal', closeUpstreamModal);
     bindDialogBackdropClose('modelRouteModal', closeRouteModal);
     bindDialogBackdropClose('upstreamModelsModal', closeModelsModal);
+    bindDialogBackdropClose('upstreamImportModal', closeUpstreamImportModal);
   }
 
   // ===== Forwarding dashboard =====
   let forwardStats = { overall: {}, providers: [], routes: [] };
+  // Range-scoped copy of providers for the Stats tab. forwardStats stays
+  // all-time because the Forwarding tab's inline stats and provider filter
+  // depend on it; null means "no window loaded yet, fall back to all-time".
+  let statsWindowProviders = null;
   let fwdEventsOffset = 0;
   const fwdEventsLimit = 50;
   let fwdEventsTotal = 0;
@@ -2783,6 +3677,7 @@
       renderForwardChart(d.timeseries || [], d.percentiles || {});
       populateForwardProviderFilter();
       renderProviderInlineStats();
+      refreshOpenProviderDetails();
     } catch (e) {
       // Non-fatal: dashboard just shows zeros.
     }
@@ -2844,15 +3739,908 @@
     sel.value = cur;
   }
 
-  // Inline mini-stat line on each provider card (Phase 0).
+  // Inline mini-stat line on each provider card.
   function renderProviderInlineStats() {
     const byId = {};
     forwardStats.providers.forEach(p => { byId[p.providerId] = p; });
     qsa('#upstreamsList [data-fwd-inline-for]').forEach(el => {
       const p = byId[el.dataset.fwdInlineFor];
       if (!p || !p.requests) { el.textContent = ''; return; }
-      el.textContent = t('forward.inlineStat', String(p.requests), String(p.success), String(p.failed), fwdFmtLatency(p.avgLatencyMs));
+      let line = t('forward.inlineStat', String(p.requests), String(p.success), String(p.failed), fwdFmtLatency(p.avgLatencyMs));
+      const tokens = (p.inputTokens || 0) + (p.outputTokens || 0);
+      if (tokens) line += ' · ' + t('stats.inlineTokens', formatNum(tokens));
+      if (p.rpm) line += ' · ' + t('stats.inlineRpm', fwdFmtRate(p.rpm));
+      el.textContent = line;
     });
+  }
+
+  // ===== Per-provider detail panel =====
+  // Shared by the expandable cards on the Forwarding tab and the drill-down on
+  // the Stats tab, so both surfaces always show the same figures.
+
+  const providerDetailCache = {}; // providerId -> last loaded detail payload
+  const openProviderDetails = {}; // providerId -> true while expanded
+
+  function fwdFmtRate(n) {
+    if (!n) return '0';
+    return n >= 10 ? Math.round(n).toString() : n.toFixed(1);
+  }
+
+  // fwdFmtPct renders a success rate. The API sends -1 for "no traffic yet",
+  // which must read as unknown rather than 0%.
+  function fwdFmtPct(v) {
+    if (v == null || v < 0) return '—';
+    return v.toFixed(1) + '%';
+  }
+
+  function fwdFmtCost(v, isPool) {
+    if (!v) return '—';
+    const n = v >= 1 ? v.toFixed(2) : v.toFixed(4);
+    return isPool ? t('stats.creditsValue', n) : '$' + n;
+  }
+
+  function fwdFmtWhen(ms) {
+    if (!ms) return '—';
+    return new Date(ms).toLocaleString();
+  }
+
+  // statusClass buckets an HTTP status into the badge colors already used by the
+  // event table.
+  function statusClass(code) {
+    if (code >= 200 && code < 300) return 'fwd-badge--ok';
+    if (code === 499) return 'fwd-badge--warn';
+    return 'fwd-badge--err';
+  }
+
+  // sparkline draws a compact SVG bar chart of per-minute buckets, matching the
+  // main forwarding chart's stacked success/failure encoding.
+  function sparkline(buckets) {
+    if (!buckets || !buckets.length) return '';
+    const w = 100, h = 24, n = buckets.length, bw = w / n;
+    const max = Math.max(1, ...buckets.map(b => b.requests || 0));
+    let bars = '';
+    buckets.forEach((b, i) => {
+      const total = b.requests || 0;
+      if (!total) return;
+      const th = (total / max) * h;
+      const fh = ((b.failed || 0) / max) * h;
+      const sh = th - fh;
+      const x = (i * bw).toFixed(2);
+      const fw = (bw * 0.8).toFixed(2);
+      if (sh > 0) bars += '<rect x="' + x + '" y="' + (h - th).toFixed(2) + '" width="' + fw + '" height="' + sh.toFixed(2) + '" class="spark-ok"></rect>';
+      if (fh > 0) bars += '<rect x="' + x + '" y="' + (h - fh).toFixed(2) + '" width="' + fw + '" height="' + fh.toFixed(2) + '" class="spark-err"></rect>';
+    });
+    return '<svg class="provider-spark" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' + bars + '</svg>';
+  }
+
+  function metricTile(label, value, sub) {
+    return '<div class="pd-tile">' +
+      '<div class="pd-tile-label">' + escapeHtml(label) + '</div>' +
+      '<div class="pd-tile-value">' + escapeHtml(value) + '</div>' +
+      (sub ? '<div class="pd-tile-sub">' + escapeHtml(sub) + '</div>' : '') +
+      '</div>';
+  }
+
+  function pdSection(title, inner) {
+    if (!inner) return '';
+    return '<div class="pd-section">' +
+      '<div class="pd-section-title">' + escapeHtml(title) + '</div>' + inner + '</div>';
+  }
+
+  // rangeLabel maps a windowHours value to the same text the Stats tab selector
+  // uses, so the badge reads "Last hour" rather than "1 hour window". Unknown
+  // values (a hand-edited URL) degrade to a bare hour count instead of blank.
+  function rangeLabel(hours) {
+    if (!hours || hours <= 0) return '';
+    const map = {
+      1: t('stats.range1h'), 6: t('stats.range6h'), 24: t('stats.range24h'),
+      168: t('stats.range7d'), 720: t('stats.range30d')
+    };
+    return map[hours] || (hours + 'h');
+  }
+
+  // renderProviderDetailHTML builds the whole panel from a /provider-stats
+  // payload. isPool switches the cost column to credits, which is the pool's
+  // real unit of spend.
+  function renderProviderDetailHTML(payload) {
+    const d = payload.detail || {};
+    const isPool = !!payload.isPool;
+    const pct = d.percentiles || {};
+
+    const tiles =
+      metricTile(t('stats.tileRequests'), formatNum(d.requests || 0),
+        // Cancellations are counted in neither ok nor failed, so show them
+        // explicitly — otherwise the two numbers silently fail to add up.
+        d.canceled
+          ? t('stats.tileOkFailCanceled', String(d.success || 0), String(d.failed || 0), String(d.canceled))
+          : t('stats.tileOkFail', String(d.success || 0), String(d.failed || 0))) +
+      metricTile(t('stats.tileSuccessRate'), fwdFmtPct(d.successRate),
+        d.failStreak ? t('stats.tileStreak', String(d.failStreak)) : '') +
+      metricTile(t('stats.tileTokens'), formatNum((d.inputTokens || 0) + (d.outputTokens || 0)),
+        t('stats.tileTokenSplit', formatNum(d.inputTokens || 0), formatNum(d.outputTokens || 0))) +
+      metricTile(t('stats.tileCost'), fwdFmtCost(d.costUsd, isPool), '') +
+      metricTile(t('stats.tileRpm'), fwdFmtRate(d.rpm),
+        t('stats.tileTpm', fwdFmtRate(d.tpm))) +
+      metricTile(t('stats.tileLatency'), fwdFmtLatency(d.avgLatencyMs || 0),
+        pct.count ? 'p50 ' + fwdFmtLatency(pct.p50) + ' · p95 ' + fwdFmtLatency(pct.p95) + ' · p99 ' + fwdFmtLatency(pct.p99) : '') +
+      metricTile(t('stats.tileTtfb'), d.avgTtfbMs ? fwdFmtLatency(d.avgTtfbMs) : '—',
+        d.tokensPerSec ? t('stats.tileTokensPerSec', fwdFmtRate(d.tokensPerSec)) : '') +
+      metricTile(t('stats.tileConcurrency'), String(d.inFlight || 0),
+        t('stats.tilePeak', String(d.peakInFlight || 0))) +
+      metricTile(t('stats.tileStream'), formatNum(d.streamed || 0),
+        t('stats.tileCanceled', String(d.canceled || 0))) +
+      metricTile(t('stats.tileLastOk'), fwdFmtWhen(d.lastOk), '');
+
+    // When headline numbers are scoped to a time window, show a badge so the
+    // numbers in the tiles cannot be mistaken for all-time figures.
+    const wh = d.windowHours || 0;
+    const wLabel = rangeLabel(wh);
+    const windowBadge = wLabel
+      ? '<div class="pd-range-badge"><i class="fa-regular fa-clock" aria-hidden="true"></i>' +
+          escapeHtml(wLabel) +
+          '<span class="pd-range-alltime-note">' +
+          escapeHtml(t('stats.detailAllTimeNote')) + '</span></div>'
+      : '';
+
+    let html = windowBadge + '<div class="pd-tiles">' + tiles + '</div>';
+
+    const spark = sparkline(d.minutes);
+    if (spark) html += pdSection(t('stats.sectionActivity'), spark);
+
+    if (d.statuses && d.statuses.length) {
+      const sTitle = wh ? t('stats.sectionAllTime', t('stats.sectionStatus')) : t('stats.sectionStatus');
+      html += pdSection(sTitle,
+        '<div class="pd-badges">' + d.statuses.map(s =>
+          '<span class="fwd-badge ' + statusClass(s.status) + '">' +
+          escapeHtml(String(s.status)) + ' × ' + escapeHtml(formatNum(s.count)) +
+          '</span>').join('') + '</div>');
+    }
+
+    if (d.models && d.models.length) {
+      const mTitle = wh ? t('stats.sectionAllTime', t('stats.sectionModels')) : t('stats.sectionModels');
+      html += pdSection(mTitle,
+        '<div class="pd-table-scroll"><table class="pd-table"><thead><tr>' +
+        '<th>' + escapeHtml(t('stats.colModel')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colRequests')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colOkPct')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colTokens')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colAvg')) + '</th>' +
+        '</tr></thead><tbody>' +
+        d.models.map(m => '<tr>' +
+          '<td class="font-mono">' + escapeHtml(m.model) + '</td>' +
+          '<td>' + escapeHtml(formatNum(m.requests)) + '</td>' +
+          '<td>' + escapeHtml(fwdFmtPct(m.successRate)) + '</td>' +
+          '<td>' + escapeHtml(formatNum((m.inputTokens || 0) + (m.outputTokens || 0))) + '</td>' +
+          '<td>' + escapeHtml(fwdFmtLatency(m.avgLatencyMs)) + '</td>' +
+          '</tr>').join('') +
+        '</tbody></table></div>');
+    }
+
+    if (d.accounts && d.accounts.length) {
+      const aTitle = wh ? t('stats.sectionAllTime', t('stats.sectionAccounts')) : t('stats.sectionAccounts');
+      html += pdSection(aTitle,
+        '<div class="pd-table-scroll"><table class="pd-table"><thead><tr>' +
+        '<th>' + escapeHtml(t('stats.colAccount')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colRequests')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colOkPct')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colTokens')) + '</th>' +
+        '<th>' + escapeHtml(t('stats.colAvg')) + '</th>' +
+        '</tr></thead><tbody>' +
+        d.accounts.map(a => {
+          const label = a.accountLabel || a.accountId || '';
+          return '<tr>' +
+            '<td>' + escapeHtml(privacyModeEnabled ? maskEmail(label) : label) + '</td>' +
+            '<td>' + escapeHtml(formatNum(a.requests)) + '</td>' +
+            '<td>' + escapeHtml(fwdFmtPct(a.successRate)) + '</td>' +
+            '<td>' + escapeHtml(formatNum((a.inputTokens || 0) + (a.outputTokens || 0))) + '</td>' +
+            '<td>' + escapeHtml(fwdFmtLatency(a.avgLatencyMs)) + '</td>' +
+            '</tr>';
+        }).join('') +
+        '</tbody></table></div>');
+    }
+
+    if (d.recentErrors && d.recentErrors.length) {
+      html += pdSection(t('stats.sectionErrors'),
+        '<div class="pd-errors">' + d.recentErrors.map(e =>
+          '<div class="pd-error">' +
+          '<span class="fwd-badge ' + statusClass(e.status) + '">' + escapeHtml(String(e.status || '-')) + '</span>' +
+          '<span class="pd-error-time">' + escapeHtml(fwdFmtWhen(e.time)) + '</span>' +
+          '<span class="pd-error-msg" title="' + escapeAttr(e.message || '') + '">' + escapeHtml(e.message || '') + '</span>' +
+          '</div>').join('') + '</div>');
+    }
+
+    // Per-provider actions: a scoped event log and a scoped reset, so an
+    // operator can investigate or clear one provider without touching the rest.
+    const pid = escapeAttr(payload.providerId || (d.providerId || ''));
+    html += '<div class="pd-actions">' +
+      '<button class="btn btn-outline btn-sm" type="button" data-pd-action="events" data-id="' + pid + '">' +
+      escapeHtml(t('stats.viewEvents')) + '</button>' +
+      '<button class="btn btn-outline btn-sm" type="button" data-pd-action="export" data-id="' + pid + '">' +
+      escapeHtml(t('stats.exportCsv')) + '</button>' +
+      '<button class="btn btn-danger btn-sm" type="button" data-pd-action="reset" data-id="' + pid + '">' +
+      escapeHtml(t('stats.resetProvider')) + '</button>' +
+      '</div>';
+
+    return html;
+  }
+
+  // loadProviderDetail fetches and renders one provider's panel into every host
+  // element currently showing it (a card on Forwarding, a row on Stats).
+  //
+  // hours controls the headline-number scope: pass statsHistoryHours from the
+  // Stats tab so the detail panel shows the same range as its row; pass 0 (or
+  // omit) for the Forwarding tab, where there is no range selector and KPI
+  // cards are intentionally all-time.
+  async function loadProviderDetail(providerId, hours) {
+    const hosts = qsa('[data-provider-detail="' + cssEscape(providerId) + '"]');
+    if (!hosts.length) return;
+    try {
+      let url = '/provider-stats?id=' + encodeURIComponent(providerId);
+      if (hours && hours > 0) url += '&hours=' + encodeURIComponent(hours);
+      const res = await api(url);
+      if (!res.ok) throw new Error('http ' + res.status);
+      const payload = await res.json();
+      payload.providerId = providerId;
+      providerDetailCache[providerId] = payload;
+      const html = renderProviderDetailHTML(payload);
+      hosts.forEach(el => { el.innerHTML = html; });
+    } catch (e) {
+      hosts.forEach(el => {
+        el.innerHTML = '<div class="muted-text text-xs" style="padding:0.75rem 0;">' +
+          escapeHtml(t('stats.loadFailed')) + '</div>';
+      });
+    }
+  }
+
+  // cssEscape quotes an id for use inside an attribute selector. Provider ids are
+  // UUIDs today, but a hand-imported bundle can carry anything.
+  function cssEscape(s) {
+    if (window.CSS && CSS.escape) return CSS.escape(s);
+    return String(s).replace(/["\\]/g, '\\$&');
+  }
+
+  // toggleProviderDetail expands or collapses one provider's panel.
+  //
+  // scope matters: the same providerId has a detail host on BOTH the Forwarding
+  // tab and the Stats table, so the host must be resolved within the container
+  // the click came from. Resolving globally would toggle whichever surface
+  // happens to appear first in the document.
+  function toggleProviderDetail(providerId, btn, scope) {
+    const sel = '[data-provider-detail="' + cssEscape(providerId) + '"]';
+    const root = scope || document;
+    const host = root.querySelector(sel);
+    if (!host) return;
+    const open = !host.classList.contains('hidden');
+    if (open) {
+      host.classList.add('hidden');
+      delete openProviderDetails[providerId];
+      if (btn) btn.setAttribute('aria-expanded', 'false');
+      return;
+    }
+    host.classList.remove('hidden');
+    openProviderDetails[providerId] = true;
+    if (btn) btn.setAttribute('aria-expanded', 'true');
+    if (!host.innerHTML) {
+      host.innerHTML = '<div class="muted-text text-xs" style="padding:0.75rem 0;">' +
+        escapeHtml(t('stats.loading')) + '</div>';
+    }
+    // Determine the range: panels opened from inside the Stats table carry the
+    // current window; panels on the Forwarding tab have no range selector and
+    // should always show all-time so the KPI cards there stay consistent.
+    const hoursForDetail = scope && scope.id === 'statsTableBody' ? statsHistoryHours : 0;
+    loadProviderDetail(providerId, hoursForDetail);
+  }
+
+  // refreshOpenProviderDetails re-fetches every expanded panel, so an open panel
+  // tracks live traffic instead of freezing at its opening snapshot.
+  function refreshOpenProviderDetails() {
+    Object.keys(openProviderDetails).forEach(id => {
+      const host = document.querySelector('[data-provider-detail="' + cssEscape(id) + '"]');
+      if (!host) return;
+      // Re-use the same scope heuristic as toggleProviderDetail: if the host
+      // lives inside statsTableBody the panel respects the range selector.
+      const inStats = !!host.closest('#statsTableBody');
+      loadProviderDetail(id, inStats ? statsHistoryHours : 0);
+    });
+  }
+
+  // resetProviderStats clears one provider's counters after confirmation.
+  async function resetProviderStats(providerId) {
+    const label = (providerDetailCache[providerId] && providerDetailCache[providerId].name) || providerId;
+    if (!confirm(t('stats.confirmResetProvider', label))) return;
+    try {
+      const res = await api('/forward-stats/reset-provider', {
+        method: 'POST',
+        body: JSON.stringify({ id: providerId })
+      });
+      if (!res.ok) throw new Error('http ' + res.status);
+      toast(t('stats.resetProviderDone'), 'success');
+      loadForwardStats();
+      loadStatsWindow();
+      // After a reset the panel is always re-opened from Stats context, so
+      // pass the current range so the fresh zeros match the windowed row.
+      loadProviderDetail(providerId, statsHistoryHours);
+    } catch (e) {
+      toastError(t('stats.resetProviderFailed'));
+    }
+  }
+
+  // exportProviderEvents downloads this provider's event log as CSV. The admin
+  // password rides in a cookie (as for SSE), so a plain navigation authenticates.
+  function exportProviderEvents(providerId) {
+    setAdminCookie(password);
+    const url = '/admin/api/forward-events/export?format=csv&provider=' + encodeURIComponent(providerId);
+    window.open(url, '_blank');
+  }
+
+  // filterEventsByProvider scopes the shared event log to one provider and
+  // scrolls to it, rather than duplicating a second log widget per panel.
+  function filterEventsByProvider(providerId) {
+    const sel = $('fwdFilterProvider');
+    if (sel) {
+      sel.value = providerId;
+      // The custom-select wrapper mirrors the native value into its own label.
+      if (typeof syncCustomSelect === 'function') syncCustomSelect(sel);
+    }
+    fwdEventsOffset = 0;
+    loadForwardEvents();
+    // The events table now lives in the activity pane; without this the scroll
+    // below would target a hidden element and appear to do nothing.
+    switchForwardPane('activity');
+    const table = $('fwdEventsBody');
+    if (table && table.closest('.card')) {
+      table.closest('.card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }
+
+  // switchForwardPane toggles the Forwarding tab between config and activity.
+  function switchForwardPane(pane) {
+    const target = pane === 'activity' ? 'activity' : 'config';
+    const cfg = $('fwdPaneConfig');
+    const act = $('fwdPaneActivity');
+    if (cfg) cfg.classList.toggle('hidden', target !== 'config');
+    if (act) act.classList.toggle('hidden', target !== 'activity');
+    const bar = $('fwdSubtabs');
+    if (bar) {
+      bar.querySelectorAll('[data-fwd-pane]').forEach(b => {
+        const on = b.dataset.fwdPane === target;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+    }
+  }
+
+  // ===== Stats tab: cross-provider comparison =====
+  // Reads the same /forward-stats payload the Forwarding tab loads, so the two
+  // views cannot disagree, and reuses the shared provider detail panel for
+  // drill-down.
+
+  let statsSortKey = 'requests';
+  let statsSortDesc = true;
+  let statsHistoryHours = 1;
+  // Last trend payload, kept so a language switch can re-render the chart
+  // heading and note (both are built in JS, not via data-i18n).
+  let statsTrendLast = { buckets: [], unit: 'hour' };
+
+  // statsSortValue projects a provider row onto its sort key. tokens is derived
+  // rather than stored, and lastUsed sorts unused providers last regardless of
+  // direction (a never-used provider is not "oldest").
+  function statsSortValue(row, key) {
+    if (key === 'tokens') return (row.inputTokens || 0) + (row.outputTokens || 0);
+    if (key === 'providerName') return (row.providerName || '').toLowerCase();
+    return row[key] || 0;
+  }
+
+  // statsRows is the single entry point to the data behind the Stats tab, so
+  // the range filter only has to be honoured in one place.
+  function statsRows() {
+    return statsWindowProviders || forwardStats.providers || [];
+  }
+
+  function sortedStatsRows() {
+    const rows = statsRows().slice();
+    rows.sort((a, b) => {
+      const av = statsSortValue(a, statsSortKey);
+      const bv = statsSortValue(b, statsSortKey);
+      let cmp;
+      if (typeof av === 'string' || typeof bv === 'string') {
+        cmp = String(av).localeCompare(String(bv));
+      } else {
+        cmp = av - bv;
+      }
+      return statsSortDesc ? -cmp : cmp;
+    });
+    return rows;
+  }
+
+  // ---- At-a-glance comparison ----
+  // The numeric table is exact but demands that the reader do the ranking. This
+  // block does the ranking for them: one "who wins" card per dimension, then a
+  // normalised bar per provider so the size of the gap is visible too.
+  //
+  // Only providers with traffic take part. A provider with zero requests has no
+  // latency and no success rate, and including it would either invent a 0 or
+  // hand it a bogus win.
+
+  function statsCompareRows() {
+    return statsRows().filter(p => (p.requests || 0) > 0);
+  }
+
+  // costPer1M normalises spend so a low-volume provider is not flattered by a
+  // small total bill. Returns null when the provider has no price configured or
+  // no tokens yet — an unpriced provider is unknown, not free.
+  function costPer1M(p) {
+    const tokens = (p.inputTokens || 0) + (p.outputTokens || 0);
+    if (!p.costUsd || !tokens) return null;
+    return p.costUsd / tokens * 1e6;
+  }
+
+  function statsProviderLabel(p) {
+    return p.providerName || p.providerId || t('upstreams.unnamed');
+  }
+
+  // compareMetric describes one comparable dimension: how to read the value off
+  // a row, which direction is better, and how to format it.
+  //
+  // sortHint names the sort order rather than saying "lower is better". Since the
+  // bars encode raw magnitude, the ranking is communicated by position and colour,
+  // and the heading should tell the reader how the list is ordered.
+  //
+  // Cost is USD-only on purpose. The Kiro pool is metered in credits, so the two
+  // units cannot share a scale or a winner; the pool still appears in the
+  // latency, reliability and volume comparisons, where the units do match.
+  function statsCompareMetrics() {
+    return [
+      {
+        key: 'latency',
+        label: t('stats.cmpLatency'),
+        sortHint: t('stats.cmpSortFastest'),
+        lowerBetter: true,
+        value: p => p.avgLatencyMs || 0,
+        format: v => fwdFmtLatency(v),
+        champion: t('stats.cmpFastest')
+      },
+      {
+        key: 'success',
+        label: t('stats.cmpSuccess'),
+        sortHint: t('stats.cmpSortReliable'),
+        lowerBetter: false,
+        // -1 means "no decided requests" (e.g. everything was canceled); such a
+        // provider is excluded from this dimension rather than scored as 0%.
+        value: p => (p.successRate == null || p.successRate < 0 ? null : p.successRate),
+        format: v => fwdFmtPct(v),
+        champion: t('stats.cmpMostReliable')
+      },
+      {
+        key: 'cost',
+        label: t('stats.cmpCost'),
+        sortHint: t('stats.cmpSortCheapest'),
+        lowerBetter: true,
+        value: p => (p.isPool ? null : costPer1M(p)),
+        format: v => '$' + (v >= 1 ? v.toFixed(2) : v.toFixed(4)),
+        champion: t('stats.cmpCheapest'),
+        note: t('stats.cmpCostNote')
+      },
+      {
+        key: 'volume',
+        label: t('stats.cmpVolume'),
+        sortHint: t('stats.cmpSortBusiest'),
+        lowerBetter: false,
+        value: p => p.requests || 0,
+        format: v => formatNum(v),
+        champion: t('stats.cmpBusiest')
+      }
+    ];
+  }
+
+  // metricEntries pairs each eligible provider with its value for one metric,
+  // best first.
+  function metricEntries(metric, rows) {
+    const out = [];
+    rows.forEach(p => {
+      const v = metric.value(p);
+      if (v == null || !isFinite(v)) return;
+      out.push({ provider: p, value: v });
+    });
+    out.sort((a, b) => metric.lowerBetter ? a.value - b.value : b.value - a.value);
+    return out;
+  }
+
+  // barPct scales a value to bar width.
+  //
+  // The bar always encodes the RAW magnitude: a longer bar means a bigger number,
+  // never "better". An earlier version inverted the scale for lower-is-better
+  // metrics so the winner had the longest bar; that read backwards, because a
+  // 364ms provider drawn as a full-width bar looks like the slowest one no matter
+  // what the caption says. Direction is carried by sort order and colour instead.
+  //
+  // Skewed distributions get a log scale. With one provider at 13.1K requests and
+  // the rest in the hundreds, a linear scale collapses everything below the leader
+  // into an indistinguishable dot, so 347 and 140 look identical.
+  function barPct(value, entries, useLog) {
+    const vals = entries.map(e => e.value).filter(v => isFinite(v));
+    const max = Math.max(...vals);
+    if (!isFinite(max) || max <= 0) return 0;
+    if (!useLog) return (value / max) * 100;
+    // log1p keeps zero at zero and is defined for all non-negative values.
+    return (Math.log1p(Math.max(0, value)) / Math.log1p(max)) * 100;
+  }
+
+  // shouldLogScale reports whether a metric's spread is wide enough that a linear
+  // bar chart would hide the differences among the smaller entries. The threshold
+  // is the ratio between the largest value and the median.
+  function shouldLogScale(entries) {
+    const vals = entries.map(e => e.value).filter(v => isFinite(v) && v > 0).sort((a, b) => a - b);
+    if (vals.length < 3) return false;
+    const median = vals[Math.floor(vals.length / 2)];
+    const max = vals[vals.length - 1];
+    return median > 0 && max / median >= 20;
+  }
+
+  // How many rows each bar group shows before "show all". The top of the ranking
+  // is what an operator acts on; 12th versus 13th place changes no decision.
+  const STATS_BAR_COLLAPSED = 5;
+  const statsBarExpanded = {}; // metric key -> true while fully expanded
+
+  function statsChampionCard(metric, entries) {
+    // A "winner" chosen from a field of one is not a comparison. This happens in
+    // practice on the cost metric, where usually only a provider or two has
+    // pricing configured.
+    if (entries.length < 2) {
+      const only = entries.length === 1
+        ? t('stats.cmpOnlyOne', statsProviderLabel(entries[0].provider), metric.format(entries[0].value))
+        : t('stats.cmpNoData');
+      return '<div class="stats-champ stats-champ--empty">' +
+        '<div class="stats-champ-title">' + escapeHtml(metric.champion) + '</div>' +
+        '<div class="stats-champ-name muted-text">' + escapeHtml(only) + '</div>' +
+        '</div>';
+    }
+    const best = entries[0];
+    // The runner-up gap is the actionable part: "fastest" matters much less when
+    // the second place is 2% behind than when it is twice as slow.
+    let gap = '';
+    const next = entries[1];
+    const a = best.value, b = next.value;
+    if (a > 0 && b > 0) {
+      const pct = metric.lowerBetter ? (b - a) / b * 100 : (a - b) / a * 100;
+      if (pct >= 1) gap = t('stats.cmpGap', pct.toFixed(0), statsProviderLabel(next.provider));
+    }
+    return '<div class="stats-champ">' +
+      '<div class="stats-champ-title">' + escapeHtml(metric.champion) + '</div>' +
+      '<div class="stats-champ-name" title="' + escapeAttr(statsProviderLabel(best.provider)) + '">' +
+        escapeHtml(statsProviderLabel(best.provider)) + '</div>' +
+      '<div class="stats-champ-value">' + escapeHtml(metric.format(best.value)) + '</div>' +
+      (gap ? '<div class="stats-champ-gap">' + escapeHtml(gap) + '</div>' : '') +
+      '</div>';
+  }
+
+  // rankTone buckets a row's rank into a colour tier. Colour now carries rank
+  // information for every row rather than marking only first and last, which left
+  // the middle of the field as a wall of identical bars.
+  function rankTone(i, n) {
+    if (i === 0) return 'best';
+    if (n > 2 && i === n - 1) return 'worst';
+    // Top third / middle / bottom third.
+    if (i < n / 3) return 'good';
+    if (i < (n * 2) / 3) return 'mid';
+    return 'poor';
+  }
+
+  function statsCompareBars(metric, entries) {
+    // With fewer than two participants there is no comparison to draw; the
+    // champion card already states the single value.
+    if (entries.length < 2) return '';
+
+    const useLog = shouldLogScale(entries);
+    const expanded = !!statsBarExpanded[metric.key];
+    const hidden = Math.max(0, entries.length - STATS_BAR_COLLAPSED);
+    const shown = expanded ? entries : entries.slice(0, STATS_BAR_COLLAPSED);
+
+    const rowsHtml = shown.map((e, i) => {
+      const pct = Math.max(1.5, Math.min(100, barPct(e.value, entries, useLog)));
+      const label = statsProviderLabel(e.provider);
+      return '<div class="stats-bar-row">' +
+        '<span class="stats-bar-rank">' + (i + 1) + '</span>' +
+        '<span class="stats-bar-label" title="' + escapeAttr(label) + '">' +
+          escapeHtml(label) +
+          (e.provider.isPool ? ' <span class="stats-tag stats-tag--pool">' + escapeHtml(t('stats.poolTag')) + '</span>' : '') +
+        '</span>' +
+        '<span class="stats-bar-track">' +
+          '<span class="stats-bar-fill stats-bar-fill--' + rankTone(i, entries.length) + '" style="width:' + pct.toFixed(1) + '%"></span>' +
+        '</span>' +
+        '<span class="stats-bar-value">' + escapeHtml(metric.format(e.value)) + '</span>' +
+        '</div>';
+    }).join('');
+
+    const toggle = hidden
+      ? '<button type="button" class="stats-bar-more" data-cmp-toggle="' + escapeAttr(metric.key) + '">' +
+          escapeHtml(expanded ? t('stats.cmpShowLess') : t('stats.cmpShowAll', String(entries.length))) +
+        '</button>'
+      : '';
+
+    return '<div class="stats-cmp-group">' +
+      '<div class="stats-cmp-head">' +
+        '<span class="stats-cmp-title">' + escapeHtml(metric.label) + '</span>' +
+        '<span class="stats-cmp-hint">' + escapeHtml(metric.sortHint) + '</span>' +
+      '</div>' +
+      (metric.note ? '<div class="stats-cmp-note">' + escapeHtml(metric.note) + '</div>' : '') +
+      (useLog ? '<div class="stats-cmp-note">' + escapeHtml(t('stats.cmpLogNote')) + '</div>' : '') +
+      rowsHtml +
+      toggle +
+      '</div>';
+  }
+
+  function renderStatsCompare() {
+    const host = $('statsCompare');
+    if (!host) return;
+    const rows = statsCompareRows();
+    // With a single active provider there is nothing to compare against, so the
+    // block would be pure decoration.
+    if (rows.length < 2) {
+      host.innerHTML = rows.length
+        ? '<p class="muted-text text-xs stats-cmp-empty">' + escapeHtml(t('stats.cmpNeedTwo')) + '</p>'
+        : '';
+      return;
+    }
+
+    const metrics = statsCompareMetrics();
+    const entriesByKey = {};
+    metrics.forEach(m => { entriesByKey[m.key] = metricEntries(m, rows); });
+
+    host.innerHTML =
+      '<div class="stats-champ-grid">' +
+        metrics.map(m => statsChampionCard(m, entriesByKey[m.key])).join('') +
+      '</div>' +
+      '<div class="stats-cmp-bars">' +
+        metrics.map(m => statsCompareBars(m, entriesByKey[m.key])).join('') +
+      '</div>';
+  }
+
+  // ---- Table heatmap ----
+  // Tints the best and worst cell of each comparable column. Only columns with a
+  // meaningful direction are tinted: total tokens and total cost measure how
+  // much a provider was used, not how well it performed, so tinting them would
+  // punish the provider carrying the most traffic.
+  const STATS_HEAT_COLS = {
+    requests: { lowerBetter: false },
+    successRate: { lowerBetter: false },
+    avgLatencyMs: { lowerBetter: true },
+    rpm: { lowerBetter: false }
+  };
+
+  // statsHeatClasses maps providerId -> column key -> 'best' | 'worst'.
+  function statsHeatClasses(rows) {
+    const out = {};
+    if (rows.length < 2) return out;
+    Object.keys(STATS_HEAT_COLS).forEach(key => {
+      const lower = STATS_HEAT_COLS[key].lowerBetter;
+      const vals = [];
+      rows.forEach(p => {
+        let v = key === 'successRate'
+          ? (p.successRate == null || p.successRate < 0 ? null : p.successRate)
+          : p[key];
+        if (v == null || !isFinite(v)) return;
+        vals.push({ id: p.providerId, v: v });
+      });
+      if (vals.length < 2) return;
+      vals.sort((a, b) => lower ? a.v - b.v : b.v - a.v);
+      const bestV = vals[0].v, worstV = vals[vals.length - 1].v;
+      // An all-equal column has no winner to highlight.
+      if (bestV === worstV) return;
+      vals.forEach(e => {
+        if (e.v !== bestV && e.v !== worstV) return;
+        out[e.id] = out[e.id] || {};
+        out[e.id][key] = e.v === bestV ? 'best' : 'worst';
+      });
+    });
+    return out;
+  }
+
+  function heatCls(heat, id, key) {
+    const v = heat[id] && heat[id][key];
+    return v ? ' stats-heat--' + v : '';
+  }
+
+  function renderStatsTable() {
+    const body = $('statsTableBody');
+    if (!body) return;
+    const rows = sortedStatsRows();
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="8" class="muted-text" style="padding:1rem;text-align:center;">' +
+        escapeHtml(t('stats.noProviders')) + '</td></tr>';
+      return;
+    }
+
+    // Heatmap ranks only providers with traffic, matching the comparison block.
+    const heat = statsHeatClasses(rows.filter(p => (p.requests || 0) > 0));
+
+    body.innerHTML = rows.map(p => {
+      const id = escapeAttr(p.providerId || '');
+      const tokens = (p.inputTokens || 0) + (p.outputTokens || 0);
+      const name = p.providerName || p.providerId || t('upstreams.unnamed');
+      // Health dot: a provider on a failure streak is called out here, because
+      // this table is where an operator decides which provider to stop using.
+      const dotClass = p.requests === 0 ? 'idle' : (p.healthy ? 'ok' : 'bad');
+      const badges =
+        (p.isPool ? '<span class="stats-tag stats-tag--pool">' + escapeHtml(t('stats.poolTag')) + '</span>' : '') +
+        (p.configured && !p.enabled && !p.isPool ? '<span class="stats-tag stats-tag--off">' + escapeHtml(t('upstreams.disabled')) + '</span>' : '') +
+        (!p.configured ? '<span class="stats-tag stats-tag--orphan" title="' + escapeAttr(t('stats.orphanHint')) + '">' + escapeHtml(t('stats.orphanTag')) + '</span>' : '');
+      const pid = p.providerId || '';
+
+      return '<tr class="stats-row" data-stats-provider="' + id + '" tabindex="0">' +
+        '<td><span class="stats-dot stats-dot--' + dotClass + '"></span>' +
+          '<span class="stats-name">' + escapeHtml(name) + '</span>' + badges + '</td>' +
+        '<td class="num' + heatCls(heat, pid, 'requests') + '">' + escapeHtml(formatNum(p.requests || 0)) + '</td>' +
+        '<td class="num' + heatCls(heat, pid, 'successRate') + '">' + escapeHtml(fwdFmtPct(p.successRate)) + '</td>' +
+        '<td class="num">' + escapeHtml(tokens ? formatNum(tokens) : '—') + '</td>' +
+        '<td class="num">' + escapeHtml(fwdFmtCost(p.costUsd, p.isPool)) + '</td>' +
+        '<td class="num' + heatCls(heat, pid, 'avgLatencyMs') + '">' + escapeHtml(p.requests ? fwdFmtLatency(p.avgLatencyMs) : '—') + '</td>' +
+        '<td class="num' + heatCls(heat, pid, 'rpm') + '">' + escapeHtml(fwdFmtRate(p.rpm)) + '</td>' +
+        '<td class="num">' + escapeHtml(p.lastUsed ? fwdFmtWhen(p.lastUsed) : '—') + '</td>' +
+        '</tr>' +
+        '<tr class="stats-detail-row"><td colspan="8">' +
+          '<div class="provider-detail hidden" data-provider-detail="' + id + '"></div>' +
+        '</td></tr>';
+    }).join('');
+
+    // Reflect the active sort in the header.
+    qsa('#statsTable th[data-stats-sort]').forEach(th => {
+      const active = th.dataset.statsSort === statsSortKey;
+      th.classList.toggle('sorted', active);
+      th.classList.toggle('desc', active && statsSortDesc);
+      th.setAttribute('aria-sort', active ? (statsSortDesc ? 'descending' : 'ascending') : 'none');
+    });
+
+    // Re-expand whatever was open before the re-render.
+    Object.keys(openProviderDetails).forEach(pid => {
+      const host = document.querySelector('#statsTableBody [data-provider-detail="' + cssEscape(pid) + '"]');
+      if (host) {
+        host.classList.remove('hidden');
+        if (providerDetailCache[pid]) host.innerHTML = renderProviderDetailHTML(providerDetailCache[pid]);
+      }
+    });
+  }
+
+  // renderStatsTrend draws the history chart. The bucket unit follows the
+  // selected range (per-minute for the 1-hour view, hourly beyond that), so the
+  // heading names the unit rather than assuming hours.
+  function renderStatsTrend(buckets, unit) {
+    statsTrendLast = { buckets: buckets || [], unit: unit };
+    const host = $('statsTrendChart');
+    const isMinute = unit === 'minute';
+    const title = $('statsTrendTitle');
+    if (title) title.textContent = t(isMinute ? 'stats.trendTitleMinute' : 'stats.trendTitle');
+    const note = $('statsTrendNote');
+    // Per-minute buckets live only in memory, so say so instead of letting an
+    // empty 1-hour chart read as "no traffic" after a restart.
+    if (note) note.textContent = isMinute ? t('stats.trendMinuteNote') : '';
+    if (!host) return;
+    const series = buckets || [];
+    const total = series.reduce((n, b) => n + (b.requests || 0), 0);
+    if (!total) {
+      host.innerHTML = '<div class="muted-text text-xs" style="padding:1rem 0;">' +
+        escapeHtml(t('forward.noData')) + '</div>';
+    } else {
+      const w = 100, h = 40, n = series.length, bw = w / n;
+      const max = Math.max(1, ...series.map(b => b.requests || 0));
+      let bars = '';
+      series.forEach((b, i) => {
+        const reqs = b.requests || 0;
+        if (!reqs) return;
+        const th = (reqs / max) * h;
+        const fh = ((b.failed || 0) / max) * h;
+        const sh = th - fh;
+        const x = (i * bw).toFixed(2);
+        const fw = (bw * 0.8).toFixed(2);
+        if (sh > 0) bars += '<rect x="' + x + '" y="' + (h - th).toFixed(2) + '" width="' + fw + '" height="' + sh.toFixed(2) + '" class="spark-ok"></rect>';
+        if (fh > 0) bars += '<rect x="' + x + '" y="' + (h - fh).toFixed(2) + '" width="' + fw + '" height="' + fh.toFixed(2) + '" class="spark-err"></rect>';
+      });
+      host.innerHTML = '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" style="width:100%;height:60px;">' + bars + '</svg>';
+    }
+
+    const summary = $('statsTrendSummary');
+    if (summary) {
+      const failed = series.reduce((n, b) => n + (b.failed || 0), 0);
+      const tokens = series.reduce((n, b) => n + (b.inputTokens || 0) + (b.outputTokens || 0), 0);
+      summary.textContent = total
+        ? t('stats.trendSummary', formatNum(total), formatNum(failed), formatNum(tokens))
+        : '';
+    }
+  }
+
+  async function loadStatsHistory() {
+    try {
+      const res = await api('/forward-history?hours=' + encodeURIComponent(statsHistoryHours));
+      if (!res.ok) throw new Error('http ' + res.status);
+      const d = await res.json();
+      renderStatsTrend(d.buckets || [], d.unit);
+    } catch (e) {
+      renderStatsTrend([], statsHistoryHours <= 1 ? 'minute' : 'hour');
+    }
+  }
+
+  // loadStatsWindow refetches the per-provider figures scoped to the selected
+  // range and re-renders the two surfaces that read them. On failure the window
+  // copy is dropped so the tab falls back to all-time rather than freezing on a
+  // stale range.
+  async function loadStatsWindow() {
+    try {
+      const res = await api('/forward-stats?hours=' + encodeURIComponent(statsHistoryHours));
+      if (!res.ok) throw new Error('http ' + res.status);
+      const d = await res.json();
+      statsWindowProviders = Array.isArray(d.providers) ? d.providers : null;
+    } catch (e) {
+      statsWindowProviders = null;
+    }
+    renderStatsTable();
+    renderStatsCompare();
+  }
+
+  function openStats() {
+    loadForwardStats();
+    loadStatsWindow();
+    loadStatsHistory();
+  }
+
+  function bindStatsEvents() {
+    // Delegated so the per-group "show all" buttons survive every re-render.
+    const cmp = $('statsCompare');
+    if (cmp) {
+      cmp.addEventListener('click', e => {
+        const btn = e.target.closest('[data-cmp-toggle]');
+        if (!btn) return;
+        const key = btn.dataset.cmpToggle;
+        statsBarExpanded[key] = !statsBarExpanded[key];
+        renderStatsCompare();
+      });
+    }
+
+    const table = $('statsTable');
+    if (table) {
+      table.addEventListener('click', e => {
+        const th = e.target.closest('th[data-stats-sort]');
+        if (th) {
+          const key = th.dataset.statsSort;
+          if (key === statsSortKey) {
+            statsSortDesc = !statsSortDesc;
+          } else {
+            statsSortKey = key;
+            // Names read best A→Z; every numeric column reads best largest-first.
+            statsSortDesc = key !== 'providerName';
+          }
+          renderStatsTable();
+          return;
+        }
+        const row = e.target.closest('tr[data-stats-provider]');
+        if (row) toggleProviderDetail(row.dataset.statsProvider, null, $('statsTableBody'));
+      });
+      // Keyboard parity for row expansion.
+      table.addEventListener('keydown', e => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const row = e.target.closest('tr[data-stats-provider]');
+        if (!row) return;
+        e.preventDefault();
+        toggleProviderDetail(row.dataset.statsProvider, null, $('statsTableBody'));
+      });
+    }
+
+    const range = $('statsRangeSelect');
+    if (range) {
+      range.addEventListener('change', () => {
+        statsHistoryHours = parseInt(range.value, 10) || 24;
+        loadStatsWindow();
+        loadStatsHistory();
+      });
+    }
+    const refresh = $('statsRefreshBtn');
+    if (refresh) refresh.addEventListener('click', openStats);
+    const exportBtn = $('statsExportBtn');
+    if (exportBtn) {
+      exportBtn.addEventListener('click', () => {
+        setAdminCookie(password);
+        window.open('/admin/api/forward-events/export?format=csv', '_blank');
+      });
+    }
   }
 
   async function loadForwardEvents() {
@@ -2867,6 +4655,11 @@
     if (prov) params.set('provider', prov);
     if (status) params.set('status', status);
     if (model) params.set('model', model);
+    // The range is expressed as a lower bound resolved at request time, not a
+    // stored timestamp, so paging and live refreshes always mean "the last N
+    // hours from now" rather than from whenever the filter was picked.
+    const sinceMs = fwdFilterSinceMs();
+    if (sinceMs) params.set('since', String(sinceMs));
     try {
       const res = await api('/forward-events?' + params.toString());
       if (!res.ok) throw new Error('http ' + res.status);
@@ -2874,7 +4667,7 @@
       fwdEventsTotal = d.total || 0;
       renderForwardEvents(Array.isArray(d.items) ? d.items : []);
     } catch (e) {
-      body.innerHTML = '<tr><td colspan="5" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('common.failed')) + '</td></tr>';
+      body.innerHTML = '<tr class="fwd-empty-row"><td colspan="6" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('common.failed')) + '</td></tr>';
     }
   }
 
@@ -2882,8 +4675,12 @@
     const body = $('fwdEventsBody');
     if (!body) return;
     if (!items.length) {
-      body.innerHTML = '<tr><td colspan="5" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('forward.noEvents')) + '</td></tr>';
+      body.innerHTML = '<tr class="fwd-empty-row"><td colspan="6" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('forward.noEvents')) + '</td></tr>';
     } else {
+      // A fresh page invalidates every retained event: uids are never reused, so
+      // stale entries would otherwise accumulate for the life of the tab.
+      fwdEventStore = {};
+      fwdEventKeys = new Set();
       body.innerHTML = items.map(fwdEventRow).join('');
     }
     const countEl = $('fwdEventsCount');
@@ -2891,7 +4688,26 @@
     updateForwardPagination();
   }
 
+  // Events carry no server-side id, so rows get a client-side uid and the event
+  // object is retained to render its detail panel (and copy its JSON) on demand.
+  let fwdEventSeq = 0;
+  let fwdEventStore = {};
+  // Rendered events, keyed by natural identity. The SSE stream backfills its most
+  // recent 50 events on connect, which overlaps whatever the REST page just
+  // rendered; without this every event present at load time appears twice.
+  let fwdEventKeys = new Set();
+
+  // A stable identity for an event that has no server-side id. time is a
+  // millisecond stamp and the remaining fields distinguish concurrent requests
+  // that share one.
+  function fwdEventKey(e) {
+    return [e.time, e.providerId, e.accountId, e.clientModel, e.status, e.latencyMs].join('|');
+  }
+
   function fwdEventRow(e) {
+    const uid = 'ev' + (++fwdEventSeq);
+    fwdEventStore[uid] = e;
+    fwdEventKeys.add(fwdEventKey(e));
     const model = e.targetModel && e.targetModel !== e.clientModel
       ? escapeHtml(e.clientModel) + ' <span class="muted-text">&rarr;</span> ' + escapeHtml(e.targetModel)
       : escapeHtml(e.clientModel || '');
@@ -2899,13 +4715,92 @@
     const badge = e.ok
       ? '<span class="fwd-badge fwd-badge--ok">' + (e.status || 200) + '</span>'
       : '<span class="fwd-badge fwd-badge--err">' + (e.status || 'ERR') + '</span>';
-    return '<tr>' +
+    // Failures are the reason to open a row, so surface a truncated reason inline
+    // and keep the full text for the panel.
+    const hint = !e.ok && e.errorMsg
+      ? ' <span class="fwd-err-hint" title="' + escapeHtml(e.errorMsg) + '">' + escapeHtml(fwdTruncate(e.errorMsg, 48)) + '</span>'
+      : '';
+    return '<tr class="fwd-event-row" data-fwd-event="' + uid + '" tabindex="0" role="button" aria-expanded="false">' +
       '<td class="font-mono text-xs">' + escapeHtml(fwdFmtTime(e.time)) + '</td>' +
       '<td class="font-mono text-xs">' + model + '</td>' +
       '<td class="text-xs">' + prov + '</td>' +
-      '<td>' + badge + '</td>' +
+      '<td>' + badge + hint + '</td>' +
       '<td class="font-mono text-xs">' + escapeHtml(fwdFmtLatency(e.latencyMs)) + '</td>' +
-      '</tr>';
+      '<td class="fwd-chev"><i class="fa-solid fa-chevron-down" aria-hidden="true"></i></td>' +
+      '</tr>' +
+      '<tr class="fwd-detail-row hidden" data-fwd-detail="' + uid + '"><td colspan="6"></td></tr>';
+  }
+
+  function fwdTruncate(s, n) {
+    s = String(s).replace(/\s+/g, ' ').trim();
+    return s.length > n ? s.slice(0, n - 1) + '…' : s;
+  }
+
+  // toggleForwardEventDetail expands one event row, rendering its panel lazily.
+  function toggleForwardEventDetail(uid) {
+    const body = $('fwdEventsBody');
+    if (!body) return;
+    const row = body.querySelector('tr[data-fwd-event="' + cssEscape(uid) + '"]');
+    const detail = body.querySelector('tr[data-fwd-detail="' + cssEscape(uid) + '"]');
+    if (!row || !detail) return;
+    const open = !detail.classList.contains('hidden');
+    if (open) {
+      detail.classList.add('hidden');
+      row.setAttribute('aria-expanded', 'false');
+      row.classList.remove('fwd-event-row--open');
+      return;
+    }
+    const e = fwdEventStore[uid];
+    if (!e) return;
+    detail.querySelector('td').innerHTML = fwdEventDetailHtml(e, uid);
+    detail.classList.remove('hidden');
+    row.setAttribute('aria-expanded', 'true');
+    row.classList.add('fwd-event-row--open');
+  }
+
+  // fwdEventDetailHtml renders the fields the table has no room for. ErrorMsg is
+  // the upstream's own reason: it is deliberately withheld from API clients (it
+  // can leak upstream host/proxy topology) but this page is behind admin auth.
+  function fwdEventDetailHtml(e, uid) {
+    const isPool = e.providerId === '__kiro_pool__';
+    const rows = [];
+    const add = (label, value) => {
+      if (value === '' || value == null) return;
+      rows.push('<div class="fwd-detail-item"><span class="fwd-detail-label">' + escapeHtml(label) +
+        '</span><span class="fwd-detail-value">' + value + '</span></div>');
+    };
+    add(t('forward.detailWhen'), escapeHtml(fwdFmtWhen(e.time)));
+    add(t('forward.detailEndpoint'), escapeHtml(e.endpoint || '—'));
+    add(t('forward.detailClientModel'), escapeHtml(e.clientModel || '—'));
+    if (e.targetModel) add(t('forward.detailTargetModel'), escapeHtml(e.targetModel));
+    add(t('forward.detailProvider'), escapeHtml(e.providerName || fwdProviderNames[e.providerId] || e.providerId || '—'));
+    if (e.accountLabel || e.accountId) add(t('forward.detailAccount'), escapeHtml(e.accountLabel || e.accountId));
+    if (e.routeId) add(t('forward.detailRoute'), '<span class="font-mono">' + escapeHtml(e.routeId) + '</span>');
+    add(t('forward.detailStatus'), String(e.status || '—'));
+    add(t('forward.detailLatency'), escapeHtml(fwdFmtLatency(e.latencyMs)));
+    add(t('forward.detailTtfb'), e.ttfbMs ? escapeHtml(fwdFmtLatency(e.ttfbMs)) : '—');
+    add(t('forward.detailTokensIn'), String(e.inputTokens || 0));
+    add(t('forward.detailTokensOut'), String(e.outputTokens || 0));
+    add(t('forward.detailCost'), escapeHtml(fwdFmtCost(e.costUsd, isPool)));
+    add(t('forward.detailStream'), e.stream ? t('forward.detailYes') : t('forward.detailNo'));
+    if (e.canceled) add(t('forward.detailCanceled'), t('forward.detailYes'));
+
+    let err = '';
+    if (e.errorMsg) {
+      err = '<div class="fwd-detail-error"><div class="fwd-detail-label">' +
+        escapeHtml(t('forward.detailError')) + '</div><pre class="fwd-detail-errtext">' +
+        escapeHtml(e.errorMsg) + '</pre></div>';
+    } else if (!e.ok) {
+      err = '<div class="fwd-detail-error"><div class="fwd-detail-label">' +
+        escapeHtml(t('forward.detailError')) + '</div><p class="muted-text text-xs">' +
+        escapeHtml(t('forward.detailNoError')) + '</p></div>';
+    }
+
+    return '<div class="fwd-detail-panel">' + err +
+      '<div class="fwd-detail-grid">' + rows.join('') + '</div>' +
+      '<div class="fwd-detail-actions"><button type="button" class="btn btn-outline btn-sm" ' +
+      'data-fwd-copy="' + escapeHtml(uid) + '"><i class="fa-solid fa-copy" aria-hidden="true"></i>' +
+      '<span class="btn-text">' + escapeHtml(t('forward.detailCopy')) + '</span></button></div></div>';
   }
 
   function updateForwardPagination() {
@@ -2933,29 +4828,68 @@
       // fighting active filters/pagination.
       if (fwdEventsOffset === 0 && !fwdFilterActive()) {
         const bodyEl = $('fwdEventsBody');
-        if (bodyEl) {
-          const empty = bodyEl.querySelector('td[colspan]');
+        // The stream replays its recent history on connect, so an event the REST
+        // page already rendered must not be prepended a second time.
+        if (bodyEl && !fwdEventKeys.has(fwdEventKey(e))) {
+          const empty = bodyEl.querySelector('tr.fwd-empty-row');
           if (empty) bodyEl.innerHTML = '';
           bodyEl.insertAdjacentHTML('afterbegin', fwdEventRow(e));
-          const rows = bodyEl.querySelectorAll('tr');
-          for (let i = rows.length - 1; i >= fwdEventsLimit; i--) rows[i].remove();
+          // Each event is a pair of rows (summary + its detail row), so trim by
+          // event rather than by <tr> or a detail row would outlive its parent.
+          const evRows = bodyEl.querySelectorAll('tr[data-fwd-event]');
+          for (let i = evRows.length - 1; i >= fwdEventsLimit; i--) {
+            const uid = evRows[i].dataset.fwdEvent;
+            const det = bodyEl.querySelector('tr[data-fwd-detail="' + cssEscape(uid) + '"]');
+            if (det) det.remove();
+            evRows[i].remove();
+            // Release the identity too, or a trimmed event could never re-render.
+            if (fwdEventStore[uid]) fwdEventKeys.delete(fwdEventKey(fwdEventStore[uid]));
+            delete fwdEventStore[uid];
+          }
         }
       }
-      // Refresh aggregate cards/chart lazily.
-      loadForwardStats();
+      // Refresh aggregate cards/chart lazily. Coalesced: a busy proxy can emit
+      // hundreds of events per second, and one refetch each would flood the
+      // admin API (and now the open detail panels too).
+      scheduleForwardStatsRefresh();
     };
     src.onerror = () => { if (dot) dot.textContent = ''; };
+  }
+
+  let fwdStatsRefreshTimer = null;
+  function scheduleForwardStatsRefresh() {
+    if (fwdStatsRefreshTimer) return;
+    fwdStatsRefreshTimer = setTimeout(() => {
+      fwdStatsRefreshTimer = null;
+      loadForwardStats();
+      // The Stats tab reads a separate range-scoped payload, so it needs its own
+      // refresh; skipped when hidden to avoid a request nobody is looking at.
+      const statsTab = $('tabStats');
+      if (statsTab && !statsTab.classList.contains('hidden')) loadStatsWindow();
+    }, 2000);
+  }
+
+  // Selected range as an absolute lower bound in epoch ms, or 0 for "all time".
+  // Recomputed on every call so a page kept open does not drift.
+  function fwdFilterSinceMs() {
+    const sel = $('fwdFilterRange');
+    const hours = sel ? parseFloat(sel.value) : NaN;
+    if (!isFinite(hours) || hours <= 0) return 0;
+    return Date.now() - Math.round(hours * 3600 * 1000);
   }
 
   function fwdFilterActive() {
     const prov = $('fwdFilterProvider') ? $('fwdFilterProvider').value : '';
     const status = $('fwdFilterStatus') ? $('fwdFilterStatus').value : '';
     const model = $('fwdFilterModel') ? $('fwdFilterModel').value.trim() : '';
-    return !!(prov || status || model);
+    // A range counts as an active filter: live events must not be prepended
+    // when the view is scoped, or a row outside the window would slip in.
+    return !!(prov || status || model || fwdFilterSinceMs());
   }
 
   function closeForwardStream() {
     if (fwdSource) { fwdSource.close(); fwdSource = null; }
+    if (fwdStatsRefreshTimer) { clearTimeout(fwdStatsRefreshTimer); fwdStatsRefreshTimer = null; }
     const dot = $('forwardLiveDot');
     if (dot) dot.textContent = '';
   }
@@ -2973,10 +4907,44 @@
 
   let fwdModelSearchTimer = null;
   function bindForwardEvents() {
+    // Sub-tab switching between the config pane and the live activity pane.
+    const subtabs = $('fwdSubtabs');
+    if (subtabs) {
+      subtabs.addEventListener('click', e => {
+        const btn = e.target.closest('[data-fwd-pane]');
+        if (btn) switchForwardPane(btn.dataset.fwdPane);
+      });
+    }
+
+    // Row expansion: delegated, so it survives the table being re-rendered on
+    // every page load and on each live SSE event.
+    const eventsBody = $('fwdEventsBody');
+    if (eventsBody) {
+      eventsBody.addEventListener('click', e => {
+        const copyBtn = e.target.closest('[data-fwd-copy]');
+        if (copyBtn) {
+          const ev = fwdEventStore[copyBtn.dataset.fwdCopy];
+          if (ev) copyText(JSON.stringify(ev, null, 2)).then(() => toast(t('common.copied'), 'success'));
+          return;
+        }
+        const row = e.target.closest('tr[data-fwd-event]');
+        if (row) toggleForwardEventDetail(row.dataset.fwdEvent);
+      });
+      eventsBody.addEventListener('keydown', e => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const row = e.target.closest('tr[data-fwd-event]');
+        if (!row) return;
+        e.preventDefault();
+        toggleForwardEventDetail(row.dataset.fwdEvent);
+      });
+    }
+
     const prov = $('fwdFilterProvider');
     if (prov) prov.addEventListener('change', () => { fwdEventsOffset = 0; loadForwardEvents(); });
     const status = $('fwdFilterStatus');
     if (status) status.addEventListener('change', () => { fwdEventsOffset = 0; loadForwardEvents(); });
+    const range = $('fwdFilterRange');
+    if (range) range.addEventListener('change', () => { fwdEventsOffset = 0; loadForwardEvents(); });
     const model = $('fwdFilterModel');
     if (model) model.addEventListener('input', () => {
       clearTimeout(fwdModelSearchTimer);
@@ -3032,6 +5000,52 @@
     if (d.success) toast(t('settings.promptFilterSaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
+  async function loadMemoryConfig() {
+    const res = await api('/memory/config');
+    const d = await res.json();
+    $('memoryEnabled').checked = !!d.enabled;
+    $('memoryBaseURL').value = d.baseURL || '';
+    // The key is returned masked; show the mask as a placeholder so the operator
+    // knows a key is stored, and leave the field empty so an unchanged save does
+    // not overwrite it (backend preserves the stored key on a masked/empty value).
+    $('memoryApiKey').value = '';
+    $('memoryApiKey').placeholder = d.apiKeyMasked || '';
+    $('memoryWriteMode').value = d.writeMode || 'explicit';
+    $('memoryRetrievalLimit').value = d.retrievalLimit ? String(d.retrievalLimit) : '';
+    $('memoryInject').checked = !!d.inject;
+    $('memoryMaxInjectTokens').value = d.maxInjectTokens ? String(d.maxInjectTokens) : '';
+    $('memoryRedactSecrets').checked = d.redactSecrets !== false;
+    $('memoryStoreSourceCode').checked = !!d.storeSourceCode;
+    $('memoryFailOpen').checked = d.failOpen !== false;
+    updateMemoryWriteModeWarning();
+    refreshCustomSelects();
+  }
+  function updateMemoryWriteModeWarning() {
+    const warn = $('memoryWriteModeWarning');
+    if (!warn) return;
+    warn.classList.toggle('hidden', $('memoryWriteMode').value !== 'automatic');
+  }
+  async function saveMemoryConfig() {
+    const body = {
+      enabled: $('memoryEnabled').checked,
+      baseURL: $('memoryBaseURL').value.trim(),
+      writeMode: $('memoryWriteMode').value,
+      retrievalLimit: parseInt($('memoryRetrievalLimit').value, 10) || 0,
+      inject: $('memoryInject').checked,
+      maxInjectTokens: parseInt($('memoryMaxInjectTokens').value, 10) || 0,
+      redactSecrets: $('memoryRedactSecrets').checked,
+      storeSourceCode: $('memoryStoreSourceCode').checked,
+      failOpen: $('memoryFailOpen').checked,
+    };
+    // Only send the API key when the operator typed a new one; an empty field
+    // means "keep the stored key" (backend preserves it).
+    const key = $('memoryApiKey').value.trim();
+    if (key) body.apiKey = key;
+    const res = await api('/memory/config', { method: 'POST', body: JSON.stringify(body) });
+    const d = await res.json();
+    if (d.success) { toast(t('memory.saved'), 'success'); loadMemoryConfig(); }
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
   function renderPromptRules() {
     const c = $('promptFilterRules');
     if (!c) return;
@@ -3075,11 +5089,13 @@
   var METHOD_ICONS = {
     builderid: 'fa-solid fa-id-card',
     iam: 'fa-solid fa-key',
+    microsoft: 'fa-brands fa-microsoft',
     sso: 'fa-solid fa-shield-halved',
     local: 'fa-solid fa-folder-open',
     credentials: 'fa-solid fa-code',
     cookie: 'fa-solid fa-cookie-bite',
-    kiro: 'fa-solid fa-building'
+    kiro: 'fa-solid fa-building',
+    apikey: 'fa-solid fa-key'
   };
   function methodCard(type, title, desc) {
     var icon = METHOD_ICONS[type] || 'fa-solid fa-circle-plus';
@@ -3099,6 +5115,7 @@
     if (type === 'add') modalAdd(title, body);
     else if (type === 'builderid') modalBuilderId(title, body);
     else if (type === 'iam') modalIam(title, body);
+    else if (type === 'microsoft') openMicrosoftModal(title, body);
     else if (type === 'sso') modalSso(title, body);
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'localdetect') modalLocalDetect(title, body);
@@ -3112,6 +5129,7 @@
   }
   function closeModal() {
     closeDialog('addModal');
+    resetMicrosoftFlow(true);
     iamSession = '';
     kiroSsoSession = '';
     if (builderIdPollTimer) { clearTimeout(builderIdPollTimer); builderIdPollTimer = null; }
@@ -3125,6 +5143,7 @@
       methodCard('builderid', t('modal.builderIdTitle'), t('modal.builderIdDesc')) +
       methodCard('iam', t('modal.iamTitle'), t('modal.iamDesc')) +
       methodCard('kiro', t('modal.kiroTitle'), t('modal.kiroDesc')) +
+      methodCard('microsoft', t('modal.microsoftTitle'), t('modal.microsoftDesc')) +
       methodCard('sso', t('modal.ssoTitle'), t('modal.ssoDesc')) +
       methodCard('localdetect', t('modal.localDetectTitle'), t('modal.localDetectDesc')) +
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
@@ -3140,7 +5159,9 @@
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.builderIdDesc')) + '</p>' +
       '<div id="builderIdStep1">' +
-      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="builderIdRegion" value="us-east-1" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label>' +
+      '<input type="text" id="builderIdRegion" value="us-east-1" list="builderIdRegionList" autocomplete="off" />' +
+      '<datalist id="builderIdRegionList"><option value="us-east-1"><option value="us-east-2"><option value="us-west-2"><option value="eu-central-1"><option value="eu-west-1"><option value="ap-northeast-1"><option value="ap-southeast-1"><option value="ap-south-1"></datalist></div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="startBuilderIdBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
@@ -3165,7 +5186,9 @@
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.iamDesc')) + '</p>' +
       '<div class="form-group"><label>' + escapeHtml(t('iam.startUrl')) + '</label><input type="text" id="iamStartUrl" placeholder="https://xxx.awsapps.com/start" /></div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="iamRegion" value="us-east-1" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label>' +
+      '<input type="text" id="iamRegion" value="us-east-1" list="iamRegionList" autocomplete="off" />' +
+      '<datalist id="iamRegionList"><option value="us-east-1"><option value="us-east-2"><option value="us-west-2"><option value="eu-central-1"><option value="eu-west-1"><option value="ap-northeast-1"><option value="ap-southeast-1"><option value="ap-south-1"></datalist></div>' +
       '<div id="iamStep2" class="hidden">' +
       '<div class="form-group"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
       '<div class="endpoint"><span id="iamAuthUrl" class="font-mono text-xs"></span></div>' +
@@ -3183,6 +5206,82 @@
       '</div>';
     $('iamBtn').addEventListener('click', startIamSso);
   }
+  function openMicrosoftModal(title, body) {
+    resetMicrosoftFlow(true);
+    renderMicrosoftModal(title, body);
+  }
+  function renderMicrosoftModal(title, body) {
+    title = title || $('modalTitle');
+    body = body || $('modalBody');
+    title.textContent = t('modal.microsoftTitle');
+
+    if (microsoftSelectionId && microsoftProfiles.length) {
+      body.innerHTML =
+        '<p class="help-block">' + escapeHtml(t('microsoft.selectProfileDesc')) + '</p>' +
+        '<fieldset class="microsoft-profile-list"><legend class="sr-only">' + escapeHtml(t('microsoft.selectProfileTitle')) + '</legend>' +
+        microsoftProfiles.map((profile, index) => {
+          const arn = String(profile.arn || '');
+          const checked = arn === microsoftSelectedProfileArn || (!microsoftSelectedProfileArn && index === 0);
+          return '<label class="microsoft-profile-card' + (checked ? ' selected' : '') + '">' +
+            '<input type="radio" name="microsoftProfile" value="' + escapeAttr(arn) + '"' + (checked ? ' checked' : '') + ' />' +
+            '<span class="microsoft-profile-body">' +
+            '<span class="microsoft-profile-name">' + escapeHtml(profile.name || arn) + '</span>' +
+            '<span class="microsoft-profile-arn font-mono">' + escapeHtml(arn) + '</span>' +
+            (profile.region ? '<span class="microsoft-profile-region">' + escapeHtml(t('microsoft.profileRegion', profile.region)) + '</span>' : '') +
+            '</span></label>';
+        }).join('') +
+        '</fieldset>' +
+        '<div class="modal-footer">' +
+        '<button class="btn btn-secondary" data-microsoft-back="1" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+        '<button class="btn btn-primary" id="microsoftSelectProfileBtn" type="button">' + escapeHtml(t('microsoft.selectProfile')) + '</button>' +
+        '</div>';
+      qsa('input[name="microsoftProfile"]', body).forEach(radio => radio.addEventListener('change', e => {
+        microsoftSelectedProfileArn = e.target.value;
+        qsa('.microsoft-profile-card', body).forEach(card => {
+          const input = card.querySelector('input');
+          card.classList.toggle('selected', Boolean(input && input.checked));
+        });
+      }));
+      $('microsoftSelectProfileBtn').addEventListener('click', selectMicrosoftProfile);
+      syncMicrosoftBusyUI();
+      return;
+    }
+
+    const hasAuthorizeUrl = Boolean(microsoftAuthorizeUrl);
+    const loginLabel = microsoftStage === 'microsoft' ? t('microsoft.providerStep') : t('microsoft.portalStep');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.microsoftDesc')) + '</p>' +
+      (hasAuthorizeUrl ?
+        '<div class="form-group"><label>' + escapeHtml(loginLabel) + '</label>' +
+        '<div class="endpoint"><span id="microsoftAuthUrl" class="font-mono text-xs"></span></div>' +
+        '<div class="flex gap-2 mt-2">' +
+        '<button class="btn btn-sm btn-outline flex-1" id="microsoftOpenBtn" type="button">' + escapeHtml(t('builderid.open')) + '</button>' +
+        '<button class="btn btn-sm btn-outline flex-1" id="microsoftCopyBtn" type="button">' + escapeHtml(t('common.copy')) + '</button>' +
+        '</div></div>' +
+        '<div class="message message-info microsoft-callback-note"><p>' + escapeHtml(t('microsoft.callbackInstructions')) + '</p></div>' +
+        '<div class="form-group mt-4"><label>' + escapeHtml(t('microsoft.callbackUrl')) + '</label>' +
+        '<textarea id="microsoftCallback" class="font-mono microsoft-callback-input" placeholder="' + escapeAttr(t('microsoft.callbackPlaceholder')) + '"></textarea></div>'
+        : '') +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-microsoft-back="1" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="microsoftBtn" type="button">' +
+      escapeHtml(hasAuthorizeUrl ? t('microsoft.complete') : t('microsoft.start')) +
+      '</button></div>';
+
+    if (hasAuthorizeUrl) {
+      $('microsoftAuthUrl').textContent = microsoftAuthorizeUrl;
+      $('microsoftOpenBtn').addEventListener('click', () => {
+        const opened = window.open(microsoftAuthorizeUrl, '_blank', 'noopener');
+        if (opened) opened.opener = null;
+      });
+      $('microsoftCopyBtn').addEventListener('click', async () => {
+        await copyText(microsoftAuthorizeUrl);
+        toast(t('common.copied'), 'primary');
+      });
+    }
+    $('microsoftBtn').addEventListener('click', hasAuthorizeUrl ? completeMicrosoftLogin : startMicrosoftLogin);
+    syncMicrosoftBusyUI();
+  }
   function modalSso(title, body) {
     title.textContent = t('modal.ssoTitle');
     body.innerHTML =
@@ -3196,12 +5295,36 @@
       '</div>' +
       '<div class="form-group"><label>' + escapeHtml(t('sso.tokenLabel')) + ' <small>' + escapeHtml(t('sso.tokenHint')) + '</small></label>' +
       '<textarea id="ssoToken" placeholder="' + escapeAttr(t('sso.tokenPlaceholder')) + '"></textarea></div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="ssoRegion" value="us-east-1" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label>' +
+      '<input type="text" id="ssoRegion" value="us-east-1" list="ssoRegionList" autocomplete="off" />' +
+      '<datalist id="ssoRegionList"><option value="us-east-1"><option value="us-east-2"><option value="us-west-2"><option value="eu-central-1"><option value="eu-west-1"><option value="ap-northeast-1"><option value="ap-southeast-1"><option value="ap-south-1"></datalist></div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="importSsoBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
       '</div>';
     $('importSsoBtn').addEventListener('click', importSsoToken);
+  }
+  function modalApiKey(title, body) {
+    title.textContent = t('modal.apiKeyTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.apiKeyDesc')) + '</p>' +
+      '<div class="help-block">' +
+      '<p>' + escapeHtml(t('apikey.hint')) + '</p>' +
+      '<p class="font-mono text-xs">ksk_xxxxxxxx</p>' +
+      '<p class="font-mono text-xs">ksk_xxxxxxxx|eu-central-1</p>' +
+      '</div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.label')) + '</label>' +
+      '<textarea id="kiroApiKeyInput" class="font-mono" placeholder="' + escapeAttr(t('apikey.placeholder')) + '"></textarea></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + ' <small>' + escapeHtml(t('apikey.regionHint')) + '</small></label>' +
+      '<input type="text" id="kiroApiKeyRegion" list="kiroApiKeyRegionList" value="us-east-1" placeholder="us-east-1" autocomplete="off" />' +
+      '<datalist id="kiroApiKeyRegionList"><option value="us-east-1"><option value="us-east-2"><option value="us-west-2"><option value="eu-central-1"><option value="eu-west-1"><option value="ap-northeast-1"><option value="ap-southeast-1"><option value="ap-south-1"></datalist></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('apikey.nickname')) + '</label>' +
+      '<input type="text" id="kiroApiKeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importApiKeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importApiKeyBtn').addEventListener('click', importApiKey);
   }
 
   function modalLocal(title, body) {
@@ -3371,9 +5494,10 @@
       '<div class="form-group"><label>' + escapeHtml(t('apikey.nickname')) + '</label>' +
       '<input type="text" id="apikeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('apikey.authRegion')) + '</label>' +
-      '<input type="text" id="apikeyAuthRegion" value="us-east-1" /></div>' +
+      '<input type="text" id="apikeyAuthRegion" list="apikeyRegionList" value="us-east-1" placeholder="us-east-1" autocomplete="off" /></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('apikey.apiRegion')) + '</label>' +
-      '<input type="text" id="apikeyApiRegion" value="us-east-1" /></div>' +
+      '<input type="text" id="apikeyApiRegion" list="apikeyRegionList" value="us-east-1" placeholder="us-east-1" autocomplete="off" /></div>' +
+      '<datalist id="apikeyRegionList"><option value="us-east-1"><option value="us-east-2"><option value="us-west-2"><option value="eu-central-1"><option value="eu-west-1"><option value="ap-northeast-1"><option value="ap-southeast-1"><option value="ap-south-1"></datalist>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="importApikeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
@@ -3388,7 +5512,7 @@
       '<textarea id="apikeyBatchList" class="font-mono" rows="8" placeholder="' + escapeAttr(t('apikeyBatch.listPlaceholder')) + '"></textarea>' +
       '<p class="help-block">' + escapeHtml(t('apikeyBatch.listHint')) + '</p></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('apikey.apiRegion')) + '</label>' +
-      '<input type="text" id="apikeyBatchRegion" value="us-east-1" /></div>' +
+      '<input type="text" id="apikeyBatchRegion" list="apikeyRegionList" value="us-east-1" placeholder="us-east-1" autocomplete="off" /></div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="importApikeyBatchBtn" type="button">' + escapeHtml(t('apikeyBatch.import')) + '</button>' +
@@ -3509,6 +5633,39 @@
   }
 
   // Import handlers
+  async function importApiKey() {
+    const raw = ($('kiroApiKeyInput') && $('kiroApiKeyInput').value || '').trim();
+    if (!raw) return toastWarning(t('apikey.missing'));
+    let key = raw;
+    let regionFromKey = '';
+    if (raw.includes('|')) {
+      const parts = raw.split('|');
+      key = (parts[0] || '').trim();
+      regionFromKey = (parts[1] || '').trim();
+    }
+    if (!key) return toastWarning(t('apikey.missing'));
+    const region = regionFromKey || ($('kiroApiKeyRegion') && $('kiroApiKeyRegion').value.trim()) || 'us-east-1';
+    const nickname = ($('kiroApiKeyNickname') && $('kiroApiKeyNickname').value.trim()) || '';
+    const payload = {
+      kiroApiKey: key,
+      authMethod: 'api_key',
+      region,
+      nickname
+    };
+    try {
+      const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+      const d = await res.json();
+      if (d.success) {
+        closeModal(); loadAccounts(); loadStats();
+        toastPrimary(t('apikey.importSuccess') + ': ' + (d.account?.email || d.account?.id));
+        autoRefreshNewAccount(d.account?.id);
+      } else {
+        toastError(t('common.failed') + ': ' + (d.error || ''));
+      }
+    } catch (e) {
+      toastError(t('common.failed') + ': ' + (e.message || e));
+    }
+  }
   async function importLocalKiro() {
     const provider = $('localProvider').value;
     const tokenJson = $('localTokenJson').value.trim();
@@ -3547,28 +5704,10 @@
     let skipped = 0;
     try {
       const json = JSON.parse(raw);
-      if (json.accounts && Array.isArray(json.accounts)) {
-        items = json.accounts.map(a => {
-          const c = a.credentials || {};
-          return {
-            refreshToken: c.refreshToken || a.refreshToken,
-            clientId: c.clientId || a.clientId,
-            clientSecret: c.clientSecret || a.clientSecret,
-            region: c.region || a.region,
-            authMethod: c.authMethod || a.authMethod,
-            provider: c.provider || a.provider || a.idp,
-            issuerUrl: c.issuerUrl || a.issuerUrl,
-            idpClientId: c.idpClientId || a.idpClientId,
-            scopes: c.scopes || a.scopes,
-            loginHint: c.loginHint || a.loginHint,
-            idpTokenEndpoint: c.idpTokenEndpoint || a.idpTokenEndpoint,
-            expiresAt: c.expiresAt || a.expiresAt,
-            accessToken: c.accessToken || a.accessToken,
-          };
-        });
-      } else {
-        items = Array.isArray(json) ? json : [json];
-      }
+      const source = json.accounts && Array.isArray(json.accounts)
+        ? json.accounts
+        : (Array.isArray(json) ? json : [json]);
+      items = source.map(normalizeCredentialRecord);
     } catch {
       const parsed = parseLineCredentials(raw);
       items = parsed.items;
@@ -3584,26 +5723,71 @@
     }
     let ok = 0, fail = 0, newIds = [];
     for (const item of items) {
-      if (!item.refreshToken) { fail++; continue; }
-      let authMethod = item.authMethod || '';
-      if (item.clientId && item.clientSecret) authMethod = 'idc';
-      else if (authMethod === "external_idp" || authMethod === "externalidp") authMethod = "external_idp"; else if (!authMethod || authMethod === "social") authMethod = "social";
-      else if (authMethod.toLowerCase() === "idc") authMethod = "idc"; else authMethod = "social";
-      let provider = item.provider || '';
+      const rawMethod = String(item.authMethod || '').trim();
+      const rawProvider = String(item.provider || '').trim();
+      const methodKey = rawMethod.toLowerCase();
+      const providerKey = rawProvider.toLowerCase();
+      const kiroApiKey = String(item.kiroApiKey || '').trim();
+      const isApiKey = Boolean(kiroApiKey) || methodKey === 'api_key' || methodKey === 'apikey' ||
+        (!item.refreshToken && String(item.accessToken || '').trim().startsWith('ksk_'));
+      if (!isApiKey && !item.refreshToken) { fail++; continue; }
+      if (isApiKey) {
+        const payload = {
+          id: item.id || '',
+          email: item.email || '',
+          userId: item.userId || '',
+          nickname: item.nickname || '',
+          kiroApiKey: kiroApiKey || item.accessToken || '',
+          authMethod: 'api_key',
+          provider: rawProvider || 'APIKey',
+          region: item.region || 'us-east-1'
+        };
+        try {
+          const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
+          const d = await res.json();
+          if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
+          else fail++;
+        } catch { fail++; }
+        continue;
+      }
+      const externalAliases = [
+        'external_idp', 'external-idp', 'external', 'microsoft', 'm365', 'office365',
+        'azure', 'azuread', 'azure-ad', 'azure_ad', 'entra', 'entra-id'
+      ];
+      const isExternalIdp = externalAliases.includes(methodKey) ||
+        externalAliases.includes(providerKey) ||
+        Boolean(item.tokenEndpoint || item.issuerUrl);
+      let authMethod;
+      if (isExternalIdp) authMethod = 'external_idp';
+      else if (item.clientId && item.clientSecret) authMethod = 'idc';
+      else if (methodKey === 'idc') authMethod = 'idc';
+      else if (methodKey === 'social' || methodKey === 'google' || methodKey === 'github') authMethod = 'social';
+      else authMethod = methodKey ? 'social' : '';
+      let provider = isExternalIdp ? 'AzureAD' : rawProvider;
       if (!provider && authMethod === 'social') provider = 'Google';
       if (!provider && authMethod === 'idc') provider = 'BuilderId';
       const payload = {
+        id: item.id || '',
+        email: item.email || '',
+        userId: item.userId || '',
+        nickname: item.nickname || '',
+        profileArn: item.profileArn || '',
         refreshToken: item.refreshToken,
         accessToken: item.accessToken || '',
         clientId: item.clientId || '',
         clientSecret: item.clientSecret || '',
         authMethod, provider,
-        issuerUrl: item.issuerUrl || "",
-        idpClientId: item.idpClientId || "",
-        scopes: item.scopes || "",
-        loginHint: item.loginHint || "",
-        idpTokenEndpoint: item.idpTokenEndpoint || "",
-        region: item.region || 'us-east-1'
+        region: item.region || (isExternalIdp ? '' : 'us-east-1'),
+        tokenEndpoint: item.tokenEndpoint || '',
+        issuerUrl: item.issuerUrl || '',
+        scopes: item.scopes || '',
+        // Kiro Hosted SSO ("Your organization") carries these three; upstream's
+        // Microsoft SSO flow does not. Dropping them makes a re-imported Entra
+        // account come back as social and fail with 401 Bad credentials, so they
+        // are forwarded alongside upstream's fields rather than replaced by them.
+        idpClientId: item.idpClientId || '',
+        loginHint: item.loginHint || '',
+        idpTokenEndpoint: item.idpTokenEndpoint || ''
       };
       try {
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
@@ -3618,6 +5802,39 @@
     if (skipped > 0) msg += t('credentials.lineParseSkipped', skipped);
     toastPrimary(msg, { duration: 5200 });
     newIds.forEach(autoRefreshNewAccount);
+  }
+  function normalizeCredentialRecord(record) {
+    const source = record && typeof record === 'object' ? record : {};
+    const credentials = source.credentials && typeof source.credentials === 'object'
+      ? source.credentials
+      : {};
+    const value = key => Object.prototype.hasOwnProperty.call(credentials, key)
+      ? credentials[key]
+      : source[key];
+    return {
+      id: value('id'),
+      email: value('email'),
+      userId: value('userId'),
+      nickname: value('nickname'),
+      profileArn: value('profileArn'),
+      accessToken: value('accessToken'),
+      refreshToken: value('refreshToken'),
+      kiroApiKey: value('kiroApiKey'),
+      clientId: value('clientId'),
+      clientSecret: value('clientSecret'),
+      authMethod: value('authMethod'),
+      provider: value('provider') || source.idp,
+      region: value('region'),
+      tokenEndpoint: value('tokenEndpoint'),
+      issuerUrl: value('issuerUrl'),
+      scopes: value('scopes'),
+      // Kiro Hosted SSO fields. Without them a re-imported Entra account loses
+      // its IdP identity and comes back as social (401 Bad credentials).
+      idpClientId: value('idpClientId'),
+      loginHint: value('loginHint'),
+      idpTokenEndpoint: value('idpTokenEndpoint'),
+      expiresAt: value('expiresAt')
+    };
   }
   function parseLineCredentials(text) {
     const items = [];
@@ -3836,6 +6053,187 @@
       toastError(t('login.connectError'));
     }
   }
+  function cancelMicrosoftServerSession(sessionId, selectionId) {
+    if (!sessionId && !selectionId) return;
+    api('/auth/microsoft-sso/cancel', {
+      method: 'POST',
+      body: JSON.stringify({
+        sessionId: sessionId || '',
+        selectionId: selectionId || ''
+      })
+    }).catch(() => {});
+  }
+  function resetMicrosoftFlow(notifyServer) {
+    const sessionId = microsoftSession;
+    const selectionId = microsoftSelectionId;
+    microsoftGeneration++;
+    microsoftSession = '';
+    microsoftSelectionId = '';
+    microsoftStage = 'kiro';
+    microsoftAuthorizeUrl = '';
+    microsoftProfiles = [];
+    microsoftSelectedProfileArn = '';
+    microsoftBusy = false;
+    if (notifyServer) cancelMicrosoftServerSession(sessionId, selectionId);
+  }
+  function syncMicrosoftBusyUI() {
+    const loginAction = $('microsoftBtn');
+    if (loginAction) {
+      loginAction.disabled = microsoftBusy;
+      loginAction.textContent = microsoftBusy
+        ? t('microsoft.processing')
+        : (microsoftAuthorizeUrl ? t('microsoft.complete') : t('microsoft.start'));
+    }
+    const profileAction = $('microsoftSelectProfileBtn');
+    if (profileAction) {
+      profileAction.disabled = microsoftBusy;
+      profileAction.textContent = microsoftBusy ? t('microsoft.processing') : t('microsoft.selectProfile');
+    }
+    qsa('[data-microsoft-back]', $('modalBody')).forEach(button => {
+      button.disabled = microsoftBusy;
+    });
+  }
+  async function startMicrosoftLogin() {
+    if (microsoftBusy) return;
+    microsoftBusy = true;
+    syncMicrosoftBusyUI();
+    const generation = microsoftGeneration;
+    try {
+      const res = await api('/auth/microsoft-sso/start', {
+        method: 'POST',
+        body: JSON.stringify({})
+      });
+      const d = await res.json().catch(() => ({}));
+      if (generation !== microsoftGeneration) {
+        cancelMicrosoftServerSession(d.sessionId || '', d.selectionId || '');
+        return;
+      }
+      if (!res.ok || !d.sessionId || !d.authorizeUrl) {
+        toastError(t('common.failed') + ': ' + (d.error || res.statusText || ''));
+        return;
+      }
+      microsoftSession = d.sessionId;
+      microsoftAuthorizeUrl = d.authorizeUrl;
+      microsoftStage = 'kiro';
+      microsoftBusy = false;
+      renderMicrosoftModal();
+    } catch (e) {
+      if (generation === microsoftGeneration) {
+        toastError(t('common.failed') + ': ' + (e.message || ''));
+      }
+    } finally {
+      if (generation === microsoftGeneration && microsoftBusy) {
+        microsoftBusy = false;
+        syncMicrosoftBusyUI();
+      }
+    }
+  }
+  async function completeMicrosoftLogin() {
+    if (microsoftBusy) return;
+    const callback = ($('microsoftCallback')?.value || '').trim();
+    if (!callback) {
+      toastWarning(t('microsoft.callbackRequired'));
+      $('microsoftCallback')?.focus();
+      return;
+    }
+    microsoftBusy = true;
+    syncMicrosoftBusyUI();
+    const generation = microsoftGeneration;
+    const sessionId = microsoftSession;
+    try {
+      const res = await api('/auth/microsoft-sso/complete', {
+        method: 'POST',
+        body: JSON.stringify({
+          sessionId: microsoftSession,
+          callbackUrl: callback
+        })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (generation !== microsoftGeneration) {
+        cancelMicrosoftServerSession(sessionId, d.selectionId || '');
+        return;
+      }
+      if (!res.ok || d.error) {
+        toastError(t('common.failed') + ': ' + (d.error || res.statusText || ''));
+        return;
+      }
+      if (d.requiresProfileSelection && d.selectionId && Array.isArray(d.profiles) && d.profiles.length) {
+        microsoftSelectionId = d.selectionId;
+        microsoftProfiles = d.profiles;
+        microsoftSelectedProfileArn = String(d.profiles[0]?.arn || '');
+        microsoftBusy = false;
+        renderMicrosoftModal();
+        return;
+      }
+      if (d.account) {
+        finishMicrosoftLogin(d.account, d.warning);
+        return;
+      }
+      if (d.stage === 'microsoft' && d.authorizeUrl) {
+        microsoftStage = 'microsoft';
+        microsoftAuthorizeUrl = d.authorizeUrl;
+        microsoftBusy = false;
+        renderMicrosoftModal();
+        return;
+      }
+      toastError(t('common.failed') + ': ' + (d.error || t('microsoft.invalidResponse')));
+    } catch (e) {
+      if (generation === microsoftGeneration) {
+        toastError(t('common.failed') + ': ' + (e.message || ''));
+      }
+    } finally {
+      if (generation === microsoftGeneration && microsoftBusy) {
+        microsoftBusy = false;
+        syncMicrosoftBusyUI();
+      }
+    }
+  }
+  async function selectMicrosoftProfile() {
+    if (microsoftBusy) return;
+    const selected = qsa('input[name="microsoftProfile"]:checked', $('modalBody'))[0];
+    const profileArn = (selected?.value || microsoftSelectedProfileArn || '').trim();
+    if (!profileArn) {
+      toastWarning(t('microsoft.profileRequired'));
+      return;
+    }
+    microsoftBusy = true;
+    syncMicrosoftBusyUI();
+    const generation = microsoftGeneration;
+    try {
+      const res = await api('/auth/microsoft-sso/select-profile', {
+        method: 'POST',
+        body: JSON.stringify({
+          selectionId: microsoftSelectionId,
+          profileArn
+        })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (generation !== microsoftGeneration) return;
+      if (!res.ok || !d.account) {
+        toastError(t('common.failed') + ': ' + (d.error || res.statusText || ''));
+        return;
+      }
+      finishMicrosoftLogin(d.account, d.warning);
+    } catch (e) {
+      if (generation === microsoftGeneration) {
+        toastError(t('common.failed') + ': ' + (e.message || ''));
+      }
+    } finally {
+      if (generation === microsoftGeneration && microsoftBusy) {
+        microsoftBusy = false;
+        syncMicrosoftBusyUI();
+      }
+    }
+  }
+  function finishMicrosoftLogin(account, warning) {
+    resetMicrosoftFlow(false);
+    closeModal();
+    loadAccounts();
+    loadStats();
+    toastPrimary(t('microsoft.success') + ': ' + (account?.email || account?.id || ''));
+    if (warning) toastWarning(String(warning));
+    autoRefreshNewAccount(account?.id);
+  }
   async function autoRefreshNewAccount(id) {
     if (!id) return;
     try { await api('/accounts/' + id + '/refresh', { method: 'POST' }); } catch (e) { }
@@ -3913,13 +6311,7 @@
     if (exportSelectedIds.size === 0) { toastWarning(t('export.noSelection')); return; }
     const jsonPromise = getExportData().then(data => {
       if (!data) throw new Error('no-data');
-      const filtered = (data.accounts || []).map(a => {
-        const c = a.credentials || {};
-        const { clientId, clientSecret, accessToken, refreshToken,
-          authMethod, provider, issuerUrl, idpClientId, scopes, loginHint, region, expiresAt } = c;
-        return { clientId, clientSecret, accessToken, refreshToken,
-          authMethod, provider, issuerUrl, idpClientId, scopes, loginHint, region, expiresAt };
-      });
+      const filtered = (data.accounts || []).map(credentialImportPayloadFromExportAccount);
       return JSON.stringify(filtered, null, 2);
     });
     try {
@@ -3932,13 +6324,7 @@
   async function exportDownloadJson() {
     const data = await getExportData();
     if (!data) return;
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'kiro-accounts-' + new Date().toISOString().slice(0, 10) + '.json';
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadJson('kiro-accounts-' + todayStamp() + '.json', data);
   }
 
   // Version and update
@@ -4213,6 +6599,80 @@
     });
   }
 
+  // Floating scroll navigation — a single pill that scrolls either the window
+  // (normal tabs) or the console output pane (console tab, which scrolls in its
+  // own overflow container rather than the page).
+  let scrollNavTarget = null; // null => page/window scrolling
+  let scrollNavRaf = false;
+  const SCROLL_NAV_THRESHOLD = 24;
+
+  function scrollNavMetrics() {
+    if (scrollNavTarget) {
+      return {
+        top: scrollNavTarget.scrollTop,
+        max: scrollNavTarget.scrollHeight - scrollNavTarget.clientHeight,
+      };
+    }
+    const el = document.scrollingElement || document.documentElement;
+    return {
+      top: window.scrollY || el.scrollTop || 0,
+      max: el.scrollHeight - window.innerHeight,
+    };
+  }
+
+  function scrollNavUpdate() {
+    scrollNavRaf = false;
+    const nav = $('scrollNav');
+    if (!nav) return;
+    if ($('mainPage').classList.contains('hidden')) { nav.hidden = true; return; }
+    const { top, max } = scrollNavMetrics();
+    if (max <= SCROLL_NAV_THRESHOLD) { nav.hidden = true; return; }
+    nav.hidden = false;
+    const upBtn = nav.querySelector('[data-dir="up"]');
+    const downBtn = nav.querySelector('[data-dir="down"]');
+    if (upBtn) upBtn.disabled = top <= SCROLL_NAV_THRESHOLD;
+    if (downBtn) downBtn.disabled = top >= max - SCROLL_NAV_THRESHOLD;
+  }
+
+  function scrollNavSchedule() {
+    if (scrollNavRaf) return;
+    scrollNavRaf = true;
+    requestAnimationFrame(scrollNavUpdate);
+  }
+
+  function scrollNavSetTarget(el) {
+    if (scrollNavTarget) scrollNavTarget.removeEventListener('scroll', scrollNavSchedule);
+    scrollNavTarget = el || null;
+    if (scrollNavTarget) scrollNavTarget.addEventListener('scroll', scrollNavSchedule, { passive: true });
+    scrollNavSchedule();
+  }
+
+  function scrollNavTo(dir) {
+    const { max } = scrollNavMetrics();
+    const top = dir === 'up' ? 0 : max;
+    (scrollNavTarget || window).scrollTo({ top, behavior: 'smooth' });
+  }
+
+  function initScrollNav() {
+    const nav = $('scrollNav');
+    if (!nav) return;
+    nav.querySelectorAll('.scroll-nav-btn').forEach(btn => {
+      btn.addEventListener('click', () => scrollNavTo(btn.dataset.dir));
+    });
+    window.addEventListener('scroll', scrollNavSchedule, { passive: true });
+    window.addEventListener('resize', scrollNavSchedule);
+    // Content height changes (rendering account cards, forwarding rows, console
+    // log lines) don't fire scroll/resize, so observe the panes that grow.
+    if (typeof ResizeObserver === 'function') {
+      const ro = new ResizeObserver(scrollNavSchedule);
+      const container = document.querySelector('.app-main > .container');
+      if (container) ro.observe(container);
+      const out = $('consoleOutput');
+      if (out) ro.observe(out);
+    }
+    scrollNavSchedule();
+  }
+
   // Tabs
   function switchTab(tab) {
     qsa('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
@@ -4222,6 +6682,21 @@
     else closeConsole();
     if (tab === 'forwarding') openForwarding();
     else closeForwarding();
+    if (tab === 'stats') openStats();
+    if (tab === 'logs') loadLogs();
+    setSidebar(false);
+    // Console scrolls in its own overflow pane; every other tab scrolls the page.
+    scrollNavSetTarget(tab === 'console' ? $('consoleOutput') : null);
+  }
+
+  function setSidebar(open) {
+    const page = $('mainPage');
+    if (!page) return;
+    page.classList.toggle('sidebar-open', open);
+    const toggle = $('sidebarToggle');
+    if (toggle) toggle.setAttribute('aria-expanded', String(open));
+    const backdrop = $('sidebarBackdrop');
+    if (backdrop) backdrop.hidden = !open;
   }
 
   // Event wiring
@@ -4250,10 +6725,14 @@
 
     document.body.addEventListener('click', e => {
       if (!e.target.closest('.custom-select')) closeAllCustomSelects();
-      const lb = e.target.closest('.lang-btn');
-      if (lb) setLang(lb.dataset.lang);
-      const lt = e.target.closest('.lang-toggle');
-      if (lt) toggleLang();
+    });
+    // The switcher is a <select>, so it reports through change rather than click.
+    // Delegated because both copies (login topbar and sidebar) share the class,
+    // and the custom-select overlay re-dispatches change from the hidden native
+    // element — the listener has to sit on an ancestor to see it either way.
+    document.body.addEventListener('change', e => {
+      const ls = e.target.closest('.lang-select');
+      if (ls && ls.value !== currentLang) setLang(ls.value);
     });
     window.addEventListener('resize', positionOpenCustomSelects);
     window.addEventListener('scroll', positionOpenCustomSelects, true);
@@ -4263,6 +6742,14 @@
     $('logoutBtn').addEventListener('click', logout);
 
     qsa('#tabBar .tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
+
+    const sidebarToggle = $('sidebarToggle');
+    if (sidebarToggle) sidebarToggle.addEventListener('click', () => {
+      setSidebar(!$('mainPage').classList.contains('sidebar-open'));
+    });
+    const sidebarBackdrop = $('sidebarBackdrop');
+    if (sidebarBackdrop) sidebarBackdrop.addEventListener('click', () => setSidebar(false));
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') setSidebar(false); });
 
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
       const id = btn.dataset.copy;
@@ -4275,6 +6762,25 @@
         toast(t('common.failed'), 'error');
       }
     }));
+
+    // API View buttons
+    $('viewModelsBtn').addEventListener('click', showModelsView);
+    $('viewStatsBtn').addEventListener('click', showStatsView);
+    $('apiViewModalClose').addEventListener('click', closeApiViewModal);
+    bindDialogBackdropClose('apiViewModal', closeApiViewModal);
+
+    // Logs tab
+    const logsRefreshBtn = $('logsRefreshBtn');
+    if (logsRefreshBtn) logsRefreshBtn.addEventListener('click', loadLogs);
+    const logsClearBtn = $('logsClearBtn');
+    if (logsClearBtn) logsClearBtn.addEventListener('click', clearLogs);
+    const logsAuto = $('logsAutoRefresh');
+    if (logsAuto) logsAuto.addEventListener('change', toggleLogsAutoRefresh);
+    const logsFilterSel = $('logsFilterSelect');
+    if (logsFilterSel) logsFilterSel.addEventListener('change', e => {
+      logsFilter = e.target.value;
+      loadLogs();
+    });
   }
 
   function bindAccountEvents() {
@@ -4312,6 +6818,7 @@
       const id = btn.dataset.id;
       const action = btn.dataset.action;
       if (action === 'refresh') refreshAccount(id, btn.closest('.account-card'));
+      else if (action === 'inject') injectAccount(id, btn);
       else if (action === 'detail') showDetail(id);
       else if (action === 'copyJSON') copyAccountJSON(id, btn);
       else if (action === 'toggle') toggleAccount(id, btn.dataset.enabled === 'true');
@@ -4357,6 +6864,11 @@
     });
   }
 
+  function bindMemoryEvents() {
+    $('saveMemoryBtn').addEventListener('click', saveMemoryConfig);
+    $('memoryWriteMode').addEventListener('change', updateMemoryWriteModeWarning);
+  }
+
   function bindModalEvents() {
     $('addModalClose').addEventListener('click', closeModal);
     $('detailModalClose').addEventListener('click', closeDetailModal);
@@ -4375,6 +6887,12 @@
     $('modalBody').addEventListener('click', e => {
       const m = e.target.closest('[data-method]');
       if (m) { showModal(m.dataset.method); return; }
+      const microsoftBack = e.target.closest('[data-microsoft-back]');
+      if (microsoftBack) {
+        resetMicrosoftFlow(true);
+        showModal('add');
+        return;
+      }
       const g = e.target.closest('[data-modal-goto]');
       if (g) { showModal(g.dataset.modalGoto); return; }
       if (e.target.dataset.closeAdd) closeModal();
@@ -4418,17 +6936,231 @@
     });
   }
 
+  // ── API View Modal ──
+  function closeApiViewModal() {
+    closeDialog('apiViewModal');
+  }
+
+  function formatUptime(seconds) {
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    const parts = [];
+    if (d > 0) parts.push(d + (currentLang === 'zh' ? '天' : 'd'));
+    if (h > 0) parts.push(h + (currentLang === 'zh' ? '时' : 'h'));
+    if (m > 0) parts.push(m + (currentLang === 'zh' ? '分' : 'm'));
+    parts.push(s + (currentLang === 'zh' ? '秒' : 's'));
+    return parts.join(' ');
+  }
+
+  async function showModelsView() {
+    const title = $('apiViewTitle');
+    const body = $('apiViewBody');
+    title.textContent = t('api.viewModelsTitle');
+    body.innerHTML = '<div class="api-view-loading"><i class="fa-solid fa-spinner fa-spin"></i> ' + escapeHtml(t('api.loading')) + '</div>';
+    openDialog('apiViewModal');
+
+    try {
+      const res = await fetch(baseUrl + '/v1/models');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const models = data.data || [];
+      renderModelsView(body, models);
+    } catch (e) {
+      body.innerHTML = '<div class="api-view-error"><i class="fa-solid fa-circle-exclamation"></i> ' + escapeHtml(t('api.fetchError') + ': ' + e.message) + '</div>';
+    }
+  }
+
+  function renderModelsView(container, models) {
+    const thinkingSuffix = '-thinking';
+    let html = '<div class="api-view-toolbar">';
+    html += '<span class="api-view-count">' + escapeHtml(t('api.totalModels').replace('{count}', models.length)) + '</span>';
+    html += '<input type="text" class="api-view-search" id="modelsSearchInput" placeholder="' + escapeAttr(t('api.searchModels')) + '" />';
+    html += '</div>';
+    html += '<div id="modelsGridContainer">';
+    html += buildModelsGroupedHtml(models, thinkingSuffix);
+    html += '</div>';
+    container.innerHTML = html;
+
+    const searchInput = $('modelsSearchInput');
+    if (searchInput) {
+      searchInput.addEventListener('input', () => {
+        const kw = searchInput.value.toLowerCase().trim();
+        const filtered = kw ? models.filter(m => (m.id || '').toLowerCase().includes(kw) || (m.owned_by || '').toLowerCase().includes(kw)) : models;
+        $('modelsGridContainer').innerHTML = buildModelsGroupedHtml(filtered, thinkingSuffix);
+      });
+    }
+  }
+
+  // SVG icons for model providers (inline style forces size over Tailwind preflight)
+  const _svgStyle = 'style="width:1.375rem;height:1.375rem;max-width:1.375rem;max-height:1.375rem;flex:none;display:block"';
+  const MODEL_SVGS = {
+    claude: '<svg ' + _svgStyle + ' viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z"/></svg>',
+    openai: '<svg ' + _svgStyle + ' viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M9.205 8.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357 1.356-.523 2.117-.523 2.854 0 4.662 2.212 4.662 4.566 0 .167 0 .357-.024.547l-4.71-2.759a.797.797 0 00-.856 0l-5.97 3.473zm10.609 8.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473 1.95-1.118a.433.433 0 01.476 0l4.543 2.617c1.309.76 2.189 2.378 2.189 3.948 0 1.808-1.07 3.473-2.76 4.163zM7.802 12.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545 1.95-4.472 4.591-4.472 1 0 1.927.333 2.712.928L8.23 5.067c-.285.166-.428.404-.428.737v6.898zM12 15.128l-2.795-1.57v-3.33L12 8.658l2.795 1.57v3.33L12 15.128zm1.796 7.23c-1 0-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974 1.142c.167.095.238.238.238.428v5.233c0 2.545-1.974 4.472-4.614 4.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482 4.482 0 014.21 6.327v5.423c0 .333.143.571.428.738l5.947 3.449-1.95 1.118a.432.432 0 01-.476 0zm-.262 3.9c-2.688 0-4.662-2.021-4.662-4.519 0-.19.024-.38.047-.57l4.686 2.71c.286.167.571.167.856 0l5.97-3.448v2.26c0 .19-.07.333-.237.428l-4.543 2.616c-.619.357-1.356.523-2.117.523zm5.899 2.83a5.947 5.947 0 005.827-4.756C22.287 18.339 24 15.84 24 13.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498 0-3.401-2.759-5.947-5.946-5.947-.642 0-1.26.095-1.88.31A5.962 5.962 0 0010.205 0a5.947 5.947 0 00-5.827 4.757C1.713 5.447 0 7.945 0 10.49c0 1.666.713 3.283 1.998 4.448-.119.5-.19 1-.19 1.499 0 3.401 2.759 5.946 5.946 5.946.642 0 1.26-.095 1.88-.309a5.96 5.96 0 004.162 1.713z"/></svg>',
+    deepseek: '<svg ' + _svgStyle + ' viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M23.748 4.482c-.254-.124-.364.113-.512.234-.051.039-.094.09-.137.136-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.156-.708-.311-.955-.65-.172-.241-.219-.51-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.093.172.187.129.323-.082.28-.18.552-.266.833-.055.179-.137.217-.329.14a5.526 5.526 0 01-1.736-1.18c-.857-.828-1.631-1.742-2.597-2.458a11.365 11.365 0 00-.689-.471c-.985-.957.13-1.743.388-1.836.27-.098.093-.432-.779-.428-.872.004-1.67.295-2.687.684a3.055 3.055 0 01-.465.137 9.597 9.597 0 00-2.883-.102c-1.885.21-3.39 1.102-4.497 2.623C.082 8.606-.231 10.684.152 12.85c.403 2.284 1.569 4.175 3.36 5.653 1.858 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.133-.284 4.994-1.86.47.234.962.327 1.78.397.63.059 1.236-.03 1.705-.128.735-.156.684-.837.419-.961-2.155-1.004-1.682-.595-2.113-.926 1.096-1.296 2.746-2.642 3.392-7.003.05-.347.007-.565 0-.845-.004-.17.035-.237.23-.256a4.173 4.173 0 001.545-.475c1.396-.763 1.96-2.015 2.093-3.517.02-.23-.004-.467-.247-.588zM11.581 18c-2.089-1.642-3.102-2.183-3.52-2.16-.392.024-.321.471-.235.763.09.288.207.486.371.739.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.167-1.361-.802-2.5-1.86-3.301-3.307-.774-1.393-1.224-2.887-1.298-4.482-.02-.386.093-.522.477-.592a4.696 4.696 0 011.529-.039c2.132.312 3.946 1.265 5.468 2.774.868.86 1.525 1.887 2.202 2.891.72 1.066 1.494 2.082 2.48 2.914.348.292.625.514.891.677-.802.09-2.14.11-3.054-.614zm1-6.44a.306.306 0 01.415-.287.302.302 0 01.2.288.306.306 0 01-.31.307.303.303 0 01-.304-.308zm3.11 1.596c-.2.081-.399.151-.59.16a1.245 1.245 0 01-.798-.254c-.274-.23-.47-.358-.552-.758a1.73 1.73 0 01.016-.588c.07-.327-.008-.537-.239-.727-.187-.156-.426-.199-.688-.199a.559.559 0 01-.254-.078c-.11-.054-.2-.19-.114-.358.028-.054.16-.186.192-.21.356-.202.767-.136 1.146.016.352.144.618.408 1.001.782.391.451.462.576.685.914.176.265.336.537.445.848.067.195-.019.354-.25.452z"/></svg>',
+    qwen: '<svg ' + _svgStyle + ' viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M12.604 1.34c.393.69.784 1.382 1.174 2.075a.18.18 0 00.157.091h5.552c.174 0 .322.11.446.327l1.454 2.57c.19.337.24.478.024.837-.26.43-.513.864-.76 1.3l-.367.658c-.106.196-.223.28-.04.512l2.652 4.637c.172.301.111.494-.043.77-.437.785-.882 1.564-1.335 2.34-.159.272-.352.375-.68.37-.777-.016-1.552-.01-2.327.016a.099.099 0 00-.081.05 575.097 575.097 0 01-2.705 4.74c-.169.293-.38.363-.725.364-.997.003-2.002.004-3.017.002a.537.537 0 01-.465-.271l-1.335-2.323a.09.09 0 00-.083-.049H4.982c-.285.03-.553-.001-.805-.092l-1.603-2.77a.543.543 0 01-.002-.54l1.207-2.12a.198.198 0 000-.197 550.951 550.951 0 01-1.875-3.272l-.79-1.395c-.16-.31-.173-.496.095-.965.465-.813.927-1.625 1.387-2.436.132-.234.304-.334.584-.335a338.3 338.3 0 012.589-.001.124.124 0 00.107-.063l2.806-4.895a.488.488 0 01.422-.246c.524-.001 1.053 0 1.583-.006L11.704 1c.341-.003.724.032.9.34zm-3.432.403a.06.06 0 00-.052.03L6.254 6.788a.157.157 0 01-.135.078H3.253c-.056 0-.07.025-.041.074l5.81 10.156c.025.042.013.062-.034.063l-2.795.015a.218.218 0 00-.2.116l-1.32 2.31c-.044.078-.021.118.068.118l5.716.008c.046 0 .08.02.104.061l1.403 2.454c.046.081.092.082.139 0l5.006-8.76.783-1.382a.055.055 0 01.096 0l1.424 2.53a.122.122 0 00.107.062l2.763-.02a.04.04 0 00.035-.02.041.041 0 000-.04l-2.9-5.086a.108.108 0 010-.113l.293-.507 1.12-1.977c.024-.041.012-.062-.035-.062H9.2c-.059 0-.073-.026-.043-.077l1.434-2.505a.107.107 0 000-.114L9.225 1.774a.06.06 0 00-.053-.031zm6.29 8.02c.046 0 .058.02.034.06l-.832 1.465-2.613 4.585a.056.056 0 01-.05.029.058.058 0 01-.05-.029L8.498 9.841c-.02-.034-.01-.052.028-.054l.216-.012 6.722-.012z"/></svg>',
+    mistral: '<svg ' + _svgStyle + ' viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path clip-rule="evenodd" fill="currentColor" d="M3.428 3.4h3.429v3.428h3.429v3.429h-.002 3.431V6.828h3.427V3.4h3.43v13.714H24v3.429H13.714v-3.428h-3.428v-3.429h-3.43v3.428h3.43v3.429H0v-3.429h3.428V3.4zm10.286 13.715h3.428v-3.429h-3.427v3.429z"/></svg>',
+    gemini: '<svg ' + _svgStyle + ' viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M20.616 10.835a14.147 14.147 0 01-4.45-3.001 14.111 14.111 0 01-3.678-6.452.503.503 0 00-.975 0 14.134 14.134 0 01-3.679 6.452 14.155 14.155 0 01-4.45 3.001c-.65.28-1.318.505-2.002.678a.502.502 0 000 .975c.684.172 1.35.397 2.002.677a14.147 14.147 0 014.45 3.001 14.112 14.112 0 013.679 6.453.502.502 0 00.975 0c.172-.685.397-1.351.677-2.003a14.145 14.145 0 013.001-4.45 14.113 14.113 0 016.453-3.678.503.503 0 000-.975 13.245 13.245 0 01-2.003-.678z"/></svg>',
+    meta: '<svg ' + _svgStyle + ' viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M6.897 4c1.915 0 3.516.932 5.43 3.376l.282-.373c.19-.246.383-.484.58-.71l.313-.35C14.588 4.788 15.792 4 17.225 4c1.273 0 2.469.557 3.491 1.516l.218.213c1.73 1.765 2.917 4.71 3.053 8.026l.011.392.002.25c0 1.501-.28 2.759-.818 3.7l-.14.23-.108.153c-.301.42-.664.758-1.086 1.009l-.265.142-.087.04a3.493 3.493 0 01-.302.118 4.117 4.117 0 01-1.33.208c-.524 0-.996-.067-1.438-.215-.614-.204-1.163-.56-1.726-1.116l-.227-.235c-.753-.812-1.534-1.976-2.493-3.586l-1.43-2.41-.544-.895-1.766 3.13-.343.592C7.597 19.156 6.227 20 4.356 20c-1.21 0-2.205-.42-2.936-1.182l-.168-.184c-.484-.573-.837-1.311-1.043-2.189l-.067-.32a8.69 8.69 0 01-.136-1.288L0 14.468c.002-.745.06-1.49.174-2.23l.1-.573c.298-1.53.828-2.958 1.536-4.157l.209-.34c1.177-1.83 2.789-3.053 4.615-3.16L6.897 4zm-.033 2.615l-.201.01c-.83.083-1.606.673-2.252 1.577l-.138.199-.01.018c-.67 1.017-1.185 2.378-1.456 3.845l-.004.022a12.591 12.591 0 00-.207 2.254l.002.188c.004.18.017.36.04.54l.043.291c.092.503.257.908.486 1.208l.117.137c.303.323.698.492 1.17.492 1.1 0 1.796-.676 3.696-3.641l2.175-3.4.454-.701-.139-.198C9.11 7.3 8.084 6.616 6.864 6.616zm10.196-.552l-.176.007c-.635.048-1.223.359-1.82.933l-.196.198c-.439.462-.887 1.064-1.367 1.807l.266.398c.18.274.362.56.55.858l.293.475 1.396 2.335.695 1.114c.583.926 1.03 1.6 1.408 2.082l.213.262c.282.326.529.54.777.673l.102.05c.227.1.457.138.718.138.176.002.35-.023.518-.073.338-.104.61-.32.813-.637l.095-.163.077-.162c.194-.459.29-1.06.29-1.785l-.006-.449c-.08-2.871-.938-5.372-2.2-6.798l-.176-.189c-.67-.683-1.444-1.074-2.27-1.074z"/></svg>',
+    zhipu: '<svg ' + _svgStyle + ' viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M11.991 23.503a.24.24 0 00-.244.248.24.24 0 00.244.249.24.24 0 00.245-.249.24.24 0 00-.22-.247l-.025-.001zM9.671 5.365a1.697 1.697 0 011.099 2.132l-.071.172-.016.04-.018.054c-.07.16-.104.32-.104.498-.035.71.47 1.279 1.186 1.314h.366c1.309.053 2.338 1.173 2.286 2.523-.052 1.332-1.152 2.38-2.478 2.327h-.174c-.715.018-1.274.64-1.239 1.368 0 .124.018.23.053.337.209.373.54.658.96.8.75.23 1.517-.125 1.9-.782l.018-.035c.402-.64 1.17-.96 1.92-.711.854.284 1.378 1.226 1.099 2.167a1.661 1.661 0 01-2.077 1.102 1.711 1.711 0 01-.907-.711l-.017-.035c-.2-.323-.463-.58-.851-.711l-.056-.018a1.646 1.646 0 00-1.954.746 1.66 1.66 0 01-1.065.764 1.677 1.677 0 01-1.989-1.279c-.209-.906.332-1.83 1.257-2.043a1.51 1.51 0 01.296-.035h.018c.68-.071 1.151-.622 1.116-1.333a1.307 1.307 0 00-.227-.693 2.515 2.515 0 01-.366-1.403 2.39 2.39 0 01.366-1.208c.14-.195.21-.444.227-.693.018-.71-.506-1.261-1.186-1.332l-.07-.018a1.43 1.43 0 01-.299-.07l-.05-.019a1.7 1.7 0 01-1.047-2.114 1.68 1.68 0 012.094-1.101zm-5.575 10.11c.26-.264.639-.367.994-.27.355.096.633.379.728.74.095.362-.007.748-.267 1.013-.402.41-1.053.41-1.455 0a1.062 1.062 0 010-1.482zm14.845-.294c.359-.09.738.024.992.297.254.274.344.665.237 1.025-.107.36-.396.634-.756.718-.551.128-1.1-.22-1.23-.781a1.05 1.05 0 01.757-1.26zm-.064-4.39c.314.32.49.753.49 1.206 0 .452-.176.886-.49 1.206-.315.32-.74.5-1.185.5-.444 0-.87-.18-1.184-.5a1.727 1.727 0 010-2.412 1.654 1.654 0 012.369 0zm-11.243.163c.364.484.447 1.128.218 1.691a1.665 1.665 0 01-2.188.923c-.855-.36-1.26-1.358-.907-2.228a1.68 1.68 0 011.33-1.038c.593-.08 1.183.169 1.547.652zm11.545-4.221c.368 0 .708.2.892.524.184.324.184.724 0 1.048a1.026 1.026 0 01-.892.524c-.568 0-1.03-.47-1.03-1.048 0-.579.462-1.048 1.03-1.048zm-14.358 0c.368 0 .707.2.891.524.184.324.184.724 0 1.048a1.026 1.026 0 01-.891.524c-.569 0-1.03-.47-1.03-1.048 0-.579.461-1.048 1.03-1.048zm10.031-1.475c.925 0 1.675.764 1.675 1.706s-.75 1.705-1.675 1.705-1.674-.763-1.674-1.705c0-.942.75-1.706 1.674-1.706zm-2.626-.684c.362-.082.653-.356.761-.718a1.062 1.062 0 00-.238-1.028 1.017 1.017 0 00-.996-.294c-.547.14-.881.7-.752 1.257.13.558.675.907 1.225.783zm0 16.876c.359-.087.644-.36.75-.72a1.062 1.062 0 00-.237-1.019 1.018 1.018 0 00-.985-.301 1.037 1.037 0 00-.762.717c-.108.361-.017.754.239 1.028.245.263.606.377.953.305l.043-.01zM17.19 3.5a.631.631 0 00.628-.64c0-.355-.279-.64-.628-.64a.631.631 0 00-.628.64c0 .355.28.64.628.64zm-10.38 0a.631.631 0 00.628-.64c0-.355-.28-.64-.628-.64a.631.631 0 00-.628.64c0 .355.279.64.628.64zm-5.182 7.852a.631.631 0 00-.628.64c0 .354.28.639.628.639a.63.63 0 00.627-.606l.001-.034a.62.62 0 00-.628-.64zm5.182 9.13a.631.631 0 00-.628.64c0 .355.279.64.628.64a.631.631 0 00.628-.64c0-.355-.28-.64-.628-.64zm10.38.018a.631.631 0 00-.628.64c0 .355.28.64.628.64a.631.631 0 00.628-.64c0-.355-.279-.64-.628-.64zm5.182-9.148a.631.631 0 00-.628.64c0 .354.279.639.628.639a.631.631 0 00.628-.64c0-.355-.28-.64-.628-.64zm-.384-4.992a.24.24 0 00.244-.249.24.24 0 00-.244-.249.24.24 0 00-.244.249c0 .142.122.249.244.249zM11.991.497a.24.24 0 00.245-.248A.24.24 0 0011.99 0a.24.24 0 00-.244.249c0 .133.108.236.223.247l.021.001zM2.011 6.36a.24.24 0 00.245-.249.24.24 0 00-.244-.249.24.24 0 00-.244.249.24.24 0 00.244.249zm0 11.263a.24.24 0 00-.243.248.24.24 0 00.244.249.24.24 0 00.244-.249.252.252 0 00-.244-.248zm19.995-.018a.24.24 0 00-.245.248.24.24 0 00.245.25.24.24 0 00.244-.25.252.252 0 00-.244-.248z"/></svg>',
+    minimax: '<svg ' + _svgStyle + ' viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M16.278 2c1.156 0 2.093.927 2.093 2.07v12.501a.74.74 0 00.744.709.74.74 0 00.743-.709V9.099a2.06 2.06 0 012.071-2.049A2.06 2.06 0 0124 9.1v6.561a.649.649 0 01-.652.645.649.649 0 01-.653-.645V9.1a.762.762 0 00-.766-.758.762.762 0 00-.766.758v7.472a2.037 2.037 0 01-2.048 2.026 2.037 2.037 0 01-2.048-2.026v-12.5a.785.785 0 00-.788-.753.785.785 0 00-.789.752l-.001 15.904A2.037 2.037 0 0113.441 22a2.037 2.037 0 01-2.048-2.026V18.04c0-.356.292-.645.652-.645.36 0 .652.289.652.645v1.934c0 .263.142.506.372.638.23.131.514.131.744 0a.734.734 0 00.372-.638V4.07c0-1.143.937-2.07 2.093-2.07zm-5.674 0c1.156 0 2.093.927 2.093 2.07v11.523a.648.648 0 01-.652.645.648.648 0 01-.652-.645V4.07a.785.785 0 00-.789-.78.785.785 0 00-.789.78v14.013a2.06 2.06 0 01-2.07 2.048 2.06 2.06 0 01-2.071-2.048V9.1a.762.762 0 00-.766-.758.762.762 0 00-.766.758v3.8a2.06 2.06 0 01-2.071 2.049A2.06 2.06 0 010 12.9v-1.378c0-.357.292-.646.652-.646.36 0 .653.29.653.646V12.9c0 .418.343.757.766.757s.766-.339.766-.757V9.099a2.06 2.06 0 012.07-2.048 2.06 2.06 0 012.071 2.048v8.984c0 .419.343.758.767.758.423 0 .766-.339.766-.758V4.07c0-1.143.937-2.07 2.093-2.07z"/></svg>',
+    proxy: '<svg ' + _svgStyle + ' viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>'
+  };
+
+  function getModelFamily(id) {
+    const lower = id.toLowerCase();
+    if (lower.startsWith('claude-') || lower.startsWith('anthropic')) return 'claude';
+    if (lower.startsWith('gpt-') || lower === 'o1' || lower.startsWith('o1-') || lower.startsWith('o3-') || lower.startsWith('o4-')) return 'openai';
+    if (lower.startsWith('deepseek')) return 'deepseek';
+    if (lower.startsWith('qwen') || lower.startsWith('qwq') || lower.startsWith('qvq')) return 'qwen';
+    if (lower.startsWith('glm') || lower.startsWith('chatglm') || lower.startsWith('zhipu') || lower.startsWith('codegeex')) return 'zhipu';
+    if (lower.startsWith('minimax') || lower.startsWith('abab')) return 'minimax';
+    if (lower.startsWith('mistral') || lower.startsWith('mixtral') || lower.startsWith('codestral')) return 'mistral';
+    if (lower.startsWith('gemini') || lower.startsWith('gemma')) return 'gemini';
+    if (lower.startsWith('llama') || lower.startsWith('meta-') || lower.startsWith('codellama')) return 'meta';
+    if (lower === 'auto' || lower.startsWith('auto')) return 'proxy';
+    return 'other';
+  }
+
+  function getModelFamilyLabel(family) {
+    const labels = {
+      claude: 'Claude (Anthropic)',
+      openai: 'OpenAI',
+      deepseek: 'DeepSeek',
+      qwen: 'Qwen (Alibaba)',
+      zhipu: 'GLM (Zhipu)',
+      minimax: 'MiniMax',
+      mistral: 'Mistral AI',
+      gemini: 'Gemini (Google)',
+      meta: 'LLaMA (Meta)',
+      proxy: 'Proxy Aliases',
+      other: currentLang === 'zh' ? '其他模型' : 'Other'
+    };
+    return labels[family] || family;
+  }
+
+  function getModelFamilyColor(family) {
+    const colors = {
+      claude: '#d97757',
+      openai: '#10a37f',
+      deepseek: '#4d6bfe',
+      qwen: '#615ced',
+      zhipu: '#3859ff',
+      minimax: '#e1474f',
+      mistral: '#ff7000',
+      gemini: '#4285f4',
+      meta: '#0668e1',
+      proxy: '#888888',
+      other: '#6b7280'
+    };
+    return colors[family] || '#6b7280';
+  }
+
+  function buildModelsGroupedHtml(models, thinkingSuffix) {
+    if (models.length === 0) {
+      return '<div class="api-view-loading">' + escapeHtml(t('api.noModels')) + '</div>';
+    }
+
+    // Group models by family
+    const groups = {};
+    const familyOrder = ['claude', 'openai', 'deepseek', 'qwen', 'zhipu', 'minimax', 'mistral', 'gemini', 'meta', 'proxy', 'other'];
+    for (const m of models) {
+      const family = getModelFamily(m.id || '');
+      if (!groups[family]) groups[family] = [];
+      groups[family].push(m);
+    }
+
+    let html = '';
+    for (const family of familyOrder) {
+      if (!groups[family] || groups[family].length === 0) continue;
+      const familyModels = groups[family];
+      const color = getModelFamilyColor(family);
+      const svg = MODEL_SVGS[family] || MODEL_SVGS.proxy;
+      const label = getModelFamilyLabel(family);
+
+      html += '<div class="model-group">';
+      html += '<div class="model-group-header">';
+      html += '<span class="model-group-icon" style="color:' + color + '">' + svg + '</span>';
+      html += '<span class="model-group-title">' + escapeHtml(label) + '</span>';
+      html += '<span class="model-group-count">' + familyModels.length + '</span>';
+      html += '</div>';
+      html += '<div class="model-group-grid">';
+
+      for (const m of familyModels) {
+        const id = m.id || '';
+        const isThinking = id.endsWith(thinkingSuffix);
+        const supportsImage = m.supports_image || false;
+
+        html += '<div class="model-item">';
+        html += '<div class="model-info">';
+        html += '<div class="model-name">' + escapeHtml(id) + '</div>';
+        html += '<div class="model-badges">';
+        if (isThinking) html += '<span class="model-badge model-badge--thinking"><i class="fa-solid fa-brain"></i> thinking</span>';
+        if (supportsImage) html += '<span class="model-badge model-badge--image"><i class="fa-solid fa-image"></i> vision</span>';
+        html += '</div>';
+        html += '</div>';
+        html += '</div>';
+      }
+
+      html += '</div></div>';
+    }
+    return html;
+  }
+
+  async function showStatsView() {
+    const title = $('apiViewTitle');
+    const body = $('apiViewBody');
+    title.textContent = t('api.viewStatsTitle');
+    body.innerHTML = '<div class="api-view-loading"><i class="fa-solid fa-spinner fa-spin"></i> ' + escapeHtml(t('api.loading')) + '</div>';
+    openDialog('apiViewModal');
+
+    try {
+      const res = await api('/status');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const d = await res.json();
+      renderStatsView(body, d);
+    } catch (e) {
+      body.innerHTML = '<div class="api-view-error"><i class="fa-solid fa-circle-exclamation"></i> ' + escapeHtml(t('api.fetchError') + ': ' + e.message) + '</div>';
+    }
+  }
+
+  function renderStatsView(container, d) {
+    const version = String(d.version || currentVersion || '-').replace(/^v/i, '');
+    let html = '<div class="stats-view-grid">';
+    html += statsCard(t('api.statsVersion'), version, '');
+    html += statsCard(t('api.statsAccounts'), d.accounts || 0, '');
+    html += statsCard(t('api.statsAvailable'), d.available || 0, 'success');
+    html += statsCard(t('api.statsTotalReqs'), formatNum(d.totalRequests || 0), 'info');
+    html += statsCard(t('api.statsSuccessReqs'), formatNum(d.successRequests || 0), 'success');
+    html += statsCard(t('api.statsFailedReqs'), formatNum(d.failedRequests || 0), 'danger');
+    html += statsCard(t('api.statsTotalTokens'), formatNum(d.totalTokens || 0), '');
+    html += statsCard(t('api.statsTotalCredits'), (d.totalCredits || 0).toFixed(2), 'info');
+    html += '</div>';
+    if (d.uptime !== undefined) {
+      html += '<div class="stats-view-uptime"><i class="fa-solid fa-clock"></i> ' + escapeHtml(t('api.statsUptime')) + ': <strong>' + escapeHtml(formatUptime(d.uptime)) + '</strong></div>';
+    }
+    container.innerHTML = html;
+  }
+
+  function statsCard(label, value, variant) {
+    const cls = variant ? ' stats-view-item--' + variant : '';
+    return '<div class="stats-view-item' + cls + '"><div class="stats-view-value">' + escapeHtml(String(value)) + '</div><div class="stats-view-label">' + escapeHtml(label) + '</div></div>';
+  }
+
   function wireEvents() {
     bindLoginEvents();
     bindShellEvents();
     bindAccountEvents();
     bindSettingsEvents();
     bindPromptFilterEvents();
+    bindMemoryEvents();
     bindModalEvents();
     bindDetailEvents();
     bindTestEvents();
     bindConsoleEvents();
     bindForwardEvents();
+    bindStatsEvents();
   }
 
   // Init
@@ -4441,6 +7173,7 @@
     initPrivacyMode();
     initRememberMe();
     initApiAddrSelect();
+    initScrollNav();
     const yr = $('footerYear');
     if (yr) yr.textContent = new Date().getFullYear();
     wireEvents();

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,8 +14,11 @@ import (
 	"kiro-go/logger"
 	"kiro-go/metrics"
 	"kiro-go/pool"
+	"kiro-go/search"
 	"net"
 	"net/http"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +29,45 @@ import (
 )
 
 const tokenRefreshSkewSeconds int64 = 120
+
+const (
+	microsoftProfileSelectionTTL          = 10 * time.Minute
+	microsoftMaxPendingProfileSelections  = 64
+	microsoftCanceledSessionTTL           = 10 * time.Minute
+	microsoftMaxCanceledSessionTombstones = 128
+	microsoftProfileDiscoveryTimeout      = 30 * time.Second
+)
+
+// looksLikeKiroAPIKey is a lightweight heuristic for plain-text imports.
+// Official keys currently use the ksk_ prefix; future formats can still be
+// imported via explicit authMethod/kiroApiKey fields.
+func looksLikeKiroAPIKey(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	// Convenience form: ksk_xxx|region
+	if idx := strings.IndexByte(value, '|'); idx > 0 {
+		value = strings.TrimSpace(value[:idx])
+	}
+	return strings.HasPrefix(value, "ksk_")
+}
+
+// RequestLog stores details about a single API request (success or failure).
+type RequestLog struct {
+	Time      int64   `json:"time"`      // Unix timestamp
+	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
+	Model     string  `json:"model"`     // Requested model
+	AccountID string  `json:"accountId"` // Account used
+	Status    string  `json:"status"`    // "success" or "error"
+	Error     string  `json:"error"`     // Error message (empty on success)
+	ErrorType string  `json:"errorType"` // Error category (empty on success)
+	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
+	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
+	Duration  int64   `json:"duration"`  // Request duration in ms
+}
+
+const requestLogsMaxSize = 500
 
 // Handler HTTP 处理器
 type Handler struct {
@@ -40,17 +83,14 @@ type Handler struct {
 	stopRefresh     chan struct{}
 	stopStatsSaver  chan struct{}
 	shutdownOnce    sync.Once
-	// 模型缓存
-	cachedModels    []ModelInfo
-	modelsCacheMu   sync.RWMutex
-	modelsCacheTime int64
-	// modelInfoByAccount keeps the last-known model metadata per account so the
-	// global aggregate can be rebuilt in-memory (no network) when one account's
-	// profile changes — dropping models no account offers anymore while keeping
-	// other accounts' models. Guarded by modelsCacheMu.
-	modelInfoByAccount map[string][]ModelInfo
-	promptCache        *promptCacheTracker
-	tokenManager       *TokenManager
+	// modelCache owns the model-routing cache concern (the /v1/models aggregate,
+	// per-account model metadata, and their locking). Extracted from this
+	// god-object; see proxy/model_cache.go. Upstream's cachedModels/modelsCacheMu/
+	// modelsCacheTime are the pre-extraction form of this and are deliberately
+	// NOT carried over — two competing caches would diverge.
+	modelCache   *ModelCache
+	promptCache  *promptCacheTracker
+	tokenManager *TokenManager
 	// profileSwitchLocks serializes profile switches per account so two concurrent
 	// switches of the SAME account cannot interleave persist/publish. Switches of
 	// DIFFERENT accounts still run in parallel (no global lock on the hot path).
@@ -59,6 +99,37 @@ type Handler struct {
 	// conversationRunner orchestrates multi-round Kiro calls with server-side
 	// web_search execution. Injected so tests can supply fakes.
 	conversationRunner ConversationRunner
+	// memory is the long-term memory provider. It is a noopMemoryProvider when
+	// the feature is disabled (never nil), and is rebuilt on config change via
+	// rebuildMemoryProvider — mirroring the account pool's reload-on-change model.
+	// Guarded by memoryMu so the admin update path can swap it while requests read it.
+	memory             MemoryProvider
+	memoryMu           sync.RWMutex
+	tokenRefreshMu     sync.Mutex
+	credentialImportMu sync.Mutex
+	// 请求日志 (环形缓冲区，包含成功和失败)
+	requestLogs   []RequestLog
+	requestLogsMu sync.RWMutex
+
+	microsoftSelections   map[string]*microsoftProfileSelection
+	microsoftSelectionsMu sync.Mutex
+	microsoftFlowMu       sync.Mutex
+	microsoftCanceled     map[string]time.Time
+	microsoftDiscoveries  map[string]*microsoftProfileDiscovery
+}
+
+type microsoftProfileSelection struct {
+	SessionID string
+	Account   config.Account
+	Profiles  []KiroProfile
+	ExpiresAt time.Time
+	timer     *time.Timer
+	mu        sync.Mutex
+	canceled  atomic.Bool
+}
+
+type microsoftProfileDiscovery struct {
+	cancel context.CancelFunc
 }
 
 type thinkingStreamSource int
@@ -92,6 +163,9 @@ func validateClaudeRequestShape(req *ClaudeRequest) string {
 		return "messages must not be empty"
 	}
 	if msg := validateClaudeThinkingConfig(req.Thinking, req.MaxTokens); msg != "" {
+		return msg
+	}
+	if msg := validateClaudeOutputConfig(req.OutputConfig); msg != "" {
 		return msg
 	}
 
@@ -236,21 +310,37 @@ func NewHandler() *Handler {
 
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
 	h := &Handler{
-		pool:               pool.GetPool(),
-		totalRequests:      int64(totalReq),
-		successRequests:    int64(successReq),
-		failedRequests:     int64(failedReq),
-		totalTokens:        int64(totalTokens),
-		totalCredits:       totalCredits,
-		startTime:          time.Now().Unix(),
-		stopRefresh:        make(chan struct{}),
-		stopStatsSaver:     make(chan struct{}),
-		promptCache:        newPromptCacheTracker(defaultPromptCacheTTL),
-		conversationRunner: NewKiroConversationRunner(),
-		modelInfoByAccount: make(map[string][]ModelInfo),
-		profileSwitchLocks: make(map[string]*sync.Mutex),
+		pool:                 pool.GetPool(),
+		totalRequests:        int64(totalReq),
+		successRequests:      int64(successReq),
+		failedRequests:       int64(failedReq),
+		totalTokens:          int64(totalTokens),
+		totalCredits:         totalCredits,
+		startTime:            time.Now().Unix(),
+		stopRefresh:          make(chan struct{}),
+		stopStatsSaver:       make(chan struct{}),
+		promptCache:          newPromptCacheTracker(defaultPromptCacheTTL),
+		conversationRunner:   NewKiroConversationRunner(),
+		profileSwitchLocks:   make(map[string]*sync.Mutex),
+		memory:               newMemoryProviderFromConfig(),
+		microsoftSelections:  make(map[string]*microsoftProfileSelection),
+		microsoftCanceled:    make(map[string]time.Time),
+		microsoftDiscoveries: make(map[string]*microsoftProfileDiscovery),
 	}
 	h.tokenManager = NewTokenManager(h.pool, nil, nil)
+	// The model-routing cache borrows Handler's per-account profile-switch lock
+	// (h.profileSwitchLock) — the SAME lock SelectProfile takes — so a gated model
+	// refresh and a profile switch of one account serialize, closing the
+	// profile-switch/model-cache race (commit 2afe75d). The lock stays owned by
+	// Handler; ModelCache only borrows it via the injected accessor.
+	h.modelCache = NewModelCache(
+		h.pool,
+		nil, // production default: ListAvailableModelsContext
+		h.ensureValidToken,
+		h.handleAccountFailure,
+		h.lookupAccountForAdmin,
+		h.profileSwitchLock,
+	)
 	// 恢复转发指标聚合数据 (事件日志与时序为内存态，不持久化)
 	if err := metrics.Load(forwardMetricsPath()); err != nil {
 		logger.Warnf("[Metrics] failed to load forward stats: %v", err)
@@ -264,6 +354,26 @@ func NewHandler() *Handler {
 	return h
 }
 
+// getMemory returns the current memory provider under a read lock. It is never
+// nil (a noopMemoryProvider stands in when the feature is disabled), so callers
+// can use the result without a nil check.
+func (h *Handler) getMemory() MemoryProvider {
+	h.memoryMu.RLock()
+	defer h.memoryMu.RUnlock()
+	return h.memory
+}
+
+// rebuildMemoryProvider swaps in a provider freshly built from the current
+// config. Called after the admin memory config changes, mirroring how
+// apiUpdateSettings calls h.pool.Reload() so the change takes effect at runtime
+// without a restart.
+func (h *Handler) rebuildMemoryProvider() {
+	next := newMemoryProviderFromConfig()
+	h.memoryMu.Lock()
+	h.memory = next
+	h.memoryMu.Unlock()
+}
+
 // backgroundRefresh 后台定时刷新账户信息
 func (h *Handler) backgroundRefresh() {
 	ticker := time.NewTicker(30 * time.Minute) // 每 30 分钟刷新一次
@@ -271,13 +381,13 @@ func (h *Handler) backgroundRefresh() {
 
 	// 启动时延迟 10 秒后执行一次
 	time.Sleep(10 * time.Second)
-	h.refreshModelsCache()
+	h.modelCache.RefreshAll()
 	h.refreshAllAccounts()
 
 	for {
 		select {
 		case <-ticker.C:
-			h.refreshModelsCache()
+			h.modelCache.RefreshAll()
 			h.refreshAllAccounts()
 		case <-h.stopRefresh:
 			return
@@ -290,25 +400,31 @@ func (h *Handler) refreshAllAccounts() {
 	accounts := config.GetAccounts()
 	for i := range accounts {
 		account := &accounts[i]
-		if !account.Enabled || account.AccessToken == "" {
+		if !account.Enabled {
+			continue
+		}
+		if accountBearerToken(account) == "" {
 			continue
 		}
 
-		// 检查 token 是否需要刷新。Route through the TokenManager so background
-		// and foreground refreshes share the same per-account coordination,
-		// validation, atomic persist, and pool publish.
-		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-			fresh, err := h.tokenManager.EnsureFresh(account.ID)
-			if err != nil {
-				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
-				h.handleAccountFailure(account, err)
-				continue
-			}
-			if fresh != nil {
-				account.AccessToken = fresh.AccessToken
-				account.RefreshToken = fresh.RefreshToken
-				account.ExpiresAt = fresh.ExpiresAt
-				account.ProfileArn = fresh.ProfileArn
+		// API Key accounts skip OAuth refresh; still sync usage/subscription.
+		if !config.IsAPIKeyAccount(account) {
+			// 检查 token 是否需要刷新。Route through the TokenManager so background
+			// and foreground refreshes share the same per-account coordination,
+			// validation, atomic persist, and pool publish.
+			if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
+				fresh, err := h.tokenManager.EnsureFresh(account.ID)
+				if err != nil {
+					logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
+					h.handleAccountFailure(account, err)
+					continue
+				}
+				if fresh != nil {
+					account.AccessToken = fresh.AccessToken
+					account.RefreshToken = fresh.RefreshToken
+					account.ExpiresAt = fresh.ExpiresAt
+					account.ProfileArn = fresh.ProfileArn
+				}
 			}
 		}
 
@@ -574,21 +690,19 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 // handleModels 模型列表
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 	// 尝试用缓存的真实模型列表
-	h.modelsCacheMu.RLock()
-	cached := h.cachedModels
-	h.modelsCacheMu.RUnlock()
+	cached := h.modelCache.Snapshot()
 	if len(cached) == 0 {
-		h.refreshModelsCache()
-		h.modelsCacheMu.RLock()
-		cached = h.cachedModels
-		h.modelsCacheMu.RUnlock()
+		h.modelCache.RefreshAll()
+		cached = h.modelCache.Snapshot()
 	}
 
-	thinkingSuffix := config.GetThinkingConfig().Suffix
+	thinkingCfg := config.GetThinkingConfig()
+	thinkingSuffix := thinkingCfg.Suffix
+	advertiseEffort := thinkingCfg.AdvertiseEffortModels
 
-	models := buildAnthropicModelsResponse(cached, thinkingSuffix)
+	models := buildAnthropicModelsResponse(cached, thinkingSuffix, advertiseEffort)
 	if len(models) == 0 {
-		models = fallbackAnthropicModels(thinkingSuffix)
+		models = fallbackAnthropicModels(thinkingSuffix, advertiseEffort)
 	}
 
 	// 添加别名模型
@@ -604,220 +718,6 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		"data":   models,
 	})
 	return
-}
-
-func buildAnthropicModelsResponse(cached []ModelInfo, thinkingSuffix string) []map[string]interface{} {
-	if len(cached) == 0 {
-		return nil
-	}
-
-	models := make([]map[string]interface{}, 0, len(cached)*2)
-	if len(cached) > 0 {
-		for _, m := range cached {
-			supportsImage := modelSupportsImage(m.InputTypes)
-			models = append(models, buildModelInfo(m.ModelId, "anthropic", supportsImage))
-			// 自动生成 thinking 变体
-			models = append(models, buildModelInfo(m.ModelId+thinkingSuffix, "anthropic", supportsImage))
-		}
-	}
-	return models
-}
-
-func fallbackAnthropicModels(thinkingSuffix string) []map[string]interface{} {
-	return []map[string]interface{}{
-		buildModelInfo("claude-sonnet-4.6", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.6", "anthropic", true),
-		buildModelInfo("claude-opus-4.6"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.7", "anthropic", true),
-		buildModelInfo("claude-opus-4.7"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5", "anthropic", true),
-		buildModelInfo("claude-sonnet-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-sonnet-4", "anthropic", true),
-		buildModelInfo("claude-sonnet-4"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-haiku-4.5", "anthropic", true),
-		buildModelInfo("claude-haiku-4.5"+thinkingSuffix, "anthropic", true),
-		buildModelInfo("claude-opus-4.5", "anthropic", true),
-		buildModelInfo("claude-opus-4.5"+thinkingSuffix, "anthropic", true),
-	}
-}
-
-func modelSupportsImage(inputTypes []string) bool {
-	for _, t := range inputTypes {
-		lt := strings.ToLower(t)
-		if strings.Contains(lt, "image") || strings.Contains(lt, "vision") {
-			return true
-		}
-	}
-	return false
-}
-
-func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface{} {
-	modalities := []string{"text"}
-	if supportsImage {
-		modalities = append(modalities, "image")
-	}
-	modalitiesMap := map[string][]string{
-		"input":  modalities,
-		"output": []string{"text"},
-	}
-
-	return map[string]interface{}{
-		"id":               id,
-		"object":           "model",
-		"owned_by":         ownedBy,
-		"supports_image":   supportsImage,
-		"input_modalities": modalities,
-		"modalities":       modalitiesMap,
-		"capabilities": map[string]bool{
-			"vision":       supportsImage,
-			"image":        supportsImage,
-			"image_vision": supportsImage,
-		},
-		"info": map[string]interface{}{
-			"meta": map[string]interface{}{
-				"capabilities": map[string]bool{
-					"vision":       supportsImage,
-					"image_vision": supportsImage,
-				},
-			},
-		},
-	}
-}
-
-// refreshModelsCache 从 Kiro API 拉取模型列表并缓存
-func (h *Handler) refreshModelsCache() {
-	accounts := config.GetEnabledAccounts()
-	if len(accounts) == 0 {
-		return
-	}
-
-	aggregated := make([]ModelInfo, 0)
-	for i := range accounts {
-		account := &accounts[i]
-		if err := h.ensureValidToken(account); err != nil {
-			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
-			h.handleAccountFailure(account, err)
-			continue
-		}
-
-		models, err := modelLister(account)
-		if err != nil {
-			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
-			h.handleAccountFailure(account, err)
-			continue
-		}
-		// 缓存每账号可用模型，用于路由时过滤
-		modelIDs := make([]string, 0, len(models))
-		for _, m := range models {
-			modelIDs = append(modelIDs, m.ModelId)
-		}
-		h.pool.SetModelList(account.ID, modelIDs)
-		h.setAccountModelInfo(account.ID, models)
-		aggregated = mergeUniqueModels(aggregated, models)
-	}
-
-	if len(aggregated) > 0 {
-		h.modelsCacheMu.Lock()
-		h.cachedModels = aggregated
-		h.modelsCacheTime = time.Now().Unix()
-		h.modelsCacheMu.Unlock()
-		logger.Infof("[ModelsCache] Cached %d models", len(aggregated))
-	}
-}
-
-// modelLister is the seam for fetching an account's available models; overridable
-// in tests. Production uses the real Kiro ListAvailableModels call.
-var modelLister = ListAvailableModels
-
-// setAccountModelInfo records the last-known model metadata for an account so the
-// global aggregate can later be rebuilt in memory. Guarded by modelsCacheMu.
-func (h *Handler) setAccountModelInfo(accountID string, models []ModelInfo) {
-	cp := make([]ModelInfo, len(models))
-	copy(cp, models)
-	h.modelsCacheMu.Lock()
-	if h.modelInfoByAccount == nil {
-		h.modelInfoByAccount = make(map[string][]ModelInfo)
-	}
-	h.modelInfoByAccount[accountID] = cp
-	h.modelsCacheMu.Unlock()
-}
-
-// rebuildAggregateLocked recomputes cachedModels from the per-account metadata,
-// so models that no remaining account offers drop out while every other account's
-// models are preserved. Caller must hold modelsCacheMu. It performs no network I/O.
-func (h *Handler) rebuildAggregateLocked() {
-	aggregated := make([]ModelInfo, 0)
-	for _, models := range h.modelInfoByAccount {
-		aggregated = mergeUniqueModels(aggregated, models)
-	}
-	h.cachedModels = aggregated
-	h.modelsCacheTime = time.Now().Unix()
-}
-
-// fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。
-// 同时更新 pool 的路由缓存与全局聚合模型列表。
-func (h *Handler) fetchAndCacheAccountModels(account *config.Account) error {
-	if err := h.ensureValidToken(account); err != nil {
-		return fmt.Errorf("token refresh failed: %w", err)
-	}
-	models, err := modelLister(account)
-	if err != nil {
-		return err
-	}
-	modelIDs := make([]string, 0, len(models))
-	for _, m := range models {
-		modelIDs = append(modelIDs, m.ModelId)
-	}
-	h.pool.SetModelList(account.ID, modelIDs)
-
-	// Record per-account metadata and rebuild the aggregate so stale models drop.
-	cp := make([]ModelInfo, len(models))
-	copy(cp, models)
-	h.modelsCacheMu.Lock()
-	if h.modelInfoByAccount == nil {
-		h.modelInfoByAccount = make(map[string][]ModelInfo)
-	}
-	h.modelInfoByAccount[account.ID] = cp
-	h.rebuildAggregateLocked()
-	h.modelsCacheMu.Unlock()
-
-	logger.Infof("[ModelsCache] Refreshed %d models for account %s", len(models), account.Email)
-	return nil
-}
-
-// apiRefreshAccountModels POST /admin/api/accounts/{id}/models/refresh
-// 立即为指定账号拉取并更新模型路由缓存。
-func (h *Handler) apiRefreshAccountModels(w http.ResponseWriter, r *http.Request, id string) {
-	accounts := config.GetAccounts()
-	var account *config.Account
-	for i := range accounts {
-		if accounts[i].ID == id {
-			account = &accounts[i]
-			break
-		}
-	}
-	if account == nil {
-		w.WriteHeader(404)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Account not found"})
-		return
-	}
-	// 从 pool 取运行时最新 token（与 refreshModelsCache 逻辑一致）
-	if latest := h.pool.GetByID(id); latest != nil {
-		account.AccessToken = latest.AccessToken
-		account.RefreshToken = latest.RefreshToken
-		account.ExpiresAt = latest.ExpiresAt
-		account.ProfileArn = latest.ProfileArn
-	}
-	if err := h.fetchAndCacheAccountModels(account); err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"count":   len(h.pool.GetModelList(id)),
-	})
 }
 
 // apiDiscoverAccountProfiles GET /admin/api/accounts/{id}/profiles
@@ -897,90 +797,6 @@ func (h *Handler) apiSelectAccountProfile(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// apiRefreshAllAccountsModels POST /admin/api/accounts/models/refresh
-// 直接复用 refreshModelsCache，为所有已启用账号刷新模型路由缓存。
-func (h *Handler) apiRefreshAllAccountsModels(w http.ResponseWriter, r *http.Request) {
-	h.refreshModelsCache()
-	h.modelsCacheMu.RLock()
-	cachedLen := len(h.cachedModels)
-	h.modelsCacheMu.RUnlock()
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":   true,
-		"refreshed": cachedLen,
-		"failed":    0,
-	})
-}
-
-func mergeUniqueModels(existing []ModelInfo, incoming []ModelInfo) []ModelInfo {
-	if len(incoming) == 0 {
-		return existing
-	}
-
-	indexByID := make(map[string]int, len(existing))
-	merged := make([]ModelInfo, len(existing))
-	copy(merged, existing)
-	for i, model := range merged {
-		indexByID[strings.ToLower(strings.TrimSpace(model.ModelId))] = i
-	}
-
-	for _, model := range incoming {
-		key := strings.ToLower(strings.TrimSpace(model.ModelId))
-		if key == "" {
-			continue
-		}
-		if idx, ok := indexByID[key]; ok {
-			merged[idx] = mergeModelInfo(merged[idx], model)
-			continue
-		}
-		indexByID[key] = len(merged)
-		merged = append(merged, model)
-	}
-
-	return merged
-}
-
-func mergeModelInfo(base ModelInfo, extra ModelInfo) ModelInfo {
-	if base.ModelName == "" {
-		base.ModelName = extra.ModelName
-	}
-	if base.Description == "" {
-		base.Description = extra.Description
-	}
-	if base.RateMultiplier == 0 {
-		base.RateMultiplier = extra.RateMultiplier
-	}
-	if base.TokenLimits == nil {
-		base.TokenLimits = extra.TokenLimits
-	}
-	base.InputTypes = mergeStringLists(base.InputTypes, extra.InputTypes)
-	return base
-}
-
-func mergeStringLists(base []string, extra []string) []string {
-	if len(extra) == 0 {
-		return base
-	}
-	seen := make(map[string]bool, len(base)+len(extra))
-	merged := make([]string, 0, len(base)+len(extra))
-	for _, item := range base {
-		key := strings.ToLower(strings.TrimSpace(item))
-		if key == "" || seen[key] {
-			continue
-		}
-		seen[key] = true
-		merged = append(merged, item)
-	}
-	for _, item := range extra {
-		key := strings.ToLower(strings.TrimSpace(item))
-		if key == "" || seen[key] {
-			continue
-		}
-		seen[key] = true
-		merged = append(merged, item)
-	}
-	return merged
-}
-
 // handleCountTokens Token 计数（Claude Code 会调用）
 func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -1003,10 +819,15 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
 	}
+	if msg := validateClaudeOutputConfig(req.OutputConfig); msg != "" {
+		h.sendClaudeError(w, 400, "invalid_request_error", msg)
+		return
+	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	actualModel, thinking, nameEffort := resolveClaudeThinkingModeAndEffort(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
+	applyModelNameEffort(&req, nameEffort)
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 
 	estimatedTokens := estimateClaudeRequestInputTokens(effectiveReq)
@@ -1046,20 +867,62 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// The last genuine user question, captured BEFORE any memory injection mutates
+	// req.Messages. Used as the retrieval query (inject) and the user side of a
+	// captured turn (capture). Empty when the turn carries no new question.
+	userText := lastClaudeUserText(req.Messages)
+
+	// Memory inject (read): retrieve relevant memories for this caller and prepend a
+	// bounded context block to the last user message, so both the forward path (reads
+	// body) and the Kiro path (reads req) see the enriched request. Fail-open: a
+	// backend error/outage returns no memories and leaves the request unchanged. It
+	// deliberately runs BEFORE tryForwardUpstream and re-marshals body so forwarded
+	// requests are enriched too. It does NOT touch the translator.
+	if config.MemoryInjectEnabled() && userText != "" {
+		principal := memoryScopeForRequest(r.Context())
+		mems, _ := h.getMemory().Search(r.Context(), SearchQuery{Scope: MemoryScope{Principal: principal}, Query: userText})
+		if block := buildMemoryContextBlock(mems, config.GetMemoryConfig().MaxInjectTokens); block != "" {
+			if injectMemoryIntoRequest(&req, block) {
+				if b, err := json.Marshal(&req); err == nil {
+					body = b
+				}
+			}
+		}
+	}
+
 	// Forward to an external upstream when the (raw, un-normalized) client model
 	// matches an enabled route. Passthrough bypasses the Kiro pool entirely.
-	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/messages", true) {
+	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/messages", true, userText) {
+		// Capture (write) for the forward path is handled inside tryForwardUpstream
+		// (non-stream only), since only it can tee the upstream response body.
 		return
 	}
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
+	actualModel, thinking, nameEffort := resolveClaudeThinkingModeAndEffort(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
+	applyModelNameEffort(&req, nameEffort)
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
+
+	apiKeyID := apiKeyIDFromContext(r.Context())
+
+	// Pure native web_search: relay via Kiro MCP (generateAssistantResponse does not run it).
+	if hasWebSearchTool(&req) {
+		h.handleWebSearchRequest(w, &req, estimatedInputTokens, apiKeyID)
+		return
+	}
+
+	// Mixed tools including native web_search: agentic loop digests web_search internally
+	// and returns client tool_use blocks as-is.
+	if hasWebSearchAmongTools(&req) {
+		logger.Infof("[WebSearch] Mixed tools with native web_search, entering agentic loop")
+		h.runWebSearchLoop(r.Context(), w, &req, thinking, estimatedInputTokens, apiKeyID)
+		return
+	}
 
 	// 转换请求
 	kiroPayload := ClaudeToKiro(&req, thinking)
@@ -1085,11 +948,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	useRunner := hasWebSearch && policy.Enabled
 
 	// Stream or non-stream
-	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, useRunner, policy)
+		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, useRunner, policy, userText)
 	} else {
-		h.handleClaudeNonStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, useRunner, policy)
+		h.handleClaudeNonStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, useRunner, policy, userText)
 	}
 }
 
@@ -1099,7 +961,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 // enabled), the ConversationRunner drives the multi-round search loop and only
 // the final round's buffered events are streamed to the client. Otherwise the
 // stream path behaves exactly as before (a single CallKiroAPIContext round).
-func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, useRunner bool, policy WebSearchPolicy) {
+func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, useRunner bool, policy WebSearchPolicy, userText string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1113,51 +975,44 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	// 获取 thinking 输出格式配置
 	thinkingFormat := thinkingOpts.Format
 
+	reqStart := time.Now()
 	msgID := "msg_" + uuid.New().String()
 	startInputTokens := estimatedInputTokens
-	excluded := make(map[string]bool)
-	var lastErr error
-	messageStarted := false
-	var messageStartUsage promptCacheUsage
+	// guard replaces the hand-maintained messageStarted flag: the executor's one
+	// Committed() check enforces "no retry after the first client-visible byte".
+	// message_start is Claude's first byte, so ensureMessageStart commits the guard.
+	guard := &streamGuard{}
+	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
-	ensureMessageStart := func() {
-		if messageStarted {
-			return
-		}
-		h.sendSSE(w, flusher, "message_start", map[string]interface{}{
-			"type": "message_start",
-			"message": map[string]interface{}{
-				"id":            msgID,
-				"type":          "message",
-				"role":          "assistant",
-				"content":       []interface{}{},
-				"model":         model,
-				"stop_reason":   nil,
-				"stop_sequence": nil,
-				"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
-			},
-		})
-		messageStarted = true
-	}
-
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
-		}
+	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
-		messageStartUsage = cacheUsage
+		messageStartUsage := cacheUsage
+
+		ensureMessageStart := func() {
+			if guard.Committed() {
+				return
+			}
+			h.sendSSE(w, flusher, "message_start", map[string]interface{}{
+				"type": "message_start",
+				"message": map[string]interface{}{
+					"id":            msgID,
+					"type":          "message",
+					"role":          "assistant",
+					"content":       []interface{}{},
+					"model":         model,
+					"stop_reason":   nil,
+					"stop_sequence": nil,
+					"usage":         buildClaudeUsageMap(startInputTokens, 0, messageStartUsage, cacheProfile != nil),
+				},
+			})
+			guard.Commit()
+		}
 
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
 		var toolUses []KiroToolUse
+		var upstreamStopReason string
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
 		var rawThinkingBuilder strings.Builder
@@ -1536,6 +1391,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
 		// usedRunner marks the web_search path so token aggregation below does not
@@ -1549,36 +1407,29 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			run, err := h.conversationRunner.Run(ctx, account, payload, policy)
 			if err != nil {
 				if classifyRunError(err) {
-					// Kiro/account error: retry from the original payload on another
-					// account, but only if we have not started streaming yet.
-					lastErr = err
-					excluded[account.ID] = true
-					h.handleAccountFailure(account, err)
-					if !messageStarted {
-						continue
-					}
-					h.recordFailure()
-					h.sendSSE(w, flusher, "error", map[string]interface{}{
-						"type":  "error",
-						"error": map[string]string{"type": "api_error", "message": err.Error()},
-					})
-					return
+					// Kiro/account error: identical to the CallKiroAPIContext failure
+					// path. Report it to the executor, which retries onto another
+					// account when nothing has been flushed yet, or routes to
+					// onCommitted (the "no retry after first byte" surface) once the
+					// stream has started.
+					return attemptAccountFailed(err)
 				}
-				// Search/config/mixed/cancel: do not fail the account.
+				// Search/config/mixed/cancel: NOT an account failure. Surface it here
+				// (terminal) so the account is neither blamed nor retried, then tell
+				// the executor the attempt is fully handled.
 				if ctx.Err() != nil {
-					return
+					return attemptHandled()
 				}
-				lastErr = err
-				if !messageStarted {
+				if !guard.Committed() {
 					h.sendClaudeErrorForWebSearch(w, err)
-					return
+					return attemptHandled()
 				}
 				h.recordFailure()
 				h.sendSSE(w, flusher, "error", map[string]interface{}{
 					"type":  "error",
 					"error": map[string]string{"type": "api_error", "message": err.Error()},
 				})
-				return
+				return attemptHandled()
 			}
 
 			// Emit the synthetic Anthropic-native web_search blocks first: the
@@ -1616,20 +1467,48 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			}
 			runSources = run.Sources
 		} else {
-			err := CallKiroAPIContext(ctx, account, payload, callback)
+			measure := func() (int, int, string, bool) {
+				return rawContentBuilder.Len(), len(toolUses), upstreamStopReason, rawThinkingBuilder.Len() > 0
+			}
+
+			// A same-account retry only happens while nothing has been flushed, so
+			// SSE block indices are still at their initial values and need no
+			// rollback. What must be cleared is every accumulator plus the thinking
+			// tag parser state: processClaudeText buffers up to 50 runes before
+			// flushing, so a short truncated attempt can leave a partial tag behind
+			// that would otherwise be prefixed onto the retry's first chunk.
+			reset := func() {
+				rawContentBuilder.Reset()
+				rawThinkingBuilder.Reset()
+				toolUses = nil
+				inputTokens = 0
+				outputTokens = 0
+				credits = 0
+				realInputTokens = 0
+				upstreamStopReason = ""
+				textBuffer = ""
+				inThinkingBlock = false
+				dropTagThinking = false
+				thinkingSource = thinkingSourceUnknown
+				thinkingStarted = false
+				eventThinkingOpen = false
+			}
+
+			// The guard is the fork's equivalent of upstream's messageStarted flag:
+			// a same-account retry is only safe while nothing has been flushed.
+			err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset,
+				func() bool { return !guard.Committed() })
 			if err != nil {
-				lastErr = err
-				excluded[account.ID] = true
-				h.handleAccountFailure(account, err)
-				if !messageStarted {
-					continue
+				if ctx.Err() != nil {
+					return attemptHandled()
 				}
-				h.recordFailure()
-				h.sendSSE(w, flusher, "error", map[string]interface{}{
-					"type":  "error",
-					"error": map[string]string{"type": "api_error", "message": err.Error()},
-				})
-				return
+				if isStreamIntegrityError(err) {
+					// The account authenticated and answered; the stream ended
+					// truncated. Rotate onto another account without cooling this
+					// healthy one down.
+					return attemptRotateWithoutBlame(err)
+				}
+				return attemptAccountFailed(err)
 			}
 		}
 
@@ -1649,21 +1528,29 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 
 		closeActiveBlock()
 
+		// upstreamInput is the value the stream (or runner aggregate) actually
+		// reported, captured before any override so accounted usage never uses
+		// context occupancy. legacyInput reproduces the historical client number.
+		upstreamInput := inputTokens
+		var legacyInput int
 		if usedRunner {
 			// Aggregate totals already summed across rounds; do not overwrite with
 			// the final round's context occupancy (spec: client-visible usage is the
 			// whole logical request). Fall back to the estimate only if unset.
-			if inputTokens <= 0 {
+			legacyInput = upstreamInput
+			if legacyInput <= 0 {
 				if realInputTokens > 0 {
-					inputTokens = realInputTokens
+					legacyInput = realInputTokens
 				} else {
-					inputTokens = estimatedInputTokens
+					legacyInput = estimatedInputTokens
 				}
 			}
 		} else if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+			legacyInput = realInputTokens
+		} else if upstreamInput > 0 {
+			legacyInput = upstreamInput
+		} else {
+			legacyInput = estimatedInputTokens
 		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		thinkingOutput := rawThinkingBuilder.String()
@@ -1673,20 +1560,34 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		if !thinking {
 			thinkingOutput = ""
 		}
-		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
+		estimatedOutput := estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		// Split internal accounting (upstream-accurate) from the client-visible
+		// number (legacy by default, accurate when the operator opts in).
+		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
+		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
+
+		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
+		// Pool metrics must use the accounted values, not the raw upstream vars:
+		// Kiro reports no token counts, so inputTokens/outputTokens are 0 on this
+		// path and the dashboard would show every pool request as 0 in / 0 out.
+		h.recordSuccessLogSplit("claude", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
 
-		stopReason := "end_turn"
-		if len(toolUses) > 0 {
-			stopReason = "tool_use"
-		}
+		// Capture (write): store this turn's Q&A into memory (async, fail-open,
+		// redaction enforced in the provider). No-op unless capture is enabled
+		// (non-explicit write mode). outputContent is the clean answer text.
+		h.captureTurnAsync(apiKeyID, userText, outputContent)
+
+		// Upstream's metadataEvent stopReason, mapped to Anthropic's vocabulary.
+		// Falls back to end_turn when the upstream sent none, and tool_use always
+		// wins when the turn produced tool calls.
+		stopReason := mapClaudeStopReason(upstreamStopReason, len(toolUses))
 
 		ensureMessageStart()
-		usageMap := buildClaudeUsageMap(inputTokens, outputTokens, cacheUsage, cacheProfile != nil)
+		usageMap := buildClaudeUsageMap(clientInput, clientOutput, cacheUsage, cacheProfile != nil)
 		// Report the server-side searches the proxy ran so the client counts them
 		// instead of "Did 0 searches". Gated by the same kill-switch as the blocks.
 		if usedRunner && len(runSearches) > 0 {
@@ -1705,16 +1606,34 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
 			"type": "message_stop",
 		})
-		return
+		return attemptHandled()
 	}
 
-	if lastErr == nil {
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
-		return
+	// Claude's mid-stream (post-commit) failure surface: blame the account (the
+	// executor does not on the committed branch, matching the original loop which
+	// called handleAccountFailure on both the pre- and post-commit paths), record
+	// the request failure, and emit an `error` SSE event. This differs from OpenAI
+	// (silent) and Responses (response.failed) — the asymmetry is intentional and
+	// lives here in the per-protocol renderer.
+	onCommitted := func(account *config.Account, err error) {
+		h.handleAccountFailure(account, err)
+		h.recordFailure()
+		h.sendSSE(w, flusher, "error", map[string]interface{}{
+			"type":  "error",
+			"error": map[string]string{"type": "api_error", "message": err.Error()},
+		})
 	}
 
-	h.recordFailure()
-	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+	onExhausted := func(noAccounts bool, lastErr error) {
+		if noAccounts {
+			h.sendClaudeError(w, 503, "api_error", "No available accounts")
+			return
+		}
+		h.recordFailureWithDetails("claude", model, "", lastErr)
+		h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+	}
+
+	ex.Run(ctx, guard, attempt, onCommitted, onExhausted)
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
@@ -1815,27 +1734,154 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 	}
 }
 
+// recordFailure bumps the global failure counters. Kept as its own method because
+// the fork's per-protocol committed-failure and exhaustion renderers call it
+// directly when there is no endpoint/model/account context worth logging.
 func (h *Handler) recordFailure() {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
 }
 
-// handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, useRunner bool, policy WebSearchPolicy) {
-	excluded := make(map[string]bool)
-	var lastErr error
+// recordFailureWithDetails records a failure and stores it in the request logs.
+func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
+	h.recordFailure()
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
-		}
+	if err == nil {
+		return
+	}
+
+	errMsg := err.Error()
+	errType := classifyError(errMsg)
+
+	entry := RequestLog{
+		Time:      time.Now().Unix(),
+		Endpoint:  endpoint,
+		Model:     model,
+		AccountID: accountID,
+		Status:    "error",
+		Error:     errMsg,
+		ErrorType: errType,
+	}
+
+	h.appendRequestLog(entry)
+	recordKiroMetric(kiroMetric{
+		Endpoint:  endpoint,
+		Model:     model,
+		AccountID: accountID,
+		ErrorMsg:  errMsg,
+		ErrorType: errType,
+	})
+}
+
+// recordSuccessLogSplit records a successful request in the request logs and in
+// the metrics store. RequestLog keeps only the combined input+output total; the
+// split is preserved for the per-provider token breakdown in the dashboard,
+// which would otherwise render every Kiro response as "out 0".
+func (h *Handler) recordSuccessLogSplit(endpoint, model, accountID string, inputTokens, outputTokens int, credits float64, durationMs int64) {
+	entry := RequestLog{
+		Time:      time.Now().Unix(),
+		Endpoint:  endpoint,
+		Model:     model,
+		AccountID: accountID,
+		Status:    "success",
+		Tokens:    inputTokens + outputTokens,
+		Credits:   credits,
+		Duration:  durationMs,
+	}
+
+	h.appendRequestLog(entry)
+	recordKiroMetric(kiroMetric{
+		Endpoint:     endpoint,
+		Model:        model,
+		AccountID:    accountID,
+		Ok:           true,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		Credits:      credits,
+		DurationMs:   durationMs,
+	})
+}
+
+func (h *Handler) appendRequestLog(entry RequestLog) {
+	h.requestLogsMu.Lock()
+	if h.requestLogs == nil {
+		h.requestLogs = make([]RequestLog, 0, requestLogsMaxSize)
+	}
+	if len(h.requestLogs) >= requestLogsMaxSize {
+		h.requestLogs = h.requestLogs[1:]
+	}
+	h.requestLogs = append(h.requestLogs, entry)
+	h.requestLogsMu.Unlock()
+}
+
+// classifyError categorizes an error message into a type for display.
+func classifyError(msg string) string {
+	switch {
+	case isQuotaErrorMessage(msg):
+		return "quota"
+	case isOverageErrorMessage(msg):
+		return "overage"
+	case isSuspensionErrorMessage(msg):
+		return "suspended"
+	case isAuthErrorMessage(msg):
+		return "auth"
+	case isProfileUnavailableErrorMessage(msg):
+		return "profile"
+	default:
+		return "unknown"
+	}
+}
+
+// getRequestLogs returns a copy of request logs (newest first).
+func (h *Handler) getRequestLogs() []RequestLog {
+	h.requestLogsMu.RLock()
+	defer h.requestLogsMu.RUnlock()
+	if len(h.requestLogs) == 0 {
+		return []RequestLog{}
+	}
+	result := make([]RequestLog, len(h.requestLogs))
+	for i, e := range h.requestLogs {
+		result[len(h.requestLogs)-1-i] = e
+	}
+	return result
+}
+
+// usageSplit separates the token count used for INTERNAL accounting from the one
+// reported to the CLIENT, so a single request can charge accurate usage against
+// the pool/key while still emitting the historical (legacy) client number.
+//
+//   - accounted: what the internal sinks (per-key TokensUsed, per-account
+//     TotalTokens, global counters) record. Upstream-reported first, estimator
+//     fallback. It NEVER uses context-window occupancy as a token count.
+//   - client: what the response's usage map reports. In legacy mode (default) it
+//     is the tail's historical value, passed in verbatim as legacyClient — so the
+//     client sees byte-identical numbers to before this change. In accurate mode
+//     it switches to the accounted value.
+//
+// upstream is the upstream-reported count (0 when the stream carried none);
+// estimated is the local estimator fallback; legacyClient is the exact value the
+// tail reported before Phase A (which, for most tails, is context occupancy).
+func usageSplit(upstream, estimated, legacyClient int) (accounted, client int) {
+	accounted = upstream
+	if accounted <= 0 {
+		accounted = estimated
+	}
+	client = legacyClient
+	if config.GetUsageReportingMode() == config.UsageReportingAccurate {
+		client = accounted
+	}
+	return accounted, client
+}
+
+// handleClaudeNonStream Claude 非流式响应
+func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, useRunner bool, policy WebSearchPolicy, userText string) {
+	// Non-stream: fully buffered, so the guard is never committed and a late
+	// upstream error can still retry (invariant #7). No committed-failure branch.
+	reqStart := time.Now()
+	guard := &streamGuard{}
+	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
+
+	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 		var content string
@@ -1846,6 +1892,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		var realInputTokens int
 		var sources []SearchSource
 		var searches []WebSearchInvocation
+		var upstreamStopReason string
 
 		if useRunner {
 			// Server-side web_search path: the runner drives as many Kiro rounds as
@@ -1856,18 +1903,17 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 				if classifyRunError(err) {
 					// A Kiro/account error: fail the account and retry from the
 					// original payload on a different account.
-					lastErr = err
-					excluded[account.ID] = true
-					h.handleAccountFailure(account, err)
-					continue
+					return attemptAccountFailed(err)
 				}
-				// Search/config/mixed/cancel error: do not fail the account.
+				// Search/config/mixed/cancel error: do not fail the account. A
+				// cancelled context renders nothing (client is gone); otherwise map
+				// the error to a Claude-compatible response. Both are terminal — the
+				// executor must not retry or fall through to the exhaustion tail.
 				if ctx.Err() != nil {
-					return
+					return attemptHandled()
 				}
-				lastErr = err
 				h.sendClaudeErrorForWebSearch(w, err)
-				return
+				return attemptHandled()
 			}
 			fr := run.FinalRound
 			content = fr.VisibleContent
@@ -1905,14 +1951,37 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 				OnContextUsage: func(pct float64) {
 					realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 				},
+				OnStopReason: func(reason string) {
+					upstreamStopReason = reason
+				},
 			}
 
-			err := CallKiroAPIContext(ctx, account, payload, callback)
+			measure := func() (int, int, string, bool) {
+				return len(content), len(toolUses), upstreamStopReason, thinkingContent != ""
+			}
+
+			reset := func() {
+				content = ""
+				thinkingContent = ""
+				toolUses = nil
+				inputTokens = 0
+				outputTokens = 0
+				credits = 0
+				realInputTokens = 0
+				upstreamStopReason = ""
+			}
+
+			// Fully buffered: nothing reaches the client until the response is
+			// encoded, so a retry can never duplicate output — canRetry is nil.
+			err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
 			if err != nil {
-				lastErr = err
-				excluded[account.ID] = true
-				h.handleAccountFailure(account, err)
-				continue
+				if ctx.Err() != nil {
+					return attemptHandled()
+				}
+				if isStreamIntegrityError(err) {
+					return attemptRotateWithoutBlame(err)
+				}
+				return attemptAccountFailed(err)
 			}
 		}
 
@@ -1926,12 +1995,23 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			rawThinkingContent = ""
 		}
 
+		// upstreamInput is the value the stream (or runner aggregate) reported,
+		// captured before any override so accounted usage never uses context
+		// occupancy. legacyInput reproduces the historical client number (which,
+		// on this tail, lets context occupancy override even the runner total).
+		upstreamInput := inputTokens
+		var legacyInput int
 		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+			legacyInput = realInputTokens
+		} else if upstreamInput > 0 {
+			legacyInput = upstreamInput
+		} else {
+			legacyInput = estimatedInputTokens
 		}
-		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+		estimatedOutput := estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
+
+		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
+		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
 
 		// Append a deterministic Sources list when the runner gathered any and the
 		// feature is configured to do so.
@@ -1939,10 +2019,18 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			finalContent += formatSourcesList(sources)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
+		// Pool metrics must use the accounted values, not the raw upstream vars:
+		// Kiro reports no token counts, so inputTokens/outputTokens are 0 on this
+		// path and the dashboard would show every pool request as 0 in / 0 out.
+		h.recordSuccessLogSplit("claude", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
+
+		// Capture (write) this turn into memory when auto-capture is on. Async +
+		// fail-open + provider-enforced redaction; never blocks or breaks the response.
+		h.captureTurnAsync(memoryScopeForRequest(ctx), userText, finalContent)
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -1962,8 +2050,8 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			}
 		}
 
-		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, inputTokens, outputTokens, model, searches)
-		resp.Usage.InputTokens = billedClaudeInputTokens(inputTokens, cacheUsage)
+		resp := KiroToClaudeResponse(finalContent, responseThinkingContent, includeEmptyThinkingBlock, toolUses, clientInput, clientOutput, model, searches, upstreamStopReason)
+		resp.Usage.InputTokens = billedClaudeInputTokens(clientInput, cacheUsage)
 		resp.Usage.CacheCreationInputTokens = cacheUsage.CacheCreationInputTokens
 		resp.Usage.CacheReadInputTokens = cacheUsage.CacheReadInputTokens
 		if len(searches) > 0 {
@@ -1977,16 +2065,19 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
-		return
+		return attemptHandled()
 	}
 
-	if lastErr == nil {
-		h.sendClaudeError(w, 503, "api_error", "No available accounts")
-		return
+	onExhausted := func(noAccounts bool, lastErr error) {
+		if noAccounts {
+			h.sendClaudeError(w, 503, "api_error", "No available accounts")
+			return
+		}
+		h.recordFailureWithDetails("claude", model, "", lastErr)
+		h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 	}
 
-	h.recordFailure()
-	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+	ex.Run(ctx, guard, attempt, nil, onExhausted)
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
@@ -2007,8 +2098,8 @@ func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, me
 // client can act on; anything else falls back to a generic 502.
 func (h *Handler) sendClaudeErrorForWebSearch(w http.ResponseWriter, err error) {
 	h.recordFailure()
-	var cfgErr *SearchConfigError
-	var provErr *SearchProviderError
+	var cfgErr *search.ConfigError
+	var provErr *search.ProviderError
 	var mixed *MixedToolUseError
 	switch {
 	case errors.As(err, &mixed):
@@ -2018,7 +2109,7 @@ func (h *Handler) sendClaudeErrorForWebSearch(w http.ResponseWriter, err error) 
 	case errors.As(err, &provErr):
 		// Auth against the provider is a server misconfiguration from the client's
 		// perspective; rate/timeout/5xx are upstream unavailability.
-		if provErr.Kind == SearchErrAuth {
+		if provErr.Kind == search.ErrAuth {
 			h.sendClaudeError(w, 500, "api_error", "web_search provider authentication failed")
 		} else {
 			h.sendClaudeError(w, 502, "api_error", "web_search provider unavailable: "+string(provErr.Kind))
@@ -2053,28 +2144,29 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	// Forward to an external upstream when the (raw, un-normalized) client model
 	// matches an enabled route. Passthrough bypasses the Kiro pool entirely.
-	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/chat/completions", false) {
+	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/chat/completions", false, "") {
 		return
 	}
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinking, nameEffort := ParseModelThinkingAndEffort(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
+	applyOpenAIModelNameEffort(&req, nameEffort)
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(r.Context(), w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(r.Context(), w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2089,21 +2181,12 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 
 	chatID := "chatcmpl-" + uuid.New().String()
-	excluded := make(map[string]bool)
-	var lastErr error
+	reqStart := time.Now()
+	guard := &streamGuard{}
+	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
-		}
-
+	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
+		var upstreamStopReason string
 		var toolCalls []ToolCall
 		var toolCallIndex int
 		var inputTokens, outputTokens int
@@ -2117,7 +2200,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		var thinkingSource thinkingStreamSource
 		var thinkingStarted bool
 		var eventThinkingOpen bool
-		responseStarted := false
 
 		sendChunk := func(content string, thinkingState int) {
 			if content == "" && thinkingState == 2 {
@@ -2214,7 +2296,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			data, _ := json.Marshal(chunk)
 			fmt.Fprintf(w, "data: %s\n\n", string(data))
 			flusher.Flush()
-			responseStarted = true
+			guard.Commit()
 		}
 
 		processText := func(text string, isThinking bool, forceFlush bool) {
@@ -2371,7 +2453,10 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				data, _ := json.Marshal(chunk)
 				fmt.Fprintf(w, "data: %s\n\n", string(data))
 				flusher.Flush()
-				responseStarted = true
+				guard.Commit()
+			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
 			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
@@ -2385,16 +2470,44 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		measure := func() (int, int, string, bool) {
+			return rawContentBuilder.Len(), len(toolCalls), upstreamStopReason, rawReasoningBuilder.Len() > 0
+		}
+
+		// Retries only happen before anything is flushed, so chunk indices stay
+		// valid. The thinking tag parser state must be cleared too: processText
+		// holds back up to 50 runes, so a short truncated attempt would
+		// otherwise prepend its leftovers to the retry's first chunk.
+		reset := func() {
+			rawContentBuilder.Reset()
+			rawReasoningBuilder.Reset()
+			toolCalls = nil
+			toolCallIndex = 0
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+			textBuffer = ""
+			inThinkingBlock = false
+			dropTagThinking = false
+			thinkingSource = thinkingSourceUnknown
+			thinkingStarted = false
+			eventThinkingOpen = false
+		}
+
+		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset,
+			func() bool { return !guard.Committed() })
 		if err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			if !responseStarted {
-				continue
+			if ctx.Err() != nil {
+				return attemptHandled()
 			}
-			h.recordFailure()
-			return
+			// Integrity failures are upstream hiccups, not account faults: rotate
+			// without cooling down a healthy account.
+			if isStreamIntegrityError(err) {
+				return attemptRotateWithoutBlame(err)
+			}
+			return attemptAccountFailed(err)
 		}
 
 		processText("", false, true)
@@ -2402,10 +2515,14 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			sendChunk("", 3)
 		}
 
+		upstreamInput := inputTokens
+		var legacyInput int
 		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+			legacyInput = realInputTokens
+		} else if upstreamInput > 0 {
+			legacyInput = upstreamInput
+		} else {
+			legacyInput = estimatedInputTokens
 		}
 		outputContent, extractedReasoning := extractThinkingFromContent(rawContentBuilder.String())
 		reasoningOutput := rawReasoningBuilder.String()
@@ -2415,20 +2532,21 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		if !thinking {
 			reasoningOutput = ""
 		}
-		outputTokens = estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
+		estimatedOutput := estimateApproxTokens(outputContent) + estimateApproxTokens(reasoningOutput)
 		for _, tc := range toolCalls {
-			outputTokens += estimateApproxTokens(tc.Function.Name)
-			outputTokens += estimateApproxTokens(tc.Function.Arguments)
+			estimatedOutput += estimateApproxTokens(tc.Function.Name)
+			estimatedOutput += estimateApproxTokens(tc.Function.Arguments)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
+		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
+
+		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-
-		finishReason := "stop"
-		if len(toolCalls) > 0 {
-			finishReason = "tool_calls"
-		}
+		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
+		// See the claude tails: accounted values, not the always-0 upstream vars.
+		h.recordSuccessLogSplit("openai", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
+		finishReason := mapOpenAIFinishReason(upstreamStopReason, len(toolCalls))
 
 		chunk := map[string]interface{}{
 			"id":      chatID,
@@ -2441,50 +2559,74 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				"finish_reason": finishReason,
 			}},
 			"usage": map[string]int{
-				"prompt_tokens":     inputTokens,
-				"completion_tokens": outputTokens,
-				"total_tokens":      inputTokens + outputTokens,
+				"prompt_tokens":     clientInput,
+				"completion_tokens": clientOutput,
+				"total_tokens":      clientInput + clientOutput,
 			},
 		}
 		data, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", string(data))
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
-		return
+		return attemptHandled()
 	}
 
-	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
-		return
+	// OpenAI's mid-stream (post-commit) failure surface is deliberately SILENT: no
+	// error object, no [DONE] — just handleAccountFailure + recordFailure + return.
+	// This asymmetry (Claude emits an error SSE, Responses emits response.failed) is
+	// intentional and is preserved by making it this protocol's committed-failure
+	// renderer. handleAccountFailure runs here because the executor does not blame
+	// the account on the committed branch (the original loop called it on both the
+	// pre- and post-commit paths) — except for stream-integrity failures, where
+	// the account answered fine and the upstream cut the stream.
+	//
+	// The stream is NOT left silent: a client that receives partial content and
+	// then nothing cannot distinguish a truncated turn from a slow one, so an
+	// error chunk is emitted (and deliberately no [DONE], which would claim the
+	// turn completed).
+	onCommitted := func(account *config.Account, err error) {
+		if !isStreamIntegrityError(err) {
+			h.handleAccountFailure(account, err)
+		}
+		h.recordFailureWithDetails("openai", model, account.ID, err)
+		data, _ := json.Marshal(map[string]interface{}{
+			"error": map[string]string{
+				"message": err.Error(),
+				"type":    "server_error",
+			},
+		})
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
 	}
 
-	h.recordFailure()
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	onExhausted := func(noAccounts bool, lastErr error) {
+		if noAccounts {
+			h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+			return
+		}
+		h.recordFailureWithDetails("openai", model, "", lastErr)
+		h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	}
+
+	ex.Run(ctx, guard, attempt, onCommitted, onExhausted)
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
-	excluded := make(map[string]bool)
-	var lastErr error
+func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+	// Non-stream: fully buffered, so the guard is never committed and a late
+	// upstream error can still retry (invariant #7). No committed-failure branch.
+	reqStart := time.Now()
+	guard := &streamGuard{}
+	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
-		}
-
+	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
 		var content string
 		var reasoningContent string
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -2500,14 +2642,38 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnStopReason: func(reason string) {
+				upstreamStopReason = reason
+			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		measure := func() (int, int, string, bool) {
+			return len(content), len(toolUses), upstreamStopReason, reasoningContent != ""
+		}
+
+		reset := func() {
+			content = ""
+			reasoningContent = ""
+			toolUses = nil
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+		}
+
+		// Fully buffered: nothing reaches the client until the response is
+		// encoded, so a retry can never duplicate output.
+		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
 		if err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
+			if ctx.Err() != nil {
+				return attemptHandled()
+			}
+			// Integrity failures are upstream hiccups, not account faults.
+			if isStreamIntegrityError(err) {
+				return attemptRotateWithoutBlame(err)
+			}
+			return attemptAccountFailed(err)
 		}
 
 		finalContent, extractedReasoning := extractThinkingFromContent(content)
@@ -2517,31 +2683,43 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			reasoningContent = ""
 		}
 
+		upstreamInput := inputTokens
+		var legacyInput int
 		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+			legacyInput = realInputTokens
+		} else if upstreamInput > 0 {
+			legacyInput = upstreamInput
+		} else {
+			legacyInput = estimatedInputTokens
 		}
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+		estimatedOutput := estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
+		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
+
+		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
+		// See the claude tails: accounted values, not the always-0 upstream vars.
+		h.recordSuccessLogSplit("openai", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, clientInput, clientOutput, model, thinkingFormat, upstreamStopReason)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
-		return
+		return attemptHandled()
 	}
 
-	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
-		return
+	onExhausted := func(noAccounts bool, lastErr error) {
+		if noAccounts {
+			h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+			return
+		}
+		h.recordFailureWithDetails("openai", model, "", lastErr)
+		h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 	}
 
-	h.recordFailure()
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	ex.Run(ctx, guard, attempt, nil, onExhausted)
 }
 
 func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, message string) {
@@ -2555,6 +2733,103 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 	})
 }
 
+// refreshAccountToken serializes the complete refresh-token rotation lifecycle:
+// load the latest persisted credential, refresh it, persist any rotation, and
+// only then publish it to the runtime pool. A single lock is intentionally used
+// across accounts because refreshes are rare and this keeps every refresh entry
+// point consistent.
+//
+// The request hot path does NOT go through here — ensureValidToken routes to the
+// TokenManager, which coalesces per account instead of taking a global lock.
+// This remains the entry point for the admin/forced refreshes (force=true), where
+// the caller wants the full load-refresh-persist-publish cycle synchronously.
+func (h *Handler) refreshAccountToken(account *config.Account, force bool) (bool, error) {
+	if account == nil || strings.TrimSpace(account.ID) == "" {
+		return false, fmt.Errorf("account is required for token refresh")
+	}
+
+	h.tokenRefreshMu.Lock()
+	defer h.tokenRefreshMu.Unlock()
+
+	var latest *config.Account
+	accounts := config.GetAccounts()
+	for i := range accounts {
+		if accounts[i].ID == account.ID {
+			latest = &accounts[i]
+			break
+		}
+	}
+	if latest == nil {
+		return false, fmt.Errorf("account %s no longer exists", account.ID)
+	}
+	working := *latest
+
+	// API Key credentials never expire and cannot be OAuth-refreshed.
+	if config.IsAPIKeyAccount(&working) {
+		token := strings.TrimSpace(working.KiroApiKey)
+		if token == "" {
+			token = strings.TrimSpace(working.AccessToken)
+		}
+		if token == "" {
+			return false, fmt.Errorf("account %s has no kiroApiKey", working.ID)
+		}
+		h.pool.UpdateCredentialState(
+			account,
+			working.ID,
+			token,
+			"",
+			0,
+			"",
+		)
+		return false, nil
+	}
+
+	if !force && (working.ExpiresAt == 0 || time.Now().Unix() < working.ExpiresAt-tokenRefreshSkewSeconds) {
+		h.pool.UpdateCredentialState(
+			account,
+			working.ID,
+			working.AccessToken,
+			working.RefreshToken,
+			working.ExpiresAt,
+			working.ProfileArn,
+		)
+		return false, nil
+	}
+	if strings.TrimSpace(working.RefreshToken) == "" {
+		return false, fmt.Errorf("account %s has no refresh token", working.ID)
+	}
+
+	accessToken, refreshToken, expiresAt, profileArn, err := auth.RefreshToken(&working)
+	if err != nil {
+		return false, err
+	}
+	if refreshToken == "" {
+		refreshToken = working.RefreshToken
+	}
+
+	if err := config.UpdateAccountCredentialState(
+		working.ID,
+		accessToken,
+		refreshToken,
+		expiresAt,
+		profileArn,
+	); err != nil {
+		return false, fmt.Errorf("persist refreshed token for account %s: %w", working.ID, err)
+	}
+
+	// Do not expose a rotated credential through the pool until persistence has
+	// succeeded. This ordering prevents a later refresh from reading stale state.
+	h.pool.UpdateCredentialState(
+		account,
+		working.ID,
+		accessToken,
+		refreshToken,
+		expiresAt,
+		profileArn,
+	)
+	return true, nil
+}
+
 // ensureValidToken 确保 token 有效。
 //
 // Coordination, IdP call, validation, atomic persist, and pool publish are all
@@ -2563,6 +2838,14 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 // parallel (no global lock). On success the freshest snapshot is copied back into
 // the caller's account struct so the in-flight request uses the new credentials.
 func (h *Handler) ensureValidToken(account *config.Account) error {
+	// API Key credentials never expire and cannot be OAuth-refreshed; they only
+	// need to be present.
+	if config.IsAPIKeyAccount(account) {
+		if accountBearerToken(account) == "" {
+			return fmt.Errorf("account %s has no kiroApiKey", account.ID)
+		}
+		return nil
+	}
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
@@ -2610,10 +2893,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiBatchAccounts(w, r)
 	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
 	case path == "/accounts/models/refresh" && r.Method == "POST":
-		h.apiRefreshAllAccountsModels(w, r)
+		h.modelCache.apiRefreshAllAccountsModels(w, r)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/models/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/models/refresh")
-		h.apiRefreshAccountModels(w, r, id)
+		h.modelCache.apiRefreshAccountModels(w, r, id)
 	case strings.HasPrefix(path, "/accounts/") && strings.HasSuffix(path, "/refresh") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/accounts/"), "/refresh")
 		h.apiRefreshAccount(w, r, id)
@@ -2655,6 +2938,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiStartIamSso(w, r)
 	case path == "/auth/iam-sso/complete" && r.Method == "POST":
 		h.apiCompleteIamSso(w, r)
+	case path == "/auth/microsoft-sso/start" && r.Method == "POST":
+		h.apiStartMicrosoftSSO(w, r)
+	case path == "/auth/microsoft-sso/complete" && r.Method == "POST":
+		h.apiCompleteMicrosoftSSO(w, r)
+	case path == "/auth/microsoft-sso/select-profile" && r.Method == "POST":
+		h.apiSelectMicrosoftSSOProfile(w, r)
+	case path == "/auth/microsoft-sso/cancel" && r.Method == "POST":
+		h.apiCancelMicrosoftSSO(w, r)
 	case path == "/auth/builderid/start" && r.Method == "POST":
 		h.apiStartBuilderIdLogin(w, r)
 	case path == "/auth/builderid/poll" && r.Method == "POST":
@@ -2687,6 +2978,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiResetStats(w, r)
 	case path == "/logs" && r.Method == "GET":
 		h.apiGetLogs(w, r)
+	case path == "/logs" && r.Method == "DELETE":
+		h.apiClearLogs(w, r)
+	case path == "/logs/history" && r.Method == "GET":
+		h.apiGetConsoleHistory(w, r)
 	case path == "/logs/stream" && r.Method == "GET":
 		h.apiStreamLogs(w, r)
 	case path == "/logs/level" && r.Method == "GET":
@@ -2713,6 +3008,20 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetPromptFilter(w, r)
 	case path == "/prompt-filter" && r.Method == "POST":
 		h.apiUpdatePromptFilter(w, r)
+	case path == "/memory/config" && r.Method == "GET":
+		h.apiGetMemoryConfig(w, r)
+	case path == "/memory/config" && r.Method == "POST":
+		h.apiUpdateMemoryConfig(w, r)
+	case path == "/memory/search" && r.Method == "GET":
+		h.apiMemorySearch(w, r)
+	case path == "/memory" && r.Method == "POST":
+		h.apiMemoryAdd(w, r)
+	case path == "/memory" && r.Method == "DELETE":
+		h.apiMemoryDelete(w, r)
+	case path == "/upstreams/export" && r.Method == "GET":
+		h.apiExportUpstreams(w, r)
+	case path == "/upstreams/import" && r.Method == "POST":
+		h.apiImportUpstreams(w, r)
 	case path == "/upstreams" && r.Method == "GET":
 		h.apiGetUpstreams(w, r)
 	case path == "/upstreams" && r.Method == "POST":
@@ -2723,6 +3032,14 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpstreamTest(w, r)
 	case path == "/forward-stats" && r.Method == "GET":
 		h.apiGetForwardStats(w, r)
+	case path == "/provider-stats" && r.Method == "GET":
+		h.apiGetProviderDetail(w, r)
+	case path == "/forward-history" && r.Method == "GET":
+		h.apiGetForwardHistory(w, r)
+	case path == "/forward-events/export" && r.Method == "GET":
+		h.apiExportForwardEvents(w, r)
+	case path == "/forward-stats/reset-provider" && r.Method == "POST":
+		h.apiResetProviderStats(w, r)
 	case path == "/forward-stats/reset" && r.Method == "POST":
 		h.apiResetForwardStats(w, r)
 	case path == "/forward-events" && r.Method == "GET":
@@ -2741,6 +3058,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpdateSecurity(w, r)
 	case path == "/export" && r.Method == "POST":
 		h.apiExportAccounts(w, r)
+	case path == "/inject/status" && r.Method == "GET":
+		h.apiInjectStatus(w, r)
+	case path == "/inject" && r.Method == "POST":
+		h.apiInjectAccount(w, r)
 	case path == "/api-keys" && r.Method == "GET":
 		h.apiListApiKeys(w, r)
 	case path == "/api-keys" && r.Method == "POST":
@@ -2789,7 +3110,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"banReason":         a.BanReason,
 			"banTime":           a.BanTime,
 			"expiresAt":         a.ExpiresAt,
-			"hasToken":          a.AccessToken != "",
+			"hasToken":          accountBearerToken(&a) != "",
 			"machineId":         a.MachineId,
 			"weight":            a.Weight,
 			"overageStatus":     a.OverageStatus,
@@ -2870,7 +3191,7 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 	// 新账号若已启用且有 token（或是 API-key 账号），立即拉取并缓存模型列表
 	if account.Enabled && (account.AccessToken != "" || account.IsApiKeyCredential()) {
 		go func(acc config.Account) {
-			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+			if err := h.modelCache.FetchAndCache(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for new account %s: %v", acc.Email, err)
 			}
 		}(account)
@@ -2885,6 +3206,9 @@ func (h *Handler) apiDeleteAccount(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 	h.pool.Reload()
+	// Drop the deleted account's cached models so /v1/models stops advertising them
+	// immediately (and a later aggregate rebuild cannot resurrect them).
+	h.modelCache.DropAccount(id)
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
@@ -2939,7 +3263,7 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	// 账号从禁用→启用时，自动拉取并缓存模型列表
 	if !oldEnabled && existing.Enabled && existing.AccessToken != "" {
 		go func(acc config.Account) {
-			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+			if err := h.modelCache.FetchAndCache(&acc); err != nil {
 				logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, err)
 			}
 		}(*existing)
@@ -3082,7 +3406,7 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 		for _, acc := range toRefreshModels {
 			go func(a config.Account) {
 				a.Enabled = true
-				if err := h.fetchAndCacheAccountModels(&a); err != nil {
+				if err := h.modelCache.FetchAndCache(&a); err != nil {
 					logger.Warnf("[ModelsCache] Auto-refresh failed for batch-enabled account %s: %v", a.Email, err)
 				}
 			}(acc)
@@ -3107,18 +3431,10 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 			// 刷新 token
 			if account.RefreshToken != "" {
-				if newAccess, newRefresh, newExpires, profileArn, err := auth.RefreshToken(account); err == nil {
-					account.AccessToken = newAccess
-					if newRefresh != "" {
-						account.RefreshToken = newRefresh
-					}
-					account.ExpiresAt = newExpires
-					config.UpdateAccountToken(id, newAccess, newRefresh, newExpires)
-					if profileArn != "" {
-						account.ProfileArn = profileArn
-						config.UpdateAccountProfileArn(id, profileArn)
-					}
-					h.pool.UpdateToken(id, newAccess, newRefresh, newExpires)
+				if _, err := h.refreshAccountToken(account, true); err != nil {
+					logger.Warnf("[BatchRefresh] Token refresh failed for %s: %v", account.Email, err)
+					failCount++
+					continue
 				}
 			}
 			// 刷新账户信息
@@ -3224,6 +3540,505 @@ func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
 			"email": account.Email,
 		},
 	})
+}
+
+func (h *Handler) apiStartMicrosoftSSO(w http.ResponseWriter, r *http.Request) {
+	sessionID, authorizeURL, expiresIn, err := auth.StartMicrosoftSSOLogin()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sessionId":    sessionID,
+		"authorizeUrl": authorizeURL,
+		"expiresIn":    expiresIn,
+		"stage":        "kiro",
+	})
+}
+
+func (h *Handler) apiCompleteMicrosoftSSO(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID   string `json:"sessionId"`
+		CallbackURL string `json:"callbackUrl"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<10)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if strings.TrimSpace(req.SessionID) == "" || strings.TrimSpace(req.CallbackURL) == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "sessionId and callbackUrl are required"})
+		return
+	}
+
+	progress, err := auth.ContinueMicrosoftSSOLogin(req.SessionID, req.CallbackURL)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if h.microsoftSessionCanceled(req.SessionID) {
+		auth.CancelMicrosoftSSOLogin(req.SessionID)
+		h.writeMicrosoftSSOCanceled(w)
+		return
+	}
+	if progress.AuthorizationURL != "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":      true,
+			"stage":        "microsoft",
+			"authorizeUrl": progress.AuthorizationURL,
+		})
+		return
+	}
+	if progress.Result == nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Microsoft SSO returned no credential"})
+		return
+	}
+
+	result := progress.Result
+	account := config.Account{
+		ID:            auth.GenerateAccountID(),
+		Email:         result.Email,
+		UserId:        result.UserID,
+		AccessToken:   result.AccessToken,
+		RefreshToken:  result.RefreshToken,
+		ClientID:      result.ClientID,
+		AuthMethod:    auth.MicrosoftSSOAuthMethod,
+		Provider:      auth.MicrosoftSSOProvider,
+		Region:        "us-east-1",
+		ExpiresAt:     result.ExpiresAt,
+		Enabled:       true,
+		MachineId:     config.GenerateMachineId(),
+		TokenEndpoint: result.TokenEndpoint,
+		IssuerURL:     result.IssuerURL,
+		Scopes:        result.Scopes,
+	}
+
+	discoveryContext, discovery, ok := h.beginMicrosoftProfileDiscovery(r.Context(), req.SessionID)
+	if !ok {
+		clearMicrosoftAccountCredential(&account)
+		h.writeMicrosoftSSOCanceled(w)
+		return
+	}
+	profiles, profileErr := DiscoverKiroProfilesContext(discoveryContext, &account)
+	discoveryErr := discoveryContext.Err()
+	h.endMicrosoftProfileDiscovery(req.SessionID, discovery)
+
+	h.microsoftFlowMu.Lock()
+	if h.microsoftSessionCanceledLocked(req.SessionID, time.Now()) {
+		h.microsoftFlowMu.Unlock()
+		clearMicrosoftAccountCredential(&account)
+		h.writeMicrosoftSSOCanceled(w)
+		return
+	}
+	if discoveryErr != nil {
+		h.microsoftFlowMu.Unlock()
+		clearMicrosoftAccountCredential(&account)
+		w.WriteHeader(http.StatusGatewayTimeout)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Microsoft profile discovery was canceled or timed out"})
+		return
+	}
+	if len(profiles) > 1 {
+		selectionID, expiredSelections, err := h.storeMicrosoftProfileSelection(req.SessionID, account, profiles)
+		h.microsoftFlowMu.Unlock()
+		discardDetachedMicrosoftProfileSelections(expiredSelections)
+		if err != nil {
+			clearMicrosoftAccountCredential(&account)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":                  true,
+			"stage":                    "profile",
+			"requiresProfileSelection": true,
+			"selectionId":              selectionID,
+			"profiles":                 profiles,
+		})
+		return
+	}
+	if len(profiles) == 1 {
+		account.ProfileArn = profiles[0].ARN
+	}
+	if err := config.AddAccount(account); err != nil {
+		h.microsoftFlowMu.Unlock()
+		h.writeAddAccountError(w, err)
+		return
+	}
+	delete(h.microsoftCanceled, strings.TrimSpace(req.SessionID))
+	h.microsoftFlowMu.Unlock()
+	h.pool.Reload()
+
+	response := map[string]interface{}{
+		"success": true,
+		"stage":   "complete",
+		"account": map[string]interface{}{"id": account.ID, "email": account.Email},
+	}
+	if profileErr != nil {
+		response["warning"] = "The account was added, but its Kiro profile could not be resolved yet"
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+func (h *Handler) apiSelectMicrosoftSSOProfile(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SelectionID string `json:"selectionId"`
+		ProfileARN  string `json:"profileArn"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	selectionID := strings.TrimSpace(req.SelectionID)
+	selection := h.getMicrosoftProfileSelection(selectionID)
+	if selection == nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Microsoft profile selection not found or expired"})
+		return
+	}
+
+	selection.mu.Lock()
+	if selection.canceled.Load() || !time.Now().Before(selection.ExpiresAt) {
+		selection.mu.Unlock()
+		h.removeMicrosoftProfileSelection(selectionID, selection)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Microsoft profile selection not found or expired"})
+		return
+	}
+
+	profileARN := strings.TrimSpace(req.ProfileARN)
+	allowed := false
+	for _, profile := range selection.Profiles {
+		if profile.ARN == profileARN {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		selection.mu.Unlock()
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Selected Kiro profile was not offered for this login"})
+		return
+	}
+
+	account := selection.Account
+	account.ProfileArn = profileARN
+	h.microsoftFlowMu.Lock()
+	now := time.Now()
+	if selection.canceled.Load() ||
+		!now.Before(selection.ExpiresAt) ||
+		h.microsoftSessionCanceledLocked(selection.SessionID, now) {
+		h.microsoftFlowMu.Unlock()
+		h.detachMicrosoftProfileSelection(selectionID, selection)
+		selection.canceled.Store(true)
+		selection.Account = config.Account{}
+		selection.Profiles = nil
+		selection.mu.Unlock()
+		h.writeMicrosoftSSOCanceled(w)
+		return
+	}
+	if err := config.AddAccount(account); err != nil {
+		h.microsoftFlowMu.Unlock()
+		selection.mu.Unlock()
+		h.writeAddAccountError(w, err)
+		return
+	}
+	h.detachMicrosoftProfileSelection(selectionID, selection)
+	selection.canceled.Store(true)
+	selection.Account = config.Account{}
+	selection.Profiles = nil
+	delete(h.microsoftCanceled, selection.SessionID)
+	h.microsoftFlowMu.Unlock()
+	selection.mu.Unlock()
+	h.pool.Reload()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"stage":   "complete",
+		"account": map[string]interface{}{"id": account.ID, "email": account.Email},
+	})
+}
+
+func (h *Handler) apiCancelMicrosoftSSO(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID   string `json:"sessionId"`
+		SelectionID string `json:"selectionId"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	sessionID := strings.TrimSpace(req.SessionID)
+	selectionID := strings.TrimSpace(req.SelectionID)
+	if sessionID == "" && selectionID != "" {
+		if selection := h.getMicrosoftProfileSelection(selectionID); selection != nil {
+			sessionID = selection.SessionID
+		}
+	}
+	if sessionID != "" {
+		h.markMicrosoftSessionCanceled(sessionID)
+	}
+	auth.CancelMicrosoftSSOLogin(sessionID)
+	if selectionID != "" {
+		h.removeMicrosoftProfileSelection(selectionID, nil)
+	}
+	if sessionID != "" {
+		h.removeMicrosoftProfileSelectionsForSession(sessionID)
+	}
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func (h *Handler) storeMicrosoftProfileSelection(
+	sessionID string,
+	account config.Account,
+	profiles []KiroProfile,
+) (string, []*microsoftProfileSelection, error) {
+	now := time.Now()
+	expiresAt := now.Add(microsoftProfileSelectionTTL)
+	tokenExpiry := time.Unix(account.ExpiresAt, 0)
+	if account.ExpiresAt > 0 && tokenExpiry.Before(expiresAt) {
+		expiresAt = tokenExpiry
+	}
+	if !expiresAt.After(now) {
+		return "", nil, fmt.Errorf("Microsoft credential expired before profile selection")
+	}
+	selectionID := uuid.NewString()
+	selection := &microsoftProfileSelection{
+		SessionID: strings.TrimSpace(sessionID),
+		Account:   account,
+		Profiles:  append([]KiroProfile(nil), profiles...),
+		ExpiresAt: expiresAt,
+	}
+	var expired []*microsoftProfileSelection
+
+	h.microsoftSelectionsMu.Lock()
+	if h.microsoftSelections == nil {
+		h.microsoftSelections = make(map[string]*microsoftProfileSelection)
+	}
+	for id, current := range h.microsoftSelections {
+		if !now.Before(current.ExpiresAt) {
+			delete(h.microsoftSelections, id)
+			current.canceled.Store(true)
+			if current.timer != nil {
+				current.timer.Stop()
+				current.timer = nil
+			}
+			expired = append(expired, current)
+		}
+	}
+	if len(h.microsoftSelections) >= microsoftMaxPendingProfileSelections {
+		h.microsoftSelectionsMu.Unlock()
+		return "", expired, fmt.Errorf("too many pending Microsoft profile selections; cancel one and try again")
+	}
+	h.microsoftSelections[selectionID] = selection
+	selection.timer = time.AfterFunc(time.Until(expiresAt), func() {
+		h.removeMicrosoftProfileSelection(selectionID, selection)
+	})
+	h.microsoftSelectionsMu.Unlock()
+	return selectionID, expired, nil
+}
+
+func (h *Handler) getMicrosoftProfileSelection(selectionID string) *microsoftProfileSelection {
+	if selectionID == "" {
+		return nil
+	}
+	h.microsoftSelectionsMu.Lock()
+	selection := h.microsoftSelections[selectionID]
+	if selection != nil && !time.Now().Before(selection.ExpiresAt) {
+		delete(h.microsoftSelections, selectionID)
+		selection.canceled.Store(true)
+		if selection.timer != nil {
+			selection.timer.Stop()
+			selection.timer = nil
+		}
+		h.microsoftSelectionsMu.Unlock()
+		discardDetachedMicrosoftProfileSelection(selection)
+		return nil
+	}
+	h.microsoftSelectionsMu.Unlock()
+	return selection
+}
+
+func (h *Handler) detachMicrosoftProfileSelection(
+	selectionID string,
+	expected *microsoftProfileSelection,
+) *microsoftProfileSelection {
+	selectionID = strings.TrimSpace(selectionID)
+	if selectionID == "" {
+		return nil
+	}
+	h.microsoftSelectionsMu.Lock()
+	current := h.microsoftSelections[selectionID]
+	if current != nil && (expected == nil || current == expected) {
+		delete(h.microsoftSelections, selectionID)
+		current.canceled.Store(true)
+		if current.timer != nil {
+			current.timer.Stop()
+			current.timer = nil
+		}
+	} else {
+		current = nil
+	}
+	h.microsoftSelectionsMu.Unlock()
+	return current
+}
+
+func (h *Handler) removeMicrosoftProfileSelection(selectionID string, expected *microsoftProfileSelection) {
+	if selection := h.detachMicrosoftProfileSelection(selectionID, expected); selection != nil {
+		discardDetachedMicrosoftProfileSelection(selection)
+	}
+}
+
+func (h *Handler) removeMicrosoftProfileSelectionsForSession(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	var removed []*microsoftProfileSelection
+	h.microsoftSelectionsMu.Lock()
+	for selectionID, selection := range h.microsoftSelections {
+		if selection.SessionID == sessionID {
+			delete(h.microsoftSelections, selectionID)
+			selection.canceled.Store(true)
+			if selection.timer != nil {
+				selection.timer.Stop()
+				selection.timer = nil
+			}
+			removed = append(removed, selection)
+		}
+	}
+	h.microsoftSelectionsMu.Unlock()
+	for _, selection := range removed {
+		discardDetachedMicrosoftProfileSelection(selection)
+	}
+}
+
+func discardDetachedMicrosoftProfileSelection(selection *microsoftProfileSelection) {
+	selection.mu.Lock()
+	selection.Account = config.Account{}
+	selection.Profiles = nil
+	selection.mu.Unlock()
+}
+
+func discardDetachedMicrosoftProfileSelections(selections []*microsoftProfileSelection) {
+	for _, selection := range selections {
+		discardDetachedMicrosoftProfileSelection(selection)
+	}
+}
+
+func clearMicrosoftAccountCredential(account *config.Account) {
+	account.AccessToken = ""
+	account.RefreshToken = ""
+	account.ClientSecret = ""
+}
+
+func (h *Handler) markMicrosoftSessionCanceled(sessionID string) {
+	now := time.Now()
+	h.microsoftFlowMu.Lock()
+	if h.microsoftCanceled == nil {
+		h.microsoftCanceled = make(map[string]time.Time)
+	}
+	h.cleanupMicrosoftCanceledLocked(now)
+	if len(h.microsoftCanceled) >= microsoftMaxCanceledSessionTombstones {
+		var oldestID string
+		var oldestExpiry time.Time
+		for id, expiry := range h.microsoftCanceled {
+			if oldestID == "" || expiry.Before(oldestExpiry) {
+				oldestID = id
+				oldestExpiry = expiry
+			}
+		}
+		delete(h.microsoftCanceled, oldestID)
+	}
+	h.microsoftCanceled[sessionID] = now.Add(microsoftCanceledSessionTTL)
+	if discovery := h.microsoftDiscoveries[sessionID]; discovery != nil {
+		discovery.cancel()
+	}
+	h.microsoftFlowMu.Unlock()
+}
+
+func (h *Handler) beginMicrosoftProfileDiscovery(
+	parent context.Context,
+	sessionID string,
+) (context.Context, *microsoftProfileDiscovery, bool) {
+	sessionID = strings.TrimSpace(sessionID)
+	h.microsoftFlowMu.Lock()
+	defer h.microsoftFlowMu.Unlock()
+	if h.microsoftSessionCanceledLocked(sessionID, time.Now()) {
+		return nil, nil, false
+	}
+	if h.microsoftDiscoveries == nil {
+		h.microsoftDiscoveries = make(map[string]*microsoftProfileDiscovery)
+	}
+	if h.microsoftDiscoveries[sessionID] != nil {
+		return nil, nil, false
+	}
+	ctx, cancel := context.WithTimeout(parent, microsoftProfileDiscoveryTimeout)
+	discovery := &microsoftProfileDiscovery{cancel: cancel}
+	h.microsoftDiscoveries[sessionID] = discovery
+	return ctx, discovery, true
+}
+
+func (h *Handler) endMicrosoftProfileDiscovery(sessionID string, expected *microsoftProfileDiscovery) {
+	expected.cancel()
+	h.microsoftFlowMu.Lock()
+	if h.microsoftDiscoveries[strings.TrimSpace(sessionID)] == expected {
+		delete(h.microsoftDiscoveries, strings.TrimSpace(sessionID))
+	}
+	h.microsoftFlowMu.Unlock()
+}
+
+func (h *Handler) microsoftSessionCanceled(sessionID string) bool {
+	h.microsoftFlowMu.Lock()
+	defer h.microsoftFlowMu.Unlock()
+	return h.microsoftSessionCanceledLocked(sessionID, time.Now())
+}
+
+func (h *Handler) microsoftSessionCanceledLocked(sessionID string, now time.Time) bool {
+	h.cleanupMicrosoftCanceledLocked(now)
+	expiry, exists := h.microsoftCanceled[strings.TrimSpace(sessionID)]
+	return exists && now.Before(expiry)
+}
+
+func (h *Handler) cleanupMicrosoftCanceledLocked(now time.Time) {
+	for sessionID, expiry := range h.microsoftCanceled {
+		if !now.Before(expiry) {
+			delete(h.microsoftCanceled, sessionID)
+		}
+	}
+}
+
+func (h *Handler) writeMicrosoftSSOCanceled(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusConflict)
+	json.NewEncoder(w).Encode(map[string]string{"error": "Microsoft SSO login was canceled"})
+}
+
+func (h *Handler) writeAddAccountError(w http.ResponseWriter, err error, rotatedRefreshToken ...string) {
+	if errors.Is(err, config.ErrDuplicateAccountID) ||
+		errors.Is(err, config.ErrDuplicateRefreshToken) ||
+		errors.Is(err, config.ErrDuplicateAPIKey) {
+		w.WriteHeader(http.StatusConflict)
+	} else {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	payload := map[string]string{"error": err.Error()}
+	if len(rotatedRefreshToken) > 0 {
+		if rotated := strings.TrimSpace(rotatedRefreshToken[0]); rotated != "" {
+			// Microsoft may have already invalidated the original refresh token.
+			// Surface the rotated value so operators can retry import without a
+			// full interactive re-login.
+			payload["rotatedRefreshToken"] = rotated
+			payload["hint"] = "The identity provider rotated the refresh token before persistence failed; retry import with rotatedRefreshToken"
+		}
+	}
+	json.NewEncoder(w).Encode(payload)
 }
 
 func (h *Handler) apiStartBuilderIdLogin(w http.ResponseWriter, r *http.Request) {
@@ -3424,7 +4239,7 @@ func (h *Handler) apiPollKiroSso(w http.ResponseWriter, r *http.Request) {
 		if _, err := RefreshAccountInfo(&account); err != nil {
 			logger.Warnf("[apiPollKiroSso] Account info refresh failed for external_idp account %s: %v", account.Email, err)
 		}
-		h.fetchAndCacheAccountModels(&account)
+		h.modelCache.FetchAndCache(&account)
 	}()
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -3533,43 +4348,88 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	var req credentialImportPayload
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
 
-	// 设置默认值
-	if req.Region == "" {
-		req.Region = "us-east-1"
+	req.RefreshToken = strings.TrimSpace(req.RefreshToken)
+	req.KiroApiKey = strings.TrimSpace(req.KiroApiKey)
+	req.AccessToken = strings.TrimSpace(req.AccessToken)
+	methodHint := strings.ToLower(strings.TrimSpace(req.AuthMethod))
+	isAPIKeyImport := req.KiroApiKey != "" ||
+		methodHint == "api_key" || methodHint == "apikey" ||
+		(req.RefreshToken == "" && looksLikeKiroAPIKey(req.AccessToken))
+	if isAPIKeyImport && req.KiroApiKey == "" {
+		// Allow plain-text / AccessToken-only API key imports.
+		req.KiroApiKey = req.AccessToken
 	}
-
-	// Handle API-key credential import (no refresh token required)
-	if req.KiroApiKey != "" || strings.EqualFold(req.AuthMethod, "api_key") || strings.EqualFold(req.AuthMethod, "apikey") {
-		if req.KiroApiKey == "" {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "kiroApiKey is required"})
+	if !isAPIKeyImport && req.RefreshToken == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "refreshToken or kiroApiKey is required"})
+		return
+	}
+	if len(req.RefreshToken) > 512<<10 || len(req.AccessToken) > 512<<10 || len(req.KiroApiKey) > 512<<10 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "credential token is too long"})
+		return
+	}
+	originalRefreshToken := req.RefreshToken
+	h.credentialImportMu.Lock()
+	defer h.credentialImportMu.Unlock()
+	accountID := strings.TrimSpace(req.ID)
+	if accountID != "" {
+		if _, err := uuid.Parse(accountID); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "id must be a UUID"})
 			return
 		}
-
-		account := config.Account{
-			ID:          auth.GenerateAccountID(),
-			Nickname:    req.Nickname,
-			KiroApiKey:  req.KiroApiKey,
-			AccessToken: req.KiroApiKey, // mirror for pool compatibility
-			AuthMethod:  "api_key",
-			Region:      req.Region,
-			AuthRegion:  req.AuthRegion,
-			ApiRegion:   req.ApiRegion,
-			ExpiresAt:   0,
-			Enabled:     true,
-			MachineId:   config.GenerateMachineId(),
+		if config.AccountIDExists(accountID) {
+			h.writeAddAccountError(w, config.ErrDuplicateAccountID)
+			return
 		}
+	}
 
+	// API Key import path: no OAuth refresh, no profileArn.
+	if isAPIKeyImport {
+		if accountID == "" {
+			accountID = auth.GenerateAccountID()
+		}
+		account := config.Account{
+			ID:         accountID,
+			Email:      strings.TrimSpace(req.Email),
+			UserId:     strings.TrimSpace(req.UserID),
+			Nickname:   strings.TrimSpace(req.Nickname),
+			KiroApiKey: req.KiroApiKey,
+			AuthMethod: "api_key",
+			Provider:   strings.TrimSpace(req.Provider),
+			Region:     strings.TrimSpace(req.Region),
+			AuthRegion: strings.TrimSpace(req.AuthRegion),
+			ApiRegion:  strings.TrimSpace(req.ApiRegion),
+			Enabled:    true,
+		}
+		// MachineId is deliberately left empty: NormalizeAPIKeyAccount derives a
+		// deterministic one from the key, so re-importing the same key yields the
+		// same machine identity.
+		if err := config.NormalizeAPIKeyAccount(&account); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if config.AccountAPIKeyExists(account.KiroApiKey) {
+			h.writeAddAccountError(w, config.ErrDuplicateAPIKey)
+			return
+		}
 		// Best-effort: fetch account info to populate email/usage.
 		if info, infoErr := RefreshAccountInfo(&account); infoErr == nil && info != nil {
-			account.Email = info.Email
-			account.UserId = info.UserId
+			if account.Email == "" {
+				account.Email = info.Email
+			}
+			if account.UserId == "" {
+				account.UserId = info.UserId
+			}
 			account.SubscriptionType = info.SubscriptionType
 			account.SubscriptionTitle = info.SubscriptionTitle
 			account.DaysRemaining = info.DaysRemaining
@@ -3579,20 +4439,18 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			account.NextResetDate = info.NextResetDate
 			account.LastRefresh = info.LastRefresh
 		}
-
 		if err := config.AddAccount(account); err != nil {
-			w.WriteHeader(500)
-			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			h.writeAddAccountError(w, err)
 			return
 		}
-
 		h.pool.Reload()
-		go func(acc config.Account) {
-			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
-				logger.Warnf("[ModelsCache] Auto-refresh failed for new api_key account %s: %v", acc.Email, err)
-			}
-		}(account)
-
+		if account.Enabled && account.AccessToken != "" {
+			go func(acc config.Account) {
+				if err := h.modelCache.FetchAndCache(&acc); err != nil {
+					logger.Warnf("[ModelsCache] Auto-refresh failed for new API key account %s: %v", acc.Email, err)
+				}
+			}(account)
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": true,
 			"account": map[string]interface{}{
@@ -3603,8 +4461,24 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if config.AccountCredentialExists(originalRefreshToken) {
+		h.writeAddAccountError(w, config.ErrDuplicateRefreshToken)
+		return
+	}
+
+	// 设置默认值
+	req.Region = strings.TrimSpace(req.Region)
+	if req.Region == "" {
+		req.Region = "us-east-1"
+	}
+
 	account, status, err := h.importOAuthCredential(req)
 	if err != nil {
+		var persistErr *credentialPersistError
+		if errors.As(err, &persistErr) {
+			h.writeAddAccountError(w, persistErr.err, persistErr.rotatedRefreshToken)
+			return
+		}
 		w.WriteHeader(status)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -3622,22 +4496,38 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 // credentialImportPayload is the request body shared by the credential import
 // endpoint and the local-cache importer.
 type credentialImportPayload struct {
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-	ClientID     string `json:"clientId"`
-	ClientSecret string `json:"clientSecret"`
-	AuthMethod   string `json:"authMethod"`
-	Provider     string `json:"provider"`
-	Region       string `json:"region"`
-	AuthRegion   string `json:"authRegion"`
-	ApiRegion    string `json:"apiRegion"`
-	KiroApiKey   string `json:"kiroApiKey"`
-	Nickname     string `json:"nickname"`
-	IssuerURL    string `json:"issuerUrl"`
-	IdPClientID  string `json:"idpClientId"`
-	Scopes       string `json:"scopes"`
-	LoginHint    string `json:"loginHint"`
+	ID            string `json:"id"`
+	Email         string `json:"email"`
+	UserID        string `json:"userId"`
+	ProfileARN    string `json:"profileArn"`
+	AccessToken   string `json:"accessToken"`
+	RefreshToken  string `json:"refreshToken"`
+	ClientID      string `json:"clientId"`
+	ClientSecret  string `json:"clientSecret"`
+	AuthMethod    string `json:"authMethod"`
+	Provider      string `json:"provider"`
+	Region        string `json:"region"`
+	AuthRegion    string `json:"authRegion"`
+	ApiRegion     string `json:"apiRegion"`
+	KiroApiKey    string `json:"kiroApiKey"`
+	Nickname      string `json:"nickname"`
+	TokenEndpoint string `json:"tokenEndpoint"`
+	IssuerURL     string `json:"issuerUrl"`
+	IdPClientID   string `json:"idpClientId"`
+	Scopes        string `json:"scopes"`
+	LoginHint     string `json:"loginHint"`
 }
+
+// credentialPersistError wraps a persistence failure that happened AFTER the
+// identity provider rotated the refresh token, so the caller can return the
+// rotated value instead of stranding the operator with a dead credential.
+type credentialPersistError struct {
+	err                 error
+	rotatedRefreshToken string
+}
+
+func (e *credentialPersistError) Error() string { return e.err.Error() }
+func (e *credentialPersistError) Unwrap() error { return e.err }
 
 // importOAuthCredential performs the refresh-token based credential import
 // (idc / social / external_idp). It returns the created account, or an HTTP
@@ -3650,27 +4540,45 @@ func (h *Handler) importOAuthCredential(req credentialImportPayload) (*config.Ac
 	if req.RefreshToken == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("refreshToken is required")
 	}
-	if req.AuthMethod == "" {
-		if req.ClientID != "" {
-			req.AuthMethod = "idc"
-		} else {
-			req.AuthMethod = "social"
-		}
-	}
-	// 标准化 authMethod
-	switch strings.ToLower(req.AuthMethod) {
-	case "idc", "builderid", "enterprise":
+	// The token the caller handed us, before any IdP rotation below. Used for the
+	// credential fingerprint so re-imports of the same credential collide.
+	originalRefreshToken := req.RefreshToken
+	// 标准化 authMethod. An absent authMethod is deliberately NOT defaulted here:
+	// the classifier below needs to see it empty to consider the implicit
+	// external-IdP shape (a bare Microsoft blob carries only clientId +
+	// accessToken), and its final default arm covers the plain cases.
+	method := strings.ToLower(strings.TrimSpace(req.AuthMethod))
+	provider := strings.ToLower(strings.TrimSpace(req.Provider))
+	derivedTokenEndpoint, derivedIssuer, derivedScopes := auth.DeriveExternalIdpEndpoints(
+		req.UserID, req.ClientID, req.AccessToken,
+	)
+	// Explicit AWS/social methods win over incidental tokenEndpoint/issuerUrl
+	// fields so mixed JSON templates cannot force the external-IdP path.
+	explicitMicrosoft := method == "external_idp" || method == "external-idp" ||
+		method == "externalidp" ||
+		method == "external" || method == "microsoft" || method == "m365" || method == "office365" ||
+		method == "azure" || method == "azuread" || method == "azure-ad" || method == "azure_ad" ||
+		method == "entra" || method == "entra-id" ||
+		provider == "external" || provider == "microsoft" || provider == "m365" || provider == "office365" ||
+		provider == "azure" || provider == "azuread" || provider == "azure-ad" || provider == "azure_ad" ||
+		provider == "entra" || provider == "entra-id"
+	implicitExternal := method == "" && provider == "" &&
+		(derivedTokenEndpoint != "" ||
+			strings.TrimSpace(req.TokenEndpoint) != "" ||
+			strings.TrimSpace(req.IssuerURL) != "")
+	switch {
+	case method == "api_key" || method == "apikey":
+		req.AuthMethod = "api_key"
+	case method == "idc" || method == "builderid" || method == "enterprise":
 		req.AuthMethod = "idc"
-	case "social", "google", "github":
+	case method == "social" || method == "google" || method == "github":
 		req.AuthMethod = "social"
-	case "external_idp", "externalidp":
-		req.AuthMethod = "external_idp"
+	case explicitMicrosoft || implicitExternal:
+		req.AuthMethod = auth.MicrosoftSSOAuthMethod
+	case req.ClientID != "" && req.ClientSecret != "":
+		req.AuthMethod = "idc"
 	default:
-		if req.ClientID != "" && req.ClientSecret != "" {
-			req.AuthMethod = "idc"
-		} else {
-			req.AuthMethod = "social"
-		}
+		req.AuthMethod = "social"
 	}
 
 	// Backend-side external_idp detection: an older cached frontend (or a JSON
@@ -3679,26 +4587,92 @@ func (h *Handler) importOAuthCredential(req credentialImportPayload) (*config.Ac
 	// fails with 401 "Bad credentials". Trust the IdP signals over the label:
 	// presence of issuerUrl / idpClientId / a Microsoft-style provider means
 	// this is an External IdP account regardless of what authMethod claims.
-	if req.AuthMethod != "external_idp" {
+	//
+	// Only "social" is rescued this way. An EXPLICIT idc/api_key from the caller
+	// is authoritative — an IdC tenant may legitimately carry a tokenEndpoint or
+	// issuerUrl, and forcing it onto the Microsoft path would fail its import
+	// with a client_id UUID error.
+	if req.AuthMethod == "social" && method != "social" {
 		if req.IssuerURL != "" || req.IdPClientID != "" ||
 			strings.Contains(strings.ToLower(req.Provider), "entra") ||
 			strings.Contains(strings.ToLower(req.Provider), "microsoft") {
-			req.AuthMethod = "external_idp"
+			req.AuthMethod = auth.MicrosoftSSOAuthMethod
 		}
 	}
 
 	// 用 refreshToken 刷新获取新的 accessToken。导入必须以一次成功的刷新为前提：
 	// 本地缓存里的 accessToken 不携带可信的过期时间，盲猜短 TTL 会让账号在选号时
 	// 永远被跳过，导致后台/按需刷新都无法触发（详见 ensureValidToken 与 Pick 的过期判定）。
+	req.ClientID = strings.TrimSpace(req.ClientID)
+	req.TokenEndpoint = strings.TrimSpace(req.TokenEndpoint)
+	req.IssuerURL = strings.TrimRight(strings.TrimSpace(req.IssuerURL), "/")
+	req.Scopes = strings.TrimSpace(req.Scopes)
+
+	if req.AuthMethod == auth.MicrosoftSSOAuthMethod {
+		if req.IssuerURL == "" {
+			req.IssuerURL = derivedIssuer
+		}
+		if req.IssuerURL == "" && req.TokenEndpoint != "" {
+			normalizedTokenEndpoint, tokenIssuer, tokenScopes := auth.ExternalIdpConfigurationFromTokenEndpoint(
+				req.TokenEndpoint, req.ClientID,
+			)
+			if normalizedTokenEndpoint != "" {
+				req.TokenEndpoint = normalizedTokenEndpoint
+				req.IssuerURL = tokenIssuer
+				if req.Scopes == "" {
+					req.Scopes = tokenScopes
+				}
+			}
+		}
+		if req.IssuerURL != "" {
+			builtTokenEndpoint, normalizedIssuer, builtScopes := auth.ExternalIdpConfigurationFromIssuer(req.IssuerURL, req.ClientID)
+			if req.TokenEndpoint == "" {
+				req.TokenEndpoint = builtTokenEndpoint
+			}
+			if normalizedIssuer != "" {
+				req.IssuerURL = normalizedIssuer
+			}
+			if req.Scopes == "" {
+				req.Scopes = builtScopes
+			}
+		}
+		if req.TokenEndpoint == "" {
+			req.TokenEndpoint = derivedTokenEndpoint
+		}
+		if req.Scopes == "" {
+			req.Scopes = derivedScopes
+		}
+		normalizedScopes, err := auth.NormalizeExternalIdpScopes(req.Scopes, req.ClientID)
+		if err != nil {
+			return nil, http.StatusBadRequest, err
+		}
+		req.Scopes = normalizedScopes
+		if err := auth.ValidateExternalIdpConfiguration(req.ClientID, req.TokenEndpoint, req.IssuerURL, req.Scopes); err != nil {
+			return nil, http.StatusBadRequest, err
+		}
+		req.Provider = auth.MicrosoftSSOProvider
+		req.ClientSecret = ""
+	}
+
+	profileARN := strings.TrimSpace(req.ProfileARN)
+	if profileARN != "" {
+		canonicalARN, _, ok := parseKiroProfileArn(profileARN)
+		if !ok {
+			return nil, http.StatusBadRequest, fmt.Errorf("profileArn is invalid")
+		}
+		profileARN = canonicalARN
+	}
+
 	tempAccount := &config.Account{
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Region:       req.Region,
-		IssuerURL:    req.IssuerURL,
-		IdPClientID:  req.IdPClientID,
-		Scopes:       req.Scopes,
+		RefreshToken:  req.RefreshToken,
+		ClientID:      req.ClientID,
+		ClientSecret:  req.ClientSecret,
+		AuthMethod:    req.AuthMethod,
+		Region:        req.Region,
+		TokenEndpoint: req.TokenEndpoint,
+		IssuerURL:     req.IssuerURL,
+		IdPClientID:   req.IdPClientID,
+		Scopes:        req.Scopes,
 	}
 	accessToken, newRefreshToken, expiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
 	if err != nil {
@@ -3718,39 +4692,95 @@ func (h *Handler) importOAuthCredential(req credentialImportPayload) (*config.Ac
 	if newRefreshToken != "" {
 		req.RefreshToken = newRefreshToken
 	}
+	rotatedRefreshToken := ""
+	if req.RefreshToken != "" && req.RefreshToken != originalRefreshToken {
+		rotatedRefreshToken = req.RefreshToken
+	}
 
 	// 获取用户信息
-	email, _, _ := auth.GetUserInfo(accessToken)
-	// external_idp: GetUserInfo may fail for Microsoft-issued tokens; fallback to loginHint
+	email := strings.TrimSpace(req.Email)
+	userID := strings.TrimSpace(req.UserID)
+	if req.AuthMethod == auth.MicrosoftSSOAuthMethod {
+		tokenEmail, tokenUserID := auth.ExternalIdpTokenIdentity(accessToken)
+		if tokenEmail != "" {
+			email = tokenEmail
+		}
+		if tokenUserID != "" {
+			userID = tokenUserID
+		}
+	} else if tokenEmail, _, _ := auth.GetUserInfo(accessToken); tokenEmail != "" {
+		email = tokenEmail
+	}
+	// external_idp: identity lookups may fail for Microsoft-issued tokens; fall
+	// back to the loginHint the importer supplied.
 	if email == "" && req.LoginHint != "" {
 		email = req.LoginHint
 	}
 
+	accountID := strings.TrimSpace(req.ID)
+	if accountID == "" {
+		accountID = auth.GenerateAccountID()
+	}
+	if profileARN == "" {
+		profileARN = newProfileArn
+	}
+	// Interactive Microsoft login only accepts profiles discovered for the
+	// refreshed token. Import keeps the same trust boundary so a client cannot
+	// pin an arbitrary data-plane ARN onto a working credential.
+	if req.AuthMethod == auth.MicrosoftSSOAuthMethod && profileARN != "" {
+		probeAccount := *tempAccount
+		probeAccount.AccessToken = accessToken
+		probeAccount.RefreshToken = req.RefreshToken
+		probeAccount.ExpiresAt = expiresAt
+		offeredProfiles, discoverErr := DiscoverKiroProfiles(&probeAccount)
+		if discoverErr != nil {
+			return nil, http.StatusBadRequest, fmt.Errorf("Unable to verify profileArn against Kiro profiles: %w", discoverErr)
+		}
+		offered := false
+		for _, profile := range offeredProfiles {
+			if profile.ARN == profileARN {
+				offered = true
+				break
+			}
+		}
+		if !offered {
+			return nil, http.StatusBadRequest, fmt.Errorf("profileArn was not offered for this credential")
+		}
+	}
 	// 创建账号
 	account := config.Account{
-		ID:           auth.GenerateAccountID(),
-		Email:        email,
-		Nickname:     req.Nickname,
-		AccessToken:  accessToken,
-		RefreshToken: req.RefreshToken,
-		ClientID:     req.ClientID,
-		ClientSecret: req.ClientSecret,
-		AuthMethod:   req.AuthMethod,
-		Provider:     req.Provider,
-		Region:       req.Region,
-		AuthRegion:   req.AuthRegion,
-		ApiRegion:    req.ApiRegion,
-		ExpiresAt:    expiresAt,
-		Enabled:      true,
-		MachineId:    config.GenerateMachineId(),
-		ProfileArn:   newProfileArn,
-		IssuerURL:    req.IssuerURL,
-		IdPClientID:  req.IdPClientID,
-		Scopes:       req.Scopes,
-		LoginHint:    req.LoginHint,
+		ID:                      accountID,
+		Email:                   email,
+		UserId:                  userID,
+		Nickname:                strings.TrimSpace(req.Nickname),
+		AccessToken:             accessToken,
+		RefreshToken:            req.RefreshToken,
+		RefreshTokenFingerprint: config.RefreshTokenFingerprint(originalRefreshToken),
+		ClientID:                req.ClientID,
+		ClientSecret:            req.ClientSecret,
+		AuthMethod:              req.AuthMethod,
+		Provider:                req.Provider,
+		Region:                  req.Region,
+		AuthRegion:              req.AuthRegion,
+		ApiRegion:               req.ApiRegion,
+		ExpiresAt:               expiresAt,
+		Enabled:                 true,
+		MachineId:               config.GenerateMachineId(),
+		ProfileArn:              profileARN,
+		TokenEndpoint:           req.TokenEndpoint,
+		IssuerURL:               req.IssuerURL,
+		IdPClientID:             req.IdPClientID,
+		Scopes:                  req.Scopes,
+		LoginHint:               req.LoginHint,
 	}
 
 	if err := config.AddAccount(account); err != nil {
+		// The IdP may have already invalidated the refresh token the caller sent.
+		// Carry the rotated one out so the HTTP layer can hand it back and the
+		// operator can retry import without a full interactive re-login.
+		if rotatedRefreshToken != "" {
+			return nil, http.StatusInternalServerError, &credentialPersistError{err: err, rotatedRefreshToken: rotatedRefreshToken}
+		}
 		return nil, http.StatusInternalServerError, err
 	}
 
@@ -3913,6 +4943,7 @@ func (h *Handler) apiImportLocalCache(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
+		"version":         config.Version,
 		"accounts":        h.pool.Count(),
 		"available":       h.pool.AvailableCount(),
 		"totalRequests":   h.totalRequests,
@@ -4114,6 +5145,70 @@ func (h *Handler) apiUpdateUpstreams(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiExportUpstreams handles GET /admin/api/upstreams/export.
+//
+// Unlike apiGetUpstreams, provider API keys are returned UNMASKED, so the file
+// can be imported on another host and work immediately. This is only safe
+// because every /admin/ path is password-gated (handleAdminAPI) and optionally
+// IP-allowlisted (ServeHTTP) before dispatch reaches here — never expose this
+// route outside that gate.
+func (h *Handler) apiExportUpstreams(w http.ResponseWriter, r *http.Request) {
+	bundle := config.ExportUpstreamBundle()
+	// The body is plaintext secret material: keep it out of browser and
+	// intermediary caches.
+	w.Header().Set("Cache-Control", "no-store")
+	filename := "kiro-forwarding-" + time.Now().Format("2006-01-02") + ".json"
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	json.NewEncoder(w).Encode(bundle)
+}
+
+// apiImportUpstreams handles POST /admin/api/upstreams/import. The body is an
+// export bundle produced by apiExportUpstreams.
+//
+// Merge semantics: existing entries are never overwritten. Duplicate providers
+// (matched on baseUrl+name) and duplicate routes (matched on client model) are
+// skipped and reported back with a machine-readable reason the UI localizes.
+// Returns 400 for a malformed or unrecognized bundle.
+func (h *Handler) apiImportUpstreams(w http.ResponseWriter, r *http.Request) {
+	var bundle config.UpstreamBundle
+	if err := json.NewDecoder(r.Body).Decode(&bundle); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	res, err := config.ImportUpstreamBundle(bundle)
+	if err != nil {
+		status := 500
+		if errors.Is(err, config.ErrInvalidUpstreamBundle) {
+			status = 400
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Marshal empty skip lists as [] rather than null.
+	skippedProviders := res.SkippedProviders
+	if skippedProviders == nil {
+		skippedProviders = []config.SkippedItem{}
+	}
+	skippedRoutes := res.SkippedRoutes
+	if skippedRoutes == nil {
+		skippedRoutes = []config.SkippedItem{}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":          true,
+		"providersAdded":   res.ProvidersAdded,
+		"providersSkipped": res.ProvidersSkipped,
+		"routesAdded":      res.RoutesAdded,
+		"routesSkipped":    res.RoutesSkipped,
+		"skippedProviders": skippedProviders,
+		"skippedRoutes":    skippedRoutes,
+	})
 }
 
 // resolveUpstreamCreds resolves the base URL, API key and proxy for an upstream
@@ -4362,9 +5457,16 @@ func (h *Handler) apiGetPublicIP(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "ip": ip, "port": config.GetPort()})
 }
 
-// apiGetForwardStats returns aggregate forward metrics: overall totals,
-// per-provider and per-route breakdowns, the rolling time-series, and latency
-// percentiles.
+// apiGetForwardStats returns aggregate metrics: overall totals, per-provider and
+// per-route breakdowns, the rolling time-series, and latency percentiles.
+//
+// Providers are joined against the upstream config so the response also carries
+// the configured display name, base URL and prices for providers that exist but
+// have no traffic yet, plus the synthetic Kiro-pool entry.
+//
+// An `hours` query restricts the per-provider figures to that window, which is
+// what the Stats tab's range selector sends. overall/percentiles stay all-time:
+// they feed the Forwarding tab's KPI cards, which are not range-scoped.
 func (h *Handler) apiGetForwardStats(w http.ResponseWriter, r *http.Request) {
 	minutes := 60
 	if v := strings.TrimSpace(r.URL.Query().Get("minutes")); v != "" {
@@ -4372,13 +5474,287 @@ func (h *Handler) apiGetForwardStats(w http.ResponseWriter, r *http.Request) {
 			minutes = n
 		}
 	}
+	hours := 0
+	if v := strings.TrimSpace(r.URL.Query().Get("hours")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hours = n
+		}
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"overall":     metrics.Overall(),
-		"providers":   metrics.ProviderStats(),
+		"providers":   mergedProviderStats(hours),
 		"routes":      metrics.RouteStats(),
 		"timeseries":  metrics.TimeSeries(minutes),
 		"percentiles": metrics.LatencyPercentiles(),
+		"windowHours": hours,
 	})
+}
+
+// providerRow is a provider's recorded stats plus the configuration context the
+// dashboard needs to render and label it.
+type providerRow struct {
+	metrics.ProviderStat
+	BaseURL      string  `json:"baseUrl,omitempty"`
+	Enabled      bool    `json:"enabled"`
+	Configured   bool    `json:"configured"`
+	IsPool       bool    `json:"isPool"`
+	PriceInPerM  float64 `json:"priceInPerM,omitempty"`
+	PriceOutPerM float64 `json:"priceOutPerM,omitempty"`
+}
+
+// mergedProviderStats joins recorded metrics with the configured upstreams so
+// the comparison table lists every provider — including ones configured but not
+// yet used (which would otherwise be invisible) and ones whose config was
+// deleted but whose history remains.
+//
+// hours > 0 scopes the recorded figures to that window; 0 means all-time.
+func mergedProviderStats(hours int) []providerRow {
+	stats := metrics.ProviderStats()
+	if hours > 0 {
+		stats = metrics.ProviderStatsWindow(hours)
+	}
+	byID := make(map[string]metrics.ProviderStat, len(stats))
+	for _, p := range stats {
+		byID[p.ProviderID] = p
+	}
+
+	providers, _ := config.GetUpstreamConfig()
+	rows := make([]providerRow, 0, len(stats)+len(providers))
+	seen := make(map[string]bool, len(stats))
+
+	for _, up := range providers {
+		st, ok := byID[up.ID]
+		if !ok {
+			st = metrics.ProviderStat{ProviderID: up.ID, SuccessRate: -1}
+		}
+		// The configured name wins: renaming a provider should retitle its history
+		// rather than leave the old label attached to past traffic.
+		st.ProviderName = up.Name
+		rows = append(rows, providerRow{
+			ProviderStat: st,
+			BaseURL:      up.BaseURL,
+			Enabled:      up.Enabled,
+			Configured:   true,
+			PriceInPerM:  up.PriceInPerM,
+			PriceOutPerM: up.PriceOutPerM,
+		})
+		seen[up.ID] = true
+	}
+
+	for _, p := range stats {
+		if seen[p.ProviderID] {
+			continue
+		}
+		rows = append(rows, providerRow{
+			ProviderStat: p,
+			// The pool is always "configured" in the sense that it cannot be
+			// deleted; anything else here is orphaned history.
+			Configured: p.ProviderID == metrics.KiroPoolID,
+			Enabled:    p.ProviderID == metrics.KiroPoolID,
+			IsPool:     p.ProviderID == metrics.KiroPoolID,
+		})
+	}
+
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Requests > rows[j].Requests })
+	return rows
+}
+
+// apiGetProviderDetail returns the full drill-down for one provider:
+// per-model and per-account breakdowns, the status histogram, recent errors,
+// percentiles and the per-minute series.
+//
+// An `hours` query scopes the headline ProviderStat numbers to that window,
+// matching what the Stats tab's range selector sends to /forward-stats.
+// Models/Accounts/Statuses are always all-time (buckets carry no per-dimension
+// breakdowns). Omitting hours or passing hours=0 returns all-time totals.
+func (h *Handler) apiGetProviderDetail(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "id is required"})
+		return
+	}
+	minutes := 60
+	if v := strings.TrimSpace(r.URL.Query().Get("minutes")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			minutes = n
+		}
+	}
+	hours := 0
+	if v := strings.TrimSpace(r.URL.Query().Get("hours")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hours = n
+		}
+	}
+
+	detail, ok := metrics.ProviderDetailWindow(id, hours, minutes)
+	if !ok {
+		// A configured provider with no traffic yet is a valid, empty detail —
+		// not a 404 — so the panel renders zeros instead of an error.
+		detail = metrics.ProviderDetail{
+			ProviderStat: metrics.ProviderStat{ProviderID: id, SuccessRate: -1},
+			Minutes:      []metrics.Bucket{},
+		}
+	}
+
+	resp := map[string]interface{}{"detail": detail}
+	if id == metrics.KiroPoolID {
+		resp["isPool"] = true
+		resp["name"] = metrics.KiroPoolName
+	} else if providers, _ := config.GetUpstreamConfig(); providers != nil {
+		for _, up := range providers {
+			if up.ID != id {
+				continue
+			}
+			resp["name"] = up.Name
+			resp["baseUrl"] = up.BaseURL
+			resp["enabled"] = up.Enabled
+			resp["priceInPerM"] = up.PriceInPerM
+			resp["priceOutPerM"] = up.PriceOutPerM
+			break
+		}
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+// apiGetForwardHistory returns rollups for the trend chart. An empty id
+// aggregates across all providers.
+//
+// Granularity follows the requested range: hours=1 would produce a single hourly
+// bar, so sub-day ranges are served from the per-minute buckets instead and the
+// response reports which unit was used.
+func (h *Handler) apiGetForwardHistory(w http.ResponseWriter, r *http.Request) {
+	hours := 24
+	if v := strings.TrimSpace(r.URL.Query().Get("hours")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hours = n
+		}
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+
+	if hours <= 1 {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"providerId": id,
+			"hours":      hours,
+			"unit":       "minute",
+			"buckets":    metrics.MinuteHistoryFor(id, 60),
+		})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"providerId": id,
+		"hours":      hours,
+		"unit":       "hour",
+		"buckets":    metrics.HistoryFor(id, hours),
+	})
+}
+
+// apiResetProviderStats clears the counters and history for a single provider,
+// leaving every other provider untouched, then persists the new state.
+func (h *Handler) apiResetProviderStats(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "id is required"})
+		return
+	}
+	if !metrics.ResetProvider(id) {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "no stats for that provider"})
+		return
+	}
+	if err := metrics.Save(forwardMetricsPath()); err != nil {
+		logger.Warnf("[Metrics] failed to save after provider reset: %v", err)
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+// apiExportForwardEvents streams the filtered event log as CSV or JSON for
+// offline analysis. It accepts the same filters as apiGetForwardEvents but
+// ignores pagination, exporting every match up to exportEventsMax.
+func (h *Handler) apiExportForwardEvents(w http.ResponseWriter, r *http.Request) {
+	const exportEventsMax = 5000
+
+	q := r.URL.Query()
+	items, total := metrics.Events(eventFilterFromQuery(q, 0, exportEventsMax))
+
+	format := strings.ToLower(strings.TrimSpace(q.Get("format")))
+	if format == "json" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="forward-events.json"`)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"exportedAt": time.Now().UnixMilli(),
+			"total":      total,
+			"exported":   len(items),
+			"items":      items,
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="forward-events.csv"`)
+	cw := csv.NewWriter(w)
+	defer cw.Flush()
+	_ = cw.Write([]string{
+		"time", "provider", "account", "endpoint", "clientModel", "targetModel",
+		"status", "ok", "canceled", "stream", "latencyMs", "ttfbMs",
+		"inputTokens", "outputTokens", "costUsd", "error",
+	})
+	for _, e := range items {
+		_ = cw.Write([]string{
+			time.UnixMilli(e.TimeMs).UTC().Format(time.RFC3339),
+			e.ProviderName,
+			e.AccountLabel,
+			e.Endpoint,
+			e.ClientModel,
+			e.TargetModel,
+			strconv.Itoa(e.Status),
+			strconv.FormatBool(e.Ok),
+			strconv.FormatBool(e.Canceled),
+			strconv.FormatBool(e.Stream),
+			strconv.FormatInt(e.LatencyMs, 10),
+			strconv.FormatInt(e.TTFBMs, 10),
+			strconv.FormatInt(e.InputTokens, 10),
+			strconv.FormatInt(e.OutputTokens, 10),
+			strconv.FormatFloat(e.CostUSD, 'f', -1, 64),
+			e.ErrorMsg,
+		})
+	}
+}
+
+// eventFilterFromQuery builds an EventFilter from admin query parameters,
+// shared by the paged log view and the export endpoint.
+func eventFilterFromQuery(q url.Values, offset, limit int) metrics.EventFilter {
+	atoi64 := func(s string) int64 {
+		n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+		if err != nil {
+			return 0
+		}
+		return n
+	}
+	code := 0
+	if n, err := strconv.Atoi(strings.TrimSpace(q.Get("code"))); err == nil {
+		code = n
+	}
+	return metrics.EventFilter{
+		ProviderID: strings.TrimSpace(q.Get("provider")),
+		AccountID:  strings.TrimSpace(q.Get("account")),
+		Status:     strings.TrimSpace(q.Get("status")),
+		StatusCode: code,
+		Model:      strings.TrimSpace(q.Get("model")),
+		SinceMs:    atoi64(q.Get("since")),
+		UntilMs:    atoi64(q.Get("until")),
+		Offset:     offset,
+		Limit:      limit,
+	}
 }
 
 // apiResetForwardStats clears all forward metrics and persists the empty state.
@@ -4390,8 +5766,9 @@ func (h *Handler) apiResetForwardStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
-// apiGetForwardEvents returns forward events newest-first with optional
-// provider/status/model filters and offset/limit pagination.
+// apiGetForwardEvents returns events newest-first with optional
+// provider/account/status/code/model/time-range filters and offset/limit
+// pagination.
 func (h *Handler) apiGetForwardEvents(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	offset := 0
@@ -4402,13 +5779,7 @@ func (h *Handler) apiGetForwardEvents(w http.ResponseWriter, r *http.Request) {
 	if n, err := strconv.Atoi(strings.TrimSpace(q.Get("limit"))); err == nil && n > 0 {
 		limit = n
 	}
-	items, total := metrics.Events(metrics.EventFilter{
-		ProviderID: strings.TrimSpace(q.Get("provider")),
-		Status:     strings.TrimSpace(q.Get("status")),
-		Model:      strings.TrimSpace(q.Get("model")),
-		Offset:     offset,
-		Limit:      limit,
-	})
+	items, total := metrics.Events(eventFilterFromQuery(q, offset, limit))
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"items":  items,
 		"total":  total,
@@ -4542,6 +5913,19 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
+func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"logs": h.getRequestLogs(),
+	})
+}
+
+func (h *Handler) apiClearLogs(w http.ResponseWriter, r *http.Request) {
+	h.requestLogsMu.Lock()
+	h.requestLogs = h.requestLogs[:0]
+	h.requestLogsMu.Unlock()
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
 // apiGenerateMachineId 生成新的机器码
 func (h *Handler) apiGenerateMachineId(w http.ResponseWriter, r *http.Request) {
 	machineId := config.GenerateMachineId()
@@ -4601,8 +5985,11 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		OnContextUsage: func(pct float64) {},
 	}
 
-	err := CallKiroAPI(account, kiroPayload, callback)
+	err := CallKiroAPIContext(r.Context(), account, kiroPayload, callback)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -4637,22 +6024,8 @@ func (h *Handler) apiRefreshAccount(w http.ResponseWriter, r *http.Request, id s
 		if account.RefreshToken == "" {
 			return nil
 		}
-		newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
-		if err != nil {
-			return err
-		}
-		account.AccessToken = newAccessToken
-		if newRefreshToken != "" {
-			account.RefreshToken = newRefreshToken
-		}
-		account.ExpiresAt = newExpiresAt
-		config.UpdateAccountToken(id, newAccessToken, newRefreshToken, newExpiresAt)
-		h.pool.UpdateToken(id, newAccessToken, newRefreshToken, newExpiresAt)
-		if profileArn != "" {
-			account.ProfileArn = profileArn
-			config.UpdateAccountProfileArn(id, profileArn)
-		}
-		return nil
+		_, err := h.refreshAccountToken(account, true)
+		return err
 	}
 
 	// 检查 token 是否快过期，先刷新
@@ -4763,6 +6136,8 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"scopes":            account.Scopes,
 		"loginHint":         account.LoginHint,
 		"region":            account.Region,
+		"profileArn":        account.ProfileArn,
+		"tokenEndpoint":     account.TokenEndpoint,
 		"expiresAt":         account.ExpiresAt,
 		"machineId":         account.MachineId,
 		"weight":            account.Weight,
@@ -4817,23 +6192,16 @@ func (h *Handler) apiGetAccountModels(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 
-	models, err := ListAvailableModels(account)
+	models, err := h.modelCache.ListModels(r.Context(), account)
 	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 
-	// 同步更新路由缓存
-	modelIDs := make([]string, 0, len(models))
-	for _, m := range models {
-		modelIDs = append(modelIDs, m.ModelId)
-	}
-	h.pool.SetModelList(id, modelIDs)
-	h.modelsCacheMu.Lock()
-	h.cachedModels = mergeUniqueModels(h.cachedModels, models)
-	h.modelsCacheTime = time.Now().Unix()
-	h.modelsCacheMu.Unlock()
+	// Publish through the gated path so a concurrent profile switch wins and the
+	// aggregate rebuild drops any stale models, instead of the old grow-only merge.
+	h.modelCache.PublishGated(id, account.ProfileArn, account.EffectiveApiRegion(), models)
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
@@ -4876,8 +6244,10 @@ func toLogEntryJSON(e logger.Entry) logEntryJSON {
 	}
 }
 
-// apiGetLogs GET /admin/api/logs - returns retained log history (SSE fallback).
-func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
+// apiGetConsoleHistory GET /admin/api/logs/history - returns retained logger
+// history (the SSE console's fallback when EventSource is unavailable). Distinct
+// from apiGetLogs, which serves the per-request RequestLog ring buffer.
+func (h *Handler) apiGetConsoleHistory(w http.ResponseWriter, r *http.Request) {
 	hist := logger.History()
 	out := make([]logEntryJSON, 0, len(hist))
 	for _, e := range hist {
@@ -4981,18 +6351,26 @@ func (h *Handler) apiSetLogLevel(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiGetThinkingConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := config.GetThinkingConfig()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"suffix":       cfg.Suffix,
-		"openaiFormat": cfg.OpenAIFormat,
-		"claudeFormat": cfg.ClaudeFormat,
+		"suffix":                cfg.Suffix,
+		"openaiFormat":          cfg.OpenAIFormat,
+		"claudeFormat":          cfg.ClaudeFormat,
+		"defaultEffort":         cfg.DefaultEffort,
+		"advertiseEffortModels": cfg.AdvertiseEffortModels,
 	})
 }
 
 // apiUpdateThinkingConfig 更新 thinking 配置
 func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request) {
+	// The effort fields are pointers so an omitted key keeps its stored value.
+	// The legacy admin page (web/index-legacy.html) still POSTs the original
+	// three-field body, and treating "absent" as "clear it" would silently reset
+	// the default level and the /v1/models toggle whenever that page saved.
 	var req struct {
-		Suffix       string `json:"suffix"`
-		OpenAIFormat string `json:"openaiFormat"`
-		ClaudeFormat string `json:"claudeFormat"`
+		Suffix                string  `json:"suffix"`
+		OpenAIFormat          string  `json:"openaiFormat"`
+		ClaudeFormat          string  `json:"claudeFormat"`
+		DefaultEffort         *string `json:"defaultEffort"`
+		AdvertiseEffortModels *bool   `json:"advertiseEffortModels"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5013,7 +6391,31 @@ func (h *Handler) apiUpdateThinkingConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := config.UpdateThinkingConfig(req.Suffix, req.OpenAIFormat, req.ClaudeFormat); err != nil {
+	current := config.GetThinkingConfig()
+
+	// Store the default effort in canonical form so the request path can compare
+	// it against the enum without re-normalizing on every turn. "" and "auto"
+	// both mean "let the model choose", and both persist as "".
+	defaultEffort := current.DefaultEffort
+	if req.DefaultEffort != nil {
+		level, ok := NormalizeThinkingEffort(*req.DefaultEffort)
+		if !ok {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid defaultEffort, must be one of: auto, " + ThinkingEffortValues()})
+			return
+		}
+		defaultEffort = ""
+		if level != EffortUnset && level != EffortAuto {
+			defaultEffort = string(level)
+		}
+	}
+
+	advertiseEffortModels := current.AdvertiseEffortModels
+	if req.AdvertiseEffortModels != nil {
+		advertiseEffortModels = *req.AdvertiseEffortModels
+	}
+
+	if err := config.UpdateThinkingConfig(req.Suffix, req.OpenAIFormat, req.ClaudeFormat, defaultEffort, advertiseEffortModels); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -5203,19 +6605,25 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 
 	// 构建兼容 Kiro Account Manager 的导出格式
 	type ExportCredentials struct {
-		AccessToken  string `json:"accessToken"`
-		CsrfToken    string `json:"csrfToken"`
-		RefreshToken string `json:"refreshToken"`
-		ClientID     string `json:"clientId,omitempty"`
-		ClientSecret string `json:"clientSecret,omitempty"`
-		Region       string `json:"region,omitempty"`
-		ExpiresAt    int64  `json:"expiresAt"`
-		AuthMethod   string `json:"authMethod,omitempty"`
-		Provider     string `json:"provider,omitempty"`
-		IssuerURL    string `json:"issuerUrl,omitempty"`
-		IdPClientID  string `json:"idpClientId,omitempty"`
-		Scopes       string `json:"scopes,omitempty"`
-		LoginHint    string `json:"loginHint,omitempty"`
+		AccessToken   string `json:"accessToken"`
+		CsrfToken     string `json:"csrfToken"`
+		RefreshToken  string `json:"refreshToken"`
+		ClientID      string `json:"clientId,omitempty"`
+		ClientSecret  string `json:"clientSecret,omitempty"`
+		Region        string `json:"region,omitempty"`
+		ExpiresAt     int64  `json:"expiresAt"`
+		AuthMethod    string `json:"authMethod,omitempty"`
+		Provider      string `json:"provider,omitempty"`
+		TokenEndpoint string `json:"tokenEndpoint,omitempty"`
+		IssuerURL     string `json:"issuerUrl,omitempty"`
+		IdPClientID   string `json:"idpClientId,omitempty"`
+		Scopes        string `json:"scopes,omitempty"`
+		LoginHint     string `json:"loginHint,omitempty"`
+		// ProfileArn / IdpTokenEndpoint are needed to reconstruct a working
+		// kiro-auth-token.json (IDE) without a fresh login. Older Kiro Account
+		// Manager exports omit them; consumers that don't need them ignore them.
+		ProfileArn       string `json:"profileArn,omitempty"`
+		IdpTokenEndpoint string `json:"idpTokenEndpoint,omitempty"`
 	}
 
 	type ExportSubscription struct {
@@ -5236,6 +6644,7 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		Nickname     string             `json:"nickname,omitempty"`
 		Idp          string             `json:"idp"`
 		UserId       string             `json:"userId,omitempty"`
+		ProfileArn   string             `json:"profileArn,omitempty"`
 		MachineId    string             `json:"machineId,omitempty"`
 		Credentials  ExportCredentials  `json:"credentials"`
 		Subscription ExportSubscription `json:"subscription"`
@@ -5256,11 +6665,47 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 
 	exportAccounts := make([]ExportAccount, 0, len(accounts))
 	for _, a := range accounts {
+		// API Key accounts are not OAuth credentials; export a flat-compatible shape.
+		if config.IsAPIKeyAccount(&a) {
+			exportAccounts = append(exportAccounts, ExportAccount{
+				ID:        a.ID,
+				Email:     a.Email,
+				Nickname:  a.Nickname,
+				Idp:       "APIKey",
+				UserId:    a.UserId,
+				MachineId: a.MachineId,
+				Credentials: ExportCredentials{
+					AccessToken:  a.KiroApiKey,
+					RefreshToken: "",
+					Region:       a.Region,
+					AuthMethod:   "api_key",
+					Provider:     "APIKey",
+				},
+				Subscription: ExportSubscription{
+					Type:  a.SubscriptionType,
+					Title: a.SubscriptionTitle,
+				},
+				Usage: ExportUsage{
+					Current:     a.UsageCurrent,
+					Limit:       a.UsageLimit,
+					PercentUsed: a.UsagePercent,
+					LastUpdated: a.LastRefresh,
+				},
+				Tags:       []string{"api_key"},
+				Status:     "active",
+				CreatedAt:  0,
+				LastUsedAt: a.LastUsed,
+			})
+			continue
+		}
+
 		// 映射 provider 到 idp
 		idp := a.Provider
 		if idp == "" {
 			if a.AuthMethod == "social" {
 				idp = "Google"
+			} else if a.AuthMethod == auth.MicrosoftSSOAuthMethod {
+				idp = auth.MicrosoftSSOProvider
 			} else {
 				idp = "BuilderId"
 			}
@@ -5284,26 +6729,30 @@ func (h *Handler) apiExportAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 
 		exportAccounts = append(exportAccounts, ExportAccount{
-			ID:        a.ID,
-			Email:     a.Email,
-			Nickname:  a.Nickname,
-			Idp:       idp,
-			UserId:    a.UserId,
-			MachineId: a.MachineId,
+			ID:         a.ID,
+			Email:      a.Email,
+			Nickname:   a.Nickname,
+			Idp:        idp,
+			UserId:     a.UserId,
+			ProfileArn: a.ProfileArn,
+			MachineId:  a.MachineId,
 			Credentials: ExportCredentials{
-				AccessToken:  a.AccessToken,
-				CsrfToken:    "",
-				RefreshToken: a.RefreshToken,
-				ClientID:     a.ClientID,
-				ClientSecret: a.ClientSecret,
-				Region:       a.Region,
-				ExpiresAt:    a.ExpiresAt * 1000, // 转为毫秒时间戳
-				AuthMethod:   authMethod,
-				Provider:     a.Provider,
-				IssuerURL:    a.IssuerURL,
-				IdPClientID:  a.IdPClientID,
-				Scopes:       a.Scopes,
-				LoginHint:    a.LoginHint,
+				AccessToken:      a.AccessToken,
+				CsrfToken:        "",
+				RefreshToken:     a.RefreshToken,
+				ClientID:         a.ClientID,
+				ClientSecret:     a.ClientSecret,
+				Region:           a.Region,
+				ExpiresAt:        a.ExpiresAt * 1000, // 转为毫秒时间戳
+				AuthMethod:       authMethod,
+				Provider:         a.Provider,
+				TokenEndpoint:    a.TokenEndpoint,
+				IssuerURL:        a.IssuerURL,
+				IdPClientID:      a.IdPClientID,
+				Scopes:           a.Scopes,
+				LoginHint:        a.LoginHint,
+				ProfileArn:       a.ProfileArn,
+				IdpTokenEndpoint: a.IdPTokenEndpoint,
 			},
 			Subscription: ExportSubscription{
 				Type:  subType,

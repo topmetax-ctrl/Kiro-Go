@@ -10,6 +10,7 @@ import (
 
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
+	"kiro-go/search"
 )
 
 // fakeConversationRunner returns a scripted KiroRunResult, so the handler can be
@@ -74,7 +75,7 @@ func TestNonStreamRunnerFinalHasNoInternalToolUseAndSources(t *testing.T) {
 	payload := basePayload()
 	rec := httptest.NewRecorder()
 	h.handleClaudeNonStream(context.Background(), rec, payload, "claude-sonnet-4.5", false,
-		claudeThinkingResponseOptions{}, 1, nil, "", true, testPolicy())
+		claudeThinkingResponseOptions{}, 1, nil, "", true, testPolicy(), "")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
@@ -115,14 +116,14 @@ func TestNonStreamRunnerFinalHasNoInternalToolUseAndSources(t *testing.T) {
 
 func TestNonStreamRunnerProviderErrorDoesNotFailAccount(t *testing.T) {
 	runner := &fakeConversationRunner{
-		err: &SearchProviderError{Kind: SearchErrAuth, StatusCode: 401, Err: errStub("unauthorized")},
+		err: &search.ProviderError{Kind: search.ErrAuth, StatusCode: 401, Err: errStub("unauthorized")},
 	}
 	h := newWebSearchTestHandler(t, runner)
 
 	payload := basePayload()
 	rec := httptest.NewRecorder()
 	h.handleClaudeNonStream(context.Background(), rec, payload, "claude-sonnet-4.5", false,
-		claudeThinkingResponseOptions{}, 1, nil, "", true, testPolicy())
+		claudeThinkingResponseOptions{}, 1, nil, "", true, testPolicy(), "")
 
 	// A provider auth error is surfaced as an error, but the account must not be
 	// excluded/failed (single account here; the runner is called exactly once).
@@ -186,7 +187,7 @@ func TestStreamRunnerFinalReplayNoInternalToolUse(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.handleClaudeStream(context.Background(), rec, basePayload(), "claude-sonnet-4.5", false,
-		claudeThinkingResponseOptions{}, 1, nil, "", true, testPolicy())
+		claudeThinkingResponseOptions{}, 1, nil, "", true, testPolicy(), "")
 
 	events := parseSSEEvents(t, rec.Body.String())
 	if len(events) == 0 {
@@ -257,13 +258,13 @@ func TestStreamRunnerFinalReplayNoInternalToolUse(t *testing.T) {
 
 func TestStreamRunnerErrorBeforeStreamStartsSendsError(t *testing.T) {
 	runner := &fakeConversationRunner{
-		err: &SearchProviderError{Kind: SearchErrAuth, StatusCode: 401, Err: errStub("unauthorized")},
+		err: &search.ProviderError{Kind: search.ErrAuth, StatusCode: 401, Err: errStub("unauthorized")},
 	}
 	h := newWebSearchTestHandler(t, runner)
 
 	rec := httptest.NewRecorder()
 	h.handleClaudeStream(context.Background(), rec, basePayload(), "claude-sonnet-4.5", false,
-		claudeThinkingResponseOptions{}, 1, nil, "", true, testPolicy())
+		claudeThinkingResponseOptions{}, 1, nil, "", true, testPolicy(), "")
 
 	if runner.calls != 1 {
 		t.Fatalf("expected exactly one runner call (no account retry on provider error), got %d", runner.calls)

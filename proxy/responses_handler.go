@@ -37,7 +37,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 
 	// Forward to an external upstream when the client model matches an enabled
 	// route. Uses the raw client body (passthrough), bypassing the Kiro pool.
-	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/responses", false) {
+	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/responses", false, "") {
 		return
 	}
 
@@ -119,8 +119,9 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	}
 
 	thinkingCfg := config.GetThinkingConfig()
-	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	actualModel, thinking, nameEffort := ParseModelThinkingAndEffort(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
+	applyOpenAIModelNameEffort(openaiReq, nameEffort)
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
@@ -129,12 +130,12 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	respID := generateResponseID()
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+		h.handleResponsesStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 			apiKeyID, ownerPrincipal, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+	h.handleResponsesNonStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 		apiKeyID, ownerPrincipal, respID, &req, storedInputCopy, storeResponse)
 }
 
@@ -153,30 +154,23 @@ func responsesOwnerPrincipal(ctx context.Context, authEnabled bool) string {
 }
 
 func (h *Handler) handleResponsesNonStream(
-	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
+	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, ownerPrincipal, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
-	excluded := make(map[string]bool)
-	var lastErr error
+	// Non-stream: fully buffered, so the guard is never committed and a late
+	// upstream error can still retry (invariant #7). No committed-failure branch.
+	reqStart := time.Now()
+	guard := &streamGuard{}
+	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
-		}
-
+	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
 		var content, reasoningContent string
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
 		var credits float64
 		var realInputTokens int
+		var upstreamStopReason string
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -192,14 +186,37 @@ func (h *Handler) handleResponsesNonStream(
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		measure := func() (int, int, string, bool) {
+			return len(content), len(toolUses), upstreamStopReason, reasoningContent != ""
+		}
+
+		reset := func() {
+			content = ""
+			reasoningContent = ""
+			toolUses = nil
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+		}
+
+		// Fully buffered path: nothing reaches the client until the response is
+		// encoded, so a retry can never duplicate output — hence a nil canRetry.
+		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset, nil)
 		if err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
+			if ctx.Err() != nil {
+				return attemptHandled()
+			}
+			// A truncated upstream stream is an upstream hiccup, not the account's
+			// fault: move to the next account without blaming this one.
+			if isStreamIntegrityError(err) {
+				return attemptRotateWithoutBlame(err)
+			}
+			return attemptAccountFailed(err)
 		}
 
 		finalContent, _ := extractThinkingFromContent(content)
@@ -207,18 +224,37 @@ func (h *Handler) handleResponsesNonStream(
 			reasoningContent = ""
 		}
 
+		upstreamInput := inputTokens
+		var legacyInput int
 		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+			legacyInput = realInputTokens
+		} else if upstreamInput > 0 {
+			legacyInput = upstreamInput
+		} else {
+			legacyInput = estimatedInputTokens
 		}
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
+		estimatedOutput := estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
+		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
+
+		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
+		// The responses path keeps no RequestLog entry (it predates that ring),
+		// but it must still reach the metrics dashboard like every other endpoint.
+		recordKiroMetric(kiroMetric{
+			Endpoint:     "responses",
+			Model:        model,
+			AccountID:    account.ID,
+			Ok:           true,
+			InputTokens:  accountedInput,
+			OutputTokens: accountedOutput,
+			Credits:      credits,
+			DurationMs:   time.Since(reqStart).Milliseconds(),
+		})
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, clientInput, clientOutput, req, upstreamStopReason)
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
 
@@ -230,20 +266,35 @@ func (h *Handler) handleResponsesNonStream(
 
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(respObj)
-		return
+		return attemptHandled()
 	}
 
-	if lastErr == nil {
-		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
-		return
+	onExhausted := func(noAccounts bool, lastErr error) {
+		if noAccounts {
+			h.sendOpenAIError(w, 503, "server_error", "No available accounts")
+			return
+		}
+		h.recordFailure()
+		h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 	}
-	h.recordFailure()
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+
+	ex.Run(ctx, guard, attempt, nil, onExhausted)
+}
+
+func mapResponsesCompletion(reason string) (status, incompleteReason string) {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "max_tokens", "max_output_tokens", "length", "model_context_window_exceeded", "context_window_exceeded":
+		return "incomplete", "max_output_tokens"
+	case "refusal", "content_filter", "content_filtered", "guardrail_intervened":
+		return "incomplete", "content_filter"
+	default:
+		return "completed", ""
+	}
 }
 
 func buildResponsesObject(
 	id, model, content string, toolUses []KiroToolUse,
-	inputTokens, outputTokens int, req *ResponsesRequest,
+	inputTokens, outputTokens int, req *ResponsesRequest, upstreamStopReason string,
 ) *ResponsesObject {
 	output := make([]ResponseOutputItem, 0, 1+len(toolUses))
 
@@ -285,24 +336,32 @@ func buildResponsesObject(
 		})
 	}
 
+	status, incompleteReason := mapResponsesCompletion(upstreamStopReason)
+	var incompleteDetails *ResponsesIncompleteDetails
+	if incompleteReason != "" {
+		incompleteDetails = &ResponsesIncompleteDetails{Reason: incompleteReason}
+	}
+
 	return &ResponsesObject{
 		ID:                 id,
 		Object:             "response",
 		CreatedAt:          time.Now().Unix(),
-		Status:             "completed",
+		Status:             status,
 		Model:              model,
 		Output:             output,
 		Usage:              ResponsesUsage{InputTokens: inputTokens, OutputTokens: outputTokens, TotalTokens: inputTokens + outputTokens},
 		PreviousResponseID: req.PreviousResponseID,
 		Metadata:           req.Metadata,
+		IncompleteDetails:  incompleteDetails,
 	}
 }
 
 func (h *Handler) handleResponsesStream(
-	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
+	ctx context.Context, w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, ownerPrincipal, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
+	reqStart := time.Now()
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -339,35 +398,24 @@ func (h *Handler) handleResponsesStream(
 		"response": initial,
 	})
 
-	excluded := make(map[string]bool)
-	var lastErr error
-	responseStarted := false
+	guard := &streamGuard{}
+	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
-			break
-		}
-		if err := h.ensureValidToken(account); err != nil {
-			lastErr = err
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
-			continue
-		}
-
+	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
 		send("response.in_progress", map[string]interface{}{
 			"type":     "response.in_progress",
 			"response": initial,
 		})
 
 		var (
-			fullText        strings.Builder
-			reasoningText   strings.Builder
-			toolUses        []KiroToolUse
-			inputTokens     int
-			outputTokens    int
-			credits         float64
-			realInputTokens int
+			fullText           strings.Builder
+			reasoningText      strings.Builder
+			toolUses           []KiroToolUse
+			inputTokens        int
+			outputTokens       int
+			credits            float64
+			realInputTokens    int
+			upstreamStopReason string
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -421,7 +469,7 @@ func (h *Handler) handleResponsesStream(
 					"content_index": contentIndex,
 					"delta":         text,
 				})
-				responseStarted = true
+				guard.Commit()
 			},
 			OnToolUse: func(tu KiroToolUse) {
 				if messageStarted {
@@ -487,36 +535,48 @@ func (h *Handler) handleResponsesStream(
 					},
 				})
 				outputIndex++
-				responseStarted = true
+				guard.Commit()
 			},
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
+			OnStopReason: func(reason string) { upstreamStopReason = reason },
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		measure := func() (int, int, string, bool) {
+			return fullText.Len(), len(toolUses), upstreamStopReason, reasoningText.Len() > 0
+		}
+
+		// Only reached while the guard is uncommitted, i.e. before any content or
+		// function-call item was sent, so the output_index / content_index cursors
+		// are still untouched and only the accumulators need clearing.
+		reset := func() {
+			fullText.Reset()
+			reasoningText.Reset()
+			toolUses = nil
+			inputTokens = 0
+			outputTokens = 0
+			credits = 0
+			realInputTokens = 0
+			upstreamStopReason = ""
+		}
+
+		// canRetry mirrors the guard: once a client-visible byte is out, a retry
+		// would concatenate two partial answers, so the integrity error is
+		// surfaced instead.
+		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset,
+			func() bool { return !guard.Committed() })
 		if err != nil {
-			if !responseStarted {
-				lastErr = err
-				excluded[account.ID] = true
-				h.handleAccountFailure(account, err)
-				continue
+			if ctx.Err() != nil {
+				return attemptHandled()
 			}
-			send("response.failed", map[string]interface{}{
-				"type": "response.failed",
-				"response": map[string]interface{}{
-					"id":     respID,
-					"status": "failed",
-					"error": map[string]string{
-						"type":    "server_error",
-						"message": err.Error(),
-					},
-				},
-			})
-			h.recordFailure()
-			return
+			// A truncated stream is an upstream fault, not the account's.
+			if isStreamIntegrityError(err) {
+				return attemptRotateWithoutBlame(err)
+			}
+			return attemptAccountFailed(err)
 		}
 
 		finalContent, _ := extractThinkingFromContent(fullText.String())
@@ -552,18 +612,37 @@ func (h *Handler) handleResponsesStream(
 			})
 		}
 
+		upstreamInput := inputTokens
+		var legacyInput int
 		if realInputTokens > 0 {
-			inputTokens = realInputTokens
-		} else if inputTokens <= 0 {
-			inputTokens = estimatedInputTokens
+			legacyInput = realInputTokens
+		} else if upstreamInput > 0 {
+			legacyInput = upstreamInput
+		} else {
+			legacyInput = estimatedInputTokens
 		}
-		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
+		estimatedOutput := estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
+		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
+
+		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
-		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
+		// The responses path keeps no RequestLog entry (it predates that ring),
+		// but it must still reach the metrics dashboard like every other endpoint.
+		recordKiroMetric(kiroMetric{
+			Endpoint:     "responses",
+			Model:        model,
+			AccountID:    account.ID,
+			Ok:           true,
+			InputTokens:  accountedInput,
+			OutputTokens: accountedOutput,
+			Credits:      credits,
+			DurationMs:   time.Since(reqStart).Milliseconds(),
+		})
 
-		respObj := buildResponsesObject(respID, model, finalContent, toolUses, inputTokens, outputTokens, req)
+		respObj := buildResponsesObject(respID, model, finalContent, toolUses, clientInput, clientOutput, req, upstreamStopReason)
 		respObj.CreatedAt = createdAt
 		respObj.StoredInput = storedInput
 		respObj.Instructions = req.Instructions
@@ -580,10 +659,10 @@ func (h *Handler) handleResponsesStream(
 		})
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
-		return
+		return attemptHandled()
 	}
 
-	if lastErr == nil {
+	sendResponseFailed := func(message string) {
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
 			"response": map[string]interface{}{
@@ -591,22 +670,31 @@ func (h *Handler) handleResponsesStream(
 				"status": "failed",
 				"error": map[string]string{
 					"type":    "server_error",
-					"message": "No available accounts",
+					"message": message,
 				},
 			},
 		})
-		return
 	}
-	h.recordFailure()
-	send("response.failed", map[string]interface{}{
-		"type": "response.failed",
-		"response": map[string]interface{}{
-			"id":     respID,
-			"status": "failed",
-			"error": map[string]string{
-				"type":    "server_error",
-				"message": lastErr.Error(),
-			},
-		},
-	})
+
+	// Responses' mid-stream (post-commit) failure surface: emit response.failed +
+	// recordFailure. Unlike Claude/OpenAI, the pre-refactor loop did NOT call
+	// handleAccountFailure on the committed branch (only the uncommitted retry
+	// branch did), so onCommitted must not either.
+	onCommitted := func(_ *config.Account, err error) {
+		sendResponseFailed(err.Error())
+		h.recordFailure()
+	}
+
+	onExhausted := func(noAccounts bool, lastErr error) {
+		if noAccounts {
+			// No account was ever usable: emit response.failed with no recordFailure,
+			// matching the pre-refactor tail.
+			sendResponseFailed("No available accounts")
+			return
+		}
+		h.recordFailure()
+		sendResponseFailed(lastErr.Error())
+	}
+
+	ex.Run(ctx, guard, attempt, onCommitted, onExhausted)
 }

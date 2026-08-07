@@ -222,16 +222,16 @@ func probeProxyScheme(p *ParsedProxy) (string, error) {
 
 // ImportProxiesResult is the per-proxy outcome returned to the caller.
 type ImportProxiesResult struct {
-	Raw          string `json:"raw"`
-	MaskedURL    string `json:"maskedUrl,omitempty"`
-	Scheme       string `json:"scheme,omitempty"`
-	AssignedID   string `json:"assignedId,omitempty"`
+	Raw           string `json:"raw"`
+	MaskedURL     string `json:"maskedUrl,omitempty"`
+	Scheme        string `json:"scheme,omitempty"`
+	AssignedID    string `json:"assignedId,omitempty"`
 	AssignedEmail string `json:"assignedEmail,omitempty"`
-	Reachable    bool   `json:"reachable"`
-	Assigned     bool   `json:"assigned"`
-	Tested       bool   `json:"tested"`
-	TestPassed   bool   `json:"testPassed"`
-	Error        string `json:"error,omitempty"`
+	Reachable     bool   `json:"reachable"`
+	Assigned      bool   `json:"assigned"`
+	Tested        bool   `json:"tested"`
+	TestPassed    bool   `json:"testPassed"`
+	Error         string `json:"error,omitempty"`
 }
 
 // ImportAndAssignProxies parses raw proxy lines, probes each one's working

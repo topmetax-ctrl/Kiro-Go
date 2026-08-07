@@ -12,7 +12,9 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,6 +22,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+)
+
+var (
+	ErrAccountNotFound       = errors.New("account not found")
+	ErrDuplicateAccountID    = errors.New("account ID already exists")
+	ErrDuplicateRefreshToken = errors.New("account refresh token already exists")
+	ErrDuplicateAPIKey       = errors.New("account API key already exists")
+	ErrEmptyAPIKey           = errors.New("kiroApiKey is empty")
 )
 
 // GenerateMachineId generates a UUID v4 format machine identifier.
@@ -43,29 +53,44 @@ type Account struct {
 	Nickname string `json:"nickname,omitempty"` // Display name for admin panel
 
 	// Authentication credentials
-	AccessToken  string `json:"accessToken"`            // OAuth access token for API calls
-	RefreshToken string `json:"refreshToken"`           // OAuth refresh token for token renewal
+	AccessToken  string `json:"accessToken"`  // OAuth access token for API calls
+	RefreshToken string `json:"refreshToken"` // OAuth refresh token for token renewal
+	// RefreshTokenFingerprint is a one-way identifier for the credential that
+	// originally created this account. It prevents a previously imported token
+	// from being imported again after the provider rotates it.
+	RefreshTokenFingerprint string `json:"refreshTokenFingerprint,omitempty"`
+	// KiroApiKey is a headless Kiro API key (typically ksk_...). When set,
+	// AuthMethod is "api_key" and the key is used directly as the Bearer token
+	// without OAuth refresh. AccessToken is kept in sync for the shared request path.
+	KiroApiKey   string `json:"kiroApiKey,omitempty"`
 	ClientID     string `json:"clientId,omitempty"`     // OIDC client ID (for IdC auth)
 	ClientSecret string `json:"clientSecret,omitempty"` // OIDC client secret (for IdC auth)
-	KiroApiKey   string `json:"kiroApiKey,omitempty"`   // API key credential for headless auth (used directly as bearer token)
-	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc" (AWS IdC), "social" (GitHub/Google), or "api_key"
-	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub")
+	AuthMethod   string `json:"authMethod"`             // Authentication method: "idc", "social", "external_idp", or "api_key"
+	Provider     string `json:"provider,omitempty"`     // Identity provider name (e.g., "BuilderId", "GitHub", "AzureAD")
 	Region       string `json:"region"`                 // AWS region (fallback for both auth and API region)
 	AuthRegion   string `json:"authRegion,omitempty"`   // Region for token refresh endpoints; falls back to region
 	ApiRegion    string `json:"apiRegion,omitempty"`    // Region for API request hosts; falls back to region
 	StartUrl     string `json:"startUrl,omitempty"`     // AWS SSO start URL
 
-	// External IdP authentication fields (for "Your organization" Kiro SSO flow)
-	IssuerURL   string `json:"issuerUrl,omitempty"`   // IdP OIDC issuer (e.g. https://login.microsoftonline.com/<tenant>/v2.0)
+	// External IdP authentication fields (for "Your organization" Kiro SSO flow).
+	// IssuerURL and Scopes live in the Microsoft Enterprise SSO block below --
+	// both flows are external OAuth2 and share those two fields.
 	IdPClientID string `json:"idpClientId,omitempty"` // Client ID registered with the external IdP (from Kiro portal)
-	Scopes      string `json:"scopes,omitempty"`      // Space-separated scopes for the IdP token endpoint
 	LoginHint   string `json:"loginHint,omitempty"`   // User email used as login_hint during IdP authorization
 
 	IdPTokenEndpoint string `json:"idpTokenEndpoint,omitempty"` // Cached IdP token endpoint (resolved via OIDC discovery during login)
 
-	ExpiresAt  int64  `json:"expiresAt,omitempty"`  // Token expiration timestamp (Unix seconds)
+	ExpiresAt  int64  `json:"expiresAt,omitempty"`  // Token expiration timestamp (Unix seconds); unused for API Key
 	MachineId  string `json:"machineId,omitempty"`  // UUID machine identifier for request tracking
 	ProfileArn string `json:"profileArn,omitempty"` // CodeWhisperer/Kiro profile ARN for generation requests
+
+	// Microsoft Enterprise SSO uses an external OAuth2 public client. These
+	// fields are deliberately separate from the AWS IdC client secret/region:
+	// Account.Region remains the AWS authentication region, while data-plane
+	// routing treats ProfileArn as authoritative whenever it is available.
+	TokenEndpoint string `json:"tokenEndpoint,omitempty"` // External IdP OAuth2 token endpoint
+	IssuerURL     string `json:"issuerUrl,omitempty"`     // External IdP OIDC issuer
+	Scopes        string `json:"scopes,omitempty"`        // Space-separated external IdP scopes
 
 	// Per-account outbound proxy (falls back to global ProxyURL if empty)
 	ProxyURL string `json:"proxyURL,omitempty"`
@@ -199,21 +224,107 @@ type UpstreamProvider struct {
 	ApiKey   string `json:"apiKey"`             // Bearer token sent to the upstream
 	ProxyURL string `json:"proxyURL,omitempty"` // Optional per-provider outbound proxy (falls back to global)
 	Enabled  bool   `json:"enabled"`            // Whether this provider may receive forwards
+
+	// Hidden collapses this provider out of the admin list once the list grows
+	// long enough to be unreadable. It is presentation-only and deliberately
+	// independent of Enabled: a hidden provider still receives forwards exactly
+	// as before, and ResolveRoute never reads this field. Folding "hide" into
+	// Enabled would give the operator a second disable switch wearing the wrong
+	// label, so a hidden-but-live provider stays live.
+	Hidden bool `json:"hidden,omitempty"`
+
+	// Operator-supplied prices in USD per 1M tokens, used only to estimate the
+	// cost shown in the stats dashboard. Zero means "unpriced": no cost is
+	// attributed, and the UI shows "—" rather than a misleading $0.00. Nothing
+	// here is billed or sent upstream.
+	PriceInPerM  float64 `json:"priceInPerM,omitempty"`
+	PriceOutPerM float64 `json:"priceOutPerM,omitempty"`
 }
 
-// ModelRoute maps a client-supplied model name to an upstream provider. Matching is
-// exact on Model. When TargetModel is non-empty the request's "model" field is
-// rewritten to it before forwarding; otherwise the original name is preserved.
+// CostUSD estimates the cost of a request from the provider's configured
+// per-1M-token prices. It returns 0 when the provider is unpriced, so callers
+// can distinguish "free" from "unknown" by checking the prices themselves.
+func (p UpstreamProvider) CostUSD(inputTokens, outputTokens int64) float64 {
+	if p.PriceInPerM <= 0 && p.PriceOutPerM <= 0 {
+		return 0
+	}
+	return (float64(inputTokens)*p.PriceInPerM + float64(outputTokens)*p.PriceOutPerM) / 1e6
+}
+
+// RouteTarget is one upstream candidate for a ModelRoute. A route may list
+// several, which is what makes "switch provider" a reordering rather than a
+// destructive edit, and what allows failover when a provider is down.
+//
+// Selection (see ResolveRoute): eligible targets are ordered by Priority
+// ascending; targets sharing a Priority form one tier and are picked from by
+// Weight. Tiers are tried in order, so a route degrades from its preferred
+// provider to its backups instead of failing outright.
+//
+// This mirrors established gateway designs: Priority is LiteLLM's deployment
+// `order` (each tier exhausted before the next), Weight is Envoy's
+// weighted_clusters (proportional split among equals).
+type RouteTarget struct {
+	UpstreamID  string `json:"upstreamId"`            // Target UpstreamProvider.ID
+	TargetModel string `json:"targetModel,omitempty"` // Optional model name to rewrite to; empty = keep original
+	Priority    int    `json:"priority"`              // Lower is preferred; 0 is the top tier
+	Weight      int    `json:"weight,omitempty"`      // Share within its tier; <=0 is treated as 1
+	Enabled     bool   `json:"enabled"`               // Whether this target may be selected
+}
+
+// ModelRoute maps a client-supplied model name to one or more upstream targets.
+// Matching is exact on Model; only the choice of destination is ranked.
 //
 // Loop-safety note: the set of routed model names MUST be disjoint from the model
 // names the upstream forwards back to this proxy. A back-referenced Kiro model with
 // no matching enabled route falls through to the default Kiro pool, breaking the loop.
+// Multi-target changes nothing here — a route with zero eligible targets resolves to
+// nothing and falls through exactly as an unrouted model does.
 type ModelRoute struct {
-	ID          string `json:"id"`                    // Unique identifier (UUID)
-	Model       string `json:"model"`                 // Client model name to match (exact)
-	UpstreamID  string `json:"upstreamId"`            // Target UpstreamProvider.ID
-	TargetModel string `json:"targetModel,omitempty"` // Optional model name to rewrite to; empty = keep original
-	Enabled     bool   `json:"enabled"`               // Whether this route is active
+	ID      string        `json:"id"`                // Unique identifier (UUID)
+	Model   string        `json:"model"`             // Client model name to match (exact)
+	Targets []RouteTarget `json:"targets,omitempty"` // Ranked upstream candidates
+	Enabled bool          `json:"enabled"`           // Whether this route is active
+
+	// UpstreamID and TargetModel are the pre-multi-target 1:1 schema.
+	//
+	// Deprecated: migrated into Targets on load (see migrateModelRoutes). Kept so
+	// older config files and exported bundles still read, and so a downgrade to a
+	// build without Targets keeps working. Do not read these at request time —
+	// use Targets.
+	UpstreamID  string `json:"upstreamId,omitempty"`
+	TargetModel string `json:"targetModel,omitempty"`
+}
+
+// migrateModelRoutes promotes the legacy 1:1 route schema into Targets, and
+// reports whether anything changed so the caller can decide to persist.
+//
+// It is idempotent (a route that already has Targets is left alone) and
+// non-destructive (the legacy fields are preserved rather than cleared, unlike
+// the AllowOverage migration, because exported bundles are read by other hosts
+// that may still be on the old build).
+//
+// Called from both Load and MergeUpstreamBundle: a v1 bundle imported into this
+// build must get Targets populated too, or its routes would silently never match.
+func migrateModelRoutes(routes []ModelRoute) bool {
+	changed := false
+	for i := range routes {
+		r := &routes[i]
+		if len(r.Targets) > 0 || strings.TrimSpace(r.UpstreamID) == "" {
+			continue
+		}
+		r.Targets = []RouteTarget{{
+			UpstreamID:  r.UpstreamID,
+			TargetModel: r.TargetModel,
+			Priority:    0,
+			Weight:      1,
+			// The legacy schema had no per-target enable — the route's own
+			// Enabled flag was the only switch. Enable the target so the
+			// route's effective behavior is unchanged by this migration.
+			Enabled: true,
+		}}
+		changed = true
+	}
+	return changed
 }
 
 // ApiKeyEntry represents a single API key with optional usage limits and counters.
@@ -256,6 +367,14 @@ type Config struct {
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
 	OpenAIThinkingFormat string `json:"openaiThinkingFormat,omitempty"` // OpenAI output format: "reasoning_content", "thinking", or "think"
 	ClaudeThinkingFormat string `json:"claudeThinkingFormat,omitempty"` // Claude output format: "reasoning_content", "thinking", or "think"
+	// DefaultThinkingEffort is the reasoning depth applied when a thinking request
+	// names no level: "low", "medium", "high", "xhigh", "max", or "" / "auto" to
+	// let the model choose. Empty keeps the historical behavior.
+	DefaultThinkingEffort string `json:"defaultThinkingEffort,omitempty"`
+	// AdvertiseEffortModels adds one "(level)" variant per level to /v1/models.
+	// Off by default: it multiplies the list size, and clients that own a level
+	// picker (9router) do not need the variants advertised to use them.
+	AdvertiseEffortModels bool `json:"advertiseEffortModels,omitempty"`
 
 	// Endpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`
@@ -323,6 +442,11 @@ type Config struct {
 	// (free-first: SearXNG primary, Tavily optional fallback) and feeds the
 	// result back so the model can answer.
 	WebSearch WebSearchConfig `json:"webSearch,omitempty"`
+
+	// Memory configures the optional long-term memory sidecar (Mem0 self-hosted).
+	// Off by default. When enabled, the proxy can store and retrieve memories via
+	// a dedicated admin API; it does NOT inject memory into the LLM request path.
+	Memory MemoryConfig `json:"memory,omitempty"`
 
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
@@ -519,6 +643,87 @@ type WebSearchRerankConfig struct {
 	MaxFinalResults int `json:"maxFinalResults,omitempty"`
 }
 
+// MemoryConfig controls the optional long-term memory sidecar (Mem0 self-hosted).
+// It is off by default (Enabled zero value = false). When enabled, the proxy can
+// store/retrieve memories through a dedicated admin API, and optionally inject
+// retrieved memories into the LLM request (Inject) and auto-capture each turn's
+// Q&A (WriteMode != "explicit"). Injection mutates req.Messages BEFORE translation,
+// never the translated Kiro payload, so the translator's HTTP-400-avoidance logic
+// is untouched. GetMemoryConfig resolves zero-valued fields to their defaults
+// centrally.
+type MemoryConfig struct {
+	// Enabled turns on the memory sidecar. When false, the factory returns a
+	// no-op provider and no calls are made to the backend.
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Provider selects the memory backend. Only "mem0" is implemented. Empty
+	// means DefaultMemoryProvider.
+	Provider string `json:"provider,omitempty"`
+
+	// BaseURL is the self-hosted Mem0 server root, e.g. "http://localhost:8888".
+	// Required when Enabled; MemoryEnabled() is false until it is set.
+	BaseURL string `json:"baseURL,omitempty"`
+
+	// APIKey is the X-Api-Key sent to Mem0. Masked when returned to the admin UI.
+	APIKey string `json:"apiKey,omitempty"`
+
+	// WriteMode governs how memories are captured: "explicit" (only via the
+	// store API — no auto-capture), "curated", or "automatic". Empty means
+	// DefaultMemoryWriteMode ("explicit"). Any mode other than "explicit" enables
+	// auto-capture of each successful turn's Q&A (see MemoryCaptureEnabled).
+	WriteMode string `json:"writeMode,omitempty"`
+
+	// RetrievalLimit bounds how many memories a search returns. 0 means
+	// DefaultMemoryRetrievalLimit.
+	RetrievalLimit int `json:"retrievalLimit,omitempty"`
+
+	// Inject turns on reading memories and injecting them into the LLM request
+	// (into the last user message, before translation). Independent of WriteMode:
+	// a deployment can inject without capturing, or capture without injecting.
+	// Defaults to false when unset — memory never touches the request path until
+	// the operator opts in.
+	Inject *bool `json:"inject,omitempty"`
+
+	// MaxInjectTokens bounds the size of the injected memory context block. 0 means
+	// DefaultMemoryMaxInjectTokens. Keeps the injected block small so it cannot push
+	// the request toward the upstream byte cap.
+	MaxInjectTokens int `json:"maxInjectTokens,omitempty"`
+
+	// Redaction bounds what may be persisted. Applied even in automatic mode.
+	Redaction MemoryRedaction `json:"redaction,omitempty"`
+
+	// Timeouts bounds per-call latency to the backend.
+	Timeouts MemoryTimeouts `json:"timeouts,omitempty"`
+
+	// FailOpen controls whether backend errors degrade silently (recall returns
+	// empty, writes are dropped) instead of surfacing to the caller. Defaults to
+	// true when unset, so a memory outage never breaks a request.
+	FailOpen *bool `json:"failOpen,omitempty"`
+}
+
+// MemoryRedaction bounds what content may be persisted. These guards apply
+// regardless of WriteMode — automatic mode does NOT bypass them.
+type MemoryRedaction struct {
+	// RedactSecrets masks obvious credentials (API keys, bearer tokens) before a
+	// memory is written. Defaults to true when unset.
+	RedactSecrets *bool `json:"redactSecrets,omitempty"`
+
+	// StoreSourceCode allows source-code-looking candidates (large fenced code
+	// blocks, diffs, .env dumps) to be persisted. Defaults to false: coding
+	// sessions routinely contain private source and secrets.
+	StoreSourceCode bool `json:"storeSourceCode,omitempty"`
+}
+
+// MemoryTimeouts bounds per-call latency to the memory backend. Mem0 "add"
+// triggers an LLM extraction call upstream, so the write timeout is larger.
+type MemoryTimeouts struct {
+	// SearchMs bounds a retrieval call. 0 means DefaultMemorySearchTimeoutMs.
+	SearchMs int `json:"searchMs,omitempty"`
+
+	// WriteMs bounds an add call. 0 means DefaultMemoryWriteTimeoutMs.
+	WriteMs int `json:"writeMs,omitempty"`
+}
+
 // AccountInfo contains account metadata retrieved from Kiro API.
 // Used for updating subscription and usage information.
 type AccountInfo struct {
@@ -540,7 +745,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.2.5"
+const Version = "1.2.6"
 
 var (
 	cfg     *Config
@@ -645,6 +850,14 @@ migrations:
 		}
 	}
 	if overageMigrated {
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
+
+	// Migration: legacy 1:1 model routes → ranked Targets. Idempotent; only
+	// persists when a route was actually rewritten.
+	if migrateModelRoutes(cfg.ModelRoutes) {
 		if err := saveLocked(); err != nil {
 			return err
 		}
@@ -841,6 +1054,11 @@ func GetAccounts() []Account {
 func GetAccountByID(id string) *Account {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
+	// cfg is nil before Init runs. Callers on the request path (e.g. metrics
+	// labeling) must get a nil result rather than a panic.
+	if cfg == nil {
+		return nil
+	}
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].ID == id {
 			a := cfg.Accounts[i]
@@ -862,11 +1080,237 @@ func GetEnabledAccounts() []Account {
 	return accounts
 }
 
+// RefreshTokenFingerprint returns a stable, non-reversible identifier for an
+// opaque refresh token. Empty tokens do not receive a fingerprint.
+func RefreshTokenFingerprint(refreshToken string) string {
+	if refreshToken == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(refreshToken))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// APIKeyFingerprint returns a stable, non-reversible identifier for a Kiro API key.
+func APIKeyFingerprint(apiKey string) string {
+	if apiKey == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(apiKey))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// IsAPIKeyAccount reports whether the account authenticates with a Kiro API key.
+func IsAPIKeyAccount(account *Account) bool {
+	if account == nil {
+		return false
+	}
+	if strings.TrimSpace(account.KiroApiKey) != "" {
+		return true
+	}
+	method := strings.ToLower(strings.TrimSpace(account.AuthMethod))
+	return method == "api_key" || method == "apikey"
+}
+
+// SplitKiroAPIKeyAndRegion parses the convenience form "key|region".
+// The key itself is not restricted to a fixed prefix so future formats remain compatible.
+func SplitKiroAPIKeyAndRegion(raw string) (key, region string, err error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", "", ErrEmptyAPIKey
+	}
+	parts := strings.Split(trimmed, "|")
+	if len(parts) > 2 {
+		return "", "", errors.New("multiple pipe separators are not allowed")
+	}
+	key = strings.TrimSpace(parts[0])
+	if key == "" {
+		return "", "", errors.New("key before pipe is empty")
+	}
+	if len(parts) == 2 {
+		region = strings.TrimSpace(parts[1])
+		if region == "" {
+			return "", "", errors.New("region after pipe is empty")
+		}
+		if err := validateKiroRegionHostLabel(region); err != nil {
+			return "", "", err
+		}
+	}
+	return key, region, nil
+}
+
+func validateKiroRegionHostLabel(region string) error {
+	region = strings.TrimSpace(region)
+	if region == "" {
+		return errors.New("region is empty")
+	}
+	for _, r := range region {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return errors.New("region contains host-unsafe characters")
+	}
+	if strings.Contains(region, " ") || strings.ContainsAny(region, "\n\r\t./") {
+		return errors.New("region contains host-unsafe characters")
+	}
+	return nil
+}
+
+// MachineIdFromAPIKey derives the machine id used by Kiro CLI/API-key clients:
+// sha256 hex of "KiroAPIKey/<api_key>".
+func MachineIdFromAPIKey(apiKey string) string {
+	sum := sha256.Sum256([]byte("KiroAPIKey/" + apiKey))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// NormalizeAPIKeyAccount fills API-key credential defaults in place.
+// It accepts "ksk_xxx|region", sets AuthMethod=api_key, copies the key into
+// AccessToken for the shared Bearer path, clears OAuth-only fields, and
+// derives MachineId when missing.
+func NormalizeAPIKeyAccount(account *Account) error {
+	if account == nil {
+		return errors.New("account is nil")
+	}
+	raw := strings.TrimSpace(account.KiroApiKey)
+	if raw == "" {
+		raw = strings.TrimSpace(account.AccessToken)
+	}
+	key, region, err := SplitKiroAPIKeyAndRegion(raw)
+	if err != nil {
+		return err
+	}
+	account.KiroApiKey = key
+	account.AccessToken = key
+	account.AuthMethod = "api_key"
+	account.RefreshToken = ""
+	account.RefreshTokenFingerprint = ""
+	account.ClientID = ""
+	account.ClientSecret = ""
+	account.TokenEndpoint = ""
+	account.IssuerURL = ""
+	account.Scopes = ""
+	account.ProfileArn = ""
+	account.ExpiresAt = 0
+	if region != "" {
+		if strings.TrimSpace(account.Region) == "" {
+			account.Region = region
+		}
+	}
+	if strings.TrimSpace(account.Region) == "" {
+		account.Region = "us-east-1"
+	}
+	if err := validateKiroRegionHostLabel(account.Region); err != nil {
+		return err
+	}
+	if strings.TrimSpace(account.MachineId) == "" {
+		account.MachineId = MachineIdFromAPIKey(key)
+	}
+	if strings.TrimSpace(account.Provider) == "" {
+		account.Provider = "APIKey"
+	}
+	if strings.TrimSpace(account.Email) == "" {
+		// Stable display label without leaking the full secret.
+		fp := APIKeyFingerprint(key)
+		if len(fp) > 12 {
+			fp = fp[:12]
+		}
+		account.Email = "api-key-" + fp
+	}
+	return nil
+}
+
+// AccountCredentialExists checks both the current refresh token and the
+// original credential fingerprint while holding the configuration read lock.
+func AccountCredentialExists(refreshToken string) bool {
+	if refreshToken == "" {
+		return false
+	}
+	fingerprint := RefreshTokenFingerprint(refreshToken)
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		if account.RefreshToken == refreshToken ||
+			(fingerprint != "" && account.RefreshTokenFingerprint == fingerprint) {
+			return true
+		}
+	}
+	return false
+}
+
+// AccountAPIKeyExists reports whether a Kiro API key is already persisted.
+func AccountAPIKeyExists(apiKey string) bool {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return false
+	}
+	fingerprint := APIKeyFingerprint(apiKey)
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		existing := strings.TrimSpace(account.KiroApiKey)
+		if existing == "" {
+			continue
+		}
+		if existing == apiKey || APIKeyFingerprint(existing) == fingerprint {
+			return true
+		}
+	}
+	return false
+}
+
+// AccountIDExists reports whether an account ID is already persisted.
+func AccountIDExists(id string) bool {
+	if id == "" {
+		return false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for _, account := range cfg.Accounts {
+		if account.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	if IsAPIKeyAccount(&account) {
+		if err := NormalizeAPIKeyAccount(&account); err != nil {
+			return err
+		}
+	} else if account.RefreshTokenFingerprint == "" {
+		account.RefreshTokenFingerprint = RefreshTokenFingerprint(account.RefreshToken)
+	}
+	for _, existing := range cfg.Accounts {
+		if account.ID != "" && existing.ID == account.ID {
+			return ErrDuplicateAccountID
+		}
+		if account.RefreshToken != "" && existing.RefreshToken == account.RefreshToken {
+			return ErrDuplicateRefreshToken
+		}
+		existingFingerprint := existing.RefreshTokenFingerprint
+		if existingFingerprint == "" {
+			existingFingerprint = RefreshTokenFingerprint(existing.RefreshToken)
+		}
+		if account.RefreshTokenFingerprint != "" &&
+			existingFingerprint == account.RefreshTokenFingerprint {
+			return ErrDuplicateRefreshToken
+		}
+		if account.KiroApiKey != "" {
+			existingKey := strings.TrimSpace(existing.KiroApiKey)
+			if existingKey != "" && (existingKey == account.KiroApiKey ||
+				APIKeyFingerprint(existingKey) == APIKeyFingerprint(account.KiroApiKey)) {
+				return ErrDuplicateAPIKey
+			}
+		}
+	}
 	cfg.Accounts = append(cfg.Accounts, account)
-	return Save()
+	if err := Save(); err != nil {
+		cfg.Accounts = cfg.Accounts[:len(cfg.Accounts)-1]
+		return err
+	}
+	return nil
 }
 
 func UpdateAccount(id string, account Account) error {
@@ -874,8 +1318,35 @@ func UpdateAccount(id string, account Account) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			// Current callers use UpdateAccount for administrative/status fields.
+			// Preserve the authoritative credential state so a stale account
+			// snapshot cannot overwrite a refresh-token rotation that completed
+			// while an upstream status request was in flight.
+			account.AccessToken = a.AccessToken
+			account.RefreshToken = a.RefreshToken
+			account.RefreshTokenFingerprint = a.RefreshTokenFingerprint
+			account.KiroApiKey = a.KiroApiKey
+			account.ClientID = a.ClientID
+			account.ClientSecret = a.ClientSecret
+			account.AuthMethod = a.AuthMethod
+			account.Provider = a.Provider
+			account.Region = a.Region
+			account.StartUrl = a.StartUrl
+			account.ExpiresAt = a.ExpiresAt
+			account.ProfileArn = a.ProfileArn
+			account.TokenEndpoint = a.TokenEndpoint
+			account.IssuerURL = a.IssuerURL
+			account.Scopes = a.Scopes
+			if account.RefreshTokenFingerprint == "" {
+				account.RefreshTokenFingerprint = RefreshTokenFingerprint(a.RefreshToken)
+			}
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i] = account
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -914,12 +1385,17 @@ func SetAccountEnabled(id string, enabled bool) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i].Enabled = enabled
 			if !enabled {
 				cfg.Accounts[i].BanStatus = "DISABLED"
 				cfg.Accounts[i].BanTime = time.Now().Unix()
 			}
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -932,13 +1408,39 @@ func SetAccountBanStatus(id, status, reason string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
 			cfg.Accounts[i].BanStatus = status
 			cfg.Accounts[i].BanReason = reason
 			cfg.Accounts[i].BanTime = time.Now().Unix()
 			if status == "BANNED" || status == "DISABLED" {
 				cfg.Accounts[i].Enabled = false
 			}
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+// ClearAccountBanStatus marks an account active without replacing any
+// credential fields from a potentially stale caller snapshot.
+func ClearAccountBanStatus(id string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, account := range cfg.Accounts {
+		if account.ID == id {
+			previous := cfg.Accounts[i]
+			cfg.Accounts[i].BanStatus = "ACTIVE"
+			cfg.Accounts[i].BanReason = ""
+			cfg.Accounts[i].BanTime = 0
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -949,8 +1451,13 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i].ProfileArn
 			cfg.Accounts[i].ProfileArn = profileArn
-			return Save()
+			if err := Save(); err != nil {
+				cfg.Accounts[i].ProfileArn = previous
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -991,19 +1498,44 @@ func DeleteAccount(id string) error {
 }
 
 func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) error {
+	return UpdateAccountCredentialState(id, accessToken, refreshToken, expiresAt, "")
+}
+
+// UpdateAccountCredentialState atomically updates all fields produced by one
+// refresh-token exchange. If persistence fails, the in-memory configuration is
+// restored so a rotated token is never published from a state that cannot
+// survive restart.
+func UpdateAccountCredentialState(
+	id string,
+	accessToken string,
+	refreshToken string,
+	expiresAt int64,
+	profileArn string,
+) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			previous := cfg.Accounts[i]
+			if cfg.Accounts[i].RefreshTokenFingerprint == "" {
+				cfg.Accounts[i].RefreshTokenFingerprint = RefreshTokenFingerprint(a.RefreshToken)
+			}
 			cfg.Accounts[i].AccessToken = accessToken
 			if refreshToken != "" {
 				cfg.Accounts[i].RefreshToken = refreshToken
 			}
 			cfg.Accounts[i].ExpiresAt = expiresAt
-			return Save()
+			if profileArn != "" {
+				cfg.Accounts[i].ProfileArn = profileArn
+			}
+			if err := Save(); err != nil {
+				cfg.Accounts[i] = previous
+				return err
+			}
+			return nil
 		}
 	}
-	return nil
+	return ErrAccountNotFound
 }
 
 func GetApiKey() string {
@@ -1298,12 +1830,29 @@ type ThinkingConfig struct {
 	Suffix       string `json:"suffix"`       // Model name suffix that triggers thinking mode
 	OpenAIFormat string `json:"openaiFormat"` // Output format for OpenAI-compatible responses
 	ClaudeFormat string `json:"claudeFormat"` // Output format for Claude-compatible responses
+	// DefaultEffort is the fallback reasoning depth for thinking requests that
+	// name no level. Empty means "let the model choose" (historical behavior).
+	DefaultEffort string `json:"defaultEffort"`
+	// AdvertiseEffortModels reports whether /v1/models should list "(level)"
+	// variants alongside each base and thinking model.
+	AdvertiseEffortModels bool `json:"advertiseEffortModels"`
 }
 
 // GetThinkingConfig 获取 thinking 配置
 func GetThinkingConfig() ThinkingConfig {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
+
+	// Before Load() runs, cfg is nil. This getter is on the request-translation
+	// path now (it supplies the default reasoning level), not just admin HTTP
+	// handlers, so it has to return usable defaults instead of panicking.
+	if cfg == nil {
+		return ThinkingConfig{
+			Suffix:       "-thinking",
+			OpenAIFormat: "reasoning_content",
+			ClaudeFormat: "thinking",
+		}
+	}
 
 	suffix := cfg.ThinkingSuffix
 	if suffix == "" {
@@ -1319,19 +1868,23 @@ func GetThinkingConfig() ThinkingConfig {
 	}
 
 	return ThinkingConfig{
-		Suffix:       suffix,
-		OpenAIFormat: openaiFormat,
-		ClaudeFormat: claudeFormat,
+		Suffix:                suffix,
+		OpenAIFormat:          openaiFormat,
+		ClaudeFormat:          claudeFormat,
+		DefaultEffort:         cfg.DefaultThinkingEffort,
+		AdvertiseEffortModels: cfg.AdvertiseEffortModels,
 	}
 }
 
 // UpdateThinkingConfig 更新 thinking 配置
-func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
+func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat, defaultEffort string, advertiseEffortModels bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ThinkingSuffix = suffix
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
+	cfg.DefaultThinkingEffort = defaultEffort
+	cfg.AdvertiseEffortModels = advertiseEffortModels
 	return Save()
 }
 
@@ -1457,11 +2010,35 @@ const (
 	DefaultWebSearchRerankCandidates = 20
 )
 
-// providerSearXNG / providerTavily are the canonical provider name tokens used
-// in routing config and metrics labels.
+// Memory sidecar defaults, used when the corresponding config field is 0/empty.
 const (
-	providerSearXNG = "searxng"
-	providerTavily  = "tavily"
+	DefaultMemoryProvider       = "mem0"
+	DefaultMemoryWriteMode      = "explicit"
+	DefaultMemoryRetrievalLimit = 8
+
+	DefaultMemorySearchTimeoutMs = 2000
+	DefaultMemoryWriteTimeoutMs  = 5000
+
+	// DefaultMemoryMaxInjectTokens bounds the injected memory-context block so a
+	// large recall cannot balloon the request (and trip the translator's payload
+	// cap). Used when MaxInjectTokens is 0.
+	DefaultMemoryMaxInjectTokens = 1200
+)
+
+// Valid memory write modes. "explicit" is the safe default; "automatic" is
+// operator opt-in only (surfaces a security warning in the admin UI).
+const (
+	MemoryWriteModeExplicit  = "explicit"
+	MemoryWriteModeCurated   = "curated"
+	MemoryWriteModeAutomatic = "automatic"
+)
+
+// ProviderSearXNG / ProviderTavily are the canonical provider name tokens used
+// in routing config and metrics labels. Exported so the search package can share
+// them without redefining (search imports config, never the reverse).
+const (
+	ProviderSearXNG = "searxng"
+	ProviderTavily  = "tavily"
 )
 
 // GetWebSearchConfig returns the web_search execution settings with zero-valued
@@ -1489,7 +2066,7 @@ func resolveWebSearchDefaults(ws WebSearchConfig) WebSearchConfig {
 		ws.Routing.PrimaryProvider = DefaultWebSearchPrimaryProvider
 	}
 	if ws.Routing.FallbackProviders == nil {
-		ws.Routing.FallbackProviders = []string{providerTavily}
+		ws.Routing.FallbackProviders = []string{ProviderTavily}
 	}
 
 	// Limits.
@@ -1634,6 +2211,35 @@ func WebSearchToggledOn() bool {
 	return cfg.WebSearch.Enabled
 }
 
+// Usage reporting modes govern only the CLIENT-VISIBLE usage numbers. Internal
+// accounting (per-key TokensUsed, per-account TotalTokens, global counters) is
+// always upstream-accurate regardless of this setting; it never uses context
+// occupancy as an input-token count.
+const (
+	// UsageReportingLegacy preserves the historical client-facing behavior:
+	// input_tokens carries context-window occupancy (contextPct * window) when a
+	// contextUsageEvent arrived. This is the default so existing clients that key
+	// off the old number are not broken.
+	UsageReportingLegacy = "legacy"
+	// UsageReportingAccurate reports the upstream-accurate input token count to the
+	// client (upstream-first, estimator fallback), matching the internal sinks.
+	UsageReportingAccurate = "accurate"
+)
+
+// GetUsageReportingMode returns the client-facing usage reporting mode, read from
+// the KIRO_USAGE_REPORTING environment variable (values "legacy" or "accurate";
+// anything else, including empty, means legacy). It is intentionally env-driven
+// rather than a config-schema field so enabling accurate reporting is a single
+// operator toggle with a trivial rollback (unset the var) and no persisted state.
+func GetUsageReportingMode() string {
+	switch strings.TrimSpace(strings.ToLower(os.Getenv("KIRO_USAGE_REPORTING"))) {
+	case UsageReportingAccurate:
+		return UsageReportingAccurate
+	default:
+		return UsageReportingLegacy
+	}
+}
+
 // SearXNGProviderEnabled reports whether SearXNG is usable: enabled (default
 // true) with a non-empty base URL. No API key is needed — it is the free path.
 func SearXNGProviderEnabled() bool {
@@ -1663,6 +2269,147 @@ func WebSearchEnabled() bool {
 		return false
 	}
 	return SearXNGProviderEnabled() || TavilyProviderEnabled()
+}
+
+// GetMemoryConfig returns the memory sidecar settings with zero-valued fields
+// resolved to their defaults. The APIKey is returned as-is (mask at the admin
+// boundary, not here). The returned value is a copy; callers cannot mutate
+// shared config state.
+func GetMemoryConfig() MemoryConfig {
+	cfgLock.RLock()
+	var m MemoryConfig
+	if cfg != nil {
+		m = cfg.Memory
+	}
+	cfgLock.RUnlock()
+	return resolveMemoryDefaults(m)
+}
+
+// GetMemoryConfigRaw returns the stored memory settings WITHOUT resolving
+// zero-valued fields to their defaults. Use this as the base for a partial
+// admin patch: reading the resolved copy and saving it would persist the
+// current defaults as explicit values, freezing them against future default
+// changes (default-drift). The returned value is a copy.
+func GetMemoryConfigRaw() MemoryConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return MemoryConfig{}
+	}
+	return cfg.Memory
+}
+
+// resolveMemoryDefaults fills zero-valued fields with their defaults. Applied
+// centrally so resolution is identical whether or not a config is loaded.
+func resolveMemoryDefaults(m MemoryConfig) MemoryConfig {
+	if strings.TrimSpace(m.Provider) == "" {
+		m.Provider = DefaultMemoryProvider
+	}
+	if strings.TrimSpace(m.WriteMode) == "" {
+		m.WriteMode = DefaultMemoryWriteMode
+	}
+	if m.RetrievalLimit <= 0 {
+		m.RetrievalLimit = DefaultMemoryRetrievalLimit
+	}
+	if m.Timeouts.SearchMs <= 0 {
+		m.Timeouts.SearchMs = DefaultMemorySearchTimeoutMs
+	}
+	if m.Timeouts.WriteMs <= 0 {
+		m.Timeouts.WriteMs = DefaultMemoryWriteTimeoutMs
+	}
+	// RedactSecrets defaults to true (nil → on).
+	if m.Redaction.RedactSecrets == nil {
+		t := true
+		m.Redaction.RedactSecrets = &t
+	}
+	// FailOpen defaults to true (nil → on): a memory outage never breaks a request.
+	if m.FailOpen == nil {
+		t := true
+		m.FailOpen = &t
+	}
+	// Inject defaults to false (nil → off): reading/injecting memory into the LLM
+	// request is opt-in, independent of the store/retrieve toggle.
+	if m.Inject == nil {
+		f := false
+		m.Inject = &f
+	}
+	if m.MaxInjectTokens <= 0 {
+		m.MaxInjectTokens = DefaultMemoryMaxInjectTokens
+	}
+	return m
+}
+
+// UpdateMemoryConfig saves the memory sidecar settings atomically.
+func UpdateMemoryConfig(m MemoryConfig) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.Memory = m
+	return Save()
+}
+
+// MemoryEnabled reports whether the memory sidecar should be active: the
+// operator toggle is on AND a backend base URL is configured. Mirrors the
+// WebSearchToggledOn/provider-usable split so a bare toggle without a backend
+// resolves to a no-op provider rather than erroring.
+func MemoryEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.Memory.Enabled && strings.TrimSpace(cfg.Memory.BaseURL) != ""
+}
+
+// MemoryRedactSecrets reports whether secret masking is applied before a write.
+// Defaults to true when unset.
+func MemoryRedactSecrets() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.Memory.Redaction.RedactSecrets == nil {
+		return true
+	}
+	return *cfg.Memory.Redaction.RedactSecrets
+}
+
+// MemoryFailOpen reports whether backend errors degrade silently instead of
+// surfacing to the caller. Defaults to true when unset.
+func MemoryFailOpen() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.Memory.FailOpen == nil {
+		return true
+	}
+	return *cfg.Memory.FailOpen
+}
+
+// MemoryInjectEnabled reports whether relevant memories should be retrieved and
+// injected into the LLM request. Requires the sidecar to be usable (MemoryEnabled)
+// AND the operator to have turned injection on (defaults off when unset), so a
+// bare memory sidecar does not silently start rewriting requests.
+func MemoryInjectEnabled() bool {
+	if !MemoryEnabled() {
+		return false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	return cfg.Memory.Inject != nil && *cfg.Memory.Inject
+}
+
+// MemoryCaptureEnabled reports whether a completed turn should be captured into
+// memory. Requires the sidecar to be usable AND a non-explicit write mode
+// ("automatic"/"curated"); "explicit" (the default) means store only via the
+// admin API, never automatically from the request path.
+func MemoryCaptureEnabled() bool {
+	if !MemoryEnabled() {
+		return false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	mode := strings.TrimSpace(cfg.Memory.WriteMode)
+	if mode == "" {
+		mode = DefaultMemoryWriteMode
+	}
+	return mode != MemoryWriteModeExplicit
 }
 
 // GetLogLevel returns the configured log level (debug/info/warn/error). Defaults to "info".
@@ -1746,43 +2493,16 @@ func GetUpstreamConfig() ([]UpstreamProvider, []ModelRoute) {
 
 // UpdateUpstreamConfig replaces the upstream providers and model routes atomically
 // and persists the change. Passing nil for either slice clears it.
+//
+// Legacy 1:1 routes are migrated into Targets here, not just on Load: the admin
+// UI and the bundle importer both write routes carrying only UpstreamID, and
+// ResolveRoute reads Targets exclusively. Without this the saved route resolves
+// to nothing until the next restart re-runs the Load-time migration.
 func UpdateUpstreamConfig(providers []UpstreamProvider, routes []ModelRoute) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	migrateModelRoutes(routes)
 	cfg.Upstreams = providers
 	cfg.ModelRoutes = routes
 	return Save()
-}
-
-// FindEnabledRoute looks up an enabled ModelRoute whose Model matches the given
-// client model name (exact match after trimming surrounding whitespace) and returns
-// it together with its enabled UpstreamProvider. Returns (nil, nil) when there is no
-// match or the target provider is missing/disabled — callers then fall through to the
-// default Kiro pool. This exact-match-only behavior is what keeps forward loops from
-// forming: a model name the upstream sends back that has no route dispatches normally.
-func FindEnabledRoute(model string) (*ModelRoute, *UpstreamProvider) {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
-	if cfg == nil {
-		return nil, nil
-	}
-	target := strings.TrimSpace(model)
-	if target == "" {
-		return nil, nil
-	}
-	for i := range cfg.ModelRoutes {
-		r := cfg.ModelRoutes[i]
-		if !r.Enabled || strings.TrimSpace(r.Model) != target {
-			continue
-		}
-		for j := range cfg.Upstreams {
-			up := cfg.Upstreams[j]
-			if up.ID == r.UpstreamID && up.Enabled {
-				routeCopy := r
-				upCopy := up
-				return &routeCopy, &upCopy
-			}
-		}
-	}
-	return nil, nil
 }

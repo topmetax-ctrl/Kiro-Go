@@ -5,7 +5,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Kiro-Go</title>
-  <link rel="icon" type="image/x-icon" href="/admin/favicon.ico" />
+  <link rel="icon" type="image/png" href="/admin/icon.png?v=20260724" />
   <script src="/admin/vendor/tailwindcss-browser/index.global.js"></script>
   <link rel="stylesheet" href="/admin/vendor/fontawesome/css/all.min.css" />
   <link rel="stylesheet" href="/admin/styles.css" id="__cssAsset" />
@@ -42,14 +42,15 @@
     <header class="login-topbar">
       <div class="login-topbar-inner">
         <div class="brand" aria-label="Kiro-Go" data-i18n-aria-label="app.title">
-          <img class="brand-icon" src="/admin/favicon.ico" alt="" />
+          <img class="brand-icon" src="/admin/icon.png?v=20260724" alt="" />
           <span class="brand-text">Kiro-Go</span>
         </div>
         <div class="topbar-actions">
-          <div class="lang-switch" id="loginLangSwitch" role="group" aria-label="" data-i18n-aria-label="lang.label">
-            <button class="lang-btn" data-lang="zh" type="button" data-i18n="lang.zh"></button>
-            <button class="lang-btn" data-lang="en" type="button" data-i18n="lang.en"></button>
-          </div>
+          <select class="lang-select" id="loginLangSelect" aria-label="" data-i18n-aria-label="lang.label">
+            <option value="zh" data-i18n="lang.zh"></option>
+            <option value="en" data-i18n="lang.en"></option>
+            <option value="vi" data-i18n="lang.vi"></option>
+          </select>
           <span class="divider" aria-hidden="true"></span>
           <button id="loginThemeToggle" class="icon-btn theme-toggle" type="button" aria-label=""
             data-i18n-title="theme.toggle" data-i18n-aria-label="theme.toggle" data-theme="system">
@@ -91,48 +92,56 @@
 
   <!-- Main app -->
   <div id="mainPage" class="hidden">
-    <header class="app-header">
-      <div class="app-header-inner">
-        <div class="brand-wrap">
-          <div class="brand">
-            <img class="brand-icon" src="/admin/favicon.ico" alt="" />
-            <span class="brand-text">Kiro-Go</span>
-          </div>
-        </div>
-        <nav class="header-nav" aria-label="" data-i18n-aria-label="aria.sections">
-          <div class="tabs" id="tabBar">
-            <button type="button" class="tab active" data-tab="accounts"><i class="fa-solid fa-users tab-icon"></i><span
-                data-i18n="tabs.accounts"></span></button>
-            <button type="button" class="tab" data-tab="settings"><i class="fa-solid fa-sliders tab-icon"></i><span
-                data-i18n="tabs.settings"></span></button>
-            <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
-                data-i18n="tabs.api"></span></button>
-            <button type="button" class="tab" data-tab="forwarding"><i class="fa-solid fa-diagram-project tab-icon"></i><span
-                data-i18n="tabs.forwarding"></span></button>
-            <button type="button" class="tab" data-tab="console"><i class="fa-solid fa-terminal tab-icon"></i><span
-                data-i18n="tabs.console"></span></button>
-          </div>
-        </nav>
-        <div class="topbar-actions flex-wrap justify-end">
-          <div class="lang-switch" id="mainLangSwitch" role="group" aria-label="" data-i18n-aria-label="lang.label">
-            <button class="lang-btn" data-lang="zh" type="button" data-i18n="lang.zh"></button>
-            <button class="lang-btn" data-lang="en" type="button" data-i18n="lang.en"></button>
-          </div>
-          <button id="mainThemeToggle" class="icon-btn theme-toggle" type="button" aria-label=""
-            data-i18n-title="theme.toggle" data-i18n-aria-label="theme.toggle" data-theme="system">
-            <i class="fa-solid fa-circle-half-stroke theme-ico-system"></i>
-            <i class="fa-solid fa-sun theme-ico-light"></i>
-            <i class="fa-solid fa-moon theme-ico-dark"></i>
-          </button>
-          <span class="divider" aria-hidden="true"></span>
-          <button class="btn btn-outline btn-sm" id="logoutBtn">
-            <i class="fa-solid fa-right-from-bracket"></i>
-            <span data-i18n="common.logout"></span>
-          </button>
+    <button id="sidebarToggle" class="sidebar-toggle" type="button" aria-label=""
+      data-i18n-aria-label="aria.sections" aria-controls="appSidebar" aria-expanded="false">
+      <i class="fa-solid fa-bars"></i>
+    </button>
+    <div id="sidebarBackdrop" class="sidebar-backdrop" hidden></div>
+    <aside id="appSidebar" class="app-sidebar">
+      <div class="sidebar-brand">
+        <div class="brand">
+          <img class="brand-icon" src="/admin/icon.png?v=20260724" alt="" />
+          <span class="brand-text">Kiro-Go</span>
         </div>
       </div>
-    </header>
+      <nav class="header-nav sidebar-nav" aria-label="" data-i18n-aria-label="aria.sections">
+        <div class="tabs" id="tabBar">
+          <button type="button" class="tab active" data-tab="accounts"><i class="fa-solid fa-users tab-icon"></i><span
+              data-i18n="tabs.accounts"></span></button>
+          <button type="button" class="tab" data-tab="settings"><i class="fa-solid fa-sliders tab-icon"></i><span
+              data-i18n="tabs.settings"></span></button>
+          <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
+              data-i18n="tabs.api"></span></button>
+          <button type="button" class="tab" data-tab="forwarding"><i class="fa-solid fa-diagram-project tab-icon"></i><span
+              data-i18n="tabs.forwarding"></span></button>
+          <button type="button" class="tab" data-tab="stats"><i class="fa-solid fa-chart-column tab-icon"></i><span
+              data-i18n="tabs.stats"></span></button>
+          <button type="button" class="tab" data-tab="console"><i class="fa-solid fa-terminal tab-icon"></i><span
+              data-i18n="tabs.console"></span></button>
+          <button type="button" class="tab" data-tab="logs"><i class="fa-solid fa-list tab-icon"></i><span
+              data-i18n="tabs.logs"></span></button>
+        </div>
+      </nav>
+      <div class="sidebar-actions topbar-actions">
+        <select class="lang-select" id="mainLangSelect" aria-label="" data-i18n-aria-label="lang.label">
+          <option value="zh" data-i18n="lang.zh"></option>
+          <option value="en" data-i18n="lang.en"></option>
+          <option value="vi" data-i18n="lang.vi"></option>
+        </select>
+        <button id="mainThemeToggle" class="icon-btn theme-toggle" type="button" aria-label=""
+          data-i18n-title="theme.toggle" data-i18n-aria-label="theme.toggle" data-theme="system">
+          <i class="fa-solid fa-circle-half-stroke theme-ico-system"></i>
+          <i class="fa-solid fa-sun theme-ico-light"></i>
+          <i class="fa-solid fa-moon theme-ico-dark"></i>
+        </button>
+        <button class="btn btn-outline btn-sm" id="logoutBtn">
+          <i class="fa-solid fa-right-from-bracket"></i>
+          <span data-i18n="common.logout"></span>
+        </button>
+      </div>
+    </aside>
 
+    <div class="app-main">
     <div class="container">
       <!-- Stats summary -->
       <div class="stats-grid">
@@ -310,6 +319,25 @@
               <option value="think" data-i18n="settings.formatThinkOpenAI"></option>
             </select>
           </div>
+          <div class="form-group">
+            <label data-i18n="settings.defaultEffort"></label>
+            <select id="thinkingDefaultEffort">
+              <option value="auto" data-i18n="settings.effortAuto"></option>
+              <option value="low" data-i18n="settings.effortLow"></option>
+              <option value="medium" data-i18n="settings.effortMedium"></option>
+              <option value="high" data-i18n="settings.effortHigh"></option>
+              <option value="xhigh" data-i18n="settings.effortXHigh"></option>
+              <option value="max" data-i18n="settings.effortMax"></option>
+            </select>
+            <small data-i18n="settings.defaultEffortHint"></small>
+          </div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="advertiseEffortModels" /><span class="slider"></span></span>
+              <span data-i18n="settings.advertiseEffortModels"></span>
+            </label>
+            <small data-i18n="settings.advertiseEffortModelsHint"></small>
+          </div>
           <button class="btn btn-primary" id="saveThinkingBtn" data-i18n="settings.saveThinking"></button>
         </div>
 
@@ -477,34 +505,85 @@
           </div>
         </div>
 
-        <!-- Upstream forwarding -->
+        <!-- Memory sidecar (Mem0) -->
         <div class="card">
-          <div class="card-header"><span class="card-title" data-i18n="settings.upstreamTitle"></span></div>
-          <small class="help-block" data-i18n="upstreams.intro"></small>
-
-          <div class="form-group" style="margin-top: 1rem;">
-            <div class="flex items-center gap-2" style="justify-content: space-between;">
-              <label class="font-semibold" data-i18n="upstreams.providersTitle"></label>
-              <button class="btn btn-outline btn-sm" id="addUpstreamBtn" type="button">
-                <i class="fa-solid fa-plus"></i>
-                <span data-i18n="upstreams.addProvider"></span>
-              </button>
-            </div>
-            <small data-i18n="upstreams.providersHint"></small>
+          <div class="card-header"><span class="card-title" data-i18n="memory.title"></span></div>
+          <small class="help-block" data-i18n="memory.intro"></small>
+          <div class="form-group mt-2">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="memoryEnabled" /><span class="slider"></span></span>
+              <span data-i18n="memory.enabled"></span>
+            </label>
+            <small class="field-hint-offset" data-i18n="memory.enabledHint"></small>
           </div>
-          <div id="upstreamsList"></div>
-
-          <div class="form-group" style="margin-top: 1rem;">
-            <div class="flex items-center gap-2" style="justify-content: space-between;">
-              <label class="font-semibold" data-i18n="upstreams.routesTitle"></label>
-              <button class="btn btn-outline btn-sm" id="addRouteBtn" type="button">
-                <i class="fa-solid fa-plus"></i>
-                <span data-i18n="upstreams.addRoute"></span>
-              </button>
-            </div>
-            <small data-i18n="upstreams.routesHint"></small>
+          <div class="form-group">
+            <label data-i18n="memory.baseURL"></label>
+            <input type="text" id="memoryBaseURL" class="font-mono" placeholder="http://localhost:8888" />
+            <small data-i18n="memory.baseURLHint"></small>
           </div>
-          <div id="modelRoutesList"></div>
+          <div class="form-group">
+            <label data-i18n="memory.apiKey"></label>
+            <input type="password" id="memoryApiKey" data-i18n-placeholder="memory.apiKeyPlaceholder" autocomplete="off" />
+            <small data-i18n="memory.apiKeyHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="memory.writeMode"></label>
+            <select id="memoryWriteMode">
+              <option value="explicit" data-i18n="memory.writeModeExplicit"></option>
+              <option value="curated" data-i18n="memory.writeModeCurated"></option>
+              <option value="automatic" data-i18n="memory.writeModeAutomatic"></option>
+            </select>
+            <small id="memoryWriteModeWarning" class="hidden" style="color: var(--danger, #d33);"
+              data-i18n="memory.writeModeAutomaticWarning"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="memory.retrievalLimit"></label>
+            <input type="number" id="memoryRetrievalLimit" min="1" max="100" step="1" placeholder="8" />
+          </div>
+          <div class="form-group">
+            <label class="font-semibold pb-2 block" data-i18n="memory.injectSection"></label>
+            <div class="flex flex-col gap-3">
+              <div>
+                <label class="flex items-center gap-2">
+                  <span class="switch"><input type="checkbox" id="memoryInject" /><span class="slider"></span></span>
+                  <span data-i18n="memory.inject"></span>
+                </label>
+                <small class="field-hint-offset" data-i18n="memory.injectHint"></small>
+              </div>
+              <div>
+                <label data-i18n="memory.maxInjectTokens"></label>
+                <input type="number" id="memoryMaxInjectTokens" min="100" max="8000" step="100" placeholder="1200" />
+                <small data-i18n="memory.maxInjectTokensHint"></small>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="font-semibold pb-2 block" data-i18n="memory.security"></label>
+            <div class="flex flex-col gap-3">
+              <div>
+                <label class="flex items-center gap-2">
+                  <span class="switch"><input type="checkbox" id="memoryRedactSecrets" /><span class="slider"></span></span>
+                  <span data-i18n="memory.redactSecrets"></span>
+                </label>
+                <small class="field-hint-offset" data-i18n="memory.redactSecretsHint"></small>
+              </div>
+              <div>
+                <label class="flex items-center gap-2">
+                  <span class="switch"><input type="checkbox" id="memoryStoreSourceCode" /><span class="slider"></span></span>
+                  <span data-i18n="memory.storeSourceCode"></span>
+                </label>
+                <small class="field-hint-offset" data-i18n="memory.storeSourceCodeHint"></small>
+              </div>
+              <div>
+                <label class="flex items-center gap-2">
+                  <span class="switch"><input type="checkbox" id="memoryFailOpen" /><span class="slider"></span></span>
+                  <span data-i18n="memory.failOpen"></span>
+                </label>
+                <small class="field-hint-offset" data-i18n="memory.failOpenHint"></small>
+              </div>
+            </div>
+          </div>
+          <button class="btn btn-primary" id="saveMemoryBtn" data-i18n="memory.save"></button>
         </div>
 
         <!-- Statistics reset -->
@@ -582,6 +661,8 @@
                 </div>
               </div>
               <div class="endpoint api-code-row"><span class="api-code" id="modelsEndpoint"></span><button
+                  class="api-view-btn" type="button" id="viewModelsBtn" aria-label=""
+                  data-i18n-aria-label="api.viewModels"><i class="fa-solid fa-eye"></i></button><button
                   class="api-copy-btn" type="button" data-copy="modelsEndpoint" aria-label=""
                   data-i18n-aria-label="api.copyModels"><i class="fa-regular fa-copy"></i></button></div>
             </section>
@@ -594,6 +675,8 @@
                 </div>
               </div>
               <div class="endpoint api-code-row"><span class="api-code" id="statsEndpoint"></span><button
+                  class="api-view-btn" type="button" id="viewStatsBtn" aria-label=""
+                  data-i18n-aria-label="api.viewStats"><i class="fa-solid fa-eye"></i></button><button
                   class="api-copy-btn" type="button" data-copy="statsEndpoint" aria-label=""
                   data-i18n-aria-label="api.copyStats"><i class="fa-regular fa-copy"></i></button></div>
             </section>
@@ -604,6 +687,61 @@
 
       <!-- Forwarding dashboard tab -->
       <div id="tabForwarding" class="tab-content hidden">
+        <!-- Config and live activity are different jobs: one is write-mostly and
+             rarely touched, the other is read-mostly and watched. Splitting them
+             keeps a long provider/route list from burying the events table. -->
+        <div class="subtabs" id="fwdSubtabs" role="tablist" data-i18n-aria-label="forward.sections">
+          <button type="button" class="subtab active" data-fwd-pane="config" role="tab" aria-selected="true"
+            aria-controls="fwdPaneConfig"><i class="fa-solid fa-sliders" aria-hidden="true"></i><span
+              data-i18n="forward.paneConfig"></span></button>
+          <button type="button" class="subtab" data-fwd-pane="activity" role="tab" aria-selected="false"
+            aria-controls="fwdPaneActivity"><i class="fa-solid fa-wave-square" aria-hidden="true"></i><span
+              data-i18n="forward.paneActivity"></span></button>
+        </div>
+
+        <div id="fwdPaneConfig" class="fwd-pane" role="tabpanel">
+        <!-- Upstream forwarding config -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="settings.upstreamTitle"></span>
+            <div class="card-actions">
+              <button class="btn btn-outline btn-sm" id="upstreamExportBtn" type="button"><i
+                  class="fa-solid fa-file-export" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="upstreams.exportBtn"></span></button>
+              <button class="btn btn-outline btn-sm" id="upstreamImportBtn" type="button"><i
+                  class="fa-solid fa-file-import" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="upstreams.importBtn"></span></button>
+            </div>
+          </div>
+          <small class="help-block" data-i18n="upstreams.intro"></small>
+
+          <div class="form-group" style="margin-top: 1rem;">
+            <div class="flex items-center gap-2" style="justify-content: space-between;">
+              <label class="font-semibold" data-i18n="upstreams.providersTitle"></label>
+              <button class="btn btn-outline btn-sm" id="addUpstreamBtn" type="button">
+                <i class="fa-solid fa-plus"></i>
+                <span data-i18n="upstreams.addProvider"></span>
+              </button>
+            </div>
+            <small data-i18n="upstreams.providersHint"></small>
+          </div>
+          <div id="upstreamsList"></div>
+
+          <div class="form-group" style="margin-top: 1rem;">
+            <div class="flex items-center gap-2" style="justify-content: space-between;">
+              <label class="font-semibold" data-i18n="upstreams.routesTitle"></label>
+              <button class="btn btn-outline btn-sm" id="addRouteBtn" type="button">
+                <i class="fa-solid fa-plus"></i>
+                <span data-i18n="upstreams.addRoute"></span>
+              </button>
+            </div>
+            <small data-i18n="upstreams.routesHint"></small>
+          </div>
+          <div id="modelRoutesList"></div>
+        </div>
+        </div>
+
+        <div id="fwdPaneActivity" class="fwd-pane hidden" role="tabpanel">
         <div class="card">
           <div class="card-header">
             <span class="card-title" data-i18n="forward.title"></span>
@@ -668,6 +806,14 @@
               <option value="success" data-i18n="forward.statusSuccess"></option>
               <option value="error" data-i18n="forward.statusError"></option>
             </select>
+            <select id="fwdFilterRange" class="w-32!" data-i18n-aria-label="forward.filterRange">
+              <option value="" data-i18n="forward.allTime"></option>
+              <option value="1" data-i18n="stats.range1h"></option>
+              <option value="6" data-i18n="stats.range6h"></option>
+              <option value="24" data-i18n="stats.range24h"></option>
+              <option value="168" data-i18n="stats.range7d"></option>
+              <option value="720" data-i18n="stats.range30d"></option>
+            </select>
             <input type="text" id="fwdFilterModel" class="w-48!" data-i18n-placeholder="forward.filterModel" />
             <div class="toolbar-spacer"></div>
             <span class="text-xs muted-text" id="fwdEventsCount"></span>
@@ -681,6 +827,7 @@
                   <th data-i18n="forward.colProvider"></th>
                   <th data-i18n="forward.colStatus"></th>
                   <th data-i18n="forward.colLatency"></th>
+                  <th><span class="sr-only" data-i18n="forward.colDetail"></span></th>
                 </tr>
               </thead>
               <tbody id="fwdEventsBody"></tbody>
@@ -690,6 +837,68 @@
             <button class="btn btn-outline btn-sm" id="fwdPrevBtn" type="button" data-i18n="forward.prev"></button>
             <span class="text-xs muted-text" id="fwdPageInfo"></span>
             <button class="btn btn-outline btn-sm" id="fwdNextBtn" type="button" data-i18n="forward.next"></button>
+          </div>
+        </div>
+        </div>
+      </div>
+
+      <!-- Stats tab: cross-provider comparison and drill-down -->
+      <div id="tabStats" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="stats.title"></span>
+            <div class="card-actions">
+              <select id="statsRangeSelect" class="w-32!" data-i18n-aria-label="stats.rangeLabel">
+                <option value="1" selected data-i18n="stats.range1h"></option>
+                <option value="6" data-i18n="stats.range6h"></option>
+                <option value="24" data-i18n="stats.range24h"></option>
+                <option value="168" data-i18n="stats.range7d"></option>
+                <option value="720" data-i18n="stats.range30d"></option>
+              </select>
+              <button class="btn btn-outline btn-sm" id="statsExportBtn" type="button">
+                <i class="fa-solid fa-download" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="stats.exportCsv"></span>
+              </button>
+              <button class="btn btn-outline btn-sm" id="statsRefreshBtn" type="button">
+                <i class="fa-solid fa-rotate" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="stats.refresh"></span>
+              </button>
+            </div>
+          </div>
+          <p class="muted-text text-xs" data-i18n="stats.intro"></p>
+
+          <!-- At-a-glance comparison: champion cards plus normalised bars, so an
+               operator can rank providers without reading the numeric table. -->
+          <div id="statsCompare" class="stats-compare"></div>
+          <p class="muted-text text-xs" data-i18n="stats.windowNote"></p>
+
+          <div class="fwd-chart-card">
+            <div class="flex items-center justify-between" style="flex-wrap:wrap;gap:0.5rem;">
+              <!-- Title is set from JS because it names the bucket unit, which
+                   depends on the selected range (minutes vs hours). -->
+              <span class="text-xs font-semibold" id="statsTrendTitle"></span>
+              <span class="text-xs muted-text font-mono" id="statsTrendSummary"></span>
+            </div>
+            <div id="statsTrendChart" class="fwd-chart"></div>
+            <div id="statsTrendNote" class="muted-text text-xs"></div>
+          </div>
+
+          <div class="stats-table-scroll">
+            <table class="stats-table" id="statsTable">
+              <thead>
+                <tr>
+                  <th data-stats-sort="providerName" data-i18n="stats.colProvider"></th>
+                  <th data-stats-sort="requests" class="num" data-i18n="stats.colRequests"></th>
+                  <th data-stats-sort="successRate" class="num" data-i18n="stats.colOkPct"></th>
+                  <th data-stats-sort="tokens" class="num" data-i18n="stats.colTokens"></th>
+                  <th data-stats-sort="costUsd" class="num" data-i18n="stats.colCost"></th>
+                  <th data-stats-sort="avgLatencyMs" class="num" data-i18n="stats.colAvg"></th>
+                  <th data-stats-sort="rpm" class="num" data-i18n="stats.colRpm"></th>
+                  <th data-stats-sort="lastUsed" class="num" data-i18n="stats.colLastUsed"></th>
+                </tr>
+              </thead>
+              <tbody id="statsTableBody"></tbody>
+            </table>
           </div>
         </div>
       </div>
@@ -731,6 +940,28 @@
           <div class="console-output" id="consoleOutput" role="log" aria-live="polite"></div>
         </section>
       </div>
+      <!-- Logs tab -->
+      <div id="tabLogs" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header logs-header">
+            <span class="card-title" data-i18n="logs.title"></span>
+            <div class="logs-actions">
+              <select id="logsFilterSelect" class="w-40!" data-i18n-aria-label="logs.filter">
+                <option value="all" data-i18n="logs.filterAll"></option>
+                <option value="success" data-i18n="logs.filterSuccess"></option>
+                <option value="error" data-i18n="logs.filterError"></option>
+              </select>
+              <button class="btn btn-outline btn-sm" id="logsRefreshBtn"><i class="fa-solid fa-rotate"></i><span class="btn-text" data-i18n="logs.refresh"></span></button>
+              <label class="logs-auto-toggle"><input type="checkbox" id="logsAutoRefresh" /> <span data-i18n="logs.autoRefresh"></span></label>
+              <button class="btn btn-danger btn-sm" id="logsClearBtn"><i class="fa-solid fa-trash"></i><span class="btn-text" data-i18n="logs.clear"></span></button>
+            </div>
+          </div>
+          <div class="logs-summary" id="logsSummary"></div>
+          <div id="logsList" class="logs-list">
+            <p class="text-muted" data-i18n="logs.empty"></p>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- Footer -->
@@ -738,7 +969,7 @@
       <div class="app-footer-inner">
         <div class="footer-panel">
           <div class="footer-identity">
-            <img class="footer-icon" src="/admin/favicon.ico" alt="" />
+            <img class="footer-icon" src="/admin/icon.png?v=20260724" alt="" />
             <div class="footer-copy">
               <div class="footer-title-row">
                 <span class="footer-title">Kiro-Go</span>
@@ -769,6 +1000,19 @@
         </div>
       </div>
     </footer>
+    </div>
+
+    <!-- Floating scroll navigation -->
+    <div id="scrollNav" class="scroll-nav" hidden>
+      <button type="button" class="scroll-nav-btn" data-dir="up" aria-label=""
+        data-i18n-aria-label="scroll.top" title="" data-i18n-title="scroll.top">
+        <i class="fa-solid fa-chevron-up" aria-hidden="true"></i>
+      </button>
+      <button type="button" class="scroll-nav-btn" data-dir="down" aria-label=""
+        data-i18n-aria-label="scroll.bottom" title="" data-i18n-title="scroll.bottom">
+        <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
+      </button>
+    </div>
   </div>
 
   <!-- Modals -->
@@ -890,6 +1134,16 @@
           <small data-i18n="upstreams.proxyUrlHint"></small>
         </div>
         <div class="form-group">
+          <label data-i18n="upstreams.pricing"></label>
+          <div class="flex items-center gap-2">
+            <input type="number" id="upstreamForm_priceIn" min="0" step="0.01" class="w-32!"
+              data-i18n-placeholder="upstreams.priceInPlaceholder" />
+            <input type="number" id="upstreamForm_priceOut" min="0" step="0.01" class="w-32!"
+              data-i18n-placeholder="upstreams.priceOutPlaceholder" />
+          </div>
+          <small data-i18n="upstreams.pricingHint"></small>
+        </div>
+        <div class="form-group">
           <label class="flex items-center gap-2">
             <span class="switch"><input type="checkbox" id="upstreamForm_enabled" checked /><span class="slider"></span></span>
             <span data-i18n="upstreams.formEnabled"></span>
@@ -899,6 +1153,35 @@
           <button class="btn btn-secondary" id="upstreamModalCancelBtn" type="button" data-i18n="upstreams.cancelBtn"></button>
           <button class="btn btn-primary" id="upstreamModalSaveBtn" type="button" data-i18n="upstreams.saveBtn"></button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="upstreamImportModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span class="modal-title" data-i18n="upstreams.importModalTitle"></span>
+        <button class="modal-close" id="upstreamImportModalClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="help-block" data-i18n="upstreams.importDesc"></p>
+        <div class="form-group">
+          <label data-i18n="upstreams.importFileLabel"></label>
+          <input type="file" id="upstreamImportFile" accept="application/json,.json" />
+        </div>
+        <div class="form-group">
+          <label data-i18n="upstreams.importLabel"></label>
+          <textarea id="upstreamImportText" class="font-mono" rows="10"
+            data-i18n-placeholder="upstreams.importPlaceholder"></textarea>
+        </div>
+        <div id="upstreamImportResults" class="mt-3"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="upstreamImportCancelBtn" type="button"
+          data-i18n="upstreams.cancelBtn"></button>
+        <button class="btn btn-primary" id="upstreamImportConfirmBtn" type="button"
+          data-i18n="upstreams.importBtnConfirm"></button>
       </div>
     </div>
   </div>
@@ -918,14 +1201,13 @@
           <small data-i18n="upstreams.routeModelHint"></small>
         </div>
         <div class="form-group">
-          <label data-i18n="upstreams.provider"></label>
-          <select id="routeForm_upstreamId"></select>
-        </div>
-        <div class="form-group">
-          <label data-i18n="upstreams.targetModel"></label>
-          <input type="text" id="routeForm_targetModel" list="routeTargetModelList" autocomplete="off" data-i18n-placeholder="upstreams.targetModelPlaceholder" />
+          <label data-i18n="upstreams.routeTargets"></label>
+          <div id="routeTargetsList"></div>
+          <button class="btn btn-outline btn-sm" id="routeAddTargetBtn" type="button" style="margin-top:0.5rem;">
+            + <span data-i18n="upstreams.routeAddTarget"></span>
+          </button>
           <datalist id="routeTargetModelList"></datalist>
-          <small data-i18n="upstreams.targetModelHint"></small>
+          <small data-i18n="upstreams.routeTargetsHint"></small>
         </div>
         <div class="form-group">
           <label class="flex items-center gap-2">
@@ -977,6 +1259,20 @@
           <button class="btn btn-outline" id="apiKeyShowCopyBtn" type="button" data-i18n="apiKeys.copyBtn"></button>
           <button class="btn btn-primary" id="apiKeyShowCloseBtn" type="button" data-i18n="apiKeys.closeBtn"></button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- API View Modal -->
+  <div id="apiViewModal" class="modal">
+    <div class="modal-content api-view-modal-content">
+      <div class="modal-header">
+        <span class="modal-title" id="apiViewTitle"></span>
+        <button class="modal-close" id="apiViewModalClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body" id="apiViewBody">
+        <div class="api-view-loading"><i class="fa-solid fa-spinner fa-spin"></i> <span data-i18n="api.loading"></span></div>
       </div>
     </div>
   </div>

@@ -17,9 +17,11 @@ const defaultPromptCacheTTL = 5 * time.Minute
 // Anthropic requires cached prefixes to reach a minimum token count before
 // caching takes effect. Breakpoints below this threshold are excluded from
 // matching and storage to avoid reporting unrealistic 100% cache hits on
-// short requests.
+// short requests. Sonnet caches from 1024 tokens; Opus and Haiku 4.5 require
+// 4096. Getting this wrong only skews the synthesized cache numbers the proxy
+// reports to clients — upstream caching is unaffected.
 const defaultMinCacheableTokens = 1024
-const opusMinCacheableTokens = 4096
+const highMinCacheableTokens = 4096
 
 type promptCacheUsage struct {
 	CacheCreationInputTokens   int
@@ -42,8 +44,8 @@ type promptCacheProfile struct {
 
 func minCacheableTokensForModel(model string) int {
 	lower := strings.ToLower(model)
-	if strings.Contains(lower, "opus") {
-		return opusMinCacheableTokens
+	if strings.Contains(lower, "opus") || strings.Contains(lower, "haiku") {
+		return highMinCacheableTokens
 	}
 	return defaultMinCacheableTokens
 }

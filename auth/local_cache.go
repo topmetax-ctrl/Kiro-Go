@@ -50,11 +50,25 @@ type rawTokenFile struct {
 	Provider     string `json:"provider"`
 	Region       string `json:"region"`
 	// External IdP fields, present only for Kiro Hosted SSO (Microsoft Entra etc.)
-	IssuerURL   string `json:"issuerUrl"`
+	IssuerURL string `json:"issuerUrl"`
+	// The Kiro IDE writes the external-IdP client id under "clientId" (verified:
+	// "idpClientId" occurs 0 times in the 0.12.263/0.12.333 bundle). Older kiro-go
+	// injects wrote "idpClientId", so both names appear on disk in practice; read
+	// both and prefer the IDE's "clientId". idPClientID() resolves the precedence.
+	ClientID    string `json:"clientId"`
 	IdPClientID string `json:"idpClientId"`
 	Scopes      string `json:"scopes"`
 	LoginHint   string `json:"loginHint"`
 	StartURL    string `json:"startUrl"`
+}
+
+// idPClientID returns the external-IdP client id, preferring the field name the
+// Kiro IDE actually writes ("clientId") over the legacy kiro-go name.
+func (t rawTokenFile) idPClientID() string {
+	if v := strings.TrimSpace(t.ClientID); v != "" {
+		return v
+	}
+	return t.IdPClientID
 }
 
 // rawClientFile mirrors the on-disk shape of a {hash}.json OIDC client file.
@@ -68,21 +82,21 @@ type rawClientFile struct {
 // carries the secret material so the caller can import without re-reading disk;
 // use Masked* helpers for any value shown to a user.
 type LocalCredential struct {
-	SourceFile   string `json:"sourceFile"`   // token file name (e.g. kiro-auth-token.json)
-	AccessToken  string `json:"-"`            // never serialized
-	RefreshToken string `json:"-"`            // never serialized
-	ClientID     string `json:"-"`            // never serialized
-	ClientSecret string `json:"-"`            // never serialized
-	AuthMethod   string `json:"authMethod"`   // idc | social | external_idp
-	Provider     string `json:"provider"`     // BuilderId | Enterprise | Google | ...
-	Region       string `json:"region"`       // auth region from the token file
+	SourceFile   string `json:"sourceFile"` // token file name (e.g. kiro-auth-token.json)
+	AccessToken  string `json:"-"`          // never serialized
+	RefreshToken string `json:"-"`          // never serialized
+	ClientID     string `json:"-"`          // never serialized
+	ClientSecret string `json:"-"`          // never serialized
+	AuthMethod   string `json:"authMethod"` // idc | social | external_idp
+	Provider     string `json:"provider"`   // BuilderId | Enterprise | Google | ...
+	Region       string `json:"region"`     // auth region from the token file
 	IssuerURL    string `json:"issuerUrl,omitempty"`
 	IdPClientID  string `json:"idpClientId,omitempty"`
 	Scopes       string `json:"scopes,omitempty"`
 	LoginHint    string `json:"loginHint,omitempty"`
-	HasClient    bool   `json:"hasClient"`    // whether clientId/secret were resolved
-	HasRefresh   bool   `json:"hasRefresh"`   // whether a refresh token is present
-	Fingerprint  string `json:"fingerprint"`  // short, non-secret id for de-dup/selection
+	HasClient    bool   `json:"hasClient"`   // whether clientId/secret were resolved
+	HasRefresh   bool   `json:"hasRefresh"`  // whether a refresh token is present
+	Fingerprint  string `json:"fingerprint"` // short, non-secret id for de-dup/selection
 }
 
 // normalizeAuthMethod maps the token file's authMethod/provider onto the values
@@ -169,7 +183,7 @@ func ScanLocalKiroCredentials() ([]LocalCredential, error) {
 			Provider:     tok.Provider,
 			Region:       strings.TrimSpace(tok.Region),
 			IssuerURL:    tok.IssuerURL,
-			IdPClientID:  tok.IdPClientID,
+			IdPClientID:  tok.idPClientID(),
 			Scopes:       tok.Scopes,
 			LoginHint:    tok.LoginHint,
 			HasRefresh:   true,

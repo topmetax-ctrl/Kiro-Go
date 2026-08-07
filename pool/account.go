@@ -65,6 +65,14 @@ func GetPool() *AccountPool {
 func (p *AccountPool) Reload() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.reloadLocked()
+}
+
+// reloadLocked rebuilds the weighted account list from config. The caller must
+// hold p.mu. Split out of Reload so other pool mutations (e.g.
+// PublishProfileSwitch) can reload and update related state within one critical
+// section, without a lock-release window between the two.
+func (p *AccountPool) reloadLocked() {
 	enabled := config.GetEnabledAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
 	var weighted []config.Account
@@ -79,6 +87,32 @@ func (p *AccountPool) Reload() {
 	}
 	p.accounts = weighted
 	p.totalAccounts = len(enabled)
+}
+
+// PublishProfileSwitch atomically republishes the account snapshot (from the
+// freshly-persisted config) AND replaces the account's routing model list under a
+// single pool lock. This closes the cutover window that a separate Reload() then
+// SetModelList() would open: between those two calls a request could observe the
+// NEW profile snapshot while still routed against the OLD profile's model set.
+// Holding p.mu across both updates makes the switch atomic to every reader.
+func (p *AccountPool) PublishProfileSwitch(accountID string, modelIDs []string) {
+	set := make(map[string]bool, len(modelIDs))
+	for _, id := range modelIDs {
+		set[strings.ToLower(strings.TrimSpace(id))] = true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reloadLocked()
+	p.modelLists[accountID] = set
+}
+
+// DeleteModelList drops an account's cached routing model set (e.g. when the
+// account is disabled or deleted) so a later aggregate rebuild cannot resurrect
+// its models. Safe to call for an unknown ID.
+func (p *AccountPool) DeleteModelList(accountID string) {
+	p.mu.Lock()
+	delete(p.modelLists, accountID)
+	p.mu.Unlock()
 }
 
 // GetNext 获取下一个可用账号（加权轮询）
@@ -134,27 +168,12 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		return snapshotAccount(acc)
 	}
 
-	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if excluded != nil && excluded[acc.ID] {
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return snapshotAccount(acc)
-		}
-	}
-	return snapshotAccount(best)
+	// All accounts are on cooldown or blocked. Return nil instead of the
+	// account with the earliest cooldown — retrying a throttled account
+	// immediately only wastes upstream quota and resets the cooldown timer.
+	// The caller should return a 503 with a Retry-After header so clients
+	// back off instead of tight-looping.
+	return nil
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -245,30 +264,9 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 		return snapshotAccount(acc)
 	}
 
-	// fallback：找冷却时间最短且支持该模型的账号
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if excluded != nil && excluded[acc.ID] {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return snapshotAccount(acc)
-		}
-	}
-	return snapshotAccount(best)
+	// All model-supporting accounts are on cooldown or blocked.
+	// Return nil — see GetNextExcluding for rationale.
+	return nil
 }
 
 // snapshotAccount returns an independent copy of acc (or nil). config.Account is
@@ -306,20 +304,52 @@ func (p *AccountPool) RecordSuccess(id string) {
 	p.errorCounts[id] = 0
 }
 
-// RecordError 记录请求错误，设置冷却
+// RecordError logs a request error and sets cooldown.
 func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.errorCounts[id]++
 
-	if isQuotaError {
-		// 配额错误，冷却 1 小时
-		p.cooldowns[id] = time.Now().Add(time.Hour)
-	} else if p.errorCounts[id] >= 3 {
-		// 连续 3 次错误，冷却 1 分钟
-		p.cooldowns[id] = time.Now().Add(time.Minute)
-	}
+	// [TEMPORARY] Cooldown disabled — anti-abuse was blocking all traffic.
+	// if isQuotaError {
+	// 	// Quota exhaustion: cooldown 1 hour.
+	// 	p.cooldowns[id] = time.Now().Add(time.Hour)
+	// } else if p.errorCounts[id] >= 3 {
+	// 	// Consecutive non-quota errors: short cooldown.
+	// 	p.cooldowns[id] = time.Now().Add(time.Minute)
+	// }
+}
+
+// RecordAntiAbuse logs an AWS anti-abuse "suspicious activity" 429 response.
+// Uses exponential backoff: 5min → 10min → 20min → 40min → 80min (capped).
+// This prevents rapid retries from renewing the AWS-side investigation timer.
+func (p *AccountPool) RecordAntiAbuse(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.errorCounts[id]++
+
+	// [TEMPORARY] Anti-abuse exponential backoff disabled.
+	// minutes := 5
+	// for i := 1; i < p.errorCounts[id]; i++ {
+	// 	minutes *= 2
+	// 	if minutes > 80 {
+	// 		minutes = 80
+	// 		break
+	// 	}
+	// }
+	// p.cooldowns[id] = time.Now().Add(time.Duration(minutes) * time.Minute)
+}
+
+// ResetAntiAbuse resets the anti-abuse error count for an account.
+// Called when an account successfully completes a streaming request,
+// indicating the AWS-side investigation period has ended.
+func (p *AccountPool) ResetAntiAbuse(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.errorCounts[id] = 0
+	delete(p.cooldowns, id)
 }
 
 // IsAuthFailure reports whether an error indicates the refresh token / credentials
@@ -414,6 +444,20 @@ func (p *AccountPool) MarkOverLimit(id string) {
 
 // UpdateToken 更新账号 Token
 func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresAt int64) {
+	p.UpdateCredentialState(nil, id, accessToken, refreshToken, expiresAt, "")
+}
+
+// UpdateCredentialState publishes one persisted refresh result to both the
+// pool and an optional caller-owned account while holding the pool lock. The
+// target may itself point into the pool.
+func (p *AccountPool) UpdateCredentialState(
+	target *config.Account,
+	id string,
+	accessToken string,
+	refreshToken string,
+	expiresAt int64,
+	profileArn string,
+) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for i := range p.accounts {
@@ -423,6 +467,19 @@ func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresA
 				p.accounts[i].RefreshToken = refreshToken
 			}
 			p.accounts[i].ExpiresAt = expiresAt
+			if profileArn != "" {
+				p.accounts[i].ProfileArn = profileArn
+			}
+		}
+	}
+	if target != nil {
+		target.AccessToken = accessToken
+		if refreshToken != "" {
+			target.RefreshToken = refreshToken
+		}
+		target.ExpiresAt = expiresAt
+		if profileArn != "" {
+			target.ProfileArn = profileArn
 		}
 	}
 }
