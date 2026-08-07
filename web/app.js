@@ -2866,10 +2866,9 @@
     $('modelRouteModalTitle').textContent = t(routeEditingId ? 'upstreams.routeModalEdit' : 'upstreams.routeModalCreate');
     $('routeForm_model').value = entry ? (entry.model || '') : '';
     $('routeForm_enabled').checked = entry ? !!entry.enabled : true;
-    // Deep-copy so Cancel discards target edits; the cache is only touched on save.
-    routeTargetDraft = entry
-      ? JSON.parse(JSON.stringify(routeTargets(entry)))
-      : [newRouteTarget()];
+    // draftFromTargets copies as it derives sameTier, so Cancel discards target
+    // edits; the cache is only touched on save.
+    routeTargetDraft = entry ? draftFromTargets(routeTargets(entry)) : [newRouteTarget()];
     if (!routeTargetDraft.length) routeTargetDraft = [newRouteTarget()];
     renderRouteTargets();
     populateClientModelDatalist();
@@ -2882,14 +2881,43 @@
     const first = upstreamCache.providers[0];
     return {
       upstreamId: (first && first.id) || '',
-      targetModel: '', priority: 0, weight: 1, enabled: true
+      targetModel: '', priority: 0, weight: 1, enabled: true, sameTier: false
     };
   }
 
-  // Renders the draft target list. Priority is positional — index 0 is the
-  // preferred provider — so reordering is the whole "switch provider" gesture and
-  // no priority number is exposed. Weight stays explicit because it only matters
-  // for the less common split-traffic case.
+  // draftFromTargets rebuilds the editable draft from stored targets, deriving
+  // each row's sameTier flag from whether it repeats the previous row's priority.
+  // Storage keeps explicit priority numbers; the UI shows tier membership. This is
+  // the inverse of the numbering done in submitRouteModal, so an edit round-trip
+  // preserves tiers instead of flattening them.
+  function draftFromTargets(targets) {
+    return targets.map((tg, i) => {
+      const prev = targets[i - 1];
+      return {
+        upstreamId: tg.upstreamId || '',
+        targetModel: tg.targetModel || '',
+        priority: tg.priority || 0,
+        weight: tg.weight > 0 ? tg.weight : 1,
+        enabled: tg.enabled !== false,
+        sameTier: !!prev && (prev.priority || 0) === (tg.priority || 0)
+      };
+    });
+  }
+
+  // draftTierNumbers returns each draft row's tier index, using the same rule as
+  // submitRouteModal so the badges always describe what will actually be saved.
+  function draftTierNumbers() {
+    let tier = -1;
+    return routeTargetDraft.map((tg, i) => {
+      if (i === 0 || !tg.sameTier) tier++;
+      return tier;
+    });
+  }
+
+  // Renders the draft target list. Tiers, not raw positions, carry the meaning:
+  // consecutive rows can share a tier, and rows in the same tier split traffic by
+  // weight instead of acting as each other's fallback. Reordering is still the
+  // "switch provider" gesture; the tier toggle is what makes weight usable.
   function renderRouteTargets() {
     const box = $('routeTargetsList');
     if (!box) return;
@@ -2897,17 +2925,35 @@
       box.innerHTML = '<div class="muted-text text-xs">' + escapeHtml(t('upstreams.routeNoProviders')) + '</div>';
       return;
     }
+    const tiers = draftTierNumbers();
+    // A tier with more than one member is the only case where weight does
+    // anything, so the weight input is enabled exactly there.
+    const tierSizes = {};
+    tiers.forEach(n => { tierSizes[n] = (tierSizes[n] || 0) + 1; });
     box.innerHTML = routeTargetDraft.map((tg, i) => {
       const opts = upstreamCache.providers.map(p =>
         '<option value="' + escapeAttr(p.id || '') + '"' + (p.id === tg.upstreamId ? ' selected' : '') + '>' +
           escapeHtml(p.name || p.baseUrl || p.id || '') + '</option>'
       ).join('');
-      const badge = i === 0
+      const tier = tiers[i];
+      const shares = tierSizes[tier] > 1;
+      const badge = tier === 0
         ? '<span class="text-xs" style="background:rgba(34,197,94,0.15);color:#16a34a;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('upstreams.routeTargetPrimary')) + '</span>'
-        : '<span class="text-xs muted-text">' + escapeHtml(t('upstreams.routeTargetFallback')) + ' ' + i + '</span>';
+        : '<span class="text-xs muted-text">' + escapeHtml(t('upstreams.routeTargetFallback')) + ' ' + tier + '</span>';
+      // Rows after the first can join the tier above; joining is what puts two
+      // targets at equal priority so their weights become meaningful.
+      const tierToggle = i === 0
+        ? ''
+        : '<label class="text-xs muted-text flex items-center gap-1" title="' + escapeAttr(t('upstreams.routeTargetSameTierHint')) + '">' +
+            '<input type="checkbox" data-target-field="sameTier" data-index="' + i + '"' + (tg.sameTier ? ' checked' : '') + ' />' +
+            escapeHtml(t('upstreams.routeTargetSameTier')) +
+          '</label>';
+      const shareLabel = shares
+        ? '<span class="text-xs muted-text">' + escapeHtml(t('upstreams.routeTargetSplitting')) + '</span>'
+        : '';
       return '<div class="card" data-target-index="' + i + '" style="margin-top:0.5rem;padding:0.5rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
-          badge +
+          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' + badge + tierToggle + shareLabel + '</div>' +
           '<div class="flex items-center gap-1">' +
             '<button class="btn btn-outline btn-sm" type="button" data-target-action="up" data-index="' + i + '"' +
               (i === 0 ? ' disabled' : '') + ' title="' + escapeAttr(t('upstreams.routeTargetUp')) + '">&uarr;</button>' +
@@ -2924,7 +2970,8 @@
             ' placeholder="' + escapeAttr(t('upstreams.targetModelPlaceholder')) + '" />' +
           '<input type="number" min="1" data-target-field="weight" data-index="' + i + '"' +
             ' value="' + escapeAttr(String(tg.weight > 0 ? tg.weight : 1)) + '" style="width:4.5rem;"' +
-            ' title="' + escapeAttr(t('upstreams.routeTargetWeightHint')) + '" />' +
+            (shares ? '' : ' disabled') +
+            ' title="' + escapeAttr(t(shares ? 'upstreams.routeTargetWeightHint' : 'upstreams.routeTargetWeightInert')) + '" />' +
           '<label class="switch" title="' + escapeAttr(t('upstreams.formEnabled')) + '">' +
             '<input type="checkbox" data-target-field="enabled" data-index="' + i + '"' + (tg.enabled === false ? '' : ' checked') + ' />' +
             '<span class="slider"></span>' +
@@ -2946,17 +2993,25 @@
     const model = $('routeForm_model').value.trim();
     const enabled = $('routeForm_enabled').checked;
     if (!model) { toast(t('upstreams.routeModelRequired'), 'error'); return; }
-    // Priority is assigned from list position here, so the stored data always
-    // matches what the operator saw; the server never reorders.
-    const targets = routeTargetDraft
-      .filter(tg => tg.upstreamId)
-      .map((tg, i) => ({
+    // Priority comes from list position, but rows flagged sameTier share the tier
+    // of the row above instead of starting a new one. That distinction is what
+    // makes weight reachable at all: the resolver only splits traffic by weight
+    // among targets of EQUAL priority (config/route_resolve.go), so numbering
+    // every row 0,1,2,... — as this did before — left every tier with a single
+    // member and the weight field permanently inert.
+    const kept = routeTargetDraft.filter(tg => tg.upstreamId);
+    let tier = -1;
+    const targets = kept.map((tg, i) => {
+      // The first row always opens a tier; sameTier is meaningless there.
+      if (i === 0 || !tg.sameTier) tier++;
+      return {
         upstreamId: tg.upstreamId,
         targetModel: (tg.targetModel || '').trim(),
-        priority: i,
+        priority: tier,
         weight: tg.weight > 0 ? tg.weight : 1,
         enabled: tg.enabled !== false
-      }));
+      };
+    });
     if (!targets.length) { toast(t('upstreams.providerRequired'), 'error'); return; }
     const prev = JSON.parse(JSON.stringify(upstreamCache));
     try {
@@ -3225,16 +3280,13 @@
           if (routeTargetDraft.length <= 1) return;
           routeTargetDraft.splice(i, 1);
         } else if (action === 'up' && i > 0) {
-          const tmp = routeTargetDraft[i - 1];
-          routeTargetDraft[i - 1] = routeTargetDraft[i];
-          routeTargetDraft[i] = tmp;
+          swapDraftRows(i, i - 1);
         } else if (action === 'down' && i < routeTargetDraft.length - 1) {
-          const tmp = routeTargetDraft[i + 1];
-          routeTargetDraft[i + 1] = routeTargetDraft[i];
-          routeTargetDraft[i] = tmp;
+          swapDraftRows(i, i + 1);
         } else {
           return;
         }
+        normalizeDraftTiers();
         renderRouteTargets();
       });
       // Field edits write straight into the draft. Text inputs use 'input' so a
@@ -3248,6 +3300,16 @@
         const field = el.dataset.targetField;
         if (field === 'enabled') routeTargetDraft[i].enabled = el.checked;
         else if (field === 'weight') routeTargetDraft[i].weight = Math.max(1, parseInt(el.value, 10) || 1);
+        else if (field === 'sameTier') {
+          // Both checkbox fields must read .checked, not .value: the generic
+          // branch below would store the string "on" and never clear the flag.
+          routeTargetDraft[i].sameTier = el.checked;
+          // Tier membership decides the badges and whether weight is editable, so
+          // the whole list has to re-render — unlike the other fields, which only
+          // affect the row being typed into.
+          renderRouteTargets();
+          return;
+        }
         else routeTargetDraft[i][field] = el.value;
         // Changing the primary provider changes which model names to suggest.
         if (field === 'upstreamId' && i === 0) populateTargetModelDatalist(el.value);
