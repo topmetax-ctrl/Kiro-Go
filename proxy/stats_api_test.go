@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"kiro-go/config"
 	"kiro-go/metrics"
@@ -361,4 +362,60 @@ func TestEventFilterFromQueryIgnoresJunk(t *testing.T) {
 	if f.StatusCode != 0 || f.SinceMs != 0 {
 		t.Fatalf("junk should parse to zero, got %+v", f)
 	}
+}
+
+// The Stats tab sends ?hours=N; without server-side scoping the selector looks
+// inert because every figure stays all-time.
+func TestForwardStatsHoursScopesProviderFigures(t *testing.T) {
+	metrics.Reset()
+	initStatsConfig(t, config.UpstreamProvider{
+		ID: "up-1", Name: "one", BaseURL: "https://one.example/v1", Enabled: true,
+	})
+	now := time.Now().UnixMilli()
+	metrics.Record(metrics.Event{
+		TimeMs: now, ProviderID: "up-1", Ok: true, Status: 200, LatencyMs: 10,
+	})
+	metrics.Record(metrics.Event{
+		TimeMs: now - 5*3600000, ProviderID: "up-1", Ok: true, Status: 200, LatencyMs: 10,
+	})
+
+	requestsFor := func(target string) float64 {
+		out := getJSON(t, &Handler{}, target)
+		for _, p := range out["providers"].([]interface{}) {
+			m := p.(map[string]interface{})
+			if m["providerId"] == "up-1" {
+				n, _ := m["requests"].(float64)
+				return n
+			}
+		}
+		t.Fatalf("up-1 missing from %s", target)
+		return 0
+	}
+
+	if got := requestsFor("/admin/api/forward-stats?hours=1"); got != 1 {
+		t.Fatalf("hours=1 requests = %v, want 1", got)
+	}
+	if got := requestsFor("/admin/api/forward-stats?hours=24"); got != 2 {
+		t.Fatalf("hours=24 requests = %v, want 2", got)
+	}
+	// No hours param keeps the existing all-time behaviour.
+	if got := requestsFor("/admin/api/forward-stats"); got != 2 {
+		t.Fatalf("unscoped requests = %v, want 2", got)
+	}
+}
+
+// A configured-but-idle provider must stay listed in a scoped response too,
+// otherwise the range filter silently hides upstreams from the table.
+func TestForwardStatsHoursStillListsIdleProvider(t *testing.T) {
+	metrics.Reset()
+	initStatsConfig(t, config.UpstreamProvider{
+		ID: "up-idle", Name: "idle-provider", BaseURL: "https://idle.example/v1", Enabled: true,
+	})
+	out := getJSON(t, &Handler{}, "/admin/api/forward-stats?hours=1")
+	for _, p := range out["providers"].([]interface{}) {
+		if p.(map[string]interface{})["providerId"] == "up-idle" {
+			return
+		}
+	}
+	t.Fatalf("idle provider dropped from scoped response: %v", out["providers"])
 }

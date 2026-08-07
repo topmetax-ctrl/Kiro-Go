@@ -254,8 +254,11 @@ type Bucket struct {
 	Failed       int64 `json:"failed"`
 	InputTokens  int64 `json:"inputTokens"`
 	OutputTokens int64 `json:"outputTokens"`
-	SumLatencyMs int64 `json:"-"`
-	AvgLatencyMs int64 `json:"avgLatencyMs"`
+	// CostUSD lets spend be summed over an arbitrary window (the Stats tab's
+	// range filter) rather than only all-time from the provider counter.
+	CostUSD      float64 `json:"costUsd"`
+	SumLatencyMs int64   `json:"-"`
+	AvgLatencyMs int64   `json:"avgLatencyMs"`
 }
 
 func (b *Bucket) add(ev Event) {
@@ -272,6 +275,7 @@ func (b *Bucket) add(ev Event) {
 	}
 	b.InputTokens += ev.InputTokens
 	b.OutputTokens += ev.OutputTokens
+	b.CostUSD += ev.CostUSD
 	b.SumLatencyMs += ev.LatencyMs
 }
 
@@ -556,11 +560,18 @@ type ProviderStat struct {
 // A provider whose only traffic was canceled therefore reports -1 (unknown)
 // rather than 0%.
 func (c *counter) successRate() float64 {
-	decided := c.requests - c.canceled
+	return rateOf(c.success, c.requests-c.canceled)
+}
+
+// rateOf is the shared success-percentage formula: -1 when nothing was decided,
+// otherwise success as a percentage of the decided requests. Bucket-derived
+// stats reuse it so a window-scoped rate is defined identically to an all-time
+// one; buckets have no canceled counter, so their decided count is success+failed.
+func rateOf(success, decided int64) float64 {
 	if decided <= 0 {
 		return -1
 	}
-	return float64(c.success) * 100 / float64(decided)
+	return float64(success) * 100 / float64(decided)
 }
 
 // tokensPerSec is output tokens divided by total latency seconds — a throughput
@@ -664,6 +675,101 @@ func ProviderStats() []ProviderStat {
 	return out
 }
 
+// ProviderStatsWindow returns per-provider aggregates restricted to the last
+// `hours`, busiest first. It backs the Stats tab's range filter, where the
+// all-time counters of ProviderStats would make the selector look inert.
+//
+// Volume, outcome, token, cost and latency figures are summed from the retained
+// time-series buckets. Everything else a ProviderStat carries is a live signal
+// rather than a windowed total — in-flight, failure streak, last-used — and is
+// copied from the provider as-is; ranking a provider "unhealthy an hour ago" is
+// not what those fields mean.
+//
+// Sub-window granularity follows the same rule as apiGetForwardHistory: ranges
+// up to bucketWindowMins are served from the per-minute buckets, longer ones
+// from the hourly rollups. Per-minute buckets are memory-only, so a short window
+// reads empty for a while after a restart.
+//
+// AvgTTFBMs, Canceled, Streamed and TokensPerSec are left zero: buckets do not
+// record them, and a windowed view must not silently substitute all-time values.
+func ProviderStatsWindow(hours int) []ProviderStat {
+	if hours <= 0 {
+		return ProviderStats()
+	}
+	useMinutes := hours*60 <= bucketWindowMins
+	now := time.Now().UnixMilli()
+
+	var cutoff int64
+	var windowMins float64
+	if useMinutes {
+		cutoff = now/60000 - int64(hours*60) + 1
+		windowMins = float64(hours * 60)
+	} else {
+		if hours > hourWindowHours {
+			hours = hourWindowHours
+		}
+		cutoff = now/3600000 - int64(hours) + 1
+		windowMins = float64(hours) * 60
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]ProviderStat, 0, len(s.byProvider))
+	for id, p := range s.byProvider {
+		src := p.hours
+		if useMinutes {
+			src = p.minutes
+		}
+		var agg Bucket
+		for k, b := range src {
+			if k < cutoff {
+				continue
+			}
+			agg.Requests += b.Requests
+			agg.Success += b.Success
+			agg.Failed += b.Failed
+			agg.InputTokens += b.InputTokens
+			agg.OutputTokens += b.OutputTokens
+			agg.CostUSD += b.CostUSD
+			agg.SumLatencyMs += b.SumLatencyMs
+		}
+
+		st := ProviderStat{
+			ProviderID:   id,
+			ProviderName: p.name,
+			Requests:     agg.Requests,
+			Success:      agg.Success,
+			Failed:       agg.Failed,
+			SuccessRate:  rateOf(agg.Success, agg.Success+agg.Failed),
+			InputTokens:  agg.InputTokens,
+			OutputTokens: agg.OutputTokens,
+			CostUSD:      agg.CostUSD,
+			// Live signals, deliberately not windowed.
+			InFlight:     p.inFlight,
+			PeakInFlight: p.peakFlight,
+			FailStreak:   p.curStreak,
+			MaxStreak:    p.maxStreak,
+			LastOk:       p.lastOkMs,
+			LastFail:     p.lastFailMs,
+			LastUsed:     p.lastUsed,
+			Healthy:      p.curStreak < 3,
+		}
+		if agg.Requests > 0 {
+			st.AvgLatencyMs = agg.SumLatencyMs / agg.Requests
+		}
+		if windowMins > 0 {
+			// Average rate across the window, not the 5-minute live rate: mixing
+			// the two would put a 30-day column next to a 5-minute one.
+			st.RPM = float64(agg.Requests) / windowMins
+			st.TPM = float64(agg.InputTokens+agg.OutputTokens) / windowMins
+		}
+		out = append(out, st)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Requests > out[j].Requests })
+	return out
+}
+
 // ProviderFailureState reports one provider's CURRENT consecutive-failure streak
 // and the timestamp of the most recent failure (UnixMilli, 0 when none).
 //
@@ -736,6 +842,12 @@ type ProviderDetail struct {
 	Statuses    []StatusStat  `json:"statuses"`
 	RecentErrs  []ErrorSample `json:"recentErrors"`
 	Minutes     []Bucket      `json:"minutes"`
+	// WindowHours is 0 for all-time, >0 when the headline ProviderStat numbers
+	// are scoped to a time window (matching the Stats tab's range selector).
+	// Models/Accounts/Statuses are always all-time because buckets do not carry
+	// per-model or per-account breakdowns; live signals (InFlight etc.) are
+	// always current.
+	WindowHours int `json:"windowHours,omitempty"`
 }
 
 // ProviderDetailFor returns the drill-down for one provider. found is false when
@@ -786,6 +898,150 @@ func ProviderDetailFor(id string, minutes int) (ProviderDetail, bool) {
 	}
 	d.RecentErrs = append([]ErrorSample(nil), p.recentErrs...)
 	// Newest error first, matching the event log's ordering.
+	for i, j := 0, len(d.RecentErrs)-1; i < j; i, j = i+1, j-1 {
+		d.RecentErrs[i], d.RecentErrs[j] = d.RecentErrs[j], d.RecentErrs[i]
+	}
+	d.Minutes = seriesLocked(p.minutes, nowMinute, minutes, 1)
+	s.mu.Unlock()
+
+	sort.Slice(d.Models, func(i, j int) bool { return d.Models[i].Requests > d.Models[j].Requests })
+	sort.Slice(d.Accounts, func(i, j int) bool { return d.Accounts[i].Requests > d.Accounts[j].Requests })
+	sort.Slice(d.Statuses, func(i, j int) bool { return d.Statuses[i].Count > d.Statuses[j].Count })
+
+	d.Percentiles = percentilesFor(id)
+	return d, true
+}
+
+// ProviderDetailWindow is like ProviderDetailFor but scopes the headline
+// ProviderStat numbers to the given time window (same bucket logic as
+// ProviderStatsWindow). Models/Accounts/Statuses remain all-time because
+// buckets do not carry per-dimension breakdowns; live signals (InFlight,
+// FailStreak, LastOk, Healthy) are always current.
+//
+// hours <= 0 falls through to ProviderDetailFor (all-time). minutes controls
+// the per-minute sparkline width, same as ProviderDetailFor.
+func ProviderDetailWindow(id string, hours, minutes int) (ProviderDetail, bool) {
+	if hours <= 0 {
+		return ProviderDetailFor(id, minutes)
+	}
+	if minutes <= 0 || minutes > bucketWindowMins {
+		minutes = 60
+	}
+
+	useMinutes := hours*60 <= bucketWindowMins
+	now := time.Now().UnixMilli()
+
+	var cutoff int64
+	var windowMins float64
+	if useMinutes {
+		nowMinute := now / 60000
+		cutoff = nowMinute - int64(hours*60) + 1
+		windowMins = float64(hours * 60)
+	} else {
+		if hours > hourWindowHours {
+			hours = hourWindowHours
+		}
+		nowHour := now / 3600000
+		cutoff = nowHour - int64(hours) + 1
+		windowMins = float64(hours) * 60
+	}
+
+	s.mu.Lock()
+	p := s.byProvider[id]
+	if p == nil {
+		s.mu.Unlock()
+		return ProviderDetail{}, false
+	}
+	nowMinute := now / 60000
+
+	// Aggregate the windowed buckets into a synthetic ProviderStat. Live
+	// signals come from the live counters, not the historical buckets.
+	src := p.hours
+	if useMinutes {
+		src = p.minutes
+	}
+	var agg Bucket
+	for k, b := range src {
+		if k < cutoff {
+			continue
+		}
+		agg.Requests += b.Requests
+		agg.Success += b.Success
+		agg.Failed += b.Failed
+		agg.InputTokens += b.InputTokens
+		agg.OutputTokens += b.OutputTokens
+		agg.CostUSD += b.CostUSD
+		agg.SumLatencyMs += b.SumLatencyMs
+	}
+	rpm, tpm := ratesLocked(p.minutes, nowMinute)
+	windowed := ProviderStat{
+		ProviderID:   id,
+		ProviderName: p.name,
+		Requests:     agg.Requests,
+		Success:      agg.Success,
+		Failed:       agg.Failed,
+		SuccessRate:  rateOf(agg.Success, agg.Success+agg.Failed),
+		InputTokens:  agg.InputTokens,
+		OutputTokens: agg.OutputTokens,
+		CostUSD:      agg.CostUSD,
+		// Live signals.
+		InFlight:     p.inFlight,
+		PeakInFlight: p.peakFlight,
+		FailStreak:   p.curStreak,
+		MaxStreak:    p.maxStreak,
+		LastOk:       p.lastOkMs,
+		LastFail:     p.lastFailMs,
+		LastUsed:     p.lastUsed,
+		Healthy:      p.curStreak < 3,
+		RPM:          rpm,
+		TPM:          tpm,
+	}
+	if agg.Requests > 0 {
+		windowed.AvgLatencyMs = agg.SumLatencyMs / agg.Requests
+	}
+	if windowMins > 0 {
+		// Override RPM/TPM with the window average, matching ProviderStatsWindow.
+		windowed.RPM = float64(agg.Requests) / windowMins
+		windowed.TPM = float64(agg.InputTokens+agg.OutputTokens) / windowMins
+	}
+
+	d := ProviderDetail{ProviderStat: windowed, WindowHours: hours}
+
+	// Models/Accounts/Statuses are all-time. The bucket maps do not carry
+	// per-dimension breakdowns, and reconstructing them from the event ring
+	// would be partial for windows longer than the ring covers.
+	for m, c := range p.byModel {
+		d.Models = append(d.Models, ModelStat{
+			Model:        m,
+			Requests:     c.requests,
+			Success:      c.success,
+			Failed:       c.failed,
+			SuccessRate:  c.successRate(),
+			AvgLatencyMs: c.avg(),
+			InputTokens:  c.inputTokens,
+			OutputTokens: c.outputTokens,
+			CostUSD:      c.costUSD,
+			LastUsed:     c.lastUsed,
+		})
+	}
+	for aid, a := range p.byAccount {
+		d.Accounts = append(d.Accounts, AccountStat{
+			AccountID:    aid,
+			AccountLabel: a.label,
+			Requests:     a.requests,
+			Success:      a.success,
+			Failed:       a.failed,
+			SuccessRate:  a.successRate(),
+			AvgLatencyMs: a.avg(),
+			InputTokens:  a.inputTokens,
+			OutputTokens: a.outputTokens,
+			LastUsed:     a.lastUsed,
+		})
+	}
+	for code, n := range p.byStatus {
+		d.Statuses = append(d.Statuses, StatusStat{Status: code, Count: n})
+	}
+	d.RecentErrs = append([]ErrorSample(nil), p.recentErrs...)
 	for i, j := 0, len(d.RecentErrs)-1; i < j; i, j = i+1, j-1 {
 		d.RecentErrs[i], d.RecentErrs[j] = d.RecentErrs[j], d.RecentErrs[i]
 	}
@@ -883,6 +1139,7 @@ func HistoryFor(id string, hours int) []Bucket {
 			t.Failed += b.Failed
 			t.InputTokens += b.InputTokens
 			t.OutputTokens += b.OutputTokens
+			t.CostUSD += b.CostUSD
 			t.SumLatencyMs += b.SumLatencyMs
 		}
 	}

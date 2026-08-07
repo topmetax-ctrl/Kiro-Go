@@ -542,3 +542,104 @@ func TestRPMOverWindow(t *testing.T) {
 		t.Fatalf("rpm = %v, want 2", ps[0].RPM)
 	}
 }
+
+// ProviderStatsWindow must actually scope its figures to the requested range —
+// the Stats tab's selector is inert otherwise, which is the bug it exists to fix.
+func TestProviderStatsWindowScopesToRange(t *testing.T) {
+	reset(t)
+
+	recent := ev("p1", true, 200, 1000)
+	recent.InputTokens = 10
+	recent.OutputTokens = 20
+	recent.CostUSD = 0.5
+	Record(recent)
+
+	old := ev("p1", true, 200, 3000)
+	old.TimeMs = nowMs() - 5*3600000 // 5 hours ago
+	old.InputTokens = 100
+	old.OutputTokens = 200
+	old.CostUSD = 4
+	Record(old)
+
+	oneHour := ProviderStatsWindow(1)
+	if len(oneHour) != 1 {
+		t.Fatalf("want 1 provider, got %d", len(oneHour))
+	}
+	if oneHour[0].Requests != 1 {
+		t.Fatalf("1h requests = %d, want 1 (the 5h-old event must be excluded)", oneHour[0].Requests)
+	}
+	if oneHour[0].CostUSD != 0.5 {
+		t.Fatalf("1h cost = %v, want 0.5", oneHour[0].CostUSD)
+	}
+	if oneHour[0].InputTokens+oneHour[0].OutputTokens != 30 {
+		t.Fatalf("1h tokens = %d, want 30", oneHour[0].InputTokens+oneHour[0].OutputTokens)
+	}
+	if oneHour[0].AvgLatencyMs != 1000 {
+		t.Fatalf("1h avg latency = %d, want 1000", oneHour[0].AvgLatencyMs)
+	}
+
+	day := ProviderStatsWindow(24)
+	if day[0].Requests != 2 {
+		t.Fatalf("24h requests = %d, want 2", day[0].Requests)
+	}
+	if day[0].CostUSD != 4.5 {
+		t.Fatalf("24h cost = %v, want 4.5", day[0].CostUSD)
+	}
+	if day[0].AvgLatencyMs != 2000 {
+		t.Fatalf("24h avg latency = %d, want 2000", day[0].AvgLatencyMs)
+	}
+	// Live signals are current, not windowed.
+	if day[0].ProviderName != "P-p1" || day[0].LastUsed == 0 {
+		t.Fatalf("live fields not carried over: %+v", day[0])
+	}
+}
+
+// A window with no decided traffic must report -1 (unknown), matching the
+// all-time successRate contract, so the UI renders "—" instead of 0%.
+func TestProviderStatsWindowUnknownSuccessRate(t *testing.T) {
+	reset(t)
+	old := ev("p1", true, 200, 1000)
+	old.TimeMs = nowMs() - 5*3600000
+	Record(old)
+
+	got := ProviderStatsWindow(1)
+	if len(got) != 1 {
+		t.Fatalf("want 1 provider, got %d", len(got))
+	}
+	if got[0].SuccessRate != -1 {
+		t.Fatalf("success rate = %v, want -1 for an empty window", got[0].SuccessRate)
+	}
+}
+
+// hours <= 0 means "no window" and must behave exactly like ProviderStats.
+func TestProviderStatsWindowZeroIsAllTime(t *testing.T) {
+	reset(t)
+	Record(ev("p1", true, 200, 1000))
+	if ProviderStatsWindow(0)[0].Requests != ProviderStats()[0].Requests {
+		t.Fatal("hours=0 must match all-time ProviderStats")
+	}
+}
+
+// Hourly buckets carry cost so a windowed cost survives a restart. A snapshot
+// written before this field existed simply loads it as zero.
+func TestHourlyBucketCostRoundTrips(t *testing.T) {
+	reset(t)
+	e := ev("p1", true, 200, 1000)
+	e.TimeMs = nowMs() - 3*3600000
+	e.CostUSD = 2.5
+	Record(e)
+
+	path := filepath.Join(t.TempDir(), "m.json")
+	if err := Save(path); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	reset(t)
+	if err := Load(path); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	got := ProviderStatsWindow(24)
+	if len(got) != 1 || got[0].CostUSD != 2.5 {
+		t.Fatalf("windowed cost did not survive persist: %+v", got)
+	}
+}

@@ -46,11 +46,11 @@
           <span class="brand-text">Kiro-Go</span>
         </div>
         <div class="topbar-actions">
-          <div class="lang-switch" id="loginLangSwitch" role="group" aria-label="" data-i18n-aria-label="lang.label">
-            <button class="lang-btn" data-lang="zh" type="button" data-i18n="lang.zh"></button>
-            <button class="lang-btn" data-lang="en" type="button" data-i18n="lang.en"></button>
-            <button class="lang-btn" data-lang="vi" type="button" data-i18n="lang.vi"></button>
-          </div>
+          <select class="lang-select" id="loginLangSelect" aria-label="" data-i18n-aria-label="lang.label">
+            <option value="zh" data-i18n="lang.zh"></option>
+            <option value="en" data-i18n="lang.en"></option>
+            <option value="vi" data-i18n="lang.vi"></option>
+          </select>
           <span class="divider" aria-hidden="true"></span>
           <button id="loginThemeToggle" class="icon-btn theme-toggle" type="button" aria-label=""
             data-i18n-title="theme.toggle" data-i18n-aria-label="theme.toggle" data-theme="system">
@@ -123,11 +123,11 @@
         </div>
       </nav>
       <div class="sidebar-actions topbar-actions">
-        <div class="lang-switch" id="mainLangSwitch" role="group" aria-label="" data-i18n-aria-label="lang.label">
-          <button class="lang-btn" data-lang="zh" type="button" data-i18n="lang.zh"></button>
-          <button class="lang-btn" data-lang="en" type="button" data-i18n="lang.en"></button>
-          <button class="lang-btn" data-lang="vi" type="button" data-i18n="lang.vi"></button>
-        </div>
+        <select class="lang-select" id="mainLangSelect" aria-label="" data-i18n-aria-label="lang.label">
+          <option value="zh" data-i18n="lang.zh"></option>
+          <option value="en" data-i18n="lang.en"></option>
+          <option value="vi" data-i18n="lang.vi"></option>
+        </select>
         <button id="mainThemeToggle" class="icon-btn theme-toggle" type="button" aria-label=""
           data-i18n-title="theme.toggle" data-i18n-aria-label="theme.toggle" data-theme="system">
           <i class="fa-solid fa-circle-half-stroke theme-ico-system"></i>
@@ -806,6 +806,14 @@
               <option value="success" data-i18n="forward.statusSuccess"></option>
               <option value="error" data-i18n="forward.statusError"></option>
             </select>
+            <select id="fwdFilterRange" class="w-32!" data-i18n-aria-label="forward.filterRange">
+              <option value="" data-i18n="forward.allTime"></option>
+              <option value="1" data-i18n="stats.range1h"></option>
+              <option value="6" data-i18n="stats.range6h"></option>
+              <option value="24" data-i18n="stats.range24h"></option>
+              <option value="168" data-i18n="stats.range7d"></option>
+              <option value="720" data-i18n="stats.range30d"></option>
+            </select>
             <input type="text" id="fwdFilterModel" class="w-48!" data-i18n-placeholder="forward.filterModel" />
             <div class="toolbar-spacer"></div>
             <span class="text-xs muted-text" id="fwdEventsCount"></span>
@@ -841,9 +849,9 @@
             <span class="card-title" data-i18n="stats.title"></span>
             <div class="card-actions">
               <select id="statsRangeSelect" class="w-32!" data-i18n-aria-label="stats.rangeLabel">
-                <option value="1" data-i18n="stats.range1h"></option>
+                <option value="1" selected data-i18n="stats.range1h"></option>
                 <option value="6" data-i18n="stats.range6h"></option>
-                <option value="24" selected data-i18n="stats.range24h"></option>
+                <option value="24" data-i18n="stats.range24h"></option>
                 <option value="168" data-i18n="stats.range7d"></option>
                 <option value="720" data-i18n="stats.range30d"></option>
               </select>
@@ -862,6 +870,7 @@
           <!-- At-a-glance comparison: champion cards plus normalised bars, so an
                operator can rank providers without reading the numeric table. -->
           <div id="statsCompare" class="stats-compare"></div>
+          <p class="muted-text text-xs" data-i18n="stats.windowNote"></p>
 
           <div class="fwd-chart-card">
             <div class="flex items-center justify-between" style="flex-wrap:wrap;gap:0.5rem;">

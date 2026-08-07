@@ -199,3 +199,58 @@ func TestFindEnabledRouteWrapperReturnsTopTarget(t *testing.T) {
 		t.Errorf("legacy fields not synced to selection: %+v", route)
 	}
 }
+
+// Hidden is a presentation-only flag for the admin list. Resolution must ignore
+// it completely: an operator who hides a provider to declutter a long list has
+// not asked to stop forwarding to it, and silently dropping its traffic would
+// make Hide a second, mislabelled disable switch.
+func TestResolveRouteIgnoresHidden(t *testing.T) {
+	makeCfg(t,
+		[]UpstreamProvider{
+			{ID: "u1", Name: "hidden-but-live", Enabled: true, Hidden: true},
+			{ID: "u2", Name: "visible", Enabled: true},
+		},
+		[]ModelRoute{{
+			ID: "r1", Model: "m", Enabled: true,
+			Targets: []RouteTarget{
+				{UpstreamID: "u1", Priority: 0, Enabled: true},
+				{UpstreamID: "u2", Priority: 1, Enabled: true},
+			},
+		}},
+	)
+	route, targets := ResolveRoute("m")
+	if route == nil {
+		t.Fatal("hiding a provider must not unroute the model")
+	}
+	if len(targets) != 2 {
+		t.Fatalf("want both targets eligible, got %d: %+v", len(targets), targets)
+	}
+	if targets[0].Provider.Name != "hidden-but-live" {
+		t.Errorf("hidden provider must keep its priority-0 slot, got %s", targets[0].Provider.Name)
+	}
+}
+
+// The two flags are independent, so Hidden must not rescue a disabled provider
+// either — the failure mode in the opposite direction.
+func TestResolveRouteHiddenDoesNotOverrideDisabled(t *testing.T) {
+	makeCfg(t,
+		[]UpstreamProvider{
+			{ID: "u1", Name: "off-and-hidden", Enabled: false, Hidden: true},
+			{ID: "u2", Name: "live-and-hidden", Enabled: true, Hidden: true},
+		},
+		[]ModelRoute{{
+			ID: "r1", Model: "m", Enabled: true,
+			Targets: []RouteTarget{
+				{UpstreamID: "u1", Priority: 0, Enabled: true},
+				{UpstreamID: "u2", Priority: 1, Enabled: true},
+			},
+		}},
+	)
+	_, targets := ResolveRoute("m")
+	if len(targets) != 1 {
+		t.Fatalf("want only the enabled target, got %d: %+v", len(targets), targets)
+	}
+	if targets[0].Provider.Name != "live-and-hidden" {
+		t.Errorf("want live-and-hidden, got %s", targets[0].Provider.Name)
+	}
+}

@@ -225,6 +225,14 @@ type UpstreamProvider struct {
 	ProxyURL string `json:"proxyURL,omitempty"` // Optional per-provider outbound proxy (falls back to global)
 	Enabled  bool   `json:"enabled"`            // Whether this provider may receive forwards
 
+	// Hidden collapses this provider out of the admin list once the list grows
+	// long enough to be unreadable. It is presentation-only and deliberately
+	// independent of Enabled: a hidden provider still receives forwards exactly
+	// as before, and ResolveRoute never reads this field. Folding "hide" into
+	// Enabled would give the operator a second disable switch wearing the wrong
+	// label, so a hidden-but-live provider stays live.
+	Hidden bool `json:"hidden,omitempty"`
+
 	// Operator-supplied prices in USD per 1M tokens, used only to estimate the
 	// cost shown in the stats dashboard. Zero means "unpriced": no cost is
 	// attributed, and the UI shows "—" rather than a misleading $0.00. Nothing

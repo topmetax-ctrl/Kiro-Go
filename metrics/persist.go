@@ -57,9 +57,10 @@ type persistedBucket struct {
 	Requests     int64 `json:"r"`
 	Success      int64 `json:"s"`
 	Failed       int64 `json:"f"`
-	InputTokens  int64 `json:"i,omitempty"`
-	OutputTokens int64 `json:"o,omitempty"`
-	SumLatencyMs int64 `json:"l,omitempty"`
+	InputTokens  int64   `json:"i,omitempty"`
+	OutputTokens int64   `json:"o,omitempty"`
+	CostUSD      float64 `json:"c,omitempty"`
+	SumLatencyMs int64   `json:"l,omitempty"`
 }
 
 type persistedRoute struct {
@@ -189,6 +190,7 @@ func Save(path string) error {
 				Failed:       b.Failed,
 				InputTokens:  b.InputTokens,
 				OutputTokens: b.OutputTokens,
+				CostUSD:      b.CostUSD,
 				SumLatencyMs: b.SumLatencyMs,
 			})
 		}
@@ -274,6 +276,7 @@ func Load(path string) error {
 				Failed:       b.Failed,
 				InputTokens:  b.InputTokens,
 				OutputTokens: b.OutputTokens,
+				CostUSD:      b.CostUSD,
 				SumLatencyMs: b.SumLatencyMs,
 			}
 		}

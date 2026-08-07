@@ -43,6 +43,10 @@
   let customSelectUid = 0;
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
+  // A dropdown this long is faster to type into than to scroll, so selects at or
+  // above this many options grow a filter box. data-search="true"/"false" on the
+  // <select> overrides the guess either way.
+  const CUSTOM_SELECT_SEARCH_MIN = 8;
   let netInterfacesData = null;
   let customApiAddr = localStorage.getItem('kiro_api_custom_addr') || '';
   let securityWarnings = [];
@@ -145,7 +149,7 @@
     qsa('[data-i18n-aria-label]').forEach(el => { el.setAttribute('aria-label', t(el.dataset.i18nAriaLabel)); });
     document.title = t('app.title');
     document.documentElement.lang = currentLang;
-    updateLangButtons();
+    updateLangSelects();
     applyTheme(getThemePref());
     refreshCustomSelects();
   }
@@ -176,16 +180,13 @@
       });
     });
   }
-  function updateLangButtons() {
-    qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
-    qsa('.lang-toggle').forEach(btn => {
-      const label = btn.querySelector('.lang-toggle-label');
-      if (label) label.textContent = t('lang.' + currentLang);
+  function updateLangSelects() {
+    qsa('.lang-select').forEach(sel => {
+      if (sel.value !== currentLang) sel.value = currentLang;
+      // The custom-select overlay caches the trigger label, so it needs a nudge
+      // whenever the value or the option text changes underneath it.
+      syncCustomSelect(sel);
     });
-  }
-  function toggleLang() {
-    const next = supportedLangs[(supportedLangs.indexOf(currentLang) + 1) % supportedLangs.length];
-    setLang(next);
   }
 
   // Custom select
@@ -207,6 +208,15 @@
       option.setAttribute('aria-selected', String(selected));
     });
   }
+  // A select is searchable when it opts in explicitly, or when it simply has too
+  // many options to scan by eye. Deciding per-select (rather than globally) keeps
+  // two-item toggles free of a pointless filter box.
+  function customSelectSearchable(select) {
+    const flag = select.dataset.search;
+    if (flag === 'true') return true;
+    if (flag === 'false') return false;
+    return select.options.length >= CUSTOM_SELECT_SEARCH_MIN;
+  }
   function renderCustomSelectOptions(select) {
     const wrap = select && select.__customSelect;
     if (!wrap) return;
@@ -214,17 +224,40 @@
     const trigger = wrap.querySelector('.custom-select-trigger');
     if (!content) return;
     if (trigger) labelCustomSelect(select, trigger, content, select.id);
-    content.innerHTML = '';
+    // Options live in their own box so re-rendering the list never destroys the
+    // search input the user is typing into.
+    const box = wrap.querySelector('.custom-select-options') || content;
+    const searchWrap = wrap.querySelector('.custom-select-search');
+    const input = wrap.querySelector('.custom-select-search-input');
+    const searchable = customSelectSearchable(select);
+    if (searchWrap) searchWrap.hidden = !searchable;
+    if (input) {
+      input.placeholder = t('common.searchPlaceholder');
+      input.setAttribute('aria-label', t('common.searchPlaceholder'));
+      if (!searchable) input.value = '';
+    }
+    const kw = (searchable && input ? input.value : '').trim().toLowerCase();
+    box.innerHTML = '';
+    let shown = 0;
     Array.from(select.options).forEach((option, index) => {
+      const label = (option.textContent || option.value || '').trim();
+      if (kw && !label.toLowerCase().includes(kw)) return;
       const item = document.createElement('button');
       item.type = 'button';
       item.className = 'custom-select-option';
       item.setAttribute('role', 'option');
       item.dataset.index = String(index);
       item.disabled = option.disabled;
-      item.textContent = (option.textContent || option.value || '').trim();
-      content.appendChild(item);
+      item.textContent = label;
+      box.appendChild(item);
+      shown++;
     });
+    if (!shown) {
+      const empty = document.createElement('div');
+      empty.className = 'custom-select-empty muted-text text-xs';
+      empty.textContent = t('common.noMatch');
+      box.appendChild(empty);
+    }
     syncCustomSelect(select);
   }
   function placeCustomSelectContent(select) {
@@ -260,8 +293,18 @@
       content.hidden = false;
       placeCustomSelectContent(select);
       requestAnimationFrame(() => placeCustomSelectContent(select));
-      const selected = content.querySelector('.custom-select-option.is-selected:not(:disabled)') || content.querySelector('.custom-select-option:not(:disabled)');
-      if (selected) selected.focus({ preventScroll: true });
+      // On a searchable select the point of opening is usually to type, so focus
+      // goes to the filter box; otherwise it lands on the current option so the
+      // arrow keys work straight away.
+      const input = wrap.querySelector('.custom-select-search-input');
+      if (customSelectSearchable(select) && input) {
+        input.value = '';
+        renderCustomSelectOptions(select);
+        input.focus({ preventScroll: true });
+      } else {
+        const selected = content.querySelector('.custom-select-option.is-selected:not(:disabled)') || content.querySelector('.custom-select-option:not(:disabled)');
+        if (selected) selected.focus({ preventScroll: true });
+      }
     } else {
       wrap.classList.remove('is-open');
       trigger.setAttribute('aria-expanded', 'false');
@@ -338,6 +381,21 @@
     content.className = 'custom-select-content';
     content.setAttribute('role', 'listbox');
     content.hidden = true;
+
+    // The filter box is built for every select but stays hidden unless the
+    // select is searchable, so option-count changes only have to flip `hidden`
+    // rather than rebuild the popover.
+    const searchWrap = document.createElement('div');
+    searchWrap.className = 'custom-select-search';
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.className = 'custom-select-search-input';
+    searchInput.autocomplete = 'off';
+    searchWrap.appendChild(searchInput);
+    const optionsBox = document.createElement('div');
+    optionsBox.className = 'custom-select-options';
+    content.appendChild(searchWrap);
+    content.appendChild(optionsBox);
     labelCustomSelect(select, trigger, content, id);
 
     wrap.appendChild(trigger);
@@ -356,6 +414,36 @@
         setCustomSelectOpen(select, true);
       }
     });
+    // Typing refilters in place. Re-rendering only touches the options box, so
+    // the input keeps both its value and focus.
+    searchInput.addEventListener('input', () => {
+      renderCustomSelectOptions(select);
+      placeCustomSelectContent(select);
+    });
+    searchInput.addEventListener('keydown', e => {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        // Step into the list; from the box itself, Down starts at the top and Up
+        // wraps to the bottom.
+        const options = qsa('.custom-select-option:not(:disabled)', optionsBox);
+        if (!options.length) return;
+        e.preventDefault();
+        (e.key === 'ArrowDown' ? options[0] : options[options.length - 1]).focus({ preventScroll: true });
+      } else if (e.key === 'Enter') {
+        // Enter on a filtered-to-one list is the fast path: pick it without
+        // making the user arrow down first.
+        const first = optionsBox.querySelector('.custom-select-option:not(:disabled)');
+        if (!first) return;
+        e.preventDefault();
+        chooseCustomSelectOption(select, parseInt(first.dataset.index, 10));
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        setCustomSelectOpen(select, false);
+        trigger.focus({ preventScroll: true });
+      }
+    });
+    // Clicks inside the filter box must not reach the document-level
+    // outside-click handler that closes every open select.
+    searchWrap.addEventListener('click', e => e.stopPropagation());
     content.addEventListener('click', e => {
       const option = e.target.closest('.custom-select-option');
       if (!option) return;
@@ -2177,6 +2265,11 @@
   let providerModelsLoading = {};
   let modelsModalPid = '';
   let modelsModalSearch = '';
+  // Hidden providers are collapsed behind a "show hidden" disclosure rather than
+  // dropped, so an operator can always get back to one. The expanded/collapsed
+  // choice is a view preference, so it lives in localStorage; which providers are
+  // hidden is config, and lives on the server.
+  let showHiddenProviders = localStorage.getItem('kiro_show_hidden_providers') === '1';
   // Model names served by this kiro-go instance (from /v1/models), used to
   // suggest Target Model values in the route modal. Still free-text + optional.
   let kiroGoModels = [];
@@ -2487,6 +2580,58 @@
     renderModelRoutes();
   }
 
+  // providerCard renders one provider row. Hidden providers get the same markup —
+  // every action stays reachable — plus a marker class and a badge, so the only
+  // difference between hidden and visible is where the row is placed and how it
+  // looks, never what the operator can do to it.
+  function providerCard(item) {
+    const id = escapeAttr(item.id || '');
+    const name = item.name ? escapeHtml(item.name) : '<span class="muted-text">' + escapeHtml(t('upstreams.unnamed')) + '</span>';
+    const baseUrl = escapeHtml(item.baseUrl || '');
+    const disabled = !item.enabled
+      ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('upstreams.disabled')) + '</span>'
+      : '';
+    // A hidden provider that is still enabled keeps forwarding, which is easy to
+    // forget once it is out of sight. The badge says so explicitly rather than
+    // letting "hidden" read as "off".
+    const hiddenBadge = item.hidden
+      ? '<span class="text-xs" style="background:rgba(148,163,184,0.18);color:var(--muted-foreground);padding:1px 6px;border-radius:4px;"' +
+          ' title="' + escapeAttr(t(item.enabled ? 'upstreams.hiddenStillLive' : 'upstreams.hiddenHint')) + '">' +
+          escapeHtml(t('upstreams.hidden')) + '</span>'
+      : '';
+    const hideIcon = item.hidden ? 'fa-eye' : 'fa-eye-slash';
+    const hideTitle = item.hidden ? t('upstreams.actionUnhide') : t('upstreams.actionHide');
+    return '<div class="card provider-card' + (item.hidden ? ' is-hidden-provider' : '') + '" data-upstream-id="' + id + '"' +
+      ' style="margin-top:0.5rem;padding:0.75rem;">' +
+      '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
+        '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
+          '<span class="font-semibold">' + name + '</span>' +
+          disabled +
+          hiddenBadge +
+          '<span class="text-xs muted-text font-mono">' + baseUrl + '</span>' +
+        '</div>' +
+        '<div class="flex items-center gap-2">' +
+          '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
+            '<input type="checkbox" data-upstream-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
+            '<span class="slider"></span>' +
+          '</label>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="hide" data-id="' + id + '"' +
+            ' title="' + escapeAttr(hideTitle) + '" aria-label="' + escapeAttr(hideTitle) + '">' +
+            '<i class="fa-solid ' + hideIcon + '" aria-hidden="true"></i></button>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="details" data-id="' + id + '" aria-expanded="false">' + escapeHtml(t('stats.details')) + '</button>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="load" data-id="' + id + '">' + escapeHtml(t('upstreams.loadModels')) + '</button>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="edit" data-id="' + id + '">' + escapeHtml(t('upstreams.actionEdit')) + '</button>' +
+          '<button class="btn btn-danger btn-sm" type="button" data-upstream-action="delete" data-id="' + id + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="text-xs muted-text font-mono" data-fwd-inline-for="' + id + '" style="margin-top:0.35rem;"></div>' +
+      '<div class="provider-detail hidden" data-provider-detail="' + id + '"></div>' +
+    '</div>';
+  }
+
+  // Hidden providers are moved below a disclosure row instead of being dropped
+  // from the DOM: the point of Hide is decluttering a long list, and a provider
+  // you cannot see at all is one you cannot unhide.
   function renderProviders() {
     const list = $('upstreamsList');
     if (!list) return;
@@ -2494,35 +2639,25 @@
       list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('upstreams.providersEmpty')) + '</div>';
       return;
     }
-    list.innerHTML = upstreamCache.providers.map(item => {
-      const id = escapeAttr(item.id || '');
-      const name = item.name ? escapeHtml(item.name) : '<span class="muted-text">' + escapeHtml(t('upstreams.unnamed')) + '</span>';
-      const baseUrl = escapeHtml(item.baseUrl || '');
-      const disabled = !item.enabled
-        ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('upstreams.disabled')) + '</span>'
-        : '';
-      return '<div class="card" data-upstream-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
-        '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
-          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
-            '<span class="font-semibold">' + name + '</span>' +
-            disabled +
-            '<span class="text-xs muted-text font-mono">' + baseUrl + '</span>' +
-          '</div>' +
-          '<div class="flex items-center gap-2">' +
-            '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
-              '<input type="checkbox" data-upstream-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
-              '<span class="slider"></span>' +
-            '</label>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="details" data-id="' + id + '" aria-expanded="false">' + escapeHtml(t('stats.details')) + '</button>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="load" data-id="' + id + '">' + escapeHtml(t('upstreams.loadModels')) + '</button>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="edit" data-id="' + id + '">' + escapeHtml(t('upstreams.actionEdit')) + '</button>' +
-            '<button class="btn btn-danger btn-sm" type="button" data-upstream-action="delete" data-id="' + id + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
-          '</div>' +
-        '</div>' +
-        '<div class="text-xs muted-text font-mono" data-fwd-inline-for="' + id + '" style="margin-top:0.35rem;"></div>' +
-        '<div class="provider-detail hidden" data-provider-detail="' + id + '"></div>' +
-      '</div>';
-    }).join('');
+    const shown = upstreamCache.providers.filter(p => !p.hidden);
+    const hiddenOnes = upstreamCache.providers.filter(p => p.hidden);
+    let html = shown.map(providerCard).join('');
+    // Hiding every provider would otherwise leave a blank panel that looks like a
+    // load failure, so say what happened.
+    if (!shown.length) {
+      html += '<div class="muted-text text-xs" style="padding:0.5rem 0;">' +
+        escapeHtml(t('upstreams.allHidden')) + '</div>';
+    }
+    if (hiddenOnes.length) {
+      const caret = showHiddenProviders ? 'fa-chevron-down' : 'fa-chevron-right';
+      html += '<button class="btn btn-ghost btn-sm provider-hidden-toggle" type="button"' +
+        ' data-upstream-toggle-hidden="1" aria-expanded="' + (showHiddenProviders ? 'true' : 'false') + '">' +
+        '<i class="fa-solid ' + caret + '" aria-hidden="true"></i>' +
+        escapeHtml(t('upstreams.hiddenCount', String(hiddenOnes.length))) +
+        '</button>';
+      if (showHiddenProviders) html += hiddenOnes.map(providerCard).join('');
+    }
+    list.innerHTML = html;
   }
 
   // Render the fetched-model list into the models modal, filtered by the search box.
@@ -2689,6 +2824,33 @@
     if (p) p.enabled = enabled;
     try {
       await persistUpstreams();
+      renderUpstreams();
+    } catch (e) {
+      upstreamCache = prev;
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+      renderUpstreams();
+    }
+  }
+
+  // Hiding is presentation-only: it never touches `enabled`, so a hidden provider
+  // keeps receiving forwards exactly as before. The flag is stored server-side
+  // rather than in localStorage so it follows the config across browsers and
+  // rides along with export/import.
+  async function setProviderHidden(id, hidden) {
+    const prev = JSON.parse(JSON.stringify(upstreamCache));
+    const p = upstreamCache.providers.find(x => x.id === id);
+    if (!p) return;
+    p.hidden = hidden;
+    // Unhiding from inside the collapsed group would otherwise move the row out
+    // of a section the operator can no longer see.
+    if (!hidden) showHiddenProviders = true;
+    try {
+      await persistUpstreams();
+      // A hidden-but-enabled provider is the case worth naming out loud, since
+      // the row vanishing could otherwise read as "turned off". The same two
+      // strings back the badge tooltip, so the two surfaces cannot drift apart.
+      toast(t(hidden ? (p.enabled ? 'upstreams.hiddenStillLive' : 'upstreams.hiddenHint') : 'upstreams.unhidden'),
+        hidden && p.enabled ? 'warning' : 'success');
       renderUpstreams();
     } catch (e) {
       upstreamCache = prev;
@@ -2904,6 +3066,50 @@
     });
   }
 
+  // Tier membership belongs to the SLOT, not to the target that happens to sit in
+  // it. Reordering is the documented "switch provider without losing the old
+  // setup" gesture, so moving a target into the primary slot must not drag its
+  // old sameTier flag along and collapse a shared tier. These two helpers let a
+  // reorder restore the flags by position after the rows have moved.
+  function draftTierFlags() {
+    return routeTargetDraft.map(tg => !!tg.sameTier);
+  }
+  function applyPositionalTiers(flags) {
+    routeTargetDraft.forEach((tg, i) => { tg.sameTier = !!flags[i]; });
+    normalizeDraftTiers();
+  }
+
+  // The first row opens the first tier by definition. A stale sameTier there
+  // would make draftTierNumbers start counting at 1 and mislabel every badge, so
+  // every structural change funnels through this.
+  function normalizeDraftTiers() {
+    if (routeTargetDraft.length) routeTargetDraft[0].sameTier = false;
+  }
+
+  // swapDraftRows backs the ↑/↓ buttons, which are also the keyboard-accessible
+  // path to what dragging does.
+  function swapDraftRows(a, b) {
+    if (!routeTargetDraft[a] || !routeTargetDraft[b]) return;
+    const flags = draftTierFlags();
+    const tmp = routeTargetDraft[a];
+    routeTargetDraft[a] = routeTargetDraft[b];
+    routeTargetDraft[b] = tmp;
+    applyPositionalTiers(flags);
+  }
+
+  // moveDraftRow relocates one row to an insertion slot, as produced by a drop.
+  // insertAt is a gap index (0 == above the first row), so dropping either side
+  // of the row's own position is a no-op. Returns whether anything moved.
+  function moveDraftRow(from, insertAt) {
+    if (!routeTargetDraft[from]) return false;
+    if (insertAt === from || insertAt === from + 1) return false;
+    const flags = draftTierFlags();
+    const row = routeTargetDraft.splice(from, 1)[0];
+    routeTargetDraft.splice(insertAt > from ? insertAt - 1 : insertAt, 0, row);
+    applyPositionalTiers(flags);
+    return true;
+  }
+
   // draftTierNumbers returns each draft row's tier index, using the same rule as
   // submitRouteModal so the badges always describe what will actually be saved.
   function draftTierNumbers() {
@@ -2951,9 +3157,15 @@
       const shareLabel = shares
         ? '<span class="text-xs muted-text">' + escapeHtml(t('upstreams.routeTargetSplitting')) + '</span>'
         : '';
-      return '<div class="card" data-target-index="' + i + '" style="margin-top:0.5rem;padding:0.5rem;">' +
+      // The row is only made draggable on mousedown over the handle (see the
+      // dragstart wiring), so dragging never starts from the text inputs and
+      // ordinary text selection inside them keeps working.
+      const handle = '<span class="route-target-handle" data-target-handle="1" aria-hidden="true"' +
+        ' title="' + escapeAttr(t('common.dragToReorder')) + '">' +
+        '<i class="fa-solid fa-grip-vertical"></i></span>';
+      return '<div class="card route-target-row" draggable="false" data-target-index="' + i + '" style="margin-top:0.5rem;padding:0.5rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
-          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' + badge + tierToggle + shareLabel + '</div>' +
+          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' + handle + badge + tierToggle + shareLabel + '</div>' +
           '<div class="flex items-center gap-1">' +
             '<button class="btn btn-outline btn-sm" type="button" data-target-action="up" data-index="' + i + '"' +
               (i === 0 ? ' disabled' : '') + ' title="' + escapeAttr(t('upstreams.routeTargetUp')) + '">&uarr;</button>' +
@@ -3184,6 +3396,18 @@
         else if (action === 'delete') deleteProvider(id, entry ? entry.name : '');
         else if (action === 'load') loadProviderModels(id);
         else if (action === 'details') toggleProviderDetail(id, btn, provList);
+        else if (action === 'hide') setProviderHidden(id, !(entry && entry.hidden));
+      });
+      // The hidden-group disclosure. Bound here rather than on the button itself
+      // because the button is re-rendered on every list change.
+      provList.addEventListener('click', e => {
+        if (!e.target.closest('[data-upstream-toggle-hidden]')) return;
+        showHiddenProviders = !showHiddenProviders;
+        localStorage.setItem('kiro_show_hidden_providers', showHiddenProviders ? '1' : '0');
+        renderProviders();
+        // Newly rendered rows start with an empty stat line; fill it from the
+        // stats already in memory instead of waiting for the next poll.
+        renderProviderInlineStats();
       });
       // Actions rendered inside an expanded detail panel.
       provList.addEventListener('click', e => {
@@ -3316,6 +3540,70 @@
       };
       rtTargets.addEventListener('change', applyField);
       rtTargets.addEventListener('input', applyField);
+
+      // Drag to reorder. The row carries draggable=false in the markup and is
+      // only armed while the pointer is held on the grip: HTML5 drag on a
+      // container would otherwise swallow text selection and caret placement in
+      // the target-model input.
+      let dragFrom = -1;
+      rtTargets.addEventListener('mousedown', e => {
+        const row = e.target.closest('.route-target-row');
+        if (!row) return;
+        row.draggable = !!e.target.closest('[data-target-handle]');
+      });
+      // Disarm on release so a later drag attempt from an input cannot inherit
+      // the armed state left by an earlier grip press.
+      rtTargets.addEventListener('mouseup', () => {
+        qsa('.route-target-row', rtTargets).forEach(r => { r.draggable = false; });
+      });
+      rtTargets.addEventListener('dragstart', e => {
+        const row = e.target.closest('.route-target-row');
+        if (!row || !row.draggable) return;
+        dragFrom = parseInt(row.dataset.targetIndex, 10);
+        row.classList.add('is-dragging');
+        if (e.dataTransfer) {
+          e.dataTransfer.effectAllowed = 'move';
+          // Firefox refuses to start a drag unless some payload is set.
+          e.dataTransfer.setData('text/plain', String(dragFrom));
+        }
+      });
+      // dragover fires continuously; the marker class is recomputed from the
+      // pointer's position relative to each row's midpoint, which is what makes
+      // the insertion point follow the cursor.
+      rtTargets.addEventListener('dragover', e => {
+        if (dragFrom < 0) return;
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+        const row = e.target.closest('.route-target-row');
+        qsa('.route-target-row', rtTargets).forEach(r => r.classList.remove('drop-above', 'drop-below'));
+        if (!row) return;
+        const rect = row.getBoundingClientRect();
+        row.classList.add(e.clientY < rect.top + rect.height / 2 ? 'drop-above' : 'drop-below');
+      });
+      rtTargets.addEventListener('drop', e => {
+        if (dragFrom < 0) return;
+        e.preventDefault();
+        const row = e.target.closest('.route-target-row');
+        const from = dragFrom;
+        dragFrom = -1;
+        if (!row) { renderRouteTargets(); return; }
+        const to = parseInt(row.dataset.targetIndex, 10);
+        const rect = row.getBoundingClientRect();
+        // Convert "which row, which half" into a gap index so dropping below the
+        // last row appends rather than landing on it.
+        const insertAt = e.clientY < rect.top + rect.height / 2 ? to : to + 1;
+        moveDraftRow(from, insertAt);
+        renderRouteTargets();
+      });
+      // dragend also covers the cancelled drag (Esc, or a drop outside the
+      // list), where no drop event ever arrives.
+      rtTargets.addEventListener('dragend', () => {
+        dragFrom = -1;
+        qsa('.route-target-row', rtTargets).forEach(r => {
+          r.draggable = false;
+          r.classList.remove('is-dragging', 'drop-above', 'drop-below');
+        });
+      });
     }
     const rtAddTarget = $('routeAddTargetBtn');
     if (rtAddTarget) rtAddTarget.addEventListener('click', () => {
@@ -3350,6 +3638,10 @@
 
   // ===== Forwarding dashboard =====
   let forwardStats = { overall: {}, providers: [], routes: [] };
+  // Range-scoped copy of providers for the Stats tab. forwardStats stays
+  // all-time because the Forwarding tab's inline stats and provider filter
+  // depend on it; null means "no window loaded yet, fall back to all-time".
+  let statsWindowProviders = null;
   let fwdEventsOffset = 0;
   const fwdEventsLimit = 50;
   let fwdEventsTotal = 0;
@@ -3385,8 +3677,6 @@
       renderForwardChart(d.timeseries || [], d.percentiles || {});
       populateForwardProviderFilter();
       renderProviderInlineStats();
-      renderStatsTable();
-      renderStatsCompare();
       refreshOpenProviderDetails();
     } catch (e) {
       // Non-fatal: dashboard just shows zeros.
@@ -3537,6 +3827,18 @@
       '<div class="pd-section-title">' + escapeHtml(title) + '</div>' + inner + '</div>';
   }
 
+  // rangeLabel maps a windowHours value to the same text the Stats tab selector
+  // uses, so the badge reads "Last hour" rather than "1 hour window". Unknown
+  // values (a hand-edited URL) degrade to a bare hour count instead of blank.
+  function rangeLabel(hours) {
+    if (!hours || hours <= 0) return '';
+    const map = {
+      1: t('stats.range1h'), 6: t('stats.range6h'), 24: t('stats.range24h'),
+      168: t('stats.range7d'), 720: t('stats.range30d')
+    };
+    return map[hours] || (hours + 'h');
+  }
+
   // renderProviderDetailHTML builds the whole panel from a /provider-stats
   // payload. isPool switches the cost column to credits, which is the pool's
   // real unit of spend.
@@ -3569,13 +3871,25 @@
         t('stats.tileCanceled', String(d.canceled || 0))) +
       metricTile(t('stats.tileLastOk'), fwdFmtWhen(d.lastOk), '');
 
-    let html = '<div class="pd-tiles">' + tiles + '</div>';
+    // When headline numbers are scoped to a time window, show a badge so the
+    // numbers in the tiles cannot be mistaken for all-time figures.
+    const wh = d.windowHours || 0;
+    const wLabel = rangeLabel(wh);
+    const windowBadge = wLabel
+      ? '<div class="pd-range-badge"><i class="fa-regular fa-clock" aria-hidden="true"></i>' +
+          escapeHtml(wLabel) +
+          '<span class="pd-range-alltime-note">' +
+          escapeHtml(t('stats.detailAllTimeNote')) + '</span></div>'
+      : '';
+
+    let html = windowBadge + '<div class="pd-tiles">' + tiles + '</div>';
 
     const spark = sparkline(d.minutes);
     if (spark) html += pdSection(t('stats.sectionActivity'), spark);
 
     if (d.statuses && d.statuses.length) {
-      html += pdSection(t('stats.sectionStatus'),
+      const sTitle = wh ? t('stats.sectionAllTime', t('stats.sectionStatus')) : t('stats.sectionStatus');
+      html += pdSection(sTitle,
         '<div class="pd-badges">' + d.statuses.map(s =>
           '<span class="fwd-badge ' + statusClass(s.status) + '">' +
           escapeHtml(String(s.status)) + ' × ' + escapeHtml(formatNum(s.count)) +
@@ -3583,7 +3897,8 @@
     }
 
     if (d.models && d.models.length) {
-      html += pdSection(t('stats.sectionModels'),
+      const mTitle = wh ? t('stats.sectionAllTime', t('stats.sectionModels')) : t('stats.sectionModels');
+      html += pdSection(mTitle,
         '<div class="pd-table-scroll"><table class="pd-table"><thead><tr>' +
         '<th>' + escapeHtml(t('stats.colModel')) + '</th>' +
         '<th>' + escapeHtml(t('stats.colRequests')) + '</th>' +
@@ -3602,7 +3917,8 @@
     }
 
     if (d.accounts && d.accounts.length) {
-      html += pdSection(t('stats.sectionAccounts'),
+      const aTitle = wh ? t('stats.sectionAllTime', t('stats.sectionAccounts')) : t('stats.sectionAccounts');
+      html += pdSection(aTitle,
         '<div class="pd-table-scroll"><table class="pd-table"><thead><tr>' +
         '<th>' + escapeHtml(t('stats.colAccount')) + '</th>' +
         '<th>' + escapeHtml(t('stats.colRequests')) + '</th>' +
@@ -3650,11 +3966,18 @@
 
   // loadProviderDetail fetches and renders one provider's panel into every host
   // element currently showing it (a card on Forwarding, a row on Stats).
-  async function loadProviderDetail(providerId) {
+  //
+  // hours controls the headline-number scope: pass statsHistoryHours from the
+  // Stats tab so the detail panel shows the same range as its row; pass 0 (or
+  // omit) for the Forwarding tab, where there is no range selector and KPI
+  // cards are intentionally all-time.
+  async function loadProviderDetail(providerId, hours) {
     const hosts = qsa('[data-provider-detail="' + cssEscape(providerId) + '"]');
     if (!hosts.length) return;
     try {
-      const res = await api('/provider-stats?id=' + encodeURIComponent(providerId));
+      let url = '/provider-stats?id=' + encodeURIComponent(providerId);
+      if (hours && hours > 0) url += '&hours=' + encodeURIComponent(hours);
+      const res = await api(url);
       if (!res.ok) throw new Error('http ' + res.status);
       const payload = await res.json();
       payload.providerId = providerId;
@@ -3701,16 +4024,23 @@
       host.innerHTML = '<div class="muted-text text-xs" style="padding:0.75rem 0;">' +
         escapeHtml(t('stats.loading')) + '</div>';
     }
-    loadProviderDetail(providerId);
+    // Determine the range: panels opened from inside the Stats table carry the
+    // current window; panels on the Forwarding tab have no range selector and
+    // should always show all-time so the KPI cards there stay consistent.
+    const hoursForDetail = scope && scope.id === 'statsTableBody' ? statsHistoryHours : 0;
+    loadProviderDetail(providerId, hoursForDetail);
   }
 
   // refreshOpenProviderDetails re-fetches every expanded panel, so an open panel
   // tracks live traffic instead of freezing at its opening snapshot.
   function refreshOpenProviderDetails() {
     Object.keys(openProviderDetails).forEach(id => {
-      if (document.querySelector('[data-provider-detail="' + cssEscape(id) + '"]')) {
-        loadProviderDetail(id);
-      }
+      const host = document.querySelector('[data-provider-detail="' + cssEscape(id) + '"]');
+      if (!host) return;
+      // Re-use the same scope heuristic as toggleProviderDetail: if the host
+      // lives inside statsTableBody the panel respects the range selector.
+      const inStats = !!host.closest('#statsTableBody');
+      loadProviderDetail(id, inStats ? statsHistoryHours : 0);
     });
   }
 
@@ -3726,7 +4056,10 @@
       if (!res.ok) throw new Error('http ' + res.status);
       toast(t('stats.resetProviderDone'), 'success');
       loadForwardStats();
-      loadProviderDetail(providerId);
+      loadStatsWindow();
+      // After a reset the panel is always re-opened from Stats context, so
+      // pass the current range so the fresh zeros match the windowed row.
+      loadProviderDetail(providerId, statsHistoryHours);
     } catch (e) {
       toastError(t('stats.resetProviderFailed'));
     }
@@ -3784,7 +4117,7 @@
 
   let statsSortKey = 'requests';
   let statsSortDesc = true;
-  let statsHistoryHours = 24;
+  let statsHistoryHours = 1;
   // Last trend payload, kept so a language switch can re-render the chart
   // heading and note (both are built in JS, not via data-i18n).
   let statsTrendLast = { buckets: [], unit: 'hour' };
@@ -3798,8 +4131,14 @@
     return row[key] || 0;
   }
 
+  // statsRows is the single entry point to the data behind the Stats tab, so
+  // the range filter only has to be honoured in one place.
+  function statsRows() {
+    return statsWindowProviders || forwardStats.providers || [];
+  }
+
   function sortedStatsRows() {
-    const rows = (forwardStats.providers || []).slice();
+    const rows = statsRows().slice();
     rows.sort((a, b) => {
       const av = statsSortValue(a, statsSortKey);
       const bv = statsSortValue(b, statsSortKey);
@@ -3824,7 +4163,7 @@
   // hand it a bogus win.
 
   function statsCompareRows() {
-    return (forwardStats.providers || []).filter(p => (p.requests || 0) > 0);
+    return statsRows().filter(p => (p.requests || 0) > 0);
   }
 
   // costPer1M normalises spend so a low-volume provider is not flattered by a
@@ -4220,8 +4559,26 @@
     }
   }
 
+  // loadStatsWindow refetches the per-provider figures scoped to the selected
+  // range and re-renders the two surfaces that read them. On failure the window
+  // copy is dropped so the tab falls back to all-time rather than freezing on a
+  // stale range.
+  async function loadStatsWindow() {
+    try {
+      const res = await api('/forward-stats?hours=' + encodeURIComponent(statsHistoryHours));
+      if (!res.ok) throw new Error('http ' + res.status);
+      const d = await res.json();
+      statsWindowProviders = Array.isArray(d.providers) ? d.providers : null;
+    } catch (e) {
+      statsWindowProviders = null;
+    }
+    renderStatsTable();
+    renderStatsCompare();
+  }
+
   function openStats() {
     loadForwardStats();
+    loadStatsWindow();
     loadStatsHistory();
   }
 
@@ -4271,6 +4628,7 @@
     if (range) {
       range.addEventListener('change', () => {
         statsHistoryHours = parseInt(range.value, 10) || 24;
+        loadStatsWindow();
         loadStatsHistory();
       });
     }
@@ -4297,6 +4655,11 @@
     if (prov) params.set('provider', prov);
     if (status) params.set('status', status);
     if (model) params.set('model', model);
+    // The range is expressed as a lower bound resolved at request time, not a
+    // stored timestamp, so paging and live refreshes always mean "the last N
+    // hours from now" rather than from whenever the filter was picked.
+    const sinceMs = fwdFilterSinceMs();
+    if (sinceMs) params.set('since', String(sinceMs));
     try {
       const res = await api('/forward-events?' + params.toString());
       if (!res.ok) throw new Error('http ' + res.status);
@@ -4499,14 +4862,29 @@
     fwdStatsRefreshTimer = setTimeout(() => {
       fwdStatsRefreshTimer = null;
       loadForwardStats();
+      // The Stats tab reads a separate range-scoped payload, so it needs its own
+      // refresh; skipped when hidden to avoid a request nobody is looking at.
+      const statsTab = $('tabStats');
+      if (statsTab && !statsTab.classList.contains('hidden')) loadStatsWindow();
     }, 2000);
+  }
+
+  // Selected range as an absolute lower bound in epoch ms, or 0 for "all time".
+  // Recomputed on every call so a page kept open does not drift.
+  function fwdFilterSinceMs() {
+    const sel = $('fwdFilterRange');
+    const hours = sel ? parseFloat(sel.value) : NaN;
+    if (!isFinite(hours) || hours <= 0) return 0;
+    return Date.now() - Math.round(hours * 3600 * 1000);
   }
 
   function fwdFilterActive() {
     const prov = $('fwdFilterProvider') ? $('fwdFilterProvider').value : '';
     const status = $('fwdFilterStatus') ? $('fwdFilterStatus').value : '';
     const model = $('fwdFilterModel') ? $('fwdFilterModel').value.trim() : '';
-    return !!(prov || status || model);
+    // A range counts as an active filter: live events must not be prepended
+    // when the view is scoped, or a row outside the window would slip in.
+    return !!(prov || status || model || fwdFilterSinceMs());
   }
 
   function closeForwardStream() {
@@ -4565,6 +4943,8 @@
     if (prov) prov.addEventListener('change', () => { fwdEventsOffset = 0; loadForwardEvents(); });
     const status = $('fwdFilterStatus');
     if (status) status.addEventListener('change', () => { fwdEventsOffset = 0; loadForwardEvents(); });
+    const range = $('fwdFilterRange');
+    if (range) range.addEventListener('change', () => { fwdEventsOffset = 0; loadForwardEvents(); });
     const model = $('fwdFilterModel');
     if (model) model.addEventListener('input', () => {
       clearTimeout(fwdModelSearchTimer);
@@ -4779,7 +5159,9 @@
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.builderIdDesc')) + '</p>' +
       '<div id="builderIdStep1">' +
-      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="builderIdRegion" value="us-east-1" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label>' +
+      '<input type="text" id="builderIdRegion" value="us-east-1" list="builderIdRegionList" autocomplete="off" />' +
+      '<datalist id="builderIdRegionList"><option value="us-east-1"><option value="us-east-2"><option value="us-west-2"><option value="eu-central-1"><option value="eu-west-1"><option value="ap-northeast-1"><option value="ap-southeast-1"><option value="ap-south-1"></datalist></div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="startBuilderIdBtn" type="button">' + escapeHtml(t('builderid.startLogin')) + '</button>' +
@@ -4804,7 +5186,9 @@
     body.innerHTML =
       '<p class="help-block">' + escapeHtml(t('modal.iamDesc')) + '</p>' +
       '<div class="form-group"><label>' + escapeHtml(t('iam.startUrl')) + '</label><input type="text" id="iamStartUrl" placeholder="https://xxx.awsapps.com/start" /></div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="iamRegion" value="us-east-1" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label>' +
+      '<input type="text" id="iamRegion" value="us-east-1" list="iamRegionList" autocomplete="off" />' +
+      '<datalist id="iamRegionList"><option value="us-east-1"><option value="us-east-2"><option value="us-west-2"><option value="eu-central-1"><option value="eu-west-1"><option value="ap-northeast-1"><option value="ap-southeast-1"><option value="ap-south-1"></datalist></div>' +
       '<div id="iamStep2" class="hidden">' +
       '<div class="form-group"><label>' + escapeHtml(t('iam.loginUrl')) + '</label>' +
       '<div class="endpoint"><span id="iamAuthUrl" class="font-mono text-xs"></span></div>' +
@@ -4911,7 +5295,9 @@
       '</div>' +
       '<div class="form-group"><label>' + escapeHtml(t('sso.tokenLabel')) + ' <small>' + escapeHtml(t('sso.tokenHint')) + '</small></label>' +
       '<textarea id="ssoToken" placeholder="' + escapeAttr(t('sso.tokenPlaceholder')) + '"></textarea></div>' +
-      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label><input type="text" id="ssoRegion" value="us-east-1" /></div>' +
+      '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + '</label>' +
+      '<input type="text" id="ssoRegion" value="us-east-1" list="ssoRegionList" autocomplete="off" />' +
+      '<datalist id="ssoRegionList"><option value="us-east-1"><option value="us-east-2"><option value="us-west-2"><option value="eu-central-1"><option value="eu-west-1"><option value="ap-northeast-1"><option value="ap-southeast-1"><option value="ap-south-1"></datalist></div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="importSsoBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
@@ -4930,7 +5316,8 @@
       '<div class="form-group"><label>' + escapeHtml(t('apikey.label')) + '</label>' +
       '<textarea id="kiroApiKeyInput" class="font-mono" placeholder="' + escapeAttr(t('apikey.placeholder')) + '"></textarea></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('detail.region')) + ' <small>' + escapeHtml(t('apikey.regionHint')) + '</small></label>' +
-      '<input type="text" id="kiroApiKeyRegion" value="us-east-1" /></div>' +
+      '<input type="text" id="kiroApiKeyRegion" list="kiroApiKeyRegionList" value="us-east-1" placeholder="us-east-1" autocomplete="off" />' +
+      '<datalist id="kiroApiKeyRegionList"><option value="us-east-1"><option value="us-east-2"><option value="us-west-2"><option value="eu-central-1"><option value="eu-west-1"><option value="ap-northeast-1"><option value="ap-southeast-1"><option value="ap-south-1"></datalist></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('apikey.nickname')) + '</label>' +
       '<input type="text" id="kiroApiKeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
       '<div class="modal-footer">' +
@@ -5107,9 +5494,10 @@
       '<div class="form-group"><label>' + escapeHtml(t('apikey.nickname')) + '</label>' +
       '<input type="text" id="apikeyNickname" placeholder="' + escapeAttr(t('apikey.nicknamePlaceholder')) + '" /></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('apikey.authRegion')) + '</label>' +
-      '<input type="text" id="apikeyAuthRegion" value="us-east-1" /></div>' +
+      '<input type="text" id="apikeyAuthRegion" list="apikeyRegionList" value="us-east-1" placeholder="us-east-1" autocomplete="off" /></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('apikey.apiRegion')) + '</label>' +
-      '<input type="text" id="apikeyApiRegion" value="us-east-1" /></div>' +
+      '<input type="text" id="apikeyApiRegion" list="apikeyRegionList" value="us-east-1" placeholder="us-east-1" autocomplete="off" /></div>' +
+      '<datalist id="apikeyRegionList"><option value="us-east-1"><option value="us-east-2"><option value="us-west-2"><option value="eu-central-1"><option value="eu-west-1"><option value="ap-northeast-1"><option value="ap-southeast-1"><option value="ap-south-1"></datalist>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="importApikeyBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
@@ -5124,7 +5512,7 @@
       '<textarea id="apikeyBatchList" class="font-mono" rows="8" placeholder="' + escapeAttr(t('apikeyBatch.listPlaceholder')) + '"></textarea>' +
       '<p class="help-block">' + escapeHtml(t('apikeyBatch.listHint')) + '</p></div>' +
       '<div class="form-group"><label>' + escapeHtml(t('apikey.apiRegion')) + '</label>' +
-      '<input type="text" id="apikeyBatchRegion" value="us-east-1" /></div>' +
+      '<input type="text" id="apikeyBatchRegion" list="apikeyRegionList" value="us-east-1" placeholder="us-east-1" autocomplete="off" /></div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="importApikeyBatchBtn" type="button">' + escapeHtml(t('apikeyBatch.import')) + '</button>' +
@@ -6337,10 +6725,14 @@
 
     document.body.addEventListener('click', e => {
       if (!e.target.closest('.custom-select')) closeAllCustomSelects();
-      const lb = e.target.closest('.lang-btn');
-      if (lb) setLang(lb.dataset.lang);
-      const lt = e.target.closest('.lang-toggle');
-      if (lt) toggleLang();
+    });
+    // The switcher is a <select>, so it reports through change rather than click.
+    // Delegated because both copies (login topbar and sidebar) share the class,
+    // and the custom-select overlay re-dispatches change from the hidden native
+    // element — the listener has to sit on an ancestor to see it either way.
+    document.body.addEventListener('change', e => {
+      const ls = e.target.closest('.lang-select');
+      if (ls && ls.value !== currentLang) setLang(ls.value);
     });
     window.addEventListener('resize', positionOpenCustomSelects);
     window.addEventListener('scroll', positionOpenCustomSelects, true);

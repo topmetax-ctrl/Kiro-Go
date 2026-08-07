@@ -5463,6 +5463,10 @@ func (h *Handler) apiGetPublicIP(w http.ResponseWriter, r *http.Request) {
 // Providers are joined against the upstream config so the response also carries
 // the configured display name, base URL and prices for providers that exist but
 // have no traffic yet, plus the synthetic Kiro-pool entry.
+//
+// An `hours` query restricts the per-provider figures to that window, which is
+// what the Stats tab's range selector sends. overall/percentiles stay all-time:
+// they feed the Forwarding tab's KPI cards, which are not range-scoped.
 func (h *Handler) apiGetForwardStats(w http.ResponseWriter, r *http.Request) {
 	minutes := 60
 	if v := strings.TrimSpace(r.URL.Query().Get("minutes")); v != "" {
@@ -5470,12 +5474,19 @@ func (h *Handler) apiGetForwardStats(w http.ResponseWriter, r *http.Request) {
 			minutes = n
 		}
 	}
+	hours := 0
+	if v := strings.TrimSpace(r.URL.Query().Get("hours")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hours = n
+		}
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"overall":     metrics.Overall(),
-		"providers":   mergedProviderStats(),
+		"providers":   mergedProviderStats(hours),
 		"routes":      metrics.RouteStats(),
 		"timeseries":  metrics.TimeSeries(minutes),
 		"percentiles": metrics.LatencyPercentiles(),
+		"windowHours": hours,
 	})
 }
 
@@ -5495,8 +5506,13 @@ type providerRow struct {
 // the comparison table lists every provider — including ones configured but not
 // yet used (which would otherwise be invisible) and ones whose config was
 // deleted but whose history remains.
-func mergedProviderStats() []providerRow {
+//
+// hours > 0 scopes the recorded figures to that window; 0 means all-time.
+func mergedProviderStats(hours int) []providerRow {
 	stats := metrics.ProviderStats()
+	if hours > 0 {
+		stats = metrics.ProviderStatsWindow(hours)
+	}
 	byID := make(map[string]metrics.ProviderStat, len(stats))
 	for _, p := range stats {
 		byID[p.ProviderID] = p
@@ -5546,6 +5562,11 @@ func mergedProviderStats() []providerRow {
 // apiGetProviderDetail returns the full drill-down for one provider:
 // per-model and per-account breakdowns, the status histogram, recent errors,
 // percentiles and the per-minute series.
+//
+// An `hours` query scopes the headline ProviderStat numbers to that window,
+// matching what the Stats tab's range selector sends to /forward-stats.
+// Models/Accounts/Statuses are always all-time (buckets carry no per-dimension
+// breakdowns). Omitting hours or passing hours=0 returns all-time totals.
 func (h *Handler) apiGetProviderDetail(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
 	if id == "" {
@@ -5559,8 +5580,14 @@ func (h *Handler) apiGetProviderDetail(w http.ResponseWriter, r *http.Request) {
 			minutes = n
 		}
 	}
+	hours := 0
+	if v := strings.TrimSpace(r.URL.Query().Get("hours")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hours = n
+		}
+	}
 
-	detail, ok := metrics.ProviderDetailFor(id, minutes)
+	detail, ok := metrics.ProviderDetailWindow(id, hours, minutes)
 	if !ok {
 		// A configured provider with no traffic yet is a valid, empty detail —
 		// not a 404 — so the panel renders zeros instead of an error.
