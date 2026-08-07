@@ -1571,7 +1571,10 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLogSplit("claude", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds())
+		// Pool metrics must use the accounted values, not the raw upstream vars:
+		// Kiro reports no token counts, so inputTokens/outputTokens are 0 on this
+		// path and the dashboard would show every pool request as 0 in / 0 out.
+		h.recordSuccessLogSplit("claude", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
 
 		// Capture (write): store this turn's Q&A into memory (async, fail-open,
 		// redaction enforced in the provider). No-op unless capture is enabled
@@ -2020,7 +2023,10 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
-		h.recordSuccessLogSplit("claude", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds())
+		// Pool metrics must use the accounted values, not the raw upstream vars:
+		// Kiro reports no token counts, so inputTokens/outputTokens are 0 on this
+		// path and the dashboard would show every pool request as 0 in / 0 out.
+		h.recordSuccessLogSplit("claude", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
 
 		// Capture (write) this turn into memory when auto-capture is on. Async +
 		// fail-open + provider-enforced redaction; never blocks or breaks the response.
@@ -2538,7 +2544,8 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
-		h.recordSuccessLogSplit("openai", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds())
+		// See the claude tails: accounted values, not the always-0 upstream vars.
+		h.recordSuccessLogSplit("openai", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
 		finishReason := mapOpenAIFinishReason(upstreamStopReason, len(toolCalls))
 
 		chunk := map[string]interface{}{
@@ -2693,7 +2700,8 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
-		h.recordSuccessLogSplit("openai", model, account.ID, inputTokens, outputTokens, credits, time.Since(reqStart).Milliseconds())
+		// See the claude tails: accounted values, not the always-0 upstream vars.
+		h.recordSuccessLogSplit("openai", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, clientInput, clientOutput, model, thinkingFormat, upstreamStopReason)
