@@ -19,6 +19,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 )
 
 // usageCounts is the token pair extracted from an upstream response. Zero means
@@ -95,6 +96,18 @@ const maxUsageScanBuffer = 64 * 1024
 type usageScanner struct {
 	partial []byte
 	counts  usageCounts
+
+	// sawContent records whether the stream delivered any client-visible answer:
+	// assistant text, or a tool call. Thinking/reasoning deltas deliberately do
+	// NOT set it — a stream that reasons and then dies before answering is the
+	// exact failure this tracking exists to catch, so counting reasoning as
+	// content would make that case indistinguishable from a real answer.
+	sawContent bool
+	// sawTerminal records whether the upstream sent a frame that means "this turn
+	// is over": Anthropic's message_stop or a message_delta carrying stop_reason,
+	// OpenAI's [DONE] or a non-null finish_reason, or an explicit error event.
+	// Its absence at EOF is how a truncated relay is detected.
+	sawTerminal bool
 }
 
 // Write feeds relayed bytes to the scanner. It always reports success: this is
@@ -121,22 +134,42 @@ func (s *usageScanner) Write(p []byte) (int, error) {
 	}
 }
 
-// scanLine inspects one complete SSE line for a usage object.
+// scanLine inspects one complete SSE line for a usage object and for the
+// content/terminal markers that decide whether the stream finished cleanly.
 func (s *usageScanner) scanLine(line []byte) {
 	line = bytes.TrimRight(line, "\r")
 	if len(line) == 0 {
 		return
 	}
-	// Only "data:" frames carry JSON payloads; "event:" / ":" comments do not.
+	// An SSE "event:" line names the frame type. Anthropic sends the terminal
+	// signal as `event: message_stop`, and signals a mid-stream failure as
+	// `event: error`; both settle the turn without any "usage" payload, so they
+	// must be read here rather than in the JSON branch below.
+	if rest, ok := bytes.CutPrefix(line, []byte("event:")); ok {
+		switch string(bytes.TrimSpace(rest)) {
+		case "message_stop", "error":
+			s.sawTerminal = true
+		}
+		return
+	}
+	// Only "data:" frames carry JSON payloads; ":" comments do not.
 	const prefix = "data:"
 	if !bytes.HasPrefix(line, []byte(prefix)) {
 		return
 	}
 	payload := bytes.TrimSpace(line[len(prefix):])
-	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+	if len(payload) == 0 {
 		return
 	}
-	// Cheap pre-filter: skip the JSON decode for the vast majority of frames
+	// OpenAI's stream sentinel: a clean end of turn with no JSON to decode.
+	if bytes.Equal(payload, []byte("[DONE]")) {
+		s.sawTerminal = true
+		return
+	}
+
+	s.scanFrameMarkers(payload)
+
+	// Cheap pre-filter: skip the usage decode for the vast majority of frames
 	// (content deltas), which never mention usage.
 	if !bytes.Contains(payload, []byte("usage")) {
 		return
@@ -164,12 +197,122 @@ func (s *usageScanner) scanLine(line []byte) {
 	}
 }
 
+// scanFrameMarkers decodes one data frame far enough to tell whether it carried
+// client-visible content or ended the turn. It is best-effort in the same way as
+// the usage decode: an unrecognized or malformed shape simply sets nothing.
+//
+// Both dialects are handled in a single decode because the field sets do not
+// collide: Anthropic uses type/delta/content_block, OpenAI uses choices[].
+func (s *usageScanner) scanFrameMarkers(payload []byte) {
+	// Pre-filter: only frames mentioning one of these keys can move either flag,
+	// which skips the decode for keep-alive pings and similar noise.
+	if !bytes.Contains(payload, []byte("type")) && !bytes.Contains(payload, []byte("choices")) {
+		return
+	}
+
+	var frame struct {
+		Type  string `json:"type"`
+		Delta struct {
+			Type       string `json:"type"`
+			Text       string `json:"text"`
+			StopReason string `json:"stop_reason"`
+		} `json:"delta"`
+		ContentBlock struct {
+			Type string `json:"type"`
+		} `json:"content_block"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Delta        struct {
+				Content   string          `json:"content"`
+				ToolCalls json.RawMessage `json:"tool_calls"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(payload, &frame); err != nil {
+		return
+	}
+
+	switch frame.Type {
+	case "message_stop":
+		s.sawTerminal = true
+	case "error":
+		// A mid-stream error frame settles the turn: the client is being told the
+		// request failed, which is a complete (if unhappy) outcome, not a silent
+		// truncation.
+		s.sawTerminal = true
+	case "message_delta":
+		// stop_reason on a message_delta is Anthropic's real end-of-turn signal.
+		if strings.TrimSpace(frame.Delta.StopReason) != "" {
+			s.sawTerminal = true
+		}
+	case "content_block_start":
+		// A tool call is client-visible output even though it carries no text.
+		if frame.ContentBlock.Type == "tool_use" {
+			s.sawContent = true
+		}
+	case "content_block_delta":
+		// text_delta is an answer; thinking_delta and signature_delta are not.
+		// input_json_delta streams a tool call's arguments, which counts.
+		switch frame.Delta.Type {
+		case "text_delta":
+			if frame.Delta.Text != "" {
+				s.sawContent = true
+			}
+		case "input_json_delta":
+			s.sawContent = true
+		}
+	}
+
+	for i := range frame.Choices {
+		c := &frame.Choices[i]
+		if strings.TrimSpace(c.FinishReason) != "" {
+			s.sawTerminal = true
+		}
+		if c.Delta.Content != "" || len(c.Delta.ToolCalls) > 0 {
+			s.sawContent = true
+		}
+	}
+}
+
 // Counts returns the usage seen so far, after flushing any trailing partial line
 // that arrived without a final newline.
 func (s *usageScanner) Counts() usageCounts {
-	if len(s.partial) > 0 {
-		s.scanLine(s.partial)
-		s.partial = s.partial[:0]
-	}
+	s.flushPartial()
 	return s.counts
+}
+
+// Truncated reports whether the relayed stream ended without any terminal frame.
+//
+// This is the forwarding path's equivalent of classifyStreamIntegrity on the
+// Kiro pool path (proxy/account_failover.go): a provider that closes the
+// connection cleanly after streaming reasoning — but before the answer — yields
+// io.EOF, which is otherwise indistinguishable from a finished turn. The relay
+// would then be recorded as a 200 success while the client sees a stream that
+// simply stops, with no error to explain it.
+//
+// Deliberately conservative: only the absence of a terminal marker counts. A
+// turn that produced no content but did terminate (a refusal, an empty answer,
+// an error frame) is left alone, so this can only fire on a genuinely
+// unterminated stream. hadContent distinguishes the two shapes for the log/metric
+// without changing the verdict.
+func (s *usageScanner) Truncated() bool {
+	s.flushPartial()
+	return !s.sawTerminal
+}
+
+// hadContent reports whether any client-visible answer (text or tool call) was
+// relayed. Used only to describe a truncation, never to decide one.
+func (s *usageScanner) hadContent() bool {
+	s.flushPartial()
+	return s.sawContent
+}
+
+// flushPartial scans a trailing line that arrived without a final newline. It is
+// idempotent, so the several accessors that need it can each call it.
+func (s *usageScanner) flushPartial() {
+	if len(s.partial) > 0 {
+		line := s.partial
+		s.partial = s.partial[:0]
+		s.scanLine(line)
+	}
 }

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -158,6 +159,13 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 	// upstreamErrMsg holds the upstream's own error text for non-2xx responses,
 	// so the recorded event explains the failure instead of showing a bare code.
 	var upstreamErrMsg string
+	// streamTruncated marks a 200 stream that ended with no terminal frame (see
+	// usageScanner.Truncated). It downgrades the recorded outcome to a failure and
+	// appends an SSE error frame, so neither the dashboard nor the client mistakes
+	// a half-delivered turn for a complete one. truncatedHadContent only shapes the
+	// message: it says whether any answer text made it out before the stream died.
+	var streamTruncated bool
+	var truncatedHadContent bool
 
 	// recordMetric is called once, at the end of the attempt (after the body/stream
 	// finishes), so LatencyMs reflects the full relay — not just time-to-headers.
@@ -294,6 +302,16 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 		scanner := &usageScanner{}
 		relayErr = h.streamUpstreamResponse(w, resp, scanner)
 		usage = scanner.Counts()
+		// A stream that ended without any terminal frame is a truncation, even
+		// though the read returned a clean io.EOF. Without this check the relay
+		// below records a 200 success and the client is left with a stream that
+		// simply stops — the failure is invisible to both sides. Only meaningful
+		// when the read itself succeeded and the client is still connected: a
+		// relayErr or a canceled context already explains the short stream.
+		if relayErr == nil && r.Context().Err() == nil && scanner.Truncated() {
+			streamTruncated = true
+			truncatedHadContent = scanner.hadContent()
+		}
 	case ok && captureUserText != "" && config.MemoryCaptureEnabled() && resp.Header.Get("Content-Encoding") == "":
 		// Non-stream success with capture on: buffer the body so we can BOTH relay it
 		// to the client and extract the assistant text for memory capture. Compressed
@@ -342,6 +360,24 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 		relayErr = copyUpstreamResponse(w, resp)
 	}
 
+	// A truncated stream is not a success, however clean the transport looked.
+	// Tell the client explicitly — an SSE error frame is the only way to turn a
+	// stream that silently stops into a visible failure — and record it as such so
+	// the provider's success rate reflects reality. Appended after the relayed
+	// bytes, which the client already has; this cannot un-send them, only explain
+	// why nothing more is coming.
+	if streamTruncated {
+		reason := "upstream stream ended without a terminal event (truncated response)"
+		if !truncatedHadContent {
+			reason = "upstream stream ended before any answer content (truncated response)"
+		}
+		logger.Warnf("[Forward] %s: %s", up.Name, reason)
+		h.sendForwardStreamError(w, isClaudeRoute, reason)
+		h.recordFailure()
+		recordMetric(resp.StatusCode, false, reason)
+		return forwardOutcome{committed: true, status: resp.StatusCode}
+	}
+
 	// Account usage AFTER a successful relay. Forwarded traffic still consumes the
 	// key's quota: previously recordSuccess(0,0,0) left the per-key counter flat,
 	// so a within-limit key could forward without ever approaching its limit. We
@@ -380,6 +416,48 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 	}
 	recordMetric(resp.StatusCode, ok && relayErr == nil, internalErr)
 	return forwardOutcome{committed: true, status: resp.StatusCode}
+}
+
+// sendForwardStreamError appends an error frame to an already-committed relayed
+// stream. Headers and body bytes are long gone, so the HTTP status cannot be
+// changed — the only remaining channel to the client is another SSE event.
+//
+// Each dialect gets the error shape its clients parse: Anthropic clients read a
+// named `error` event, OpenAI clients read an error object in a data frame
+// followed by [DONE] to close the stream cleanly. Best-effort by nature: if the
+// connection is already gone the writes fail silently, which is correct — there
+// is nobody left to inform.
+func (h *Handler) sendForwardStreamError(w http.ResponseWriter, isClaudeRoute bool, message string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+	if isClaudeRoute {
+		payload, err := json.Marshal(map[string]interface{}{
+			"type": "error",
+			"error": map[string]string{
+				"type":    "api_error",
+				"message": message,
+			},
+		})
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
+		flusher.Flush()
+		return
+	}
+	payload, err := json.Marshal(map[string]interface{}{
+		"error": map[string]string{
+			"type":    "server_error",
+			"message": message,
+		},
+	})
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", payload)
+	flusher.Flush()
 }
 
 // upstreamErrorBodyLimit bounds how much of a retryable error body is read for

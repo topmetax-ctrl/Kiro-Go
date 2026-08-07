@@ -67,12 +67,18 @@ func forwardStreamRequest(t *testing.T, clientModel string) *httptest.ResponseRe
 func TestForwardStreamRecordsTokensAndRelaysVerbatim(t *testing.T) {
 	metrics.Reset()
 
+	// A COMPLETE Anthropic turn: the delta carries its "type" (as real frames do)
+	// and message_delta carries stop_reason, which is Anthropic's end-of-turn
+	// signal. Both matter — without them usageScanner.Truncated() reports a
+	// truncated stream and the relay appends an SSE error frame, so the
+	// byte-identical assertion below would be testing a failure path instead of
+	// the happy one.
 	stream := "event: message_start\n" +
 		`data: {"type":"message_start","message":{"usage":{"input_tokens":500,"output_tokens":1}}}` + "\n\n" +
 		"event: content_block_delta\n" +
-		`data: {"type":"content_block_delta","delta":{"text":"hello world"}}` + "\n\n" +
+		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello world"}}` + "\n\n" +
 		"event: message_delta\n" +
-		`data: {"type":"message_delta","usage":{"output_tokens":250}}` + "\n\n"
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":250}}` + "\n\n"
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
