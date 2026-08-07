@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+
+	"kiro-go/metrics"
 )
 
 // maxTargetWeight clamps Weight when expanding a tier for weighted selection.
@@ -75,6 +77,22 @@ func ResolveRoute(model string) (*ModelRoute, []ResolvedTarget) {
 		}
 		for _, t := range r.Targets {
 			if !t.Enabled || strings.TrimSpace(t.UpstreamID) == "" {
+				continue
+			}
+			// The Kiro Pool sentinel is a special target that does not match any
+			// configured upstream. When it appears, create a synthetic ResolvedTarget
+			// so the forwarder recognizes it and falls through to the pool instead of
+			// surfacing an "upstream not found" error. This lets the pool participate
+			// in multi-target failover: 9aws P0 -> xpiki P0 -> Kiro Pool P1.
+			if t.UpstreamID == metrics.KiroPoolID {
+				eligible = append(eligible, ResolvedTarget{
+					Target: t,
+					Provider: UpstreamProvider{
+						ID:      metrics.KiroPoolID,
+						Name:    metrics.KiroPoolName,
+						Enabled: true,
+					},
+				})
 				continue
 			}
 			for j := range cfg.Upstreams {

@@ -2260,6 +2260,12 @@
   // Working copy of the route modal's target list. Held apart from upstreamCache
   // so Cancel discards edits; only submitRouteModal writes it back.
   let routeTargetDraft = [];
+  // Sentinel upstream id meaning "the built-in Kiro account pool" rather than a
+  // configured provider. Must match metrics.KiroPoolID on the backend, which
+  // ResolveRoute turns into a synthetic target and the forwarder treats as "stop
+  // relaying, fall through to the pool". Selecting it in a route makes the pool a
+  // ranked failover step instead of the all-or-nothing default.
+  const KIRO_POOL_ID = '__kiro_pool__';
   // Models fetched per provider (keyed by provider id) for the browse/copy/test UI.
   let providerModels = {};
   let providerModelsLoading = {};
@@ -2571,6 +2577,9 @@
   }
 
   function providerName(id) {
+    // The pool sentinel names no configured provider, so resolve it by hand or
+    // every route listing it would render the raw "__kiro_pool__" id.
+    if (id === KIRO_POOL_ID) return t('upstreams.kiroPoolTarget');
     const p = upstreamCache.providers.find(x => x.id === id);
     return p ? (p.name || p.baseUrl || id) : id;
   }
@@ -3039,10 +3048,15 @@
 
   // newRouteTarget defaults to the first provider: with one configured provider
   // (the common case) the operator never has to touch the select.
+  //
+  // With NO providers it defaults to the Kiro pool rather than to an empty id.
+  // submitRouteModal drops targets with a blank upstreamId, so an empty default
+  // would make the row silently vanish on save; the pool is always available and
+  // is the only destination that needs no configuration at all.
   function newRouteTarget() {
     const first = upstreamCache.providers[0];
     return {
-      upstreamId: (first && first.id) || '',
+      upstreamId: (first && first.id) || KIRO_POOL_ID,
       targetModel: '', priority: 0, weight: 1, enabled: true, sameTier: false
     };
   }
@@ -3127,22 +3141,31 @@
   function renderRouteTargets() {
     const box = $('routeTargetsList');
     if (!box) return;
-    if (!upstreamCache.providers.length) {
-      box.innerHTML = '<div class="muted-text text-xs">' + escapeHtml(t('upstreams.routeNoProviders')) + '</div>';
-      return;
-    }
     const tiers = draftTierNumbers();
     // A tier with more than one member is the only case where weight does
     // anything, so the weight input is enabled exactly there.
     const tierSizes = {};
     tiers.forEach(n => { tierSizes[n] = (tierSizes[n] || 0) + 1; });
+    // Reaching a pool target ends the upstream walk (proxy/upstream_forward.go
+    // returns false there and the request falls through to the account pool), so
+    // every row below the first one is unreachable. Rows are not dropped for it —
+    // moving the pool row back down revives them — but they are marked, because a
+    // silently dead target is worse than a visibly dead one.
+    const poolRow = routeTargetDraft.findIndex(tg => tg.upstreamId === KIRO_POOL_ID);
     box.innerHTML = routeTargetDraft.map((tg, i) => {
+      const isPool = tg.upstreamId === KIRO_POOL_ID;
+      const unreachable = poolRow >= 0 && i > poolRow;
       const opts = upstreamCache.providers.map(p =>
         '<option value="' + escapeAttr(p.id || '') + '"' + (p.id === tg.upstreamId ? ' selected' : '') + '>' +
           escapeHtml(p.name || p.baseUrl || p.id || '') + '</option>'
-      ).join('');
+      ).join('') +
+        '<option value="' + escapeAttr(KIRO_POOL_ID) + '"' + (isPool ? ' selected' : '') + '>' +
+          escapeHtml(t('upstreams.kiroPoolTarget')) + '</option>';
       const tier = tiers[i];
-      const shares = tierSizes[tier] > 1;
+      // The pool is never a weighted member of a tier: it terminates the chain
+      // rather than being relayed to, so splitting traffic with it is not a thing
+      // the router can do.
+      const shares = tierSizes[tier] > 1 && !isPool;
       const badge = tier === 0
         ? '<span class="text-xs" style="background:rgba(34,197,94,0.15);color:#16a34a;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('upstreams.routeTargetPrimary')) + '</span>'
         : '<span class="text-xs muted-text">' + escapeHtml(t('upstreams.routeTargetFallback')) + ' ' + tier + '</span>';
@@ -3157,6 +3180,15 @@
       const shareLabel = shares
         ? '<span class="text-xs muted-text">' + escapeHtml(t('upstreams.routeTargetSplitting')) + '</span>'
         : '';
+      const poolNote = isPool
+        ? '<span class="text-xs muted-text" title="' + escapeAttr(t('upstreams.kiroPoolTargetHint')) + '">' +
+            escapeHtml(t('upstreams.kiroPoolTargetNote')) + '</span>'
+        : '';
+      const deadNote = unreachable
+        ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;"' +
+            ' title="' + escapeAttr(t('upstreams.routeTargetUnreachableHint')) + '">' +
+            escapeHtml(t('upstreams.routeTargetUnreachable')) + '</span>'
+        : '';
       // The row is only made draggable on mousedown over the handle (see the
       // dragstart wiring), so dragging never starts from the text inputs and
       // ordinary text selection inside them keeps working.
@@ -3165,7 +3197,7 @@
         '<i class="fa-solid fa-grip-vertical"></i></span>';
       return '<div class="card route-target-row" draggable="false" data-target-index="' + i + '" style="margin-top:0.5rem;padding:0.5rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
-          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' + handle + badge + tierToggle + shareLabel + '</div>' +
+          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' + handle + badge + tierToggle + shareLabel + poolNote + deadNote + '</div>' +
           '<div class="flex items-center gap-1">' +
             '<button class="btn btn-outline btn-sm" type="button" data-target-action="up" data-index="' + i + '"' +
               (i === 0 ? ' disabled' : '') + ' title="' + escapeAttr(t('upstreams.routeTargetUp')) + '">&uarr;</button>' +
@@ -3177,9 +3209,16 @@
         '</div>' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;margin-top:0.35rem;">' +
           '<select data-target-field="upstreamId" data-index="' + i + '" style="flex:1;min-width:9rem;">' + opts + '</select>' +
-          '<input type="text" data-target-field="targetModel" data-index="' + i + '" list="routeTargetModelList" autocomplete="off"' +
-            ' value="' + escapeAttr(tg.targetModel || '') + '" style="flex:1;min-width:9rem;"' +
-            ' placeholder="' + escapeAttr(t('upstreams.targetModelPlaceholder')) + '" />' +
+          // Target Model rewrites the model name sent to an upstream HTTP endpoint.
+          // The pool is not relayed to, so there is nothing to rewrite: the request
+          // reaches the account pool under its original client model name. Showing
+          // the field would invite an edit that silently does nothing.
+          (isPool
+            ? '<span class="muted-text text-xs" style="flex:1;min-width:9rem;">' +
+                escapeHtml(t('upstreams.kiroPoolTargetNoRewrite')) + '</span>'
+            : '<input type="text" data-target-field="targetModel" data-index="' + i + '" list="routeTargetModelList" autocomplete="off"' +
+                ' value="' + escapeAttr(tg.targetModel || '') + '" style="flex:1;min-width:9rem;"' +
+                ' placeholder="' + escapeAttr(t('upstreams.targetModelPlaceholder')) + '" />') +
           '<input type="number" min="1" data-target-field="weight" data-index="' + i + '"' +
             ' value="' + escapeAttr(String(tg.weight > 0 ? tg.weight : 1)) + '" style="width:4.5rem;"' +
             (shares ? '' : ' disabled') +
@@ -3474,10 +3513,10 @@
     const addProvBtn = $('addUpstreamBtn');
     if (addProvBtn) addProvBtn.addEventListener('click', () => openUpstreamModal(null));
     const addRouteBtn = $('addRouteBtn');
-    if (addRouteBtn) addRouteBtn.addEventListener('click', () => {
-      if (!upstreamCache.providers.length) { toast(t('upstreams.needProviderFirst'), 'warning'); return; }
-      openRouteModal(null);
-    });
+    // No provider gate: the Kiro pool is always a valid target, so a route is
+    // configurable with zero upstreams configured ("send this model to the pool"
+    // is a legitimate route on its own).
+    if (addRouteBtn) addRouteBtn.addEventListener('click', () => openRouteModal(null));
     const upSave = $('upstreamModalSaveBtn');
     if (upSave) upSave.addEventListener('click', submitUpstreamModal);
     const upCancel = $('upstreamModalCancelBtn');
@@ -3522,6 +3561,9 @@
         const i = parseInt(el.dataset.index, 10);
         if (isNaN(i) || !routeTargetDraft[i]) return;
         const field = el.dataset.targetField;
+        // Captured before the write below, so the re-render check can tell "moved
+        // off the pool" from "was never on it".
+        const wasPool = routeTargetDraft[i].upstreamId === KIRO_POOL_ID;
         if (field === 'enabled') routeTargetDraft[i].enabled = el.checked;
         else if (field === 'weight') routeTargetDraft[i].weight = Math.max(1, parseInt(el.value, 10) || 1);
         else if (field === 'sameTier') {
@@ -3535,6 +3577,14 @@
           return;
         }
         else routeTargetDraft[i][field] = el.value;
+        // Selecting the Kiro pool — or moving off it — changes the row's shape, not
+        // just its value: the Target Model input disappears (there is no upstream to
+        // rewrite the name for), weight goes inert, and the rows below become
+        // unreachable. Re-render so the markup matches the new destination.
+        if (field === 'upstreamId' && (el.value === KIRO_POOL_ID || wasPool)) {
+          renderRouteTargets();
+          return;
+        }
         // Changing the primary provider changes which model names to suggest.
         if (field === 'upstreamId' && i === 0) populateTargetModelDatalist(el.value);
       };
@@ -3607,7 +3657,8 @@
     }
     const rtAddTarget = $('routeAddTargetBtn');
     if (rtAddTarget) rtAddTarget.addEventListener('click', () => {
-      if (!upstreamCache.providers.length) { toast(t('upstreams.needProviderFirst'), 'warning'); return; }
+      // See addRouteBtn: newRouteTarget falls back to the pool sentinel, so a row
+      // can be added without any provider configured.
       routeTargetDraft.push(newRouteTarget());
       renderRouteTargets();
     });

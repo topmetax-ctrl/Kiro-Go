@@ -18,6 +18,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"kiro-go/metrics"
 )
 
 // UpstreamBundle is the on-disk/on-wire format for a forwarding-config export.
@@ -147,6 +149,15 @@ func ExportUpstreamBundle() UpstreamBundle {
 			continue
 		}
 		top := routes[i].Targets[0]
+		// Never backfill the Kiro-pool sentinel into the legacy field. A v1 importer
+		// resolves upstreamId against the bundle's own provider list, where the
+		// sentinel — naming the built-in pool rather than a configured upstream —
+		// can never appear; it would reject the whole file instead of degrading.
+		// Leaving the legacy field empty is the graceful outcome: v1 skips this one
+		// route as unresolvable, and every other route still imports.
+		if strings.TrimSpace(top.UpstreamID) == metrics.KiroPoolID {
+			continue
+		}
 		routes[i].UpstreamID = top.UpstreamID
 		routes[i].TargetModel = top.TargetModel
 	}
@@ -228,6 +239,12 @@ func ValidateUpstreamBundle(b *UpstreamBundle) error {
 				return fmt.Errorf("%w: route %q: needs either targets or upstreamId",
 					ErrInvalidUpstreamBundle, label)
 			}
+			// The Kiro-pool sentinel resolves against the importing host's built-in
+			// account pool, not against the bundle's provider list, so it is valid
+			// everywhere by definition. Same reasoning as the targets loop below.
+			if upID == metrics.KiroPoolID {
+				continue
+			}
 			if !inBundle[upID] {
 				return fmt.Errorf("%w: route %q: upstreamId %q does not match any provider in this file",
 					ErrInvalidUpstreamBundle, label, upID)
@@ -239,6 +256,12 @@ func ValidateUpstreamBundle(b *UpstreamBundle) error {
 			if upID == "" {
 				return fmt.Errorf("%w: route %q target %d: upstreamId is required",
 					ErrInvalidUpstreamBundle, label, j+1)
+			}
+			// The Kiro-pool sentinel names the built-in account pool, which is not a
+			// configured provider and so is never listed in the bundle. It is valid on
+			// every host by definition, so it needs no bundle-local reference.
+			if upID == metrics.KiroPoolID {
+				continue
 			}
 			if !inBundle[upID] {
 				return fmt.Errorf("%w: route %q target %d: upstreamId %q does not match any provider in this file",
@@ -370,6 +393,14 @@ func MergeUpstreamBundle(
 		if len(r.Targets) > 0 {
 			kept := make([]RouteTarget, 0, len(r.Targets))
 			for _, tg := range r.Targets {
+				// The Kiro-pool sentinel is host-independent: it refers to the importing
+				// host's own account pool, not to anything that travelled in the bundle.
+				// Remapping it through idMap would find no entry and silently drop the
+				// pool from the route, turning a configured fallback into a dead end.
+				if strings.TrimSpace(tg.UpstreamID) == metrics.KiroPoolID {
+					kept = append(kept, tg)
+					continue
+				}
 				mapped, ok := idMap[strings.TrimSpace(tg.UpstreamID)]
 				if !ok || mapped == "" {
 					continue
@@ -382,7 +413,7 @@ func MergeUpstreamBundle(
 		// The legacy field is remapped too when present, so a v1 build importing
 		// this route later still resolves it. It is optional in schema 2, so an
 		// unresolvable one is only fatal when there is no surviving target either.
-		if legacy := strings.TrimSpace(r.UpstreamID); legacy != "" {
+		if legacy := strings.TrimSpace(r.UpstreamID); legacy != "" && legacy != metrics.KiroPoolID {
 			if mapped, ok := idMap[legacy]; ok && mapped != "" {
 				r.UpstreamID = mapped
 			} else {

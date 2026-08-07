@@ -92,7 +92,32 @@ func forwardTargetInCooldown(providerID string, now time.Time) bool {
 // Note this can reorder ACROSS priority tiers, which is the point: a tripped
 // primary should lose to a healthy fallback. Operator priority still decides
 // among targets of equal health.
+//
+// THE KIRO-POOL SENTINEL IS AN ORDERING BARRIER
+//
+// A pool target is not relayed to; reaching it ends the upstream walk and falls
+// through to the account pool (see tryForwardUpstream). So every target after it
+// is unreachable, and health-based reordering must not cross it in either
+// direction:
+//
+//   - Promoting the sentinel past a tripped upstream would skip that upstream
+//     for good, silently turning "pool is the backup" into "pool is the only
+//     backend" — the exact outcome demotion-not-removal exists to prevent.
+//   - The sentinel's own streak is real (kiro_pool_metrics.go records pool
+//     traffic under this ID), so it would otherwise be classified like any
+//     provider and moved on the strength of pool health.
+//
+// Cooldown therefore applies only to the targets ahead of the first sentinel.
+// The operator's "pool last" intent is structural and outranks health.
 func applyForwardCooldown(targets []config.ResolvedTarget, now time.Time) int {
+	// Everything from the first sentinel on is either the pool itself or
+	// unreachable behind it; reorder only the upstream prefix.
+	for i, t := range targets {
+		if t.Provider.ID == metrics.KiroPoolID {
+			targets = targets[:i]
+			break
+		}
+	}
 	if len(targets) < 2 {
 		// A single target is always tried: there is nothing to prefer over it, and
 		// deprioritizing it would change nothing.

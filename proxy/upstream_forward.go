@@ -60,6 +60,14 @@ func (h *Handler) tryForwardUpstream(r *http.Request, w http.ResponseWriter, bod
 	// failed BEFORE anything was written to the client — see forwardToTarget.
 	var last forwardOutcome
 	for i, rt := range targets {
+		// The Kiro Pool sentinel is a special target that signals "fall through to
+		// the built-in account pool". When it appears, stop trying upstream targets
+		// and return false so the caller continues with the normal Kiro dispatch.
+		// This lets the pool participate in failover: an operator can configure
+		// "9aws P0 -> Kiro Pool P1" and the pool becomes the backup, not the default.
+		if rt.Provider.ID == metrics.KiroPoolID {
+			return false
+		}
 		moreTargets := i+1 < len(targets)
 		outcome := h.forwardToTarget(r, w, body, model, stream, subPath, isClaudeRoute, captureUserText, route, rt, i, moreTargets)
 		last = outcome
