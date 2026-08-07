@@ -4255,6 +4255,7 @@
       // A fresh page invalidates every retained event: uids are never reused, so
       // stale entries would otherwise accumulate for the life of the tab.
       fwdEventStore = {};
+      fwdEventKeys = new Set();
       body.innerHTML = items.map(fwdEventRow).join('');
     }
     const countEl = $('fwdEventsCount');
@@ -4266,10 +4267,22 @@
   // object is retained to render its detail panel (and copy its JSON) on demand.
   let fwdEventSeq = 0;
   let fwdEventStore = {};
+  // Rendered events, keyed by natural identity. The SSE stream backfills its most
+  // recent 50 events on connect, which overlaps whatever the REST page just
+  // rendered; without this every event present at load time appears twice.
+  let fwdEventKeys = new Set();
+
+  // A stable identity for an event that has no server-side id. time is a
+  // millisecond stamp and the remaining fields distinguish concurrent requests
+  // that share one.
+  function fwdEventKey(e) {
+    return [e.time, e.providerId, e.accountId, e.clientModel, e.status, e.latencyMs].join('|');
+  }
 
   function fwdEventRow(e) {
     const uid = 'ev' + (++fwdEventSeq);
     fwdEventStore[uid] = e;
+    fwdEventKeys.add(fwdEventKey(e));
     const model = e.targetModel && e.targetModel !== e.clientModel
       ? escapeHtml(e.clientModel) + ' <span class="muted-text">&rarr;</span> ' + escapeHtml(e.targetModel)
       : escapeHtml(e.clientModel || '');
@@ -4390,7 +4403,9 @@
       // fighting active filters/pagination.
       if (fwdEventsOffset === 0 && !fwdFilterActive()) {
         const bodyEl = $('fwdEventsBody');
-        if (bodyEl) {
+        // The stream replays its recent history on connect, so an event the REST
+        // page already rendered must not be prepended a second time.
+        if (bodyEl && !fwdEventKeys.has(fwdEventKey(e))) {
           const empty = bodyEl.querySelector('tr.fwd-empty-row');
           if (empty) bodyEl.innerHTML = '';
           bodyEl.insertAdjacentHTML('afterbegin', fwdEventRow(e));
@@ -4402,6 +4417,8 @@
             const det = bodyEl.querySelector('tr[data-fwd-detail="' + cssEscape(uid) + '"]');
             if (det) det.remove();
             evRows[i].remove();
+            // Release the identity too, or a trimmed event could never re-render.
+            if (fwdEventStore[uid]) fwdEventKeys.delete(fwdEventKey(fwdEventStore[uid]));
             delete fwdEventStore[uid];
           }
         }
