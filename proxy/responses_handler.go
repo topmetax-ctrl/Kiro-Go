@@ -41,6 +41,10 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Attribute pool traffic to the route that fell through to it. req.Model is
+	// still the raw client model here; the rewrite happens further down.
+	r = withPoolRouteContext(r, req.Model)
+
 	storedInputCopy := append(json.RawMessage(nil), req.Input...)
 
 	storeResponse := true
@@ -248,6 +252,7 @@ func (h *Handler) handleResponsesNonStream(
 			Model:        model,
 			AccountID:    account.ID,
 			Ok:           true,
+			RouteID:      poolRouteIDFromContext(ctx),
 			InputTokens:  accountedInput,
 			OutputTokens: accountedOutput,
 			Credits:      credits,
@@ -636,6 +641,7 @@ func (h *Handler) handleResponsesStream(
 			Model:        model,
 			AccountID:    account.ID,
 			Ok:           true,
+			RouteID:      poolRouteIDFromContext(ctx),
 			InputTokens:  accountedInput,
 			OutputTokens: accountedOutput,
 			Credits:      credits,

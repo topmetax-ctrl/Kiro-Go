@@ -38,6 +38,13 @@ type kiroMetric struct {
 	DurationMs   int64
 	ErrorMsg     string
 	ErrorType    string
+
+	// RouteID attributes this outcome to a forwarding route whose chain ended at
+	// the Kiro-pool sentinel. Empty for ordinary pool traffic (no route matched),
+	// and empty is what metrics.Record uses to skip per-route aggregation — so
+	// leaving it unset is free. See pool_route_context.go for why it must be
+	// captured from the raw client model rather than resolved here.
+	RouteID string
 }
 
 // kiroStatusFor maps a pool outcome onto an HTTP-ish status code so the pool
@@ -91,6 +98,7 @@ func kiroAccountLabel(accountID string) string {
 func recordKiroMetric(m kiroMetric) {
 	ev := metrics.Event{
 		ClientModel:  m.Model,
+		RouteID:      m.RouteID,
 		ProviderID:   metrics.KiroPoolID,
 		ProviderName: metrics.KiroPoolName,
 		AccountID:    m.AccountID,

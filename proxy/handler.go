@@ -898,6 +898,12 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// The forward path declined. If it declined because the route's chain ended at
+	// the Kiro-pool sentinel, tag the request so the pool's metrics are attributed
+	// to that route. Must happen HERE — before req.Model is rewritten below — since
+	// the route was resolved against the raw model.
+	r = withPoolRouteContext(r, req.Model)
+
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking, nameEffort := resolveClaudeThinkingModeAndEffort(req.Model, req.Thinking, thinkingCfg.Suffix)
@@ -912,7 +918,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Pure native web_search: relay via Kiro MCP (generateAssistantResponse does not run it).
 	if hasWebSearchTool(&req) {
-		h.handleWebSearchRequest(w, &req, estimatedInputTokens, apiKeyID)
+		h.handleWebSearchRequest(r.Context(), w, &req, estimatedInputTokens, apiKeyID)
 		return
 	}
 
@@ -1574,7 +1580,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		// Pool metrics must use the accounted values, not the raw upstream vars:
 		// Kiro reports no token counts, so inputTokens/outputTokens are 0 on this
 		// path and the dashboard would show every pool request as 0 in / 0 out.
-		h.recordSuccessLogSplit("claude", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogSplit(ctx, "claude", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
 
 		// Capture (write): store this turn's Q&A into memory (async, fail-open,
 		// redaction enforced in the provider). No-op unless capture is enabled
@@ -1629,7 +1635,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			h.sendClaudeError(w, 503, "api_error", "No available accounts")
 			return
 		}
-		h.recordFailureWithDetails("claude", model, "", lastErr)
+		h.recordFailureWithDetails(ctx, "claude", model, "", lastErr)
 		h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 	}
 
@@ -1743,7 +1749,11 @@ func (h *Handler) recordFailure() {
 }
 
 // recordFailureWithDetails records a failure and stores it in the request logs.
-func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
+//
+// ctx carries the route this request is being served for, when the pool is
+// answering on behalf of a forwarding route (see pool_route_context.go). It may
+// be nil on paths with no request scope; attribution is then simply skipped.
+func (h *Handler) recordFailureWithDetails(ctx context.Context, endpoint, model, accountID string, err error) {
 	h.recordFailure()
 
 	if err == nil {
@@ -1770,6 +1780,7 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 		AccountID: accountID,
 		ErrorMsg:  errMsg,
 		ErrorType: errType,
+		RouteID:   poolRouteIDFromContext(ctx),
 	})
 }
 
@@ -1777,7 +1788,9 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 // the metrics store. RequestLog keeps only the combined input+output total; the
 // split is preserved for the per-provider token breakdown in the dashboard,
 // which would otherwise render every Kiro response as "out 0".
-func (h *Handler) recordSuccessLogSplit(endpoint, model, accountID string, inputTokens, outputTokens int, credits float64, durationMs int64) {
+//
+// ctx carries the pool-route attribution, as in recordFailureWithDetails.
+func (h *Handler) recordSuccessLogSplit(ctx context.Context, endpoint, model, accountID string, inputTokens, outputTokens int, credits float64, durationMs int64) {
 	entry := RequestLog{
 		Time:      time.Now().Unix(),
 		Endpoint:  endpoint,
@@ -1799,6 +1812,7 @@ func (h *Handler) recordSuccessLogSplit(endpoint, model, accountID string, input
 		OutputTokens: outputTokens,
 		Credits:      credits,
 		DurationMs:   durationMs,
+		RouteID:      poolRouteIDFromContext(ctx),
 	})
 }
 
@@ -2026,7 +2040,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		// Pool metrics must use the accounted values, not the raw upstream vars:
 		// Kiro reports no token counts, so inputTokens/outputTokens are 0 on this
 		// path and the dashboard would show every pool request as 0 in / 0 out.
-		h.recordSuccessLogSplit("claude", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogSplit(ctx, "claude", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
 
 		// Capture (write) this turn into memory when auto-capture is on. Async +
 		// fail-open + provider-enforced redaction; never blocks or breaks the response.
@@ -2073,7 +2087,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			h.sendClaudeError(w, 503, "api_error", "No available accounts")
 			return
 		}
-		h.recordFailureWithDetails("claude", model, "", lastErr)
+		h.recordFailureWithDetails(ctx, "claude", model, "", lastErr)
 		h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 	}
 
@@ -2147,6 +2161,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/chat/completions", false, "") {
 		return
 	}
+
+	// Attribute pool traffic to the route that fell through to it — before the
+	// model rewrite below, which strips the suffix the route was matched on.
+	r = withPoolRouteContext(r, req.Model)
 
 	// 解析模型和 thinking 模式
 	thinkingCfg := config.GetThinkingConfig()
@@ -2545,7 +2563,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		// See the claude tails: accounted values, not the always-0 upstream vars.
-		h.recordSuccessLogSplit("openai", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogSplit(ctx, "openai", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
 		finishReason := mapOpenAIFinishReason(upstreamStopReason, len(toolCalls))
 
 		chunk := map[string]interface{}{
@@ -2588,7 +2606,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		if !isStreamIntegrityError(err) {
 			h.handleAccountFailure(account, err)
 		}
-		h.recordFailureWithDetails("openai", model, account.ID, err)
+		h.recordFailureWithDetails(ctx, "openai", model, account.ID, err)
 		data, _ := json.Marshal(map[string]interface{}{
 			"error": map[string]string{
 				"message": err.Error(),
@@ -2604,7 +2622,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 			return
 		}
-		h.recordFailureWithDetails("openai", model, "", lastErr)
+		h.recordFailureWithDetails(ctx, "openai", model, "", lastErr)
 		h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 	}
 
@@ -2701,7 +2719,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		// See the claude tails: accounted values, not the always-0 upstream vars.
-		h.recordSuccessLogSplit("openai", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogSplit(ctx, "openai", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, clientInput, clientOutput, model, thinkingFormat, upstreamStopReason)
@@ -2715,7 +2733,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 			return
 		}
-		h.recordFailureWithDetails("openai", model, "", lastErr)
+		h.recordFailureWithDetails(ctx, "openai", model, "", lastErr)
 		h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 	}
 

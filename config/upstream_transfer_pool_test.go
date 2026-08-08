@@ -129,11 +129,11 @@ func TestMergeKeepsPoolSentinelInLegacyField(t *testing.T) {
 	}
 }
 
-// Export must not backfill the sentinel into the legacy field. A v1 importer
-// resolves upstreamId against the bundle's providers, where the sentinel can
-// never appear, and rejects the ENTIRE file rather than degrading — so one
-// pool-using route would cost the operator every other route in the export.
-func TestExportDoesNotBackfillPoolSentinel(t *testing.T) {
+// Export must never put the sentinel in the legacy field, but it must not leave
+// that field EMPTY either when a resolvable target exists: the pre-multi-target
+// validator errors on both, and either way aborts the whole file. So the backfill
+// degrades past the pool to the first target a v1 build can actually resolve.
+func TestExportBackfillsPastPoolSentinel(t *testing.T) {
 	t.Cleanup(func() {
 		cfgLock.Lock()
 		cfg = nil
@@ -143,7 +143,7 @@ func TestExportDoesNotBackfillPoolSentinel(t *testing.T) {
 	cfg = &Config{
 		Upstreams: []UpstreamProvider{prov("u1", "alpha", "https://a.example/v1", "k1")},
 		ModelRoutes: []ModelRoute{
-			// Pool is the PREFERRED target here, so the backfill would pick it.
+			// Pool is the PREFERRED target here, so a naive backfill would pick it.
 			multiRoute("r1", "pool-first", metrics.KiroPoolID, "u1"),
 			multiRoute("r2", "upstream-first", "u1", metrics.KiroPoolID),
 		},
@@ -155,19 +155,50 @@ func TestExportDoesNotBackfillPoolSentinel(t *testing.T) {
 		t.Fatalf("want 2 routes, got %d", len(b.Routes))
 	}
 	poolFirst := findRoute(t, b.Routes, "pool-first")
-	if poolFirst.UpstreamID != "" {
-		t.Errorf("legacy upstreamId = %q, want empty (never the sentinel)", poolFirst.UpstreamID)
+	// Degraded to u1 — the sentinel is skipped, not emitted, and not left blank.
+	if poolFirst.UpstreamID != "u1" {
+		t.Errorf("legacy upstreamId = %q, want u1 (first resolvable target)", poolFirst.UpstreamID)
 	}
+	// The real preference still lives in Targets, which is what a v2 reader uses,
+	// so degrading the legacy field costs nothing on the modern path.
 	if len(poolFirst.Targets) != 2 || poolFirst.Targets[0].UpstreamID != metrics.KiroPoolID {
 		t.Errorf("targets must be intact for v2 readers: %+v", poolFirst.Targets)
 	}
-	// A route whose top target is a real upstream still gets the backfill, so
-	// suppressing it above is narrow rather than a blanket opt-out.
 	if up := findRoute(t, b.Routes, "upstream-first"); up.UpstreamID != "u1" {
 		t.Errorf("legacy upstreamId = %q, want u1", up.UpstreamID)
 	}
 
 	// The bundle we just produced must still validate and re-import cleanly.
+	if err := ValidateUpstreamBundle(&b); err != nil {
+		t.Errorf("own export should validate: %v", err)
+	}
+}
+
+// A pool-only route has no resolvable target to degrade to, so the legacy field
+// stays empty. The route must still be exported with its Targets intact: a v2
+// importer handles it correctly, and dropping it would lose config on the path
+// that actually matters.
+func TestExportPoolOnlyRouteKeepsTargets(t *testing.T) {
+	t.Cleanup(func() {
+		cfgLock.Lock()
+		cfg = nil
+		cfgLock.Unlock()
+	})
+	cfgLock.Lock()
+	cfg = &Config{
+		Upstreams:   []UpstreamProvider{},
+		ModelRoutes: []ModelRoute{multiRoute("r1", "pool-only", metrics.KiroPoolID)},
+	}
+	cfgLock.Unlock()
+
+	b := ExportUpstreamBundle()
+	got := findRoute(t, b.Routes, "pool-only")
+	if got.UpstreamID != "" {
+		t.Errorf("legacy upstreamId = %q, want empty (nothing resolvable to degrade to)", got.UpstreamID)
+	}
+	if len(got.Targets) != 1 || got.Targets[0].UpstreamID != metrics.KiroPoolID {
+		t.Errorf("targets = %+v, want the lone pool sentinel preserved", got.Targets)
+	}
 	if err := ValidateUpstreamBundle(&b); err != nil {
 		t.Errorf("own export should validate: %v", err)
 	}

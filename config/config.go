@@ -263,6 +263,34 @@ func (p UpstreamProvider) CostUSD(inputTokens, outputTokens int64) float64 {
 // This mirrors established gateway designs: Priority is LiteLLM's deployment
 // `order` (each tier exhausted before the next), Weight is Envoy's
 // weighted_clusters (proportional split among equals).
+// KiroPoolTargetID is the sentinel RouteTarget.UpstreamID meaning "the built-in
+// Kiro account pool" rather than a configured UpstreamProvider. ResolveRoute
+// synthesizes a provider for it, and the forwarder treats it as "stop relaying,
+// fall through to the pool" — which is what lets the pool be a ranked failover
+// step instead of the all-or-nothing default.
+//
+// It lives here, next to the type whose field carries it, rather than in metrics
+// where the same string is also declared as metrics.KiroPoolID. The two are
+// deliberately separate declarations of one value: metrics documents itself as
+// depending on nothing but the standard library and never importing config, so
+// having config import metrics to name a ROUTING concept would invert that
+// layering and pull the metrics store into config's dependency graph. The pool's
+// identity is shared with metrics because pool traffic is recorded under the same
+// id; TestKiroPoolSentinelMatchesMetrics asserts the two stay equal.
+const (
+	KiroPoolTargetID   = "__kiro_pool__"
+	KiroPoolTargetName = "Kiro Pool"
+)
+
+// IsKiroPoolTarget reports whether an upstream id names the built-in pool.
+//
+// Trimming matters: a hand-edited bundle may carry " __kiro_pool__", and import
+// validation trims before comparing, so a raw == elsewhere would accept the
+// target at import and then silently drop it at resolution.
+func IsKiroPoolTarget(upstreamID string) bool {
+	return strings.TrimSpace(upstreamID) == KiroPoolTargetID
+}
+
 type RouteTarget struct {
 	UpstreamID  string `json:"upstreamId"`            // Target UpstreamProvider.ID
 	TargetModel string `json:"targetModel,omitempty"` // Optional model name to rewrite to; empty = keep original

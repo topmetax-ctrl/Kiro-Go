@@ -11,6 +11,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -504,7 +505,7 @@ func buildWebSearchContentBlocks(query, toolUseID string, results *WebSearchResu
 // ==================== Pure-path handler ====================
 
 // handleWebSearchRequest serves pure native web_search requests via MCP.
-func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeRequest, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleWebSearchRequest(ctx context.Context, w http.ResponseWriter, req *ClaudeRequest, estimatedInputTokens int, apiKeyID string) {
 	query := extractSearchQuery(req)
 	if query == "" {
 		h.sendClaudeError(w, 400, "invalid_request_error", "Unable to extract search query from message")
@@ -521,7 +522,7 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 		if account != nil {
 			accountID = account.ID
 		}
-		h.recordFailureWithDetails("claude", req.Model, accountID, err)
+		h.recordFailureWithDetails(ctx, "claude", req.Model, accountID, err)
 		// Prefer a real error over a silent empty body (issue #120 symptom).
 		status := 502
 		errType := "api_error"
@@ -552,7 +553,7 @@ func (h *Handler) handleWebSearchRequest(w http.ResponseWriter, req *ClaudeReque
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, 0)
 	}
 	h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, 0)
-	h.recordSuccessLogSplit("claude", req.Model, accountID, inputTokens, outputTokens, 0, time.Since(reqStart).Milliseconds())
+	h.recordSuccessLogSplit(ctx, "claude", req.Model, accountID, inputTokens, outputTokens, 0, time.Since(reqStart).Milliseconds())
 
 	if req.Stream {
 		h.streamWebSearchSSE(w, req.Model, query, toolUseID, results, inputTokens, outputTokens)

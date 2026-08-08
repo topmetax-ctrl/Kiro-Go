@@ -16,8 +16,6 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
-
-	"kiro-go/metrics"
 )
 
 // maxTargetWeight clamps Weight when expanding a tier for weighted selection.
@@ -84,12 +82,20 @@ func ResolveRoute(model string) (*ModelRoute, []ResolvedTarget) {
 			// so the forwarder recognizes it and falls through to the pool instead of
 			// surfacing an "upstream not found" error. This lets the pool participate
 			// in multi-target failover: 9aws P0 -> xpiki P0 -> Kiro Pool P1.
-			if t.UpstreamID == metrics.KiroPoolID {
+			//
+			// Matched on the TRIMMED id, like the emptiness check above. A hand-edited
+			// bundle carrying " __kiro_pool__" passes import validation (which trims),
+			// so comparing the raw value here would drop the target and silently
+			// delete the operator's pool fallback.
+			if IsKiroPoolTarget(t.UpstreamID) {
+				// Normalize the stored id so every later comparison — the forwarder's
+				// sentinel check, the cooldown barrier — sees the canonical form.
+				t.UpstreamID = KiroPoolTargetID
 				eligible = append(eligible, ResolvedTarget{
 					Target: t,
 					Provider: UpstreamProvider{
-						ID:      metrics.KiroPoolID,
-						Name:    metrics.KiroPoolName,
+						ID:      KiroPoolTargetID,
+						Name:    KiroPoolTargetName,
 						Enabled: true,
 					},
 				})
@@ -147,9 +153,36 @@ func orderTargets(in []ResolvedTarget) []ResolvedTarget {
 
 // weightedOrder returns one Priority tier with the weighted pick first, then the
 // tier's remaining targets (so failover still covers the whole tier).
+//
+// THE POOL SENTINEL NEVER WINS THE WEIGHTED PICK
+//
+// Reaching a pool target ends the upstream walk: proxy/upstream_forward.go returns
+// false there and the request falls through to the account pool. So if the
+// sentinel were hoisted to the front of a tier it shares with a real upstream,
+// that upstream would not be tried at all — a route configured "u1 and pool at
+// equal priority" would send a weight-proportional share of traffic straight past
+// the paid upstream. The sentinel is therefore held at the END of its tier: it can
+// be the tier's fallback, never its pick.
 func weightedOrder(tier []ResolvedTarget, n uint64) []ResolvedTarget {
 	if len(tier) <= 1 {
 		return tier
+	}
+
+	// Split the sentinel out before any weighting so it cannot be selected. Order
+	// among several (a pathological config) is preserved.
+	relayable := make([]ResolvedTarget, 0, len(tier))
+	pools := make([]ResolvedTarget, 0, 1)
+	for _, t := range tier {
+		if t.Provider.ID == KiroPoolTargetID {
+			pools = append(pools, t)
+			continue
+		}
+		relayable = append(relayable, t)
+	}
+	if len(pools) > 0 {
+		// With nothing else in the tier there is no choice to make; otherwise weight
+		// the relayable targets among themselves and append the pool as last resort.
+		return append(weightedOrder(relayable, n), pools...)
 	}
 
 	// Expand each target Weight times; the pick is an index into the expansion,

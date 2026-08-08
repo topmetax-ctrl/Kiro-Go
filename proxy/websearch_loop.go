@@ -61,7 +61,7 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 			if account != nil {
 				accountID = account.ID
 			}
-			h.recordFailureWithDetails("claude", req.Model, accountID, err)
+			h.recordFailureWithDetails(ctx, "claude", req.Model, accountID, err)
 			status := 502
 			errType := "api_error"
 			if isAuthErrorMessage(err.Error()) {
@@ -86,7 +86,7 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 			searched, searchErr := h.searchAllWebUses(req.Model, round.toolUses)
 			if searchErr != nil {
 				logger.Warnf("[WebSearchLoop] MCP search failed: %v", searchErr)
-				h.recordFailureWithDetails("claude", req.Model, lastAccountID, searchErr)
+				h.recordFailureWithDetails(ctx, "claude", req.Model, lastAccountID, searchErr)
 				h.sendClaudeError(w, 502, "api_error", "Web search failed: "+searchErr.Error())
 				return
 			}
@@ -110,7 +110,7 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 			results, _, _, sErr := h.performWebSearch(req.Model, toolUseQuery(tu.Input))
 			if sErr != nil {
 				logger.Warnf("[WebSearchLoop] final-round MCP search failed: %v", sErr)
-				h.recordFailureWithDetails("claude", req.Model, lastAccountID, sErr)
+				h.recordFailureWithDetails(ctx, "claude", req.Model, lastAccountID, sErr)
 				h.sendClaudeError(w, 502, "api_error", "Web search failed: "+sErr.Error())
 				return
 			}
@@ -131,7 +131,7 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 			h.pool.UpdateStats(lastAccountID, inputTokens+outputTokens, totalCredits)
 		}
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, totalCredits)
-		h.recordSuccessLogSplit("claude", req.Model, lastAccountID, inputTokens, outputTokens, totalCredits, time.Since(reqStart).Milliseconds())
+		h.recordSuccessLogSplit(ctx, "claude", req.Model, lastAccountID, inputTokens, outputTokens, totalCredits, time.Since(reqStart).Milliseconds())
 
 		if req.Stream {
 			h.renderWebSearchLoopSSE(w, req.Model, content, stopReason, inputTokens, outputTokens)

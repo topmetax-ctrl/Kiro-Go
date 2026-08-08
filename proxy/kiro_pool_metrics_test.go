@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -46,7 +47,7 @@ func TestRecordSuccessLogSplitFeedsMetrics(t *testing.T) {
 	metrics.Reset()
 	h := &Handler{}
 
-	h.recordSuccessLogSplit("claude", "claude-sonnet-4", "acct-1", 1200, 340, 2.5, 1500)
+	h.recordSuccessLogSplit(context.Background(), "claude", "claude-sonnet-4", "acct-1", 1200, 340, 2.5, 1500)
 
 	d, ok := metrics.ProviderDetailFor(metrics.KiroPoolID, 60)
 	if !ok {
@@ -83,7 +84,7 @@ func TestRecordFailureWithDetailsFeedsMetrics(t *testing.T) {
 	metrics.Reset()
 	h := &Handler{}
 
-	h.recordFailureWithDetails("openai", "gpt-4o", "acct-2", errors.New("quota exceeded"))
+	h.recordFailureWithDetails(context.Background(), "openai", "gpt-4o", "acct-2", errors.New("quota exceeded"))
 
 	d, ok := metrics.ProviderDetailFor(metrics.KiroPoolID, 60)
 	if !ok {
@@ -105,7 +106,7 @@ func TestRecordFailureWithNilErrorIsNotCounted(t *testing.T) {
 	h := &Handler{}
 	// A nil error means "no detail worth logging"; it must not manufacture a
 	// metrics event either, or failure counts would double.
-	h.recordFailureWithDetails("claude", "m", "a", nil)
+	h.recordFailureWithDetails(context.Background(), "claude", "m", "a", nil)
 	// Reset keeps known provider names (so filter dropdowns stay labeled), so
 	// assert on the recorded request count rather than the entry's existence.
 	if d, ok := metrics.ProviderDetailFor(metrics.KiroPoolID, 60); ok && d.Requests != 0 {
@@ -116,7 +117,7 @@ func TestRecordFailureWithNilErrorIsNotCounted(t *testing.T) {
 func TestKiroPoolAppearsAlongsideForwardProviders(t *testing.T) {
 	metrics.Reset()
 	h := &Handler{}
-	h.recordSuccessLogSplit("claude", "m", "acct", 10, 5, 0, 100)
+	h.recordSuccessLogSplit(context.Background(), "claude", "m", "acct", 10, 5, 0, 100)
 	metrics.Record(metrics.Event{
 		ProviderID: "up-1", ProviderName: "some-upstream", Ok: true, Status: 200, LatencyMs: 50,
 	})

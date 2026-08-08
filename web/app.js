@@ -2716,15 +2716,24 @@
       // the rest are failover, so they are dimmed and arrow-chained rather than
       // listed as equals.
       const targets = routeTargets(item);
+      // A pool target ends the chain: the forwarder stops relaying there and the
+      // request falls through to the account pool, so anything listed after it is
+      // never tried. The modal marks those rows unreachable; this view has to agree
+      // or the two descriptions of one config contradict each other.
+      const poolAt = targets.findIndex(tg => tg.upstreamId === KIRO_POOL_ID && tg.enabled !== false);
       const chain = targets.length
         ? targets.map((tg, i) => {
             const nm = escapeHtml(providerName(tg.upstreamId));
             const rewrite = tg.targetModel ? '<span class="muted-text">:' + escapeHtml(tg.targetModel) + '</span>' : '';
-            const off = tg.enabled === false
+            const dead = poolAt >= 0 && i > poolAt;
+            const off = (tg.enabled === false || dead)
               ? ' style="text-decoration:line-through;opacity:0.5;"'
               : (i === 0 ? ' style="font-weight:600;"' : ' style="opacity:0.65;"');
+            const tip = dead
+              ? ' title="' + escapeAttr(t('upstreams.routeTargetUnreachableHint')) + '"'
+              : '';
             return (i > 0 ? '<span class="muted-text text-xs">&rsaquo;</span>' : '') +
-              '<span class="text-xs font-mono"' + off + '>' + nm + rewrite + '</span>';
+              '<span class="text-xs font-mono"' + off + tip + '>' + nm + rewrite + '</span>';
           }).join(' ')
         : '<span class="text-xs" style="color:#ef4444;">' + escapeHtml(t('upstreams.routeNoTargets')) + '</span>';
       const count = targets.length > 1
@@ -3041,6 +3050,10 @@
     // edits; the cache is only touched on save.
     routeTargetDraft = entry ? draftFromTargets(routeTargets(entry)) : [newRouteTarget()];
     if (!routeTargetDraft.length) routeTargetDraft = [newRouteTarget()];
+    // A stored route can carry a pool target sharing a tier — written by an older
+    // build, or by hand. Normalize on load so the badges describe the routing the
+    // resolver will actually perform rather than the stale config.
+    normalizeDraftTiers();
     renderRouteTargets();
     populateClientModelDatalist();
     openDialog('modelRouteModal');
@@ -3096,8 +3109,25 @@
   // The first row opens the first tier by definition. A stale sameTier there
   // would make draftTierNumbers start counting at 1 and mislabel every badge, so
   // every structural change funnels through this.
+  //
+  // It also enforces that the Kiro pool never shares a tier. Reaching a pool
+  // target ends the upstream walk, so a tier containing both the pool and an
+  // upstream is not a thing the router can honor: the resolver holds the sentinel
+  // at the end of its tier (config/route_resolve.go), which means a shared tier
+  // silently means something different from what the badges show. Rather than
+  // render a state the backend reinterprets, the pool always opens its own tier —
+  // both the pool row itself and the row below it, which would otherwise join the
+  // pool's tier.
   function normalizeDraftTiers() {
-    if (routeTargetDraft.length) routeTargetDraft[0].sameTier = false;
+    if (!routeTargetDraft.length) return;
+    routeTargetDraft[0].sameTier = false;
+    routeTargetDraft.forEach((tg, i) => {
+      if (i === 0) return;
+      const prev = routeTargetDraft[i - 1];
+      if (tg.upstreamId === KIRO_POOL_ID || prev.upstreamId === KIRO_POOL_ID) {
+        tg.sameTier = false;
+      }
+    });
   }
 
   // swapDraftRows backs the ↑/↓ buttons, which are also the keyboard-accessible
@@ -3171,7 +3201,15 @@
         : '<span class="text-xs muted-text">' + escapeHtml(t('upstreams.routeTargetFallback')) + ' ' + tier + '</span>';
       // Rows after the first can join the tier above; joining is what puts two
       // targets at equal priority so their weights become meaningful.
-      const tierToggle = i === 0
+      //
+      // Not offered where it cannot mean anything: the pool never shares a tier
+      // (it terminates the chain rather than splitting traffic), so neither a pool
+      // row nor the row directly below one gets the toggle. normalizeDraftTiers
+      // enforces the same rule on the data, so a stale flag cannot survive either;
+      // hiding the control keeps the UI from advertising a state it will undo.
+      const noTierToggle = i === 0 || isPool ||
+        (routeTargetDraft[i - 1] && routeTargetDraft[i - 1].upstreamId === KIRO_POOL_ID);
+      const tierToggle = noTierToggle
         ? ''
         : '<label class="text-xs muted-text flex items-center gap-1" title="' + escapeAttr(t('upstreams.routeTargetSameTierHint')) + '">' +
             '<input type="checkbox" data-target-field="sameTier" data-index="' + i + '"' + (tg.sameTier ? ' checked' : '') + ' />' +
@@ -3250,6 +3288,12 @@
     // among targets of EQUAL priority (config/route_resolve.go), so numbering
     // every row 0,1,2,... — as this did before — left every tier with a single
     // member and the weight field permanently inert.
+    //
+    // Normalize once more before numbering: what gets SAVED must match the badges,
+    // and a pool row may never share a tier (the resolver holds the sentinel last
+    // within its tier, so a shared tier would persist an order the router refuses
+    // to honor).
+    normalizeDraftTiers();
     const kept = routeTargetDraft.filter(tg => tg.upstreamId);
     let tier = -1;
     const targets = kept.map((tg, i) => {
@@ -3581,7 +3625,12 @@
         // just its value: the Target Model input disappears (there is no upstream to
         // rewrite the name for), weight goes inert, and the rows below become
         // unreachable. Re-render so the markup matches the new destination.
+        //
+        // normalizeDraftTiers first: a row that just became the pool must not stay
+        // in a shared tier, since the resolver holds the sentinel at the END of its
+        // tier and the badges would then describe an order that cannot happen.
         if (field === 'upstreamId' && (el.value === KIRO_POOL_ID || wasPool)) {
+          normalizeDraftTiers();
           renderRouteTargets();
           return;
         }
