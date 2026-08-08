@@ -47,6 +47,23 @@ func TestCategorizeUpstreamStatusDriven(t *testing.T) {
 		// Non-status-driven markers upstream reports with a generic code.
 		{"suspension marker", 500, "Your User ID temporarily is suspended", KiroErrSuspension},
 		{"profile unavailable marker", 500, "no available Kiro profile", KiroErrProfileUnavail},
+
+		// A locked account arrives as 403 AccessDeniedException — the same status as
+		// a bad token — so the suspension marker has to be read before the 401/403
+		// class becomes auth. Calling this "token invalid or expired" would send the
+		// operator after a credential that is fine; it needs an AWS support ticket.
+		// Body below is the verbatim shape observed from runtime.eu-central-1.kiro.dev.
+		{"403 suspension is not auth", 403,
+			`{"__type":"com.amazon.kiro.runtimeservice#AccessDeniedException","message":"Your User ID is temporarily suspended. We detected unusual user activity and locked it as a security precaution.","reason":"TEMPORARILY_SUSPENDED"}`,
+			KiroErrSuspension},
+		{"403 with plain bad token is still auth", 403,
+			`{"__type":"com.amazon.kiro.runtimeservice#AccessDeniedException","message":"The bearer token included in the request is invalid."}`,
+			KiroErrAuth},
+		// The anti-abuse 429 must not be swallowed by the suspension marker: both
+		// bodies talk about "unusual"/"suspicious" activity, but only one of them
+		// means the account is locked.
+		{"429 suspicious activity is anti-abuse", 429,
+			`{"message":"Too many requests, suspicious activity detected"}`, KiroErrAntiAbuse},
 	}
 
 	for _, tc := range tests {

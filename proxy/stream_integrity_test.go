@@ -34,6 +34,25 @@ func TestClassifyStreamIntegrity(t *testing.T) {
 		{"truncated content", 8, 0, "", false, errUpstreamTruncatedResponse},
 		{"reasoning only stricter than ide", 0, 0, "", true, errUpstreamTruncatedResponse},
 		{"no signal at all", 0, 0, "", false, errUpstreamTruncatedResponse},
+
+		// An empty turn is only complete when the stop reason explains why it is
+		// empty. These cases are the silent-failure shape: thinking streamed, the
+		// turn "finished normally", and the client got nothing. Checking stopReason
+		// before content (which this function used to do) let all three pass.
+		{"empty end_turn is not complete", 0, 0, "end_turn", false, errUpstreamTruncatedResponse},
+		{"reasoning plus end_turn is not complete", 0, 0, "end_turn", true, errUpstreamTruncatedResponse},
+		{"unknown stop reason folds into end_turn", 0, 0, "something_new", true, errUpstreamTruncatedResponse},
+
+		// Stop reasons that do account for an empty turn: the budget was spent
+		// (often by thinking), the model declined, or a stop sequence hit at once.
+		// Retrying reproduces the same outcome and hides the real reason.
+		{"empty max_tokens is complete", 0, 0, "max_tokens", true, nil},
+		{"empty length is complete", 0, 0, "length", true, nil},
+		{"empty context overflow is complete", 0, 0, "model_context_window_exceeded", false, nil},
+		{"empty refusal is complete", 0, 0, "refusal", false, nil},
+		{"empty guardrail is complete", 0, 0, "guardrail_intervened", false, nil},
+		{"empty stop_sequence is complete", 0, 0, "stop_sequence", false, nil},
+		{"stop reason casing and spacing ignored", 0, 0, "  Max_Tokens  ", false, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := classifyStreamIntegrity(tc.content, tc.tools, tc.stopReason, tc.sawReasoning)

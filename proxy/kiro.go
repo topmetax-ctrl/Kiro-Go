@@ -660,22 +660,40 @@ endpointLoop:
 				continue endpointLoop
 			}
 
-			if resp.StatusCode == 429 {
-				resp.Body.Close()
-				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-				lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
-				continue endpointLoop
-			}
-
 			if resp.StatusCode != 200 {
+				// The body must be read even on 429. AWS reports two different
+				// failures with that one status: real quota exhaustion, and an
+				// anti-abuse throttle whose body says "suspicious activity". They
+				// need opposite handling — a fixed quota cooldown versus exponential
+				// backoff, because each rapid retry renews AWS's investigation timer
+				// — and the body is the only thing that distinguishes them. Closing
+				// it unread (which this branch used to do for 429) made
+				// KiroErrAntiAbuse unreachable in production and every throttle look
+				// like an exhausted account.
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
-				lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+				body := string(errBody)
+				upstreamErr := &KiroUpstreamError{
+					Category:   categorizeUpstream(resp.StatusCode, body),
+					StatusCode: resp.StatusCode,
+					Endpoint:   ep.Name,
+					Body:       body,
+				}
+				lastErr = upstreamErr
+
+				switch upstreamErr.Category {
+				case KiroErrAntiAbuse:
+					logger.Warnf("[KiroAPI] Endpoint %s anti-abuse throttle (429), trying next...", ep.Name)
+				case KiroErrQuota:
+					logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
+				default:
+					logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
+				}
+
 				// Authentication errors and payment errors are not retried across endpoints.
 				if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 					return lastErr
 				}
-				logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
 				continue endpointLoop
 			}
 

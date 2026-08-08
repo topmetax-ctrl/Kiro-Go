@@ -45,9 +45,9 @@ var errUpstreamTruncatedResponse = errors.New("upstream truncated response witho
 // clean EOF, so a stream that died mid-answer is otherwise indistinguishable
 // from a finished one.
 //
-// Complete when a stopReason arrived, or when a tool call was delivered. Both
-// match Kiro IDE, whose empty and truncation predicates each require
-// toolCallCount === 0.
+// Complete when a tool call was delivered, or when a stopReason arrived AND the
+// turn actually produced an answer. The tool-call case matches Kiro IDE, whose
+// empty and truncation predicates each require toolCallCount === 0.
 //
 // Truncated when content arrived without any terminal signal.
 //
@@ -59,21 +59,66 @@ var errUpstreamTruncatedResponse = errors.New("upstream truncated response witho
 // answer or the tool call. Handing a client reasoning with no answer as a
 // successful turn is what made the failure invisible, so it is classified as
 // truncated here.
+//
+// # A STOP REASON DOES NOT PROVE THE TURN PRODUCED ANYTHING
+//
+// Checking stopReason first (which this function used to do) reopened exactly
+// the hole the reasoning rule above was written to close. Upstream can send
+// reasoningContentEvent frames followed by metadataEvent{stopReason:"end_turn"}
+// and no assistantResponseEvent and no toolUseEvent at all. That combination
+// survived every guard: reasoning sets sawOutput in parseEventStreamTracked, so
+// errEmptyKiroStream never fires, and the non-empty stopReason short-circuited
+// here before the content check was ever reached. The client got
+// message_delta(stop_reason=end_turn) + message_stop with an empty body — a
+// turn that just ends mid-conversation with nothing on screen.
+//
+// So an empty turn is judged by whether the stop reason EXPLAINS the emptiness:
+//
+//   - max_tokens / context_window_exceeded / refusal / stop_sequence: yes. The
+//     budget was consumed (often by thinking), the model declined, or a stop
+//     sequence hit immediately. Retrying burns quota to reproduce the same
+//     outcome, and the client needs the real reason to react correctly.
+//   - end_turn (and anything unrecognized, which mapClaudeStopReason also folds
+//     into end_turn): no. "The turn finished normally" and "there is no answer"
+//     cannot both be true, so the stream is treated as truncated and retried.
 func classifyStreamIntegrity(contentChars, toolCallCount int, stopReason string, sawReasoning bool) error {
-	if strings.TrimSpace(stopReason) != "" {
-		return nil
-	}
+	// A delivered tool call is a real answer even with no prose alongside it.
 	if toolCallCount > 0 {
 		return nil
 	}
-	if contentChars > 0 || sawReasoning {
+	if contentChars > 0 {
+		if strings.TrimSpace(stopReason) != "" {
+			return nil
+		}
+		// Content with no terminal signal: died mid-answer.
 		return errUpstreamTruncatedResponse
 	}
-	// No content, no reasoning, no tools: unreachable through the wired paths
-	// (errEmptyKiroStream fires first, see above). Treated as truncated rather
-	// than complete so a future caller that bypasses that guard still cannot
-	// ship an empty turn as a success.
+	// Nothing client-visible was produced. Only a stop reason that accounts for
+	// that is allowed to pass; sawReasoning is deliberately not a substitute for
+	// an answer.
+	if stopReasonExplainsEmptyTurn(stopReason) {
+		return nil
+	}
 	return errUpstreamTruncatedResponse
+}
+
+// stopReasonExplainsEmptyTurn reports whether stopReason is itself a sufficient
+// account of a turn that carried no text and no tool call.
+//
+// The vocabulary matches mapClaudeStopReason's switch, which is what the client
+// ultimately sees. Anything not listed there becomes end_turn, and an empty
+// end_turn is the silent failure this guard exists to catch — so the default is
+// deliberately "does not explain".
+func stopReasonExplainsEmptyTurn(stopReason string) bool {
+	switch strings.ToLower(strings.TrimSpace(stopReason)) {
+	case "max_tokens", "max_output_tokens", "length",
+		"model_context_window_exceeded", "context_window_exceeded",
+		"refusal", "content_filter", "content_filtered", "guardrail_intervened",
+		"stop_sequence":
+		return true
+	default:
+		return false
+	}
 }
 
 // isStreamIntegrityError reports whether err is a soft integrity failure.

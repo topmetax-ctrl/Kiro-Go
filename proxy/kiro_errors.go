@@ -59,8 +59,31 @@ func (e *KiroUpstreamError) Unwrap() error { return e.Err }
 // suspension / profile-unavailable markers that upstream reports with a generic
 // status. Body matching here is a last-resort refinement, not the primary
 // signal, so digits embedded in request-IDs cannot flip the category.
+//
+// SUSPENSION IS CHECKED BEFORE 401/403 BECOME "auth"
+//
+// AWS reports a temporarily-locked account as 403 AccessDeniedException with
+// reason TEMPORARILY_SUSPENDED, i.e. the same status as a genuinely bad token.
+// Returning KiroErrAuth for the whole 403 class would tell the operator
+// "Authentication failed - token invalid or expired" about a credential that is
+// perfectly valid and needs an AWS support ticket instead. The legacy substring
+// path already ordered suspension ahead of auth (see handleAccountFailure); this
+// keeps the typed path from disagreeing with it.
 func categorizeUpstream(statusCode int, body string) KiroErrorCategory {
 	lower := strings.ToLower(body)
+
+	// Body markers that identify a specific failure regardless of the status code
+	// upstream chose to report it with.
+	switch {
+	case strings.Contains(lower, "temporarily_suspended"),
+		strings.Contains(lower, "temporarily suspended"),
+		strings.Contains(lower, "temporarily is suspended"),
+		strings.Contains(lower, "account suspended"):
+		return KiroErrSuspension
+	case strings.Contains(lower, "no available kiro profile"):
+		return KiroErrProfileUnavail
+	}
+
 	switch statusCode {
 	case 402:
 		if strings.Contains(lower, "overage") {
@@ -74,16 +97,6 @@ func categorizeUpstream(statusCode int, body string) KiroErrorCategory {
 			return KiroErrAntiAbuse
 		}
 		return KiroErrQuota
-	}
-
-	// Non-status-driven markers upstream may return with other codes.
-	switch {
-	case strings.Contains(lower, "temporarily_suspended"),
-		strings.Contains(lower, "temporarily is suspended"),
-		strings.Contains(lower, "account suspended"):
-		return KiroErrSuspension
-	case strings.Contains(lower, "no available kiro profile"):
-		return KiroErrProfileUnavail
 	}
 	return KiroErrUnknown
 }

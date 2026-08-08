@@ -35,6 +35,12 @@ services:
       - KIRO_INJECT_CACHE_DIR=/host-kiro-cache
       # Where the inject feature writes profile.json (the globalStorage bind-mount).
       - KIRO_INJECT_PROFILE_DIR=/host-kiro-profile
+      # Keep WARN visible. The stream-integrity guard reports a recovered upstream
+      # truncation at WARN ("[StreamIntegrity] ... retrying same account"), which is
+      # the only signal that a turn would otherwise have ended empty. config.json's
+      # logLevel is rewritten by the running service, so pinning it here (env wins
+      # over config, see logger.Init) is what keeps that evidence from disappearing.
+      - LOG_LEVEL=warn
     restart: unless-stopped
     networks:
       - websearch
