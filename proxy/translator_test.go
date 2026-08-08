@@ -158,26 +158,45 @@ func TestOpenAIToKiroAssistantToolCallsDoNotInjectPlaceholder(t *testing.T) {
 
 	payload := OpenAIToKiro(req, false)
 
-	// The mid-history assistant turn carried ONLY a tool call (no text) and is
-	// not the active tool turn, so its structured toolUses are cleared. That
-	// leaves it hollow, and a hollow assistant turn is dropped entirely rather
-	// than backfilled with a "." placeholder (which the model would imitate).
-	// No surviving turn may contain tool-invocation text or structured toolUses.
+	// The mid-history assistant turn called a tool without narrating. Its
+	// structured toolUses must survive — that is the real example the model needs
+	// — but no "." placeholder or tool-invocation TEXT may be injected into the
+	// assistant turn, since text is what the model imitates.
+	structuredUses := 0
 	for i, h := range payload.ConversationState.History {
 		a := h.AssistantResponseMessage
 		if a == nil {
 			continue
 		}
-		if len(a.ToolUses) != 0 {
-			t.Fatalf("history[%d] retains structured toolUses", i)
-		}
+		structuredUses += len(a.ToolUses)
 		if strings.Contains(a.Content, "get_weather") || strings.Contains(a.Content, "[Called tool") {
 			t.Fatalf("history[%d] assistant contains tool-invocation text: %q", i, a.Content)
 		}
-		if strings.TrimSpace(a.Content) == "." || strings.TrimSpace(a.Content) == "" {
-			t.Fatalf("history[%d] is a hollow assistant turn that should have been dropped", i)
+		if strings.TrimSpace(a.Content) == minimalFallbackUserContent {
+			t.Fatalf("history[%d] assistant was backfilled with a %q placeholder", i, minimalFallbackUserContent)
 		}
 	}
+	if structuredUses != 1 {
+		t.Fatalf("expected the history tool call to stay structured, got %d\n%s",
+			structuredUses, dumpConversation(mergedConversation(payload)))
+	}
+
+	// The call had no matching result in the request, so repair must supply one:
+	// upstream rejects an unanswered tool call outright.
+	synthesized := false
+	for _, h := range mergedConversation(payload) {
+		for _, r := range turnToolResults(h) {
+			if r.ToolUseID == "call_1" && r.Status == toolResultStatusError {
+				synthesized = true
+			}
+		}
+	}
+	if !synthesized {
+		t.Fatalf("expected a synthetic error result pairing the unanswered call\n%s",
+			dumpConversation(mergedConversation(payload)))
+	}
+
+	assertKiroPayloadValid(t, payload)
 }
 
 func TestOpenAIConversationIDStableFromAnchor(t *testing.T) {
@@ -367,14 +386,24 @@ func TestToolResultsContinuationIncludesInstructionPrefix(t *testing.T) {
 	}
 
 	payload := OpenAIToKiro(req, false)
-	content := payload.ConversationState.CurrentMessage.UserInputMessage.Content
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 
-	if !strings.Contains(content, toolResultsContinuationPrefix) {
-		t.Fatalf("expected tool continuation prefix, got %q", content)
+	// The trailing tool result rides structurally on the current message, paired
+	// with the call in the preceding assistant turn. It is deliberately NOT also
+	// narrated into the content: shipping both would duplicate the output.
+	if cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
+		t.Fatalf("expected the tool result attached structurally to the current message, got %#v",
+			cur.UserInputMessageContext)
 	}
-	if !strings.Contains(content, "result-1") {
-		t.Fatalf("expected tool result text in continuation content, got %q", content)
+	got := cur.UserInputMessageContext.ToolResults[0]
+	if got.ToolUseID != "call_1" {
+		t.Fatalf("expected the result to answer call_1, got %q", got.ToolUseID)
 	}
+	if len(got.Content) == 0 || !strings.Contains(got.Content[0].Text, "result-1") {
+		t.Fatalf("expected tool result text preserved, got %#v", got.Content)
+	}
+
+	assertKiroPayloadValid(t, payload)
 }
 
 func TestKiroToOpenAIResponseWithReasoningPreservesFinishReason(t *testing.T) {
@@ -709,30 +738,30 @@ func TestOpenAIToolResultImageCarriedWhenFollowedByUser(t *testing.T) {
 	payload := OpenAIToKiro(req, false)
 
 	// The tool result is followed by a later user turn, so it is flushed into
-	// history. sanitizeKiroHistory narrates the tool result into the user turn's
-	// text (via the "Tool results:" prefix) and drops the structured ToolResults,
-	// but the extracted image stays attached to that same flushed user turn. We
-	// assert the shipped contract: the image rides on the narrated tool-result
-	// history turn, identified by its "Tool results:" content prefix, and no
-	// structured ToolResults survive anywhere in history.
+	// history as a structured results turn, and the image extracted from that
+	// result stays attached to the same turn. The contract asserted here: the
+	// image rides on the turn that carries the structured result for call_img,
+	// and the structured pairing survives (upstream requires it).
 	var toolHistImages, structuredToolResults int
 	for _, h := range payload.ConversationState.History {
 		if h.UserInputMessage == nil {
 			continue
 		}
-		if strings.HasPrefix(h.UserInputMessage.Content, toolResultsContinuationPrefix) {
-			toolHistImages += len(h.UserInputMessage.Images)
-		}
-		if context := h.UserInputMessage.UserInputMessageContext; context != nil {
-			structuredToolResults += len(context.ToolResults)
+		for _, r := range turnToolResults(h) {
+			structuredToolResults++
+			if r.ToolUseID == "call_img" {
+				toolHistImages += len(h.UserInputMessage.Images)
+			}
 		}
 	}
 	if toolHistImages != 1 {
-		t.Fatalf("expected tool image carried in history, got %d", toolHistImages)
+		t.Fatalf("expected tool image carried on the structured result turn, got %d\n%s",
+			toolHistImages, dumpConversation(mergedConversation(payload)))
 	}
-	if structuredToolResults != 0 {
-		t.Fatalf("history must not retain structured tool results, got %d", structuredToolResults)
+	if structuredToolResults != 1 {
+		t.Fatalf("expected the structured tool result to survive in history, got %d", structuredToolResults)
 	}
+	assertKiroPayloadValid(t, payload)
 
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if len(cur.Images) != 0 {

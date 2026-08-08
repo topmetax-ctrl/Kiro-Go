@@ -11,8 +11,10 @@ import (
 // "[Called tool X with input ...]" inside assistant turns, the model learned to
 // emit that literal text instead of issuing real structured tool calls.
 //
-// After the fix, assistant history turns must never contain tool-invocation
-// syntax. Tool identity is attributed only on the user "Tool results" side.
+// The guard is unchanged by the switch to structured history tool calls: tool
+// activity must still never appear as INVOCATION TEXT inside an assistant turn.
+// What changed is where the activity legitimately lives — in structured
+// toolUses/toolResults, which the model cannot mistake for text to imitate.
 func TestNoToolInvocationTextInAssistantHistory(t *testing.T) {
 	// Build a long OpenAI conversation with many completed tool cycles.
 	msgs := []OpenAIMessage{{Role: "user", Content: "start a multi-step task"}}
@@ -34,37 +36,57 @@ func TestNoToolInvocationTextInAssistantHistory(t *testing.T) {
 		if a == nil {
 			continue
 		}
-		// No assistant turn may contain tool-invocation-looking text.
+		// No assistant turn may contain tool-invocation-looking TEXT. This is the
+		// pattern the model imitated; structured toolUses are not imitable.
 		for _, bad := range []string{"[Called tool", "Called tool ", "with input {"} {
 			if strings.Contains(a.Content, bad) {
 				t.Fatalf("history[%d] assistant content contains mimicable tool text %q: %q", i, bad, a.Content)
 			}
 		}
-		// No assistant turn may carry structured tool calls (rejected upstream).
-		if len(a.ToolUses) > 0 {
-			t.Fatalf("history[%d] assistant retains %d structured toolUses", i, len(a.ToolUses))
-		}
 	}
 
-	// Tool outputs must still be preserved (on the user side) for context.
-	var allText strings.Builder
+	// The structured tool calls must survive, so the model sees real examples of
+	// issuing a tool call rather than examples of announcing and stopping.
+	structuredUses := 0
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil {
-			allText.WriteString(h.UserInputMessage.Content)
-			allText.WriteString("\n")
+		if a := h.AssistantResponseMessage; a != nil {
+			structuredUses += len(a.ToolUses)
 		}
 	}
-	combined := allText.String()
+	if structuredUses != 8 {
+		t.Fatalf("expected all 8 history tool calls to stay structured, got %d", structuredUses)
+	}
+
+	// Tool outputs must still be preserved, now as structured results.
+	seen := map[string]bool{}
+	for _, h := range payload.ConversationState.History {
+		if h.UserInputMessage == nil {
+			continue
+		}
+		for _, r := range turnToolResults(h) {
+			for _, c := range r.Content {
+				for i := 0; i < 8; i++ {
+					if strings.Contains(c.Text, fmt.Sprintf("OUTPUT_%d", i)) {
+						seen[fmt.Sprintf("OUTPUT_%d", i)] = true
+					}
+				}
+			}
+		}
+		// Narrated text is also acceptable (orphan-repair path).
+		for i := 0; i < 8; i++ {
+			if strings.Contains(h.UserInputMessage.Content, fmt.Sprintf("OUTPUT_%d", i)) {
+				seen[fmt.Sprintf("OUTPUT_%d", i)] = true
+			}
+		}
+	}
 	for i := 0; i < 8; i++ {
 		marker := fmt.Sprintf("OUTPUT_%d", i)
-		if !strings.Contains(combined, marker) {
+		if !seen[marker] {
 			t.Fatalf("tool output %q lost from history", marker)
 		}
 	}
-	// Tool identity should be attributed on the user side.
-	if !strings.Contains(combined, "[exec_command]") {
-		t.Fatalf("expected tool results attributed to exec_command on the user side")
-	}
+
+	assertKiroPayloadValid(t, payload)
 }
 
 func newPollToolCall(id, name, args string) ToolCall {
@@ -74,11 +96,16 @@ func newPollToolCall(id, name, args string) ToolCall {
 	return tc
 }
 
-// TestCollapsesConsecutiveIdenticalToolResults covers a client retry loop that
-// sends the same failing tool result many times. After hollow assistant turns
-// are dropped, those identical user "Tool results" turns become adjacent
-// duplicates; the proxy collapses each run to a single copy.
-func TestCollapsesConsecutiveIdenticalToolResults(t *testing.T) {
+// TestIdenticalToolResultsKeepTheirOwnPairs covers a client retry loop that
+// sends the same failing output many times. The text is identical, but each
+// result answers a DIFFERENT tool call (c0..c4), so the turns must not be
+// collapsed: dropping four of them would leave four calls unanswered, which is
+// exactly the TOOL_USES_AND_RESULTS violation that produces upstream 400s.
+//
+// An earlier version collapsed these runs to save context. That was safe only
+// because the structured calls had already been stripped; with the pairing
+// restored, the dedup pass must exempt turns carrying structured results.
+func TestIdenticalToolResultsKeepTheirOwnPairs(t *testing.T) {
 	msgs := []OpenAIMessage{{Role: "user", Content: "start"}}
 	// 5 identical failing cycles in a row (model retrying the same tool).
 	for i := 0; i < 5; i++ {
@@ -93,15 +120,21 @@ func TestCollapsesConsecutiveIdenticalToolResults(t *testing.T) {
 
 	payload := OpenAIToKiro(&OpenAIRequest{Model: "claude-opus-4.8", Messages: msgs}, false)
 
-	count := 0
+	// Every call keeps its own answering result.
+	answered := map[string]bool{}
 	for _, h := range payload.ConversationState.History {
-		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, "SAME_ERROR_OUTPUT") {
-			count++
+		for _, r := range turnToolResults(h) {
+			answered[r.ToolUseID] = true
 		}
 	}
-	if count != 1 {
-		t.Fatalf("expected 5 identical tool-result turns collapsed to 1, got %d", count)
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("c%d", i)
+		if !answered[id] {
+			t.Fatalf("tool call %s lost its result; upstream would reject the request", id)
+		}
 	}
+
+	assertKiroPayloadValid(t, payload)
 }
 
 // TestDropsDotPollutedAssistantTurns covers the second-order pollution: after

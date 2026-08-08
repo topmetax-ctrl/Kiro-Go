@@ -1,7 +1,7 @@
 package proxy
 
 // advancePayload produces the payload for the next Kiro round after a search
-// round. It preserves the single-active-tool-turn invariant that Kiro requires:
+// round:
 //
 //  1. The working payload's current user message becomes a history user turn.
 //  2. The just-received assistant round is appended as the final history turn,
@@ -9,9 +9,10 @@ package proxy
 //  3. A new current user message carries the structured tool_results (keyed to
 //     those tool_uses) plus the original tool definitions so the model may
 //     search again.
-//  4. sanitizeKiroHistory flattens every older tool turn to text, leaving only
-//     the final assistant turn structured (matched by the current toolResults).
-//  5. The payload is re-truncated to the byte cap.
+//  4. repairKiroPayload reconciles the conversation against the upstream shape
+//     rules, keeping every tool pair structured.
+//  5. The payload is re-truncated to the byte cap, then repaired again because
+//     dropping the oldest turns can sever a pair that was intact before.
 //
 // The input payload is treated as the working copy owned by the runner; it is
 // already a clone of the handler's original, so mutating it here is safe.
@@ -20,11 +21,20 @@ func advancePayload(working *KiroPayload, round KiroRoundResult, toolResults []K
 
 	cs := &next.ConversationState
 
-	// (1) Demote the current user message to a history user turn. Strip its tool
-	// context; history turns must not carry structured tool specs/results (they
-	// get narrated to text by sanitizeKiroHistory anyway).
+	// (1) Demote the current user message to a history user turn. Its tool specs
+	// are dropped (only the current message advertises tools) but any structured
+	// tool results it carries are kept: they answer an earlier assistant turn's
+	// calls, and discarding them would orphan those calls.
 	prevUser := cs.CurrentMessage.UserInputMessage
-	prevUser.UserInputMessageContext = nil
+	if prevUser.UserInputMessageContext != nil {
+		prevCtx := *prevUser.UserInputMessageContext
+		prevCtx.Tools = nil
+		if len(prevCtx.ToolResults) == 0 {
+			prevUser.UserInputMessageContext = nil
+		} else {
+			prevUser.UserInputMessageContext = &prevCtx
+		}
+	}
 	cs.History = append(cs.History, KiroHistoryMessage{UserInputMessage: &prevUser})
 
 	// (2) Append the assistant round with its structured tool_uses as the final
@@ -43,11 +53,12 @@ func advancePayload(working *KiroPayload, round KiroRoundResult, toolResults []K
 	})
 
 	// (3) New current user message: structured tool_results + preserved tool defs.
+	// The results ride structurally only; narrating them into the content as well
+	// would ship the same search output twice.
 	origin := prevUser.Origin
 	modelID := prevUser.ModelID
 	tools := previousTools(working)
 	cs.CurrentMessage.UserInputMessage = KiroUserInputMessage{
-		Content: buildToolResultsContinuation(toolResults),
 		ModelID: modelID,
 		Origin:  origin,
 		UserInputMessageContext: &UserInputMessageContext{
@@ -56,12 +67,13 @@ func advancePayload(working *KiroPayload, round KiroRoundResult, toolResults []K
 		},
 	}
 
-	// (4) Keep exactly one active structured tool turn; flatten the rest.
-	ids := collectToolResultIDs(toolResults)
-	cs.History = sanitizeKiroHistory(cs.History, ids)
+	// (4) Reconcile the conversation shape, keeping every tool pair structured.
+	repairKiroPayload(next)
 
-	// (5) Re-truncate to the byte cap (priming was folded into history already).
+	// (5) Re-truncate to the byte cap (priming was folded into history already),
+	// then repair again: truncation can drop a turn that held a paired result.
 	truncatePayloadToLimit(next, false)
+	repairKiroPayload(next)
 	return next
 }
 

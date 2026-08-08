@@ -377,41 +377,30 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		history = append(priming, history...)
 	}
 
-	// Keep structured tool results only while they answer the final assistant
-	// tool turn. Older tool cycles are flattened by sanitizeKiroHistory because
-	// Kiro rejects structured tool calls and results in history.
-	currentToolResultIDs := collectToolResultIDs(currentToolResults)
-	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
-
-	if keepCurrentToolResults {
-		history = sanitizeKiroHistory(history, currentToolResultIDs)
-	} else {
-		history = sanitizeKiroHistory(history, nil)
-	}
-
+	// Structured tool calls and results stay structured, in history and on the
+	// current message alike. Upstream requires them to appear in matched pairs
+	// (TOOL_USES_AND_RESULTS / TOOL_RESULTS_AND_NO_USES); repairKiroPayload below
+	// fixes any broken pairing. See kiro_history_repair.go for why the old
+	// flatten-everything approach was wrong and what it cost.
+	//
 	// 构建最终内容
 	//
-	// Tool-result text is folded into the message whenever the results are NOT
-	// attached structurally, and also when the turn carries no real text of its
-	// own. Both cases would otherwise ship an image placeholder (or the minimal
-	// fallback) over a tool result that had readable text in it.
+	// The current turn's tool results ride structurally, so their text is not
+	// folded into the content here — doing both would ship the same output twice.
 	finalContent := ""
 	switch {
 	case currentHasRealText:
 		finalContent = currentContent
-		if !keepCurrentToolResults && len(currentToolResults) > 0 {
-			// Orphaned results are not attached structurally (that would trip an
-			// upstream 400), so their text has to ride along with the message.
-			finalContent = joinHistoryText(finalContent, buildToolResultsContinuation(currentToolResults))
-		}
 	case len(currentToolResults) > 0:
-		finalContent = buildToolResultsContinuation(currentToolResults)
+		// A results-only turn needs no text: the structured results satisfy
+		// NON_EMPTY_USER_MESSAGE on their own.
+		finalContent = ""
 	case len(currentImages) > 0:
 		finalContent = normalizeUserContent("", true)
 	default:
 		finalContent = minimalFallbackUserContent
 	}
-	if finalContent == "" {
+	if finalContent == "" && len(currentToolResults) == 0 {
 		if len(currentImages) > 0 {
 			finalContent = normalizeUserContent("", true)
 		} else {
@@ -436,16 +425,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		Images:  currentImages,
 	}
 
-	// Only attach structured tool results when they answer the last history
-	// assistant turn; otherwise they have already been folded into finalContent.
-	var attachToolResults []KiroToolResult
-	if keepCurrentToolResults {
-		attachToolResults = currentToolResults
-	}
-	if len(kiroTools) > 0 || len(attachToolResults) > 0 {
+	// Tool results always ride structurally; repairKiroPayload reconciles them
+	// against the preceding assistant turn's tool calls.
+	if len(kiroTools) > 0 || len(currentToolResults) > 0 {
 		payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
 			Tools:       kiroTools,
-			ToolResults: attachToolResults,
+			ToolResults: currentToolResults,
 		}
 	}
 
@@ -462,7 +447,11 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 
 	applyKiroCachePoint(payload)
+	// Repair before truncation so the shape is sound, then again after, because
+	// dropping the oldest turns can sever a tool pair that was previously intact.
+	repairKiroPayload(payload)
 	truncatePayloadToLimit(payload, systemPrompt != "")
+	repairKiroPayload(payload)
 
 	return payload
 }
@@ -1517,24 +1506,14 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		history = append(priming, history...)
 	}
 
-	// Keep structured tool results only while they answer the final assistant
-	// tool turn. Older tool cycles are flattened by sanitizeKiroHistory because
-	// Kiro rejects structured tool calls and results in history.
-	currentToolResultIDs := collectToolResultIDs(currentToolResults)
-	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
-
-	if keepCurrentToolResults {
-		history = sanitizeKiroHistory(history, currentToolResultIDs)
-	} else {
-		history = sanitizeKiroHistory(history, nil)
-	}
-	// 构建最终内容。工具结果既保留结构化配对，也携带可读文本；
+	// Structured tool calls and results stay structured, in history and on the
+	// current message alike; repairKiroPayload below reconciles the pairing that
+	// upstream requires. See kiro_history_repair.go.
+	//
+	// 构建最终内容。工具结果以结构化形式携带，因此不再重复写入文本；
 	// 同一消息带有图片时，图片占位文本不能覆盖工具结果内容。
 	finalContent := currentContent
-	if len(currentToolResults) > 0 {
-		finalContent = joinHistoryText(finalContent, buildToolResultsContinuation(currentToolResults))
-	}
-	if finalContent == "" {
+	if finalContent == "" && len(currentToolResults) == 0 {
 		if len(currentImages) > 0 {
 			finalContent = normalizeUserContent("", true)
 		} else {
@@ -1556,14 +1535,12 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 		Images:  currentImages,
 	}
 
-	var attachToolResults []KiroToolResult
-	if keepCurrentToolResults {
-		attachToolResults = currentToolResults
-	}
-	if len(kiroTools) > 0 || len(attachToolResults) > 0 {
+	// Tool results always ride structurally; repairKiroPayload reconciles them
+	// against the preceding assistant turn's tool calls.
+	if len(kiroTools) > 0 || len(currentToolResults) > 0 {
 		payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
 			Tools:       kiroTools,
-			ToolResults: attachToolResults,
+			ToolResults: currentToolResults,
 		}
 	}
 
@@ -1580,7 +1557,11 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 
 	applyKiroCachePoint(payload)
+	// Repair before truncation so the shape is sound, then again after, because
+	// dropping the oldest turns can sever a tool pair that was previously intact.
+	repairKiroPayload(payload)
 	truncatePayloadToLimit(payload, systemPrompt != "")
+	repairKiroPayload(payload)
 
 	return payload
 }
@@ -1671,45 +1652,6 @@ func extractOpenAIMessageText(content interface{}) string {
 	return ""
 }
 
-// collectToolResultIDs returns the set of toolUseId values referenced by the
-// given tool results.
-func collectToolResultIDs(toolResults []KiroToolResult) map[string]bool {
-	if len(toolResults) == 0 {
-		return nil
-	}
-	ids := make(map[string]bool, len(toolResults))
-	for _, tr := range toolResults {
-		if id := strings.TrimSpace(tr.ToolUseID); id != "" {
-			ids[id] = true
-		}
-	}
-	return ids
-}
-
-// currentToolResultsMatchLastAssistant reports whether the current message's
-// tool results answer the structured tool calls of the final history assistant
-// message.
-func currentToolResultsMatchLastAssistant(history []KiroHistoryMessage, currentToolResultIDs map[string]bool) bool {
-	if len(history) == 0 {
-		return false
-	}
-	last := history[len(history)-1]
-	return last.AssistantResponseMessage != nil &&
-		toolResultsAnswerToolUses(last.AssistantResponseMessage.ToolUses, currentToolResultIDs)
-}
-
-func toolResultsAnswerToolUses(toolUses []KiroToolUse, toolResultIDs map[string]bool) bool {
-	if len(toolUses) == 0 || len(toolResultIDs) == 0 {
-		return false
-	}
-	for _, tu := range toolUses {
-		if !toolResultIDs[tu.ToolUseID] {
-			return false
-		}
-	}
-	return true
-}
-
 // pollutedToolCallTextPattern matches the legacy "[Called tool X with input ...]"
 // / "[Called tool X]" narration that an earlier version of this proxy wrote into
 // assistant turns. Models trained on that in-context text began emitting it as
@@ -1782,139 +1724,6 @@ func joinHistoryText(existing, narrated string) string {
 	default:
 		return existing
 	}
-}
-
-// sanitizeKiroHistory flattens structured tool calls/results inside history into
-// plain text, leaving at most one active structured tool turn intact: the final
-// history assistant message whose tool-use IDs are answered by the current
-// message's toolResults. Everything else is narrated as text so the upstream
-// accepts the request.
-//
-// currentToolResultIDs is the set of toolUseId values carried by the current
-// (outgoing) message. When the last history entry is an assistant message whose
-// tool uses are fully covered by that set, its structured toolUses are kept.
-func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[string]bool) []KiroHistoryMessage {
-	if len(history) == 0 {
-		return history
-	}
-
-	// Map every tool-use ID to its tool name across all assistant turns, so a
-	// user "Tool results" turn can attribute each result to its originating tool
-	// even after the structured toolUses are stripped from the assistant turn.
-	toolNames := make(map[string]string)
-	for i := range history {
-		if a := history[i].AssistantResponseMessage; a != nil {
-			for _, tu := range a.ToolUses {
-				if tu.ToolUseID != "" && tu.Name != "" {
-					toolNames[tu.ToolUseID] = tu.Name
-				}
-			}
-		}
-	}
-
-	// Determine whether the last history assistant turn is the "active" tool turn
-	// answered by the current message. If so, its structured toolUses stay.
-	activeIdx := -1
-	if len(currentToolResultIDs) > 0 {
-		last := history[len(history)-1]
-		if last.AssistantResponseMessage != nil && len(last.AssistantResponseMessage.ToolUses) > 0 {
-			allCovered := true
-			for _, tu := range last.AssistantResponseMessage.ToolUses {
-				if !currentToolResultIDs[tu.ToolUseID] {
-					allCovered = false
-					break
-				}
-			}
-			if allCovered {
-				activeIdx = len(history) - 1
-			}
-		}
-	}
-
-	for i := range history {
-		msg := &history[i]
-
-		if msg.AssistantResponseMessage != nil {
-			// Scrub legacy tool-call narration that a polluted client may be
-			// replaying as assistant text, so we neither reinforce the pattern
-			// nor leave it for the model to imitate.
-			if msg.AssistantResponseMessage.Content != "" {
-				msg.AssistantResponseMessage.Content = stripPollutedToolCallText(msg.AssistantResponseMessage.Content)
-			}
-		}
-
-		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) > 0 {
-			if i == activeIdx {
-				continue // keep the active tool turn structured
-			}
-			// Drop the structured tool calls WITHOUT writing any tool-invocation
-			// text into the assistant turn. Narrating the call here (e.g.
-			// "[Called tool X ...]") would give the model dozens of in-context
-			// examples of "invoke a tool by emitting this text", which it then
-			// imitates instead of issuing real structured tool calls. The tool's
-			// identity is preserved on the result side (user turn) via toolNames.
-			msg.AssistantResponseMessage.ToolUses = nil
-		}
-
-		if msg.UserInputMessage != nil && msg.UserInputMessage.UserInputMessageContext != nil {
-			ctx := msg.UserInputMessage.UserInputMessageContext
-			if len(ctx.ToolResults) > 0 {
-				narrated := narrateToolResults(ctx.ToolResults, toolNames)
-				msg.UserInputMessage.Content = joinHistoryText(msg.UserInputMessage.Content, narrated)
-				ctx.ToolResults = nil
-			}
-			// History messages must not carry structured tool specs either.
-			ctx.Tools = nil
-			if len(ctx.Tools) == 0 && len(ctx.ToolResults) == 0 {
-				msg.UserInputMessage.UserInputMessageContext = nil
-			}
-		}
-
-		// After scrubbing, an assistant turn that held only tool-call text (or
-		// only structured tool calls) is now empty. Do NOT backfill it with a
-		// placeholder like ".": replayed across a long history that produces
-		// dozens of "." assistant turns, which the model then imitates by
-		// replying ".". Mark such turns for removal instead.
-		if msg.UserInputMessage != nil && strings.TrimSpace(msg.UserInputMessage.Content) == "" && len(msg.UserInputMessage.Images) == 0 {
-			msg.UserInputMessage.Content = minimalFallbackUserContent
-		}
-	}
-
-	// Second pass: drop assistant turns that carry no real content — either left
-	// empty by scrubbing, or consisting solely of the "." placeholder that an
-	// earlier version emitted (and that a polluted client now replays). Their
-	// tool activity already survives as narrated text in the adjacent user
-	// "Tool results" turn, so removing the hollow assistant turn loses no
-	// information and avoids seeding mimicable empty/"." turns.
-	cleaned := history[:0:0]
-	for i := range history {
-		msg := history[i]
-		if msg.AssistantResponseMessage != nil && len(msg.AssistantResponseMessage.ToolUses) == 0 {
-			c := strings.TrimSpace(msg.AssistantResponseMessage.Content)
-			if c == "" || c == minimalFallbackUserContent {
-				continue // drop hollow assistant turn
-			}
-		}
-		// Collapse runs of consecutive identical user "Tool results" turns. A
-		// client stuck in a retry loop (e.g. the same tool error 100+ times)
-		// sends many identical tool results; once the hollow assistant turns
-		// between them are dropped they become adjacent duplicates that waste
-		// context and form a repetitive pattern. Keep one copy of each run.
-		if msg.UserInputMessage != nil && len(cleaned) > 0 {
-			last := cleaned[len(cleaned)-1]
-			if last.UserInputMessage != nil &&
-				strings.TrimSpace(last.UserInputMessage.Content) == strings.TrimSpace(msg.UserInputMessage.Content) &&
-				strings.TrimSpace(msg.UserInputMessage.Content) != "" &&
-				len(msg.UserInputMessage.Images) == 0 {
-				continue // skip duplicate consecutive user turn
-			}
-		}
-		cleaned = append(cleaned, msg)
-	}
-
-	// Dropping hollow assistant turns can leave history starting with an
-	// assistant message; re-trim so it begins with a user turn.
-	return trimLeadingAssistantHistory(cleaned)
 }
 
 // truncatePayloadToLimit drops the oldest conversation history turns until the
@@ -2048,34 +1857,6 @@ func truncateCurrentMessage(payload *KiroPayload) {
 		}
 		cur.Content = cur.Content[:budget]
 	}
-}
-
-func buildToolResultsContinuation(toolResults []KiroToolResult) string {
-	if len(toolResults) == 0 {
-		return minimalFallbackUserContent
-	}
-
-	parts := make([]string, 0, len(toolResults))
-	for _, tr := range toolResults {
-		if len(tr.Content) == 0 {
-			continue
-		}
-		for _, c := range tr.Content {
-			if strings.TrimSpace(c.Text) != "" {
-				parts = append(parts, c.Text)
-			}
-		}
-	}
-
-	if len(parts) == 0 {
-		return minimalFallbackUserContent
-	}
-
-	joined := toolResultsContinuationPrefix + "\n\n" + strings.Join(parts, "\n\n")
-	if len(joined) > 4000 {
-		return joined[:4000]
-	}
-	return joined
 }
 
 func trimLeadingAssistantHistory(history []KiroHistoryMessage) []KiroHistoryMessage {

@@ -5,13 +5,17 @@ import (
 	"testing"
 )
 
-// TestClaudeToKiroFlattensHistoryToolCyclesForCompaction reproduces the context
-// compaction scenario that triggered upstream HTTP 400 "Improperly formed
-// request": a long conversation whose history contains completed tool cycles
+// TestClaudeToKiroKeepsHistoryToolCyclesStructured covers the context-compaction
+// scenario: a long conversation whose history contains completed tool cycles
 // (assistant tool_use + user tool_result), followed by a plain-text instruction.
-// The generated payload must NOT carry any structured toolUses/toolResults in
-// history, since Kiro's upstream rejects those.
-func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
+//
+// History MUST retain those structured tool pairs. Upstream requires tool calls
+// and results to appear as matched pairs (TOOL_USES_AND_RESULTS /
+// TOOL_RESULTS_AND_NO_USES); it does not reject their presence. This test
+// previously asserted the opposite, encoding the misdiagnosis described in
+// kiro_history_repair.go — stripping the pairs is what produced the "model states
+// an intention then ends the turn" failure.
+func TestClaudeToKiroKeepsHistoryToolCyclesStructured(t *testing.T) {
 	req := &ClaudeRequest{
 		Model: "claude-opus-4.8",
 		Messages: []ClaudeMessage{
@@ -36,19 +40,31 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 
 	payload := ClaudeToKiro(req, false)
 
-	// No history entry may carry structured tool calls or tool results.
-	for i, h := range payload.ConversationState.History {
-		if h.AssistantResponseMessage != nil && len(h.AssistantResponseMessage.ToolUses) > 0 {
-			t.Fatalf("history[%d] still has structured toolUses; upstream rejects this", i)
-		}
-		if h.UserInputMessage != nil && h.UserInputMessage.UserInputMessageContext != nil {
-			if len(h.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
-				t.Fatalf("history[%d] still has structured toolResults; upstream rejects this", i)
+	assertKiroPayloadValid(t, payload)
+
+	// Both historical tool calls survive as structured tool uses.
+	gotUses := map[string]bool{}
+	gotResults := map[string]bool{}
+	for _, h := range payload.ConversationState.History {
+		if a := h.AssistantResponseMessage; a != nil {
+			for _, tu := range a.ToolUses {
+				gotUses[tu.ToolUseID] = true
 			}
+		}
+		for _, tr := range turnToolResults(h) {
+			gotResults[tr.ToolUseID] = true
+		}
+	}
+	for _, id := range []string{"t1", "t2"} {
+		if !gotUses[id] {
+			t.Fatalf("history lost structured tool use %q; upstream requires the pair", id)
+		}
+		if !gotResults[id] {
+			t.Fatalf("history lost structured tool result for %q", id)
 		}
 	}
 
-	// Current message is plain text, so it must not carry structured tool results.
+	// The current message is a plain instruction and must carry no tool results.
 	cur := payload.ConversationState.CurrentMessage.UserInputMessage
 	if cur.UserInputMessageContext != nil && len(cur.UserInputMessageContext.ToolResults) > 0 {
 		t.Fatalf("current message should not carry structured toolResults for a plain instruction")
@@ -57,28 +73,14 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 		t.Fatalf("expected current content to be the compaction instruction, got %q", cur.Content)
 	}
 
-	// The narrated tool activity should survive somewhere in history as text.
-	var historyText strings.Builder
-	for _, h := range payload.ConversationState.History {
-		if h.AssistantResponseMessage != nil {
-			historyText.WriteString(h.AssistantResponseMessage.Content)
-			historyText.WriteString("\n")
-		}
-		if h.UserInputMessage != nil {
-			historyText.WriteString(h.UserInputMessage.Content)
-			historyText.WriteString("\n")
-		}
-	}
-	combined := historyText.String()
-	if !strings.Contains(combined, "exec_command") {
-		t.Fatalf("expected narrated tool calls to mention exec_command, got:\n%s", combined)
-	}
+	// Tool output text must still be readable in the conversation.
+	combined := allConversationText(payload)
 	if !strings.Contains(combined, "tests pass") {
-		t.Fatalf("expected narrated tool results to retain output, got:\n%s", combined)
+		t.Fatalf("expected tool result output to survive, got:\n%s", combined)
 	}
 
-	// Regression guard: assistant turns must NOT contain tool-invocation-looking
-	// text. Such text trains the model to emit it instead of real tool calls.
+	// Regression guard: assistant turns must never contain tool-invocation text.
+	// Such text trains the model to emit it instead of real tool calls.
 	for i, h := range payload.ConversationState.History {
 		if a := h.AssistantResponseMessage; a != nil {
 			if strings.Contains(a.Content, "[Called tool") {
@@ -86,17 +88,11 @@ func TestClaudeToKiroFlattensHistoryToolCyclesForCompaction(t *testing.T) {
 			}
 		}
 	}
-	// Tool identity must be attributed on the user (result) side, never authored
-	// by the assistant.
-	if !strings.Contains(combined, "[exec_command]") {
-		t.Fatalf("expected tool results to be attributed to exec_command on the user side, got:\n%s", combined)
-	}
 }
 
 // TestClaudeToKiroKeepsActiveToolTurnStructured verifies the in-progress tool
-// case still works: the last assistant turn issues a tool_use and the final user
-// message delivers the matching tool_result. That single active turn must remain
-// structured (last history assistant keeps toolUses, current keeps toolResults).
+// case: the last assistant turn issues a tool_use and the final user message
+// delivers the matching tool_result, which must stay structured on both sides.
 func TestClaudeToKiroKeepsActiveToolTurnStructured(t *testing.T) {
 	req := &ClaudeRequest{
 		Model: "claude-opus-4.8",
@@ -113,6 +109,8 @@ func TestClaudeToKiroKeepsActiveToolTurnStructured(t *testing.T) {
 	}
 
 	payload := ClaudeToKiro(req, false)
+
+	assertKiroPayloadValid(t, payload)
 
 	hist := payload.ConversationState.History
 	if len(hist) == 0 {
