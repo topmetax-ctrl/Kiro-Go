@@ -33,7 +33,7 @@ config (or the env var) must match the digests in the database.
 Set `"portalEnabled": false` in `config.json` and restart. `/usage` and
 `/portal/api/*` return 404.
 
-## Strip legacy plaintext (optional, after confidence)
+## Portal session revoke
 
 Portal SSE re-checks the session every 5 seconds. Revoke/disable/logout
 make new HTTP calls fail immediately; an already-open stream closes on
@@ -41,6 +41,10 @@ the next re-auth tick (propagation ≤ 5s). That bound is intentional:
 per-event session lookups would serialize the hot path on the single
 SQLite connection.
 
-Set `"legacyPlaintextRetention": false` is reserved; V1 still keeps
-`apiKeys[].key` so an old binary can boot. Manual strip: edit config and
-remove `key` fields only after you no longer need rollback.
+## Strip legacy plaintext (optional, after confidence)
+
+Default upgrade keeps `apiKeys[].key` so an old binary can boot. After the
+rollback window, call `config.FinalizeLegacyPlaintext` (or an operator
+tool that wraps it). That verify-then-scrub path is irreversible for old
+binaries. Do not flip the flag by hand without verify — a mistyped edit
+can leave SQLite keys that no longer match leftover plaintext.

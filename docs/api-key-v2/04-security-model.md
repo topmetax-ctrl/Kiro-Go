@@ -34,9 +34,16 @@ the digest (when operators use the env override) requires both artifacts.
 | Name | `portal_session` | distinct from `admin_password` |
 | HttpOnly | yes | JS cannot read it |
 | SameSite | Lax | allow top-level GET from share link; block CSRF POST from other sites |
-| Secure | if TLS | MDN / OWASP cookie guidance |
+| Secure | if TLS (`IsTLSEnabled` or `r.TLS`) | production HTTPS; localhost HTTP stays usable |
 | Path | `/portal` | not sent to `/v1/*` |
 | Max-Age | 12h | short-lived |
+
+`GET /usage/p/{token}` sets `Cache-Control: no-store` and
+`Referrer-Policy: no-referrer`, then 302s to `/usage`. HTTP debug logs
+redact the token path. The portal page loads only first-party `/usage/*`
+and `/locales/*` (no third-party scripts). Pepper precedence:
+`KIRO_APIKEY_PEPPER` (memory only) then persisted `apiKeyPepper`. Pepper
+is generated once and saved; it is not regenerated on restart.
 
 Session value is an opaque random ID; only its digest is stored.
 

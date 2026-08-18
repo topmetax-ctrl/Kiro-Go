@@ -36,6 +36,20 @@ Re-running Open + Import 10 times must yield the same row count.
 
 `legacyPlaintextRetention` defaults true: config keys are not stripped.
 
+### Explicit plaintext finalization
+
+After a verification/rollback window, an operator may call
+`config.FinalizeLegacyPlaintext(verify)`. It:
+
+1. verifies every remaining `apiKeys[].key` still authenticates in SQLite;
+2. refuses to scrub if any verify fails;
+3. clears plaintext `key` fields;
+4. sets `legacyPlaintextRetention=false`;
+5. saves atomically (`Save` already writes `.bak`).
+
+Startup never flips the default. SQLite key rows are never deleted. Older
+binaries cannot authenticate those keys after finalization.
+
 ## Rollback
 
 1. Stop new binary.
