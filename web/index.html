@@ -901,6 +901,30 @@
             </table>
           </div>
         </div>
+
+        <!-- Top callers by source IP -->
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="stats.topIpsTitle"></span>
+            <span class="text-xs muted-text" id="statsTopIpsNote"></span>
+          </div>
+          <p class="muted-text text-xs" data-i18n="stats.topIpsIntro"></p>
+          <div class="stats-table-scroll">
+            <table class="stats-table" id="topIpsTable">
+              <thead>
+                <tr>
+                  <th data-i18n="stats.colIp"></th>
+                  <th class="num" data-i18n="stats.colRequests"></th>
+                  <th class="num" data-i18n="stats.colOkPct"></th>
+                  <th class="num" data-i18n="stats.colTokens"></th>
+                  <th class="num" data-i18n="stats.colAvg"></th>
+                  <th class="num" data-i18n="stats.colLastUsed"></th>
+                </tr>
+              </thead>
+              <tbody id="topIpsBody"></tbody>
+            </table>
+          </div>
+        </div>
       </div>
 
       <!-- Console tab -->
@@ -1206,7 +1230,7 @@
           <button class="btn btn-outline btn-sm" id="routeAddTargetBtn" type="button" style="margin-top:0.5rem;">
             + <span data-i18n="upstreams.routeAddTarget"></span>
           </button>
-          <datalist id="routeTargetModelList"></datalist>
+          <datalist id="routeProviderList"></datalist>
           <small data-i18n="upstreams.routeTargetsHint"></small>
         </div>
         <div class="form-group">

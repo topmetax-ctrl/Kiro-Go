@@ -11,6 +11,11 @@ import (
 // so it cannot collide with keys defined in other packages.
 type apiKeyContextKey struct{}
 
+// clientIPContextKey carries the caller's resolved source IP down the request
+// pipeline so the metrics funnel can attribute traffic per source IP without
+// threading the IP through every function signature.
+type clientIPContextKey struct{}
+
 // authError describes why authentication failed. status is the HTTP status code to send.
 type authError struct {
 	status  int
@@ -107,6 +112,27 @@ func apiKeyIDFromContext(ctx context.Context) string {
 		return ""
 	}
 	if v, ok := ctx.Value(apiKeyContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// withClientIPContext attaches the caller's source IP to the request context.
+// An empty IP returns r unchanged so no context allocation happens.
+func withClientIPContext(r *http.Request, ip string) *http.Request {
+	if ip == "" {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), clientIPContextKey{}, ip))
+}
+
+// clientIPFromContext returns the source IP stored by withClientIPContext, or
+// empty string when the request carried none.
+func clientIPFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(clientIPContextKey{}).(string); ok {
 		return v
 	}
 	return ""

@@ -187,6 +187,7 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 			ProviderID:   up.ID,
 			ProviderName: up.Name,
 			Endpoint:     forwardEndpointKind(isClaudeRoute),
+			ClientIP:     clientIPFromContext(r.Context()),
 			Status:       status,
 			LatencyMs:    time.Since(start).Milliseconds(),
 			TTFBMs:       ttfb.Milliseconds(),

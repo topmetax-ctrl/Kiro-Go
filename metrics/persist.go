@@ -15,6 +15,7 @@ type persistedState struct {
 	Overall    persistedCounter             `json:"overall"`
 	ByProvider map[string]persistedProvider `json:"byProvider"`
 	ByRoute    map[string]persistedRoute    `json:"byRoute"`
+	ByIP       map[string]persistedCounter  `json:"byIp,omitempty"`
 }
 
 type persistedCounter struct {
@@ -53,10 +54,10 @@ type persistedAccount struct {
 }
 
 type persistedBucket struct {
-	Hour         int64 `json:"h"`
-	Requests     int64 `json:"r"`
-	Success      int64 `json:"s"`
-	Failed       int64 `json:"f"`
+	Hour         int64   `json:"h"`
+	Requests     int64   `json:"r"`
+	Success      int64   `json:"s"`
+	Failed       int64   `json:"f"`
 	InputTokens  int64   `json:"i,omitempty"`
 	OutputTokens int64   `json:"o,omitempty"`
 	CostUSD      float64 `json:"c,omitempty"`
@@ -144,6 +145,10 @@ func Save(path string) error {
 		Overall:    toPersistedCounter(s.overall),
 		ByProvider: make(map[string]persistedProvider, len(s.byProvider)),
 		ByRoute:    make(map[string]persistedRoute, len(s.byRoute)),
+		ByIP:       make(map[string]persistedCounter, len(s.byIP)),
+	}
+	for ip, c := range s.byIP {
+		st.ByIP[ip] = toPersistedCounter(*c)
 	}
 	for id, p := range s.byProvider {
 		pp := persistedProvider{
@@ -290,6 +295,14 @@ func Load(path string) error {
 			targetModel: r.TargetModel,
 			providerID:  r.ProviderID,
 		}
+	}
+	s.byIP = make(map[string]*counter, len(st.ByIP))
+	for ip, c := range st.ByIP {
+		if len(s.byIP) >= maxTrackedIPs {
+			break
+		}
+		cc := fromPersistedCounter(c)
+		s.byIP[ip] = &cc
 	}
 	return nil
 }

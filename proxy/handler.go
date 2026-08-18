@@ -459,7 +459,7 @@ func (h *Handler) authenticateForClaude(w http.ResponseWriter, r *http.Request) 
 		h.sendClaudeError(w, ae.status, ae.code, ae.message)
 		return nil
 	}
-	return withApiKeyContext(r, entry)
+	return withClientIPContext(withApiKeyContext(r, entry), clientIP(r))
 }
 
 // authenticateForOpenAI runs authenticate and writes an OpenAI-style error on failure.
@@ -473,14 +473,23 @@ func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) 
 		h.sendOpenAIError(w, ae.status, ae.code, ae.message)
 		return nil
 	}
-	return withApiKeyContext(r, entry)
+	return withClientIPContext(withApiKeyContext(r, entry), clientIP(r))
 }
 
-// clientIP resolves the request's client IP. X-Forwarded-For / X-Real-IP are only
-// consulted when TrustProxy is enabled (otherwise a directly-exposed server would
-// trust attacker-supplied headers). The left-most XFF token is the origin client.
+// clientIP resolves the request's client IP. Forwarded-IP headers are only
+// consulted when TrustProxy is enabled (otherwise a directly-exposed server
+// would trust attacker-supplied headers).
+//
+// Header preference matters for correctness behind Cloudflare: a client can
+// prepend its own X-Forwarded-For, and Cloudflare appends the real IP *after*
+// it, so the left-most XFF token is spoofable. CF-Connecting-IP is set (and
+// overwritten) by Cloudflare to the true client IP, so it is preferred when
+// present. XFF/X-Real-IP remain the fallback for non-Cloudflare proxies.
 func clientIP(r *http.Request) string {
 	if config.GetTrustProxy() {
+		if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {
+			return cf
+		}
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			if ip := strings.TrimSpace(strings.Split(xff, ",")[0]); ip != "" {
 				return ip
@@ -1781,6 +1790,7 @@ func (h *Handler) recordFailureWithDetails(ctx context.Context, endpoint, model,
 		ErrorMsg:  errMsg,
 		ErrorType: errType,
 		RouteID:   poolRouteIDFromContext(ctx),
+		ClientIP:  clientIPFromContext(ctx),
 	})
 }
 
@@ -1813,6 +1823,7 @@ func (h *Handler) recordSuccessLogSplit(ctx context.Context, endpoint, model, ac
 		Credits:      credits,
 		DurationMs:   durationMs,
 		RouteID:      poolRouteIDFromContext(ctx),
+		ClientIP:     clientIPFromContext(ctx),
 	})
 }
 
@@ -3050,6 +3061,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiUpstreamTest(w, r)
 	case path == "/forward-stats" && r.Method == "GET":
 		h.apiGetForwardStats(w, r)
+	case path == "/top-ips" && r.Method == "GET":
+		h.apiGetTopIPs(w, r)
 	case path == "/provider-stats" && r.Method == "GET":
 		h.apiGetProviderDetail(w, r)
 	case path == "/forward-history" && r.Method == "GET":
@@ -5505,6 +5518,22 @@ func (h *Handler) apiGetForwardStats(w http.ResponseWriter, r *http.Request) {
 		"timeseries":  metrics.TimeSeries(minutes),
 		"percentiles": metrics.LatencyPercentiles(),
 		"windowHours": hours,
+	})
+}
+
+// apiGetTopIPs returns the source IPs that have generated the most requests.
+// The optional ?limit= caps the list (default 50); limit<=0 returns all.
+func (h *Handler) apiGetTopIPs(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	ips := metrics.TopIPs(limit)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ips":        ips,
+		"trustProxy": config.GetTrustProxy(),
 	})
 }
 

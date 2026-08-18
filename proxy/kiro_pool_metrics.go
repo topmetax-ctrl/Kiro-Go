@@ -38,6 +38,7 @@ type kiroMetric struct {
 	DurationMs   int64
 	ErrorMsg     string
 	ErrorType    string
+	ClientIP     string
 
 	// RouteID attributes this outcome to a forwarding route whose chain ended at
 	// the Kiro-pool sentinel. Empty for ordinary pool traffic (no route matched),
@@ -104,6 +105,7 @@ func recordKiroMetric(m kiroMetric) {
 		AccountID:    m.AccountID,
 		AccountLabel: kiroAccountLabel(m.AccountID),
 		Endpoint:     m.Endpoint,
+		ClientIP:     m.ClientIP,
 		Status:       kiroStatusFor(m),
 		LatencyMs:    m.DurationMs,
 		InputTokens:  int64(m.InputTokens),

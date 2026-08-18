@@ -53,6 +53,7 @@ type Event struct {
 	AccountID    string  `json:"accountId,omitempty"`
 	AccountLabel string  `json:"accountLabel,omitempty"`
 	Endpoint     string  `json:"endpoint,omitempty"` // claude/openai/responses/websearch
+	ClientIP     string  `json:"clientIp,omitempty"` // caller's source IP; empty when not resolved
 	Status       int     `json:"status"`
 	LatencyMs    int64   `json:"latencyMs"`
 	TTFBMs       int64   `json:"ttfbMs,omitempty"` // time to first response byte; 0 when unknown
@@ -295,6 +296,7 @@ type store struct {
 	overall     counter
 	byProvider  map[string]*providerAgg
 	byRoute     map[string]*routeAgg
+	byIP        map[string]*counter
 	buckets     map[int64]*Bucket
 	subscribers map[chan Event]struct{}
 }
@@ -306,6 +308,7 @@ func newStore() *store {
 		ring:        make([]Event, eventRingCapacity),
 		byProvider:  make(map[string]*providerAgg),
 		byRoute:     make(map[string]*routeAgg),
+		byIP:        make(map[string]*counter),
 		buckets:     make(map[int64]*Bucket),
 		subscribers: make(map[chan Event]struct{}),
 	}
@@ -460,6 +463,19 @@ func Record(ev Event) {
 		r.targetModel = ev.TargetModel
 		r.providerID = ev.ProviderID
 		r.add(ev)
+	}
+
+	if ev.ClientIP != "" {
+		ic := s.byIP[ev.ClientIP]
+		// Bound the map so a flood of distinct source IPs (e.g. a scan) cannot
+		// grow it without limit. Once full, only already-tracked IPs update.
+		if ic == nil && len(s.byIP) < maxTrackedIPs {
+			ic = &counter{}
+			s.byIP[ev.ClientIP] = ic
+		}
+		if ic != nil {
+			ic.add(ev)
+		}
 	}
 
 	b := s.buckets[minute]
@@ -1396,6 +1412,7 @@ func Reset() {
 	s.overall = counter{}
 	s.byProvider = make(map[string]*providerAgg)
 	s.byRoute = make(map[string]*routeAgg)
+	s.byIP = make(map[string]*counter)
 	s.buckets = make(map[int64]*Bucket)
 
 	// Re-seed provider entries so names survive the reset (the filter dropdown

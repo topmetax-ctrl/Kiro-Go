@@ -639,6 +639,10 @@
       first.focus({ preventScroll: true });
     }
   }
+  function isDialogOpen(id) {
+    const modal = $(id);
+    return !!modal && modal.classList.contains('active');
+  }
   function openDialog(id) {
     const modal = $(id);
     if (!modal) return;
@@ -3003,24 +3007,63 @@
     dl.innerHTML = kiroGoModels.map(m => '<option value="' + escapeAttr(m) + '"></option>').join('');
   }
 
-  // Fill the Target Model datalist with the selected provider's models.
-  // Target Model rewrites the model name sent upstream, so suggest provider names only.
-  // The field stays free-text and optional; this only adds dropdown suggestions.
-  function populateTargetModelDatalist(pid) {
-    const dl = $('routeTargetModelList');
+  // routeProviderOptions returns the selectable targets (configured upstreams plus
+  // the Kiro pool) with labels made UNIQUE. A searchable text field maps a chosen
+  // label back to exactly one id, so duplicate provider names (allowed in config)
+  // must be disambiguated with a short id suffix or the mapping would be ambiguous.
+  function routeProviderOptions() {
+    const out = (upstreamCache.providers || []).map(p => ({
+      id: p.id || '',
+      label: p.name || p.baseUrl || p.id || ''
+    }));
+    out.push({ id: KIRO_POOL_ID, label: t('upstreams.kiroPoolTarget') });
+    const counts = {};
+    out.forEach(o => { counts[o.label] = (counts[o.label] || 0) + 1; });
+    out.forEach(o => {
+      if (counts[o.label] > 1) o.label = o.label + ' (' + String(o.id).slice(0, 6) + ')';
+    });
+    return out;
+  }
+
+  function routeProviderLabel(id) {
+    const o = routeProviderOptions().find(x => x.id === id);
+    return o ? o.label : '';
+  }
+
+  function routeProviderIdFromLabel(label) {
+    const o = routeProviderOptions().find(x => x.label === label);
+    return o ? o.id : '';
+  }
+
+  // Fill the shared provider datalist so every target row's provider field is a
+  // searchable dropdown (type to filter among many upstreams).
+  function populateProviderDatalist() {
+    const dl = $('routeProviderList');
     if (!dl) return;
+    dl.innerHTML = routeProviderOptions()
+      .map(o => '<option value="' + escapeAttr(o.label) + '"></option>')
+      .join('');
+  }
+
+  // targetModelOptionsHTML builds the <option>s for one row's model datalist from
+  // the row provider's fetched model list.
+  function targetModelOptionsHTML(pid) {
     const opts = (providerModels[pid] || []).filter(Boolean);
-    dl.innerHTML = opts.map(m => '<option value="' + escapeAttr(m) + '"></option>').join('');
-    // If we've never fetched this provider's models, fetch quietly (no modal) so
-    // the datalist fills in without the user having to open the model browser first.
-    if (pid && providerModels[pid] === undefined && !providerModelsLoading[pid]) {
+    return opts.map(m => '<option value="' + escapeAttr(m) + '"></option>').join('');
+  }
+
+  // ensureProviderModels kicks a quiet fetch of a provider's model list (no modal)
+  // the first time it is needed, so each row's model dropdown fills in on its own.
+  function ensureProviderModels(pid) {
+    if (!pid || pid === KIRO_POOL_ID) return;
+    if (providerModels[pid] === undefined && !providerModelsLoading[pid]) {
       fetchProviderModelsSilently(pid);
     }
   }
 
   // Fetch a provider's model list without opening the browser modal. Populates the
-  // providerModels cache and re-renders the Target Model datalist if the route modal
-  // still targets this provider. Failures are swallowed (suggestions only).
+  // providerModels cache and re-renders the route targets so the matching row's
+  // model dropdown fills in. Failures are swallowed (suggestions only).
   async function fetchProviderModelsSilently(pid) {
     const p = upstreamCache.providers.find(x => x.id === pid);
     if (!p) return;
@@ -3036,8 +3079,9 @@
       providerModels[pid] = [];
     } finally {
       providerModelsLoading[pid] = false;
-      const sel = $('routeForm_upstreamId');
-      if (sel && sel.value === pid) populateTargetModelDatalist(pid);
+      // Refresh the open route modal so the row(s) targeting this provider show
+      // the freshly fetched models. Guarded so this is a no-op when closed.
+      if (isDialogOpen('modelRouteModal') && routeTargetDraft.length) renderRouteTargets();
     }
   }
 
@@ -3054,6 +3098,7 @@
     // build, or by hand. Normalize on load so the badges describe the routing the
     // resolver will actually perform rather than the stale config.
     normalizeDraftTiers();
+    populateProviderDatalist();
     renderRouteTargets();
     populateClientModelDatalist();
     openDialog('modelRouteModal');
@@ -3185,12 +3230,6 @@
     box.innerHTML = routeTargetDraft.map((tg, i) => {
       const isPool = tg.upstreamId === KIRO_POOL_ID;
       const unreachable = poolRow >= 0 && i > poolRow;
-      const opts = upstreamCache.providers.map(p =>
-        '<option value="' + escapeAttr(p.id || '') + '"' + (p.id === tg.upstreamId ? ' selected' : '') + '>' +
-          escapeHtml(p.name || p.baseUrl || p.id || '') + '</option>'
-      ).join('') +
-        '<option value="' + escapeAttr(KIRO_POOL_ID) + '"' + (isPool ? ' selected' : '') + '>' +
-          escapeHtml(t('upstreams.kiroPoolTarget')) + '</option>';
       const tier = tiers[i];
       // The pool is never a weighted member of a tier: it terminates the chain
       // rather than being relayed to, so splitting traffic with it is not a thing
@@ -3233,6 +3272,14 @@
       const handle = '<span class="route-target-handle" data-target-handle="1" aria-hidden="true"' +
         ' title="' + escapeAttr(t('common.dragToReorder')) + '">' +
         '<i class="fa-solid fa-grip-vertical"></i></span>';
+      // Each row's model field suggests ITS OWN provider's models via a per-row
+      // datalist. A single shared datalist (the old behaviour) could only ever
+      // reflect one provider, so fallback rows suggested the primary's models.
+      const modelListId = 'routeTargetModelList-' + i;
+      const providerField =
+        '<input type="text" data-target-field="upstreamProvider" data-index="' + i + '" list="routeProviderList"' +
+          ' autocomplete="off" value="' + escapeAttr(routeProviderLabel(tg.upstreamId)) + '" style="flex:1;min-width:9rem;"' +
+          ' placeholder="' + escapeAttr(t('upstreams.providerSearchPlaceholder')) + '" />';
       return '<div class="card route-target-row" draggable="false" data-target-index="' + i + '" style="margin-top:0.5rem;padding:0.5rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' + handle + badge + tierToggle + shareLabel + poolNote + deadNote + '</div>' +
@@ -3246,7 +3293,7 @@
           '</div>' +
         '</div>' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;margin-top:0.35rem;">' +
-          '<select data-target-field="upstreamId" data-index="' + i + '" style="flex:1;min-width:9rem;">' + opts + '</select>' +
+          providerField +
           // Target Model rewrites the model name sent to an upstream HTTP endpoint.
           // The pool is not relayed to, so there is nothing to rewrite: the request
           // reaches the account pool under its original client model name. Showing
@@ -3254,9 +3301,10 @@
           (isPool
             ? '<span class="muted-text text-xs" style="flex:1;min-width:9rem;">' +
                 escapeHtml(t('upstreams.kiroPoolTargetNoRewrite')) + '</span>'
-            : '<input type="text" data-target-field="targetModel" data-index="' + i + '" list="routeTargetModelList" autocomplete="off"' +
+            : '<input type="text" data-target-field="targetModel" data-index="' + i + '" list="' + modelListId + '" autocomplete="off"' +
                 ' value="' + escapeAttr(tg.targetModel || '') + '" style="flex:1;min-width:9rem;"' +
-                ' placeholder="' + escapeAttr(t('upstreams.targetModelPlaceholder')) + '" />') +
+                ' placeholder="' + escapeAttr(t('upstreams.targetModelPlaceholder')) + '" />' +
+              '<datalist id="' + modelListId + '">' + targetModelOptionsHTML(tg.upstreamId) + '</datalist>') +
           '<input type="number" min="1" data-target-field="weight" data-index="' + i + '"' +
             ' value="' + escapeAttr(String(tg.weight > 0 ? tg.weight : 1)) + '" style="width:4.5rem;"' +
             (shares ? '' : ' disabled') +
@@ -3268,8 +3316,9 @@
         '</div>' +
       '</div>';
     }).join('');
-    // Target-model suggestions follow the primary target's provider.
-    populateTargetModelDatalist(routeTargetDraft[0] && routeTargetDraft[0].upstreamId);
+    // Fill each row's model dropdown from its own provider, fetching quietly the
+    // first time a provider's model list is needed.
+    routeTargetDraft.forEach(tg => ensureProviderModels(tg.upstreamId));
   }
 
   function closeRouteModal() {
@@ -3605,9 +3654,33 @@
         const i = parseInt(el.dataset.index, 10);
         if (isNaN(i) || !routeTargetDraft[i]) return;
         const field = el.dataset.targetField;
-        // Captured before the write below, so the re-render check can tell "moved
-        // off the pool" from "was never on it".
-        const wasPool = routeTargetDraft[i].upstreamId === KIRO_POOL_ID;
+        if (field === 'upstreamProvider') {
+          // The provider field is a searchable text combobox. Resolution runs on
+          // 'change' ONLY (option picked, Enter, or blur) — never on 'input':
+          // re-rendering mid-keystroke would destroy the field, close the
+          // datalist and break both typing-to-filter and clicking a suggestion.
+          // Letting 'input' fall through untouched lets the native datalist do
+          // the live filtering.
+          if (e.type !== 'change') return;
+          const id = routeProviderIdFromLabel(el.value);
+          if (!id) {
+            // Partial / unknown label committed: snap back to the current provider
+            // so the field never lingers in an invalid state.
+            renderRouteTargets();
+            return;
+          }
+          if (id === routeTargetDraft[i].upstreamId) {
+            // Same provider re-selected: snap the text to the canonical label.
+            renderRouteTargets();
+            return;
+          }
+          routeTargetDraft[i].upstreamId = id;
+          // Provider changed: the row's model dropdown, weight state, pool shape
+          // and reachability of rows below can all change, so re-render the list.
+          normalizeDraftTiers();
+          renderRouteTargets();
+          return;
+        }
         if (field === 'enabled') routeTargetDraft[i].enabled = el.checked;
         else if (field === 'weight') routeTargetDraft[i].weight = Math.max(1, parseInt(el.value, 10) || 1);
         else if (field === 'sameTier') {
@@ -3621,21 +3694,6 @@
           return;
         }
         else routeTargetDraft[i][field] = el.value;
-        // Selecting the Kiro pool — or moving off it — changes the row's shape, not
-        // just its value: the Target Model input disappears (there is no upstream to
-        // rewrite the name for), weight goes inert, and the rows below become
-        // unreachable. Re-render so the markup matches the new destination.
-        //
-        // normalizeDraftTiers first: a row that just became the pool must not stay
-        // in a shared tier, since the resolver holds the sentinel at the END of its
-        // tier and the badges would then describe an order that cannot happen.
-        if (field === 'upstreamId' && (el.value === KIRO_POOL_ID || wasPool)) {
-          normalizeDraftTiers();
-          renderRouteTargets();
-          return;
-        }
-        // Changing the primary provider changes which model names to suggest.
-        if (field === 'upstreamId' && i === 0) populateTargetModelDatalist(el.value);
       };
       rtTargets.addEventListener('change', applyField);
       rtTargets.addEventListener('input', applyField);
@@ -4676,10 +4734,47 @@
     renderStatsCompare();
   }
 
+  // loadTopIps fetches the per-source-IP leaderboard and renders it. Failures
+  // leave the previous table in place rather than blanking the panel.
+  async function loadTopIps() {
+    try {
+      const res = await api('/top-ips?limit=50');
+      if (!res.ok) throw new Error('http ' + res.status);
+      const d = await res.json();
+      renderTopIps(Array.isArray(d.ips) ? d.ips : [], !!d.trustProxy);
+    } catch (e) {
+      renderTopIps([], false);
+    }
+  }
+
+  function renderTopIps(ips, trustProxy) {
+    const body = $('topIpsBody');
+    if (!body) return;
+    const note = $('statsTopIpsNote');
+    if (note) note.textContent = trustProxy ? t('stats.topIpsProxyOn') : '';
+    if (!ips.length) {
+      body.innerHTML = '<tr><td colspan="6" class="muted-text" style="padding:1rem;text-align:center;">' +
+        escapeHtml(t('stats.topIpsEmpty')) + '</td></tr>';
+      return;
+    }
+    body.innerHTML = ips.map(ip => {
+      const ok = ip.requests ? (100 * (ip.success || 0) / ip.requests) : -1;
+      return '<tr>' +
+        '<td><span class="stats-name font-mono">' + escapeHtml(ip.ip || '—') + '</span></td>' +
+        '<td class="num">' + escapeHtml(formatNum(ip.requests || 0)) + '</td>' +
+        '<td class="num">' + escapeHtml(fwdFmtPct(ok)) + '</td>' +
+        '<td class="num">' + escapeHtml(ip.totalTokens ? formatNum(ip.totalTokens) : '—') + '</td>' +
+        '<td class="num">' + escapeHtml(ip.requests ? fwdFmtLatency(ip.avgLatencyMs) : '—') + '</td>' +
+        '<td class="num">' + escapeHtml(ip.lastUsed ? fwdFmtWhen(ip.lastUsed) : '—') + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
   function openStats() {
     loadForwardStats();
     loadStatsWindow();
     loadStatsHistory();
+    loadTopIps();
   }
 
   function bindStatsEvents() {
