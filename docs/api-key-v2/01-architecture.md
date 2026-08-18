@@ -21,7 +21,8 @@ HTTP
     apikey.Service
          ├── KeyRepository / UsageRepository / EventRepository / PortalRepository
          └── SQLite (data/apikeys.db)
-    metrics.Record ── Subscribe ── admin SSE + portal SSE (filtered + sanitized)
+    metrics.Record ── Subscribe ── admin SSE only
+    apikey.Commit  ── portalHub ── portal SSE (scoped, replayable)
 ```
 
 ## Package boundaries
@@ -53,13 +54,15 @@ otherwise generate a UUID. Attach to context. Never log the API secret.
 
 | Channel | Store | Consumer |
 |---|---|---|
-| `metrics.Event` | memory ring + `Subscribe` | admin forwarding activity, portal LIVE |
-| `request_events` | SQLite | portal/admin history, restart-safe |
-| `usage_hourly` | SQLite | charts (server-side aggregate) |
+| `metrics.Event` | memory ring + `Subscribe` | admin forwarding activity |
+| `request_events` | SQLite | portal history, SSE replay, restart-safe |
+| `usage_hourly` | SQLite | long-range charts (server-side aggregate) |
 | `api_key_usage` | SQLite | lifetime / period totals |
+| portal hub | in-process, bounded | live portal SSE after persist |
 
-Portal SSE: `metrics.Subscribe` → drop if `ApiKeyID` ≠ session key → map to
-`PublicRequestEvent` (no provider, account, route, raw error, prompt).
+Portal SSE: `SubscribePortal(keyID)` first, capture high-water `eventId`,
+replay persisted rows for that key, drain the buffer, then live. Dedupe by
+`eventId`. Slow clients are dropped. `metrics.Subscribe` is not used.
 
 ## Quota authorize / reserve / commit
 

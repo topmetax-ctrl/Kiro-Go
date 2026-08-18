@@ -39,8 +39,10 @@ client and admin contracts.
    never ran). `success` / `failed` / `cancelled` persist and increment any
    observed or estimated tokens/credits so a mid-stream disconnect cannot
    bypass quota. Usage is tagged `usage_source` + `usage_estimated`.
-7. **Reuse `metrics.Subscribe`** for live portal/admin feeds. Do not add a third
-   SSE bus. Persist `request_events` separately so history survives restart.
+7. **Portal live feed is persist-then-publish.** Admin SSE still uses
+   `metrics.Subscribe`. Portal SSE uses a key-scoped hub fed after
+   `request_events` insert so reconnect can replay by `eventId` without a
+   subscribe-after-query gap. `metrics.Subscribe` is not a durable cursor.
 8. **Portal identity is derived from a session**, never from `?keyId=`. API keys
    never appear in URLs. Shareable portal tokens (`pt-…`) are exchanged for a
    session cookie and redirected off the token URL.
@@ -57,8 +59,9 @@ client and admin contracts.
 - **Charge cancelled streams:** originally rejected for compatibility; V1.5
   charges observed/estimated usage because otherwise stream+disconnect bypasses
   token quota. Credits still only come from metering events (often 0 on cancel).
-- **A new SSE subsystem:** `metrics.Subscribe` already has heartbeat, backfill,
-  and slow-consumer drop semantics.
+- **Portal live via `metrics.Subscribe` only:** the in-memory ring has no
+  stable `eventId`, no restart replay, and a query-then-subscribe race.
+  Admin SSE still reuses that bus. Portal needs persist-then-publish.
 
 ## Consequences
 

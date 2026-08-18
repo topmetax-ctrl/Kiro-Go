@@ -18,9 +18,9 @@ See [03-api-contract.md](03-api-contract.md) for envelopes and field lists.
 - `DELETE /portal/api/session`
 - `GET /portal/api/me`
 - `GET /portal/api/summary`
-- `GET /portal/api/usage?range=LIVE|1H|6H|24H|7D|30D|CUSTOM&from&to`
-- `GET /portal/api/events?range&model&endpoint&status&stream&offset&limit`
-- `GET /portal/api/events/stream` SSE
+- `GET /portal/api/usage?range&from&to&model&endpoint&status&streaming&error_code&metric`
+- `GET /portal/api/events?range&from&to&model&endpoint&status&streaming&error_code&cursor&limit`
+- `GET /portal/api/events/stream` SSE (`Last-Event-ID` or `after`)
 
 ## Pages
 
