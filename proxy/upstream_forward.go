@@ -387,7 +387,7 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 		h.sendForwardStreamError(w, isClaudeRoute, reason)
 		h.recordFailure()
 		recordMetric(resp.StatusCode, false, reason)
-		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, apikey.ErrorProviderError, reason, resp.StatusCode, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), stream)
+		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, apikey.ErrorProviderError, reason, resp.StatusCode, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
 		return forwardOutcome{committed: true, status: resp.StatusCode}
 	}
 
@@ -407,7 +407,7 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 		h.recordSuccessForApiKey(r.Context(), apiKeyID, inTok, outTok, 0)
 	} else if !ok {
 		h.recordFailure()
-		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, apikey.ClassifyPublicError(resp.StatusCode, "api_error", upstreamErrMsg), upstreamErrMsg, resp.StatusCode, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), stream)
+		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, apikey.ClassifyPublicError(resp.StatusCode, "api_error", upstreamErrMsg), upstreamErrMsg, resp.StatusCode, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
 	}
 
 	// Record the metric at the very end, so LatencyMs covers the full relay
@@ -423,7 +423,7 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 	if relayErr != nil && r.Context().Err() != nil {
 		logger.Debugf("[Forward] client disconnected mid-relay from %s", up.Name)
 		recordMetric(499, false, "client canceled")
-		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeCancelled, forwardEndpointKind(isClaudeRoute), model, apikey.ErrorClientCancelled, "client canceled", 499, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), stream)
+		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeCancelled, forwardEndpointKind(isClaudeRoute), model, apikey.ErrorClientCancelled, "client canceled", 499, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
 		return forwardOutcome{committed: true, canceled: true, status: 499}
 	}
 	internalErr := ""

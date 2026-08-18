@@ -17,6 +17,7 @@ var (
 	portalSSEReplaysTotal      atomic.Int64
 	portalSSEReplayedEvents    atomic.Int64
 	portalSSESlowClients       atomic.Int64
+	portalSSEReplayTruncated   atomic.Int64
 	portalQueryErrors          atomic.Int64
 )
 
@@ -52,7 +53,8 @@ func DecPortalSSEConn() {
 		}
 	}
 }
-func IncPortalSSESlow() { portalSSESlowClients.Add(1) }
+func IncPortalSSESlow()         { portalSSESlowClients.Add(1) }
+func IncPortalReplayTruncated() { portalSSEReplayTruncated.Add(1) }
 func IncPortalReplay(n int) {
 	portalSSEReplaysTotal.Add(1)
 	if n > 0 {
@@ -67,6 +69,7 @@ func PortalSSEConnectionsTotal() int64  { return portalSSEConnectionsTotal.Load(
 func PortalSSEReplays() int64           { return portalSSEReplaysTotal.Load() }
 func PortalSSEReplayedEvents() int64    { return portalSSEReplayedEvents.Load() }
 func PortalSSESlowClients() int64       { return portalSSESlowClients.Load() }
+func PortalSSEReplayTruncated() int64   { return portalSSEReplayTruncated.Load() }
 func PortalQueryErrors() int64          { return portalQueryErrors.Load() }
 
 func SettlementTotals() (success, failed, cancelled, rejected int64) {
@@ -89,5 +92,6 @@ func ResetObservabilityForTest() {
 	portalSSEReplaysTotal.Store(0)
 	portalSSEReplayedEvents.Store(0)
 	portalSSESlowClients.Store(0)
+	portalSSEReplayTruncated.Store(0)
 	portalQueryErrors.Store(0)
 }

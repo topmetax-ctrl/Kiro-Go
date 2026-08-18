@@ -379,6 +379,7 @@ type Summary struct {
 	Status         string
 	SuccessRate    float64
 	AvgLatencyMs   float64
+	AvgTTFBMs      *float64
 	HasPortalToken bool
 	NextReset      *time.Time
 }

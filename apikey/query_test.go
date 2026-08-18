@@ -356,4 +356,11 @@ func TestUnknownTTFBNotZero(t *testing.T) {
 	if !found {
 		t.Fatal("missing zero ttfb event")
 	}
+	sum, err := s.Summary(rec.Key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.AvgTTFBMs == nil || *sum.AvgTTFBMs != 0 {
+		t.Fatalf("summary avg TTFB must use known zeros, got %v", sum.AvgTTFBMs)
+	}
 }

@@ -319,6 +319,78 @@ func TestRevokeClosesSession(t *testing.T) {
 	}
 }
 
+func TestReplayTruncatedWhenBacklogExceedsCap(t *testing.T) {
+	ResetObservabilityForTest()
+	s := testService(t)
+	rec, _, _ := s.Create(CreateInput{Name: "cap", Enabled: true})
+	n := MaxEventReplay + 25
+	for i := 0; i < n; i++ {
+		if err := s.Commit(rec.Key.ID, CommitInput{
+			RequestID: fmt.Sprintf("cap-%d", i), Outcome: OutcomeSuccess,
+			Endpoint: "openai", StatusCode: 200,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hw, _ := s.EventHighWater(rec.Key.ID)
+	stream, err := s.OpenPortalStream(rec.Key.ID, 0, EventQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream.Cancel()
+	if stream.Truncated {
+		t.Fatal("first connect must not replay or truncate")
+	}
+
+	stream, err = s.OpenPortalStream(rec.Key.ID, hw-int64(n)+1, EventQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Cancel()
+	if !stream.Truncated {
+		t.Fatal("expected truncated replay when backlog exceeds cap")
+	}
+	if len(stream.Replay) != MaxEventReplay {
+		t.Fatalf("replay %d want %d", len(stream.Replay), MaxEventReplay)
+	}
+	if PortalSSEReplayTruncated() < 1 {
+		t.Fatal("expected truncated counter")
+	}
+	if UnsettledReservations() != 0 {
+		t.Fatalf("unsettled %d", UnsettledReservations())
+	}
+}
+
+func TestFilteredReplayNotTruncatedWhenFewMatch(t *testing.T) {
+	s := testService(t)
+	rec, _, _ := s.Create(CreateInput{Name: "flt", Enabled: true})
+	_ = s.Commit(rec.Key.ID, CommitInput{
+		RequestID: "anchor", Outcome: OutcomeSuccess, Endpoint: "openai", StatusCode: 200,
+	})
+	anchor, _ := s.EventHighWater(rec.Key.ID)
+	for i := 0; i < MaxEventReplay+10; i++ {
+		status := OutcomeSuccess
+		if i < 3 {
+			status = OutcomeFailed
+		}
+		_ = s.Commit(rec.Key.ID, CommitInput{
+			RequestID: fmt.Sprintf("f-%d", i), Outcome: status,
+			Endpoint: "openai", StatusCode: 200,
+		})
+	}
+	stream, err := s.OpenPortalStream(rec.Key.ID, anchor, EventQuery{Status: OutcomeFailed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Cancel()
+	if stream.Truncated {
+		t.Fatal("filter matching fewer than the cap must not truncate")
+	}
+	if len(stream.Replay) != 3 {
+		t.Fatalf("filtered replay %d", len(stream.Replay))
+	}
+}
+
 func TestDisabledKeyKillsSession(t *testing.T) {
 	s := testService(t)
 	rec, secret, _ := s.Create(CreateInput{Name: "d", Enabled: true})

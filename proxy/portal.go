@@ -247,6 +247,7 @@ func portalSummaryJSON(sum apikey.Summary) map[string]interface{} {
 		"status":                sum.Status,
 		"successRate":           sum.SuccessRate,
 		"avgLatencyMs":          sum.AvgLatencyMs,
+		"avgTtfbMs":             sum.AvgTTFBMs,
 		"lastUsedAt":            unixOrNil(rec.Key.LastUsedAt),
 		"expiresAt":             unixOrNil(rec.Key.ExpiresAt),
 		"nextReset":             unixOrNil(sum.NextReset),
@@ -344,6 +345,8 @@ func (h *Handler) portalEvents(w http.ResponseWriter, r *http.Request) {
 		"from":             page.From,
 		"to":               page.To,
 		"resolution":       page.Resolution,
+		"bucketSeconds":    page.BucketSeconds,
+		"source":           page.Source,
 		"truncated":        page.Truncated,
 		"rawAvailableFrom": page.RawAvailableFrom,
 		"dataRetention":    page.DataRetention,
@@ -403,12 +406,25 @@ func (h *Handler) portalEventStream(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	fmt.Fprintf(w, ": connected\n\n")
+	// retry: is required so EventSource does not use an undefined default
+	// after a proxy drop. 4xx is forbidden here: browsers stop reconnecting.
+	fmt.Fprintf(w, "retry: 3000\n: connected\n\n")
 	flusher.Flush()
 	for _, ev := range stream.Replay {
 		writePub(ev)
 	}
-	flusher.Flush()
+	if stream.Truncated {
+		payload, _ := json.Marshal(map[string]interface{}{
+			"reason":      "replay_truncated",
+			"lastEventId": stream.LastEventID,
+			"highWater":   stream.HighWater,
+			"replayed":    len(stream.Replay),
+		})
+		// Advance Last-Event-ID to highWater so the next browser reconnect
+		// does not re-request the same overflowed backlog.
+		fmt.Fprintf(w, "id: %d\nevent: sync_required\ndata: %s\n\n", stream.HighWater, payload)
+		flusher.Flush()
+	}
 
 	exp, expErr := h.keys.SessionExpiry(sid)
 	deadline := time.Now().Add(12 * time.Hour)

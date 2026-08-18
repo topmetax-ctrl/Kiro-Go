@@ -1863,7 +1863,7 @@ func (h *Handler) recordAccountedSuccess(ctx context.Context, apiKeyID string, a
 	h.recordSuccessForApiKey(ctx, apiKeyID, accountedIn, accountedOut, credits)
 }
 
-func (h *Handler) commitAPIKeyOutcome(ctx context.Context, outcome, endpoint, model, errCode, errMsg string, status int, inTok, outTok int, credits float64, latencyMs, ttfbMs int64, stream bool) {
+func (h *Handler) commitAPIKeyOutcome(ctx context.Context, outcome, endpoint, model, errCode, errMsg string, status int, inTok, outTok int, credits float64, latencyMs, ttfbMs int64, ttfbKnown bool, stream bool) {
 	id := apiKeyIDFromContext(ctx)
 	if id == "" || h.keys == nil {
 		return
@@ -1880,7 +1880,7 @@ func (h *Handler) commitAPIKeyOutcome(ctx context.Context, outcome, endpoint, mo
 		StatusCode:     status,
 		LatencyMs:      latencyMs,
 		TTFBMs:         ttfbMs,
-		TTFBKnown:      ttfbMs > 0,
+		TTFBKnown:      ttfbKnown,
 		Stream:         stream,
 		ErrorCode:      classifyStoredError(status, errCode, errMsg),
 		SanitizedError: errMsg,
@@ -1945,7 +1945,7 @@ func (h *Handler) recordFailureWithDetails(ctx context.Context, endpoint, model,
 		ApiKeyID:  apiKeyIDFromContext(ctx),
 		RequestID: requestIDFromContext(ctx),
 	})
-	h.commitAPIKeyOutcome(ctx, apikey.OutcomeFailed, endpoint, model, errType, errMsg, kiroStatusFor(kiroMetric{ErrorType: errType}), 0, 0, 0, 0, 0, false)
+	h.commitAPIKeyOutcome(ctx, apikey.OutcomeFailed, endpoint, model, errType, errMsg, kiroStatusFor(kiroMetric{ErrorType: errType}), 0, 0, 0, 0, 0, false, false)
 }
 
 // recordSuccessLogSplit records a successful request in the request logs and in

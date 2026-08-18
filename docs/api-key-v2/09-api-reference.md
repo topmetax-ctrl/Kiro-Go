@@ -20,7 +20,7 @@ See [03-api-contract.md](03-api-contract.md) for envelopes and field lists.
 - `GET /portal/api/summary`
 - `GET /portal/api/usage?range&from&to&model&endpoint&status&streaming&error_code&metric`
 - `GET /portal/api/events?range&from&to&model&endpoint&status&streaming&error_code&cursor&limit`
-- `GET /portal/api/events/stream` SSE (`Last-Event-ID` or `after`)
+- `GET /portal/api/events/stream` SSE (`Last-Event-ID` or `after`; named events `request`, `sync_required`, `session`)
 
 ## Pages
 

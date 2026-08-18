@@ -279,6 +279,67 @@ func TestPortalSSEExpiredSessionReconnect(t *testing.T) {
 	}
 }
 
+func TestPortalSSESyncRequiredOnReplayOverflow(t *testing.T) {
+	h, svc := testKeyHandler(t)
+	rec, sa, err := svc.Create(apikey.CreateInput{Name: "overflow", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := apikey.MaxEventReplay + 8
+	for i := 0; i < n; i++ {
+		if err := svc.Commit(rec.Key.ID, apikey.CommitInput{
+			RequestID: fmt.Sprintf("ov-%d", i), Outcome: apikey.OutcomeSuccess,
+			Endpoint: "openai", StatusCode: 200,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hw, _ := svc.EventHighWater(rec.Key.ID)
+	srv := httptest.NewServer(http.HandlerFunc(h.handlePortal))
+	t.Cleanup(srv.Close)
+	res, err := http.Post(srv.URL+"/portal/api/session", "application/json", strings.NewReader(`{"key":"`+sa+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookies := res.Cookies()
+	_ = res.Body.Close()
+
+	// 4xx would permanently stop EventSource. Overflow must stay 200 + control event.
+	stream, cancel := openPortalSSE(t, srv, cookies, "", "1")
+	defer cancel()
+	defer stream.Body.Close()
+	frames := readSSE(stream.Body, func(fs []sseFrame) bool {
+		for _, f := range fs {
+			if f.Event == "sync_required" {
+				return true
+			}
+		}
+		return false
+	}, 3*time.Second)
+	var sync sseFrame
+	for _, f := range frames {
+		if f.Event == "sync_required" {
+			sync = f
+		}
+	}
+	if sync.Event == "" {
+		t.Fatal("expected sync_required, not a silent gap")
+	}
+	if sync.ID != fmt.Sprintf("%d", hw) {
+		t.Fatalf("sync id %q want highWater %d", sync.ID, hw)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal([]byte(sync.Data), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["reason"] != "replay_truncated" {
+		t.Fatalf("reason %v", body["reason"])
+	}
+	if int(body["highWater"].(float64)) != int(hw) {
+		t.Fatalf("highWater %v", body["highWater"])
+	}
+}
+
 func TestPortalTokenRevokeKillsSSE(t *testing.T) {
 	prev := portalSSEReauth
 	portalSSEReauth = 30 * time.Millisecond

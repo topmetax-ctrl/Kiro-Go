@@ -89,10 +89,12 @@ func (s *Service) publishPortal(ev PublicEvent) {
 
 // PortalStream is the replay/live handoff for one SSE connection.
 type PortalStream struct {
-	Replay    []PublicEvent
-	Live      <-chan PublicEvent
-	Cancel    func()
-	HighWater int64
+	Replay      []PublicEvent
+	Live        <-chan PublicEvent
+	Cancel      func()
+	HighWater   int64
+	LastEventID int64
+	Truncated   bool
 }
 
 // OpenPortalStream implements subscribe-first handoff:
@@ -119,22 +121,28 @@ func (s *Service) OpenPortalStream(keyID string, lastEventID int64, filter Event
 		s.handoffHook("watermarked")
 	}
 	var replay []PublicEvent
+	var truncated bool
 	if lastEventID > 0 && hw > lastEventID {
-		replay, err = s.ReplayEvents(keyID, lastEventID, hw, filter, MaxEventReplay)
+		replay, truncated, err = s.ReplayEvents(keyID, lastEventID, hw, filter, MaxEventReplay)
 		if err != nil {
 			cancel()
 			return nil, err
 		}
 		IncPortalReplay(len(replay))
+		if truncated {
+			IncPortalReplayTruncated()
+		}
 	}
 	if s.handoffHook != nil {
 		s.handoffHook("replayed")
 	}
 	return &PortalStream{
-		Replay:    replay,
-		Live:      live,
-		Cancel:    cancel,
-		HighWater: hw,
+		Replay:      replay,
+		Live:        live,
+		Cancel:      cancel,
+		HighWater:   hw,
+		LastEventID: lastEventID,
+		Truncated:   truncated,
 	}, nil
 }
 
@@ -154,9 +162,13 @@ func (s *Service) EventHighWater(keyID string) (int64, error) {
 	return id, err
 }
 
-func (s *Service) ReplayEvents(keyID string, afterID, throughID int64, q EventQuery, limit int) ([]PublicEvent, error) {
+// ReplayEvents returns persisted events in (afterID, throughID] in id order.
+// limit+1 detects overflow: Truncated means the matching backlog exceeded the
+// replay cap. A filter that matches fewer rows than the cap is not truncated
+// even if unfiltered ids jumped by more than the cap.
+func (s *Service) ReplayEvents(keyID string, afterID, throughID int64, q EventQuery, limit int) ([]PublicEvent, bool, error) {
 	if keyID == "" {
-		return nil, ErrNotFound
+		return nil, false, ErrNotFound
 	}
 	if limit <= 0 || limit > MaxEventReplay {
 		limit = MaxEventReplay
@@ -165,10 +177,18 @@ func (s *Service) ReplayEvents(keyID string, afterID, throughID int64, q EventQu
 	where += " AND id > ? AND id <= ?"
 	args = append(args, afterID, throughID)
 	rows, err := s.db.Query(`SELECT `+eventSelectCols+` FROM request_events WHERE `+where+` ORDER BY id ASC LIMIT ?`,
-		append(args, limit)...)
+		append(args, limit+1)...)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer rows.Close()
-	return scanEvents(rows, keyID)
+	events, err := scanEvents(rows, keyID)
+	if err != nil {
+		return nil, false, err
+	}
+	truncated := len(events) > limit
+	if truncated {
+		events = events[:limit]
+	}
+	return events, truncated, nil
 }

@@ -124,10 +124,23 @@ data: {public event}
 
 Reconnect sends `Last-Event-ID`. Handoff is subscribe-first, then
 high-water, then replay `(lastId, highWater]`, then live with
-`eventId` dedupe. A slow client is disconnected (bounded buffer) and
-must replay. Session is re-checked every 5s; logout, disable, token
-revoke, and TTL close the stream. Heartbeats are SSE comments, not
-fake request events.
+`eventId` dedupe. Replay is capped at 500 matching events. If the
+matching backlog exceeds the cap the stream stays **200** (a 4xx
+would stop `EventSource`) and emits:
+
+```
+id: <highWater>
+event: sync_required
+data: {"reason":"replay_truncated","lastEventId":N,"highWater":M,"replayed":K}
+```
+
+The client must refetch summary + history + series, then continue
+live. `id: highWater` advances `Last-Event-ID` so the next reconnect
+does not re-request the same overflow. A slow client is disconnected
+(bounded buffer) and must replay. Session is re-checked every 5s;
+logout, disable, token revoke, and TTL close the stream. Heartbeats
+are SSE comments, not fake request events. The stream opens with
+`retry: 3000`.
 
 `ttfbMs` is nullable. Unknown is `null`, never `0`. `0` means a
 measured zero.

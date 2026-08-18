@@ -350,6 +350,12 @@ func (s *Service) Summary(keyID string) (Summary, error) {
 	if n > 0 {
 		sum.AvgLatencyMs = float64(latSum) / float64(n)
 	}
+	var ttfbSum, ttfbN int64
+	_ = s.db.QueryRow(`SELECT COALESCE(SUM(ttfb_ms),0), COUNT(*) FROM request_events WHERE key_id=? AND ttfb_known=1`, keyID).Scan(&ttfbSum, &ttfbN)
+	if ttfbN > 0 {
+		avg := float64(ttfbSum) / float64(ttfbN)
+		sum.AvgTTFBMs = &avg
+	}
 	var tok int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM portal_tokens WHERE key_id=? AND revoked_at IS NULL`, keyID).Scan(&tok)
 	sum.HasPortalToken = tok > 0
