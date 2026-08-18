@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"kiro-go/apikey"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"kiro-go/metrics"
@@ -188,6 +189,8 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 			ProviderName: up.Name,
 			Endpoint:     forwardEndpointKind(isClaudeRoute),
 			ClientIP:     clientIPFromContext(r.Context()),
+			ApiKeyID:     apiKeyID,
+			RequestID:    requestIDFromContext(r.Context()),
 			Status:       status,
 			LatencyMs:    time.Since(start).Milliseconds(),
 			TTFBMs:       ttfb.Milliseconds(),
@@ -384,6 +387,7 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 		h.sendForwardStreamError(w, isClaudeRoute, reason)
 		h.recordFailure()
 		recordMetric(resp.StatusCode, false, reason)
+		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, apikey.ErrorProviderError, reason, resp.StatusCode, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), stream)
 		return forwardOutcome{committed: true, status: resp.StatusCode}
 	}
 
@@ -395,9 +399,15 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 	// fabricated pricing; multiplier defaults to 1.
 	if ok && relayErr == nil {
 		inTok, outTok := forwardedUsageTokens(resp, usage)
-		h.recordSuccessForApiKey(apiKeyID, inTok, outTok, 0)
+		src := apikey.UsageSourceUpstream
+		if inTok == 0 && outTok == 0 {
+			src = apikey.UsageSourceEstimator
+		}
+		noteAPIKeyUsage(r.Context(), int64(inTok), int64(outTok), 0, src, src == apikey.UsageSourceEstimator)
+		h.recordSuccessForApiKey(r.Context(), apiKeyID, inTok, outTok, 0)
 	} else if !ok {
 		h.recordFailure()
+		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, apikey.ClassifyPublicError(resp.StatusCode, "api_error", upstreamErrMsg), upstreamErrMsg, resp.StatusCode, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), stream)
 	}
 
 	// Record the metric at the very end, so LatencyMs covers the full relay
@@ -413,6 +423,7 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 	if relayErr != nil && r.Context().Err() != nil {
 		logger.Debugf("[Forward] client disconnected mid-relay from %s", up.Name)
 		recordMetric(499, false, "client canceled")
+		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeCancelled, forwardEndpointKind(isClaudeRoute), model, apikey.ErrorClientCancelled, "client canceled", 499, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), stream)
 		return forwardOutcome{committed: true, canceled: true, status: 499}
 	}
 	internalErr := ""

@@ -386,6 +386,16 @@ type Config struct {
 	ApiKey        string        `json:"apiKey,omitempty"`  // [Deprecated] Legacy single API key, migrated into ApiKeys on first load
 	RequireApiKey bool          `json:"requireApiKey"`     // [Deprecated] Whether to enforce API key validation; with multi-key support, len(ApiKeys)>0 implicitly enforces auth
 	ApiKeys       []ApiKeyEntry `json:"apiKeys,omitempty"` // Multiple API keys, each with independent quota
+	// APIKeyPepper is the HMAC key for api-key v2 secret digests. Generated on
+	// first use and persisted (0600). Override in memory with KIRO_APIKEY_PEPPER.
+	APIKeyPepper string `json:"apiKeyPepper,omitempty"`
+	// PortalEnabled defaults true when nil. Public /usage is served only when true.
+	PortalEnabled *bool `json:"portalEnabled,omitempty"`
+	// UsageRetentionDays is the raw request_events TTL. 0 means the 30-day default.
+	UsageRetentionDays int `json:"usageRetentionDays,omitempty"`
+	// LegacyPlaintextRetention defaults true: keep apiKeys[].key in this file so
+	// an older binary can still boot after rollback.
+	LegacyPlaintextRetention *bool `json:"legacyPlaintextRetention,omitempty"`
 	KiroVersion   string        `json:"kiroVersion,omitempty"`
 	SystemVersion string        `json:"systemVersion,omitempty"`
 	NodeVersion   string        `json:"nodeVersion,omitempty"`

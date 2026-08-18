@@ -552,7 +552,7 @@ func (h *Handler) handleWebSearchRequest(ctx context.Context, w http.ResponseWri
 		accountID = account.ID
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, 0)
 	}
-	h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, 0)
+	h.recordSuccessForApiKey(ctx, apiKeyID, inputTokens, outputTokens, 0)
 	h.recordSuccessLogSplit(ctx, "claude", req.Model, accountID, inputTokens, outputTokens, 0, time.Since(reqStart).Milliseconds())
 
 	if req.Stream {

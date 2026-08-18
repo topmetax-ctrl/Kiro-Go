@@ -34,6 +34,8 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	if strings.TrimSpace(req.Model) == "" {
 		req.Model = defaultResponsesModel
 	}
+	clientModel := req.Model
+	noteAPIKeyMeta(r.Context(), "responses", clientModel, "", req.Stream)
 
 	// Forward to an external upstream when the client model matches an enabled
 	// route. Uses the raw client body (passthrough), bypassing the Kiro pool.
@@ -126,6 +128,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	actualModel, thinking, nameEffort := ParseModelThinkingAndEffort(req.Model, thinkingCfg.Suffix)
 	openaiReq.Model = actualModel
 	applyOpenAIModelNameEffort(openaiReq, nameEffort)
+	noteAPIKeyMeta(r.Context(), "responses", clientModel, actualModel, req.Stream)
 
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
@@ -165,10 +168,13 @@ func (h *Handler) handleResponsesNonStream(
 	// Non-stream: fully buffered, so the guard is never committed and a late
 	// upstream error can still retry (invariant #7). No committed-failure branch.
 	reqStart := time.Now()
+	acc := newAPIKeyUsageAcc(estimatedInputTokens)
+	defer noteLeaseUsageOnExit(ctx, acc)
 	guard := &streamGuard{}
 	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
 	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
+		acc.markProviderStarted()
 		var content, reasoningContent string
 		var toolUses []KiroToolUse
 		var inputTokens, outputTokens int
@@ -192,6 +198,7 @@ func (h *Handler) handleResponsesNonStream(
 			},
 			OnStopReason: func(reason string) { upstreamStopReason = reason },
 		}
+		callback = observeKiroCallback(acc, callback)
 
 		measure := func() (int, int, string, bool) {
 			return len(content), len(toolUses), upstreamStopReason, reasoningContent != ""
@@ -205,6 +212,7 @@ func (h *Handler) handleResponsesNonStream(
 			outputTokens = 0
 			credits = 0
 			realInputTokens = 0
+			acc.resetObserved()
 			upstreamStopReason = ""
 		}
 
@@ -242,7 +250,7 @@ func (h *Handler) handleResponsesNonStream(
 		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
 		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
 
-		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
+		h.recordAccountedSuccess(ctx, apiKeyID, accountedInput, accountedOutput, credits, upstreamInput, outputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		// The responses path keeps no RequestLog entry (it predates that ring),
@@ -378,6 +386,9 @@ func (h *Handler) handleResponsesStream(
 		return
 	}
 
+	acc := newAPIKeyUsageAcc(estimatedInputTokens)
+	defer noteLeaseUsageOnExit(ctx, acc)
+
 	send := func(eventName string, payload interface{}) {
 		data, err := json.Marshal(payload)
 		if err != nil {
@@ -408,6 +419,7 @@ func (h *Handler) handleResponsesStream(
 	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
 	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
+		acc.markProviderStarted()
 		send("response.in_progress", map[string]interface{}{
 			"type":     "response.in_progress",
 			"response": initial,
@@ -550,6 +562,7 @@ func (h *Handler) handleResponsesStream(
 			},
 			OnStopReason: func(reason string) { upstreamStopReason = reason },
 		}
+		callback = observeKiroCallback(acc, callback)
 
 		measure := func() (int, int, string, bool) {
 			return fullText.Len(), len(toolUses), upstreamStopReason, reasoningText.Len() > 0
@@ -567,6 +580,7 @@ func (h *Handler) handleResponsesStream(
 			credits = 0
 			realInputTokens = 0
 			upstreamStopReason = ""
+			acc.resetObserved()
 		}
 
 		// canRetry mirrors the guard: once a client-visible byte is out, a retry
@@ -632,7 +646,7 @@ func (h *Handler) handleResponsesStream(
 		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
 		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
 
-		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
+		h.recordAccountedSuccess(ctx, apiKeyID, accountedInput, accountedOutput, credits, upstreamInput, outputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		// The responses path keeps no RequestLog entry (it predates that ring),
@@ -670,7 +684,8 @@ func (h *Handler) handleResponsesStream(
 		return attemptHandled()
 	}
 
-	sendResponseFailed := func(message string) {
+	sendResponseFailed := func(status int, message string) {
+		noteAPIKeyHTTPStatus(ctx, status, "server_error", message)
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
 			"response": map[string]interface{}{
@@ -689,19 +704,20 @@ func (h *Handler) handleResponsesStream(
 	// handleAccountFailure on the committed branch (only the uncommitted retry
 	// branch did), so onCommitted must not either.
 	onCommitted := func(_ *config.Account, err error) {
-		sendResponseFailed(err.Error())
+		sendResponseFailed(http.StatusInternalServerError, err.Error())
 		h.recordFailure()
 	}
 
 	onExhausted := func(noAccounts bool, lastErr error) {
 		if noAccounts {
 			// No account was ever usable: emit response.failed with no recordFailure,
-			// matching the pre-refactor tail.
-			sendResponseFailed("No available accounts")
+			// matching the pre-refactor tail. The API-key lease still settles as
+			// rejected so the reservation cannot leak or fake-exhaust quota.
+			sendResponseFailed(http.StatusServiceUnavailable, "No available accounts")
 			return
 		}
 		h.recordFailure()
-		sendResponseFailed(lastErr.Error())
+		sendResponseFailed(http.StatusInternalServerError, lastErr.Error())
 	}
 
 	ex.Run(ctx, guard, attempt, onCommitted, onExhausted)

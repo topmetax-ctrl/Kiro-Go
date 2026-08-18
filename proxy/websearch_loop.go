@@ -130,7 +130,7 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 			h.pool.RecordSuccess(lastAccountID)
 			h.pool.UpdateStats(lastAccountID, inputTokens+outputTokens, totalCredits)
 		}
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, totalCredits)
+		h.recordSuccessForApiKey(ctx, apiKeyID, inputTokens, outputTokens, totalCredits)
 		h.recordSuccessLogSplit(ctx, "claude", req.Model, lastAccountID, inputTokens, outputTokens, totalCredits, time.Since(reqStart).Milliseconds())
 
 		if req.Stream {

@@ -54,6 +54,8 @@ type Event struct {
 	AccountLabel string  `json:"accountLabel,omitempty"`
 	Endpoint     string  `json:"endpoint,omitempty"` // claude/openai/responses/websearch
 	ClientIP     string  `json:"clientIp,omitempty"` // caller's source IP; empty when not resolved
+	RequestID    string  `json:"requestId,omitempty"`
+	ApiKeyID     string  `json:"apiKeyId,omitempty"`
 	Status       int     `json:"status"`
 	LatencyMs    int64   `json:"latencyMs"`
 	TTFBMs       int64   `json:"ttfbMs,omitempty"` // time to first response byte; 0 when unknown

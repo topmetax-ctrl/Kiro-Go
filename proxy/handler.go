@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"kiro-go/apikey"
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -18,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -73,16 +75,20 @@ const requestLogsMaxSize = 500
 type Handler struct {
 	pool *pool.AccountPool
 	// 运行时统计 (使用原子操作)
-	totalRequests   int64
-	successRequests int64
-	failedRequests  int64
-	totalTokens     int64
-	totalCredits    float64 // float64 需要用锁保护
-	creditsMu       sync.RWMutex
-	startTime       int64
-	stopRefresh     chan struct{}
-	stopStatsSaver  chan struct{}
-	shutdownOnce    sync.Once
+	totalRequests    int64
+	successRequests  int64
+	failedRequests   int64
+	totalTokens      int64
+	totalCredits     float64 // float64 需要用锁保护
+	creditsMu        sync.RWMutex
+	startTime        int64
+	stopRefresh      chan struct{}
+	stopStatsSaver   chan struct{}
+	stopKeyRetention chan struct{}
+	shutdownOnce     sync.Once
+	// keys is the durable API-key store. Nil in unit tests that construct
+	// &Handler{} without NewHandler — those keep the config.json fallback.
+	keys *apikey.Service
 	// modelCache owns the model-routing cache concern (the /v1/models aggregate,
 	// per-account model metadata, and their locking). Extracted from this
 	// god-object; see proxy/model_cache.go. Upstream's cachedModels/modelsCacheMu/
@@ -319,6 +325,7 @@ func NewHandler() *Handler {
 		startTime:            time.Now().Unix(),
 		stopRefresh:          make(chan struct{}),
 		stopStatsSaver:       make(chan struct{}),
+		stopKeyRetention:     make(chan struct{}),
 		promptCache:          newPromptCacheTracker(defaultPromptCacheTTL),
 		conversationRunner:   NewKiroConversationRunner(),
 		profileSwitchLocks:   make(map[string]*sync.Mutex),
@@ -349,9 +356,68 @@ func NewHandler() *Handler {
 	go h.backgroundRefresh()
 	// 启动后台统计保存 (每30秒保存一次)
 	go h.backgroundStatsSaver()
+	h.attachKeyStore()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
 	return h
+}
+
+func (h *Handler) attachKeyStore() {
+	if !config.Initialized() {
+		return
+	}
+	pepper, err := config.GetOrCreateAPIKeyPepper()
+	if err != nil {
+		logger.Fatalf("[ApiKey] pepper: %v", err)
+	}
+	path := filepath.Join(config.GetConfigDir(), "apikeys.db")
+	retain := time.Duration(config.GetUsageRetentionDays()) * 24 * time.Hour
+	svc, err := apikey.Open(path, pepper, apikey.Options{Retention: retain})
+	if err != nil {
+		logger.Fatalf("[ApiKey] open store: %v", err)
+	}
+	legacy := config.ListApiKeys()
+	entries := make([]apikey.LegacyKey, len(legacy))
+	for i, e := range legacy {
+		entries[i] = apikey.LegacyKey{
+			ID: e.ID, Name: e.Name, Key: e.Key, Enabled: e.Enabled, Migrated: e.Migrated,
+			CreatedAt: e.CreatedAt, LastUsedAt: e.LastUsedAt, TokenLimit: e.TokenLimit,
+			CreditLimit: e.CreditLimit, TokensUsed: e.TokensUsed, CreditsUsed: e.CreditsUsed,
+			RequestsCount: e.RequestsCount,
+		}
+	}
+	res, err := svc.ImportLegacy(entries)
+	if err != nil {
+		_ = svc.Close()
+		logger.Fatalf("[ApiKey] legacy import: %v", err)
+	}
+	logger.Infof("[ApiKey] store ready; imported %d, already present %d, skipped %d", res.Imported, res.AlreadyPresent, res.Skipped)
+	h.keys = svc
+	go h.backgroundKeyRetention()
+}
+
+func (h *Handler) backgroundKeyRetention() {
+	if h.keys == nil {
+		return
+	}
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			start := time.Now()
+			ev, hr, err := h.keys.Cleanup()
+			if err != nil {
+				logger.Warnf("[ApiKey] retention cleanup failed: %v", err)
+				continue
+			}
+			if ev > 0 || hr > 0 {
+				logger.Infof("[ApiKey] retention removed %d events, %d hourly buckets in %s", ev, hr, time.Since(start))
+			}
+		case <-h.stopKeyRetention:
+			return
+		}
+	}
 }
 
 // getMemory returns the current memory provider under a read lock. It is never
@@ -459,7 +525,7 @@ func (h *Handler) authenticateForClaude(w http.ResponseWriter, r *http.Request) 
 		h.sendClaudeError(w, ae.status, ae.code, ae.message)
 		return nil
 	}
-	return withClientIPContext(withApiKeyContext(r, entry), clientIP(r))
+	return withRequestIDContext(withClientIPContext(withApiKeyContext(r, entry), clientIP(r)), requestIDFromRequest(r))
 }
 
 // authenticateForOpenAI runs authenticate and writes an OpenAI-style error on failure.
@@ -473,7 +539,7 @@ func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) 
 		h.sendOpenAIError(w, ae.status, ae.code, ae.message)
 		return nil
 	}
-	return withClientIPContext(withApiKeyContext(r, entry), clientIP(r))
+	return withRequestIDContext(withClientIPContext(withApiKeyContext(r, entry), clientIP(r)), requestIDFromRequest(r))
 }
 
 // clientIP resolves the request's client IP. Forwarded-IP headers are only
@@ -590,11 +656,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	// API 端点（需要验证 API Key）
 	case path == "/v1/messages" || path == "/messages" || path == "/anthropic/v1/messages":
-		ar := h.authenticateForClaude(w, r)
-		if ar == nil {
-			return
-		}
-		h.handleClaudeMessages(w, ar)
+		h.serveInference(w, r, "claude", h.authenticateForClaude, h.handleClaudeMessages)
 	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens":
 		ar := h.authenticateForClaude(w, r)
 		if ar == nil {
@@ -602,17 +664,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.handleCountTokens(w, ar)
 	case path == "/v1/chat/completions" || path == "/chat/completions":
-		ar := h.authenticateForOpenAI(w, r)
-		if ar == nil {
-			return
-		}
-		h.handleOpenAIChat(w, ar)
+		h.serveInference(w, r, "openai", h.authenticateForOpenAI, h.handleOpenAIChat)
 	case path == "/v1/responses" || path == "/responses":
-		ar := h.authenticateForOpenAI(w, r)
-		if ar == nil {
-			return
-		}
-		h.handleOpenAIResponses(w, ar)
+		h.serveInference(w, r, "responses", h.authenticateForOpenAI, h.handleOpenAIResponses)
 	case path == "/v1/models" || path == "/models":
 		h.handleModels(w, r)
 	case path == "/api/event_logging/batch":
@@ -648,6 +702,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleStats(w, r)
+
+	case strings.HasPrefix(path, "/portal/"):
+		h.handlePortal(w, r)
+	case path == "/usage" || path == "/usage/" || strings.HasPrefix(path, "/usage/"):
+		h.handleUsagePage(w, r)
+	case strings.HasPrefix(path, "/locales/"):
+		rel := strings.TrimPrefix(path, "/locales/")
+		if rel == "" || strings.Contains(rel, "..") {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeFile(w, r, "web/locales/"+rel)
 
 	default:
 		http.Error(w, "Not Found", 404)
@@ -875,6 +941,8 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
 	}
+	clientModel := req.Model
+	noteAPIKeyMeta(r.Context(), "claude", clientModel, "", req.Stream)
 
 	// The last genuine user question, captured BEFORE any memory injection mutates
 	// req.Messages. Used as the retrieval query (inject) and the user side of a
@@ -918,6 +986,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	actualModel, thinking, nameEffort := resolveClaudeThinkingModeAndEffort(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
 	applyModelNameEffort(&req, nameEffort)
+	noteAPIKeyMeta(r.Context(), "claude", clientModel, req.Model, req.Stream)
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
@@ -987,6 +1056,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
+	acc := newAPIKeyUsageAcc(estimatedInputTokens)
+	defer noteLeaseUsageOnExit(ctx, acc)
+
 	// 获取 thinking 输出格式配置
 	thinkingFormat := thinkingOpts.Format
 
@@ -1000,6 +1072,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
 	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
+		acc.markProviderStarted()
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 		messageStartUsage := cacheUsage
 
@@ -1388,6 +1461,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				if text == "" {
 					return
 				}
+				acc.observeText(text, isThinking)
 				if isThinking {
 					rawThinkingBuilder.WriteString(text)
 				} else {
@@ -1399,9 +1473,11 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
 				outputTokens = outTok
+				acc.setUpstream(inTok, outTok)
 			},
 			OnCredits: func(c float64) {
 				credits = c
+				acc.setCredits(c)
 			},
 			OnContextUsage: func(pct float64) {
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
@@ -1477,6 +1553,8 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			inputTokens = run.TotalInputTokens
 			outputTokens = run.TotalOutputTokens
 			credits = run.TotalCredits
+			acc.setUpstream(inputTokens, outputTokens)
+			acc.setCredits(credits)
 			if run.FinalContextPct > 0 {
 				realInputTokens = int(run.FinalContextPct * float64(getContextWindowSize(model)) / 100.0)
 			}
@@ -1507,6 +1585,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				thinkingSource = thinkingSourceUnknown
 				thinkingStarted = false
 				eventThinkingOpen = false
+				acc.resetObserved()
 			}
 
 			// The guard is the fork's equivalent of upstream's messageStarted flag:
@@ -1582,7 +1661,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
 		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
 
-		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
+		h.recordAccountedSuccess(ctx, apiKeyID, accountedInput, accountedOutput, credits, upstreamInput, outputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
@@ -1632,7 +1711,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	// lives here in the per-protocol renderer.
 	onCommitted := func(account *config.Account, err error) {
 		h.handleAccountFailure(account, err)
-		h.recordFailure()
+		h.recordFailureWithDetails(ctx, "claude", model, account.ID, err)
 		h.sendSSE(w, flusher, "error", map[string]interface{}{
 			"type":  "error",
 			"error": map[string]string{"type": "api_error", "message": err.Error()},
@@ -1688,6 +1767,12 @@ func (h *Handler) Shutdown() {
 		}
 		close(h.stopRefresh)
 		close(h.stopStatsSaver)
+		if h.stopKeyRetention != nil {
+			close(h.stopKeyRetention)
+		}
+		if h.keys != nil {
+			_ = h.keys.Close()
+		}
 		// Persist a final stats snapshot synchronously (the stats saver also does
 		// this on exit, but do it here too in case that goroutine already returned).
 		h.saveStats()
@@ -1739,14 +1824,79 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 // recordSuccessForApiKey is recordSuccess + per-API-key usage attribution.
 // When apiKeyID is empty (legacy single-key path or unauthenticated path), only the
 // global counters are updated. Persistence errors are logged but do not propagate.
-func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64) {
+//
+// On a leased inference request this only Notes success; ServeHTTP's settle
+// performs the single Commit. Direct callers (tests, no lease) Commit immediately.
+func (h *Handler) recordSuccessForApiKey(ctx context.Context, apiKeyID string, inputTokens, outputTokens int, credits float64) {
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	if apiKeyID == "" {
+		apiKeyID = apiKeyIDFromContext(ctx)
+	}
+	if apiKeyID == "" {
+		return
+	}
+	in := apikey.CommitInput{
+		RequestID:    requestIDFromContext(ctx),
+		Outcome:      apikey.OutcomeSuccess,
+		InputTokens:  int64(inputTokens),
+		OutputTokens: int64(outputTokens),
+		Credits:      credits,
+		StatusCode:   http.StatusOK,
+	}
+	if noteAPIKeyOutcome(ctx, in) {
+		return
+	}
+	if h.keys != nil {
+		if err := h.keys.Commit(apiKeyID, in); err != nil {
+			logger.Warnf("[ApiKey] failed to commit usage for key %s: %v", apiKeyID, err)
+		}
 		return
 	}
 	if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
 		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
 	}
+}
+
+func (h *Handler) recordAccountedSuccess(ctx context.Context, apiKeyID string, accountedIn, accountedOut int, credits float64, upstreamIn, upstreamOut int) {
+	src, est := usageProvenance(upstreamIn, upstreamOut, accountedIn, accountedOut, credits)
+	noteAPIKeyUsage(ctx, int64(accountedIn), int64(accountedOut), credits, src, est)
+	h.recordSuccessForApiKey(ctx, apiKeyID, accountedIn, accountedOut, credits)
+}
+
+func (h *Handler) commitAPIKeyOutcome(ctx context.Context, outcome, endpoint, model, errCode, errMsg string, status int, inTok, outTok int, credits float64, latencyMs, ttfbMs int64, stream bool) {
+	id := apiKeyIDFromContext(ctx)
+	if id == "" || h.keys == nil {
+		return
+	}
+	in := apikey.CommitInput{
+		RequestID:      requestIDFromContext(ctx),
+		Outcome:        outcome,
+		InputTokens:    int64(inTok),
+		OutputTokens:   int64(outTok),
+		Credits:        credits,
+		Endpoint:       endpoint,
+		ClientModel:    model,
+		EffectiveModel: model,
+		StatusCode:     status,
+		LatencyMs:      latencyMs,
+		TTFBMs:         ttfbMs,
+		Stream:         stream,
+		ErrorCode:      classifyStoredError(status, errCode, errMsg),
+		SanitizedError: errMsg,
+	}
+	if noteAPIKeyOutcome(ctx, in) {
+		return
+	}
+	if err := h.keys.Commit(id, in); err != nil {
+		logger.Warnf("[ApiKey] commit %s for key %s: %v", outcome, id, err)
+	}
+}
+
+func classifyStoredError(status int, errCode, errMsg string) string {
+	if apikey.KnownErrorCode(errCode) {
+		return errCode
+	}
+	return apikey.ClassifyPublicError(status, errCode, errMsg)
 }
 
 // recordFailure bumps the global failure counters. Kept as its own method because
@@ -1791,7 +1941,10 @@ func (h *Handler) recordFailureWithDetails(ctx context.Context, endpoint, model,
 		ErrorType: errType,
 		RouteID:   poolRouteIDFromContext(ctx),
 		ClientIP:  clientIPFromContext(ctx),
+		ApiKeyID:  apiKeyIDFromContext(ctx),
+		RequestID: requestIDFromContext(ctx),
 	})
+	h.commitAPIKeyOutcome(ctx, apikey.OutcomeFailed, endpoint, model, errType, errMsg, kiroStatusFor(kiroMetric{ErrorType: errType}), 0, 0, 0, 0, 0, false)
 }
 
 // recordSuccessLogSplit records a successful request in the request logs and in
@@ -1824,6 +1977,8 @@ func (h *Handler) recordSuccessLogSplit(ctx context.Context, endpoint, model, ac
 		DurationMs:   durationMs,
 		RouteID:      poolRouteIDFromContext(ctx),
 		ClientIP:     clientIPFromContext(ctx),
+		ApiKeyID:     apiKeyIDFromContext(ctx),
+		RequestID:    requestIDFromContext(ctx),
 	})
 }
 
@@ -1903,10 +2058,13 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 	// Non-stream: fully buffered, so the guard is never committed and a late
 	// upstream error can still retry (invariant #7). No committed-failure branch.
 	reqStart := time.Now()
+	acc := newAPIKeyUsageAcc(estimatedInputTokens)
+	defer noteLeaseUsageOnExit(ctx, acc)
 	guard := &streamGuard{}
 	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
 	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
+		acc.markProviderStarted()
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
 
 		var content string
@@ -1947,6 +2105,8 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			inputTokens = run.TotalInputTokens
 			outputTokens = run.TotalOutputTokens
 			credits = run.TotalCredits
+			acc.setUpstream(inputTokens, outputTokens)
+			acc.setCredits(credits)
 			if fr.ContextUsagePct > 0 {
 				realInputTokens = int(fr.ContextUsagePct * float64(getContextWindowSize(model)) / 100.0)
 			}
@@ -1980,6 +2140,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 					upstreamStopReason = reason
 				},
 			}
+			callback = observeKiroCallback(acc, callback)
 
 			measure := func() (int, int, string, bool) {
 				return len(content), len(toolUses), upstreamStopReason, thinkingContent != ""
@@ -1994,6 +2155,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 				credits = 0
 				realInputTokens = 0
 				upstreamStopReason = ""
+				acc.resetObserved()
 			}
 
 			// Fully buffered: nothing reaches the client until the response is
@@ -2044,7 +2206,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			finalContent += formatSourcesList(sources)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
+		h.recordAccountedSuccess(ctx, apiKeyID, accountedInput, accountedOutput, credits, upstreamInput, outputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		h.promptCache.Update(account.ID, cacheProfile)
@@ -2106,6 +2268,9 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 }
 
 func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, message string) {
+	if ctx := leaseContextFromWriter(w); ctx != nil {
+		noteAPIKeyHTTPStatus(ctx, status, errType, message)
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2166,6 +2331,8 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 		return
 	}
+	clientModel := req.Model
+	noteAPIKeyMeta(r.Context(), "openai", clientModel, "", req.Stream)
 
 	// Forward to an external upstream when the (raw, un-normalized) client model
 	// matches an enabled route. Passthrough bypasses the Kiro pool entirely.
@@ -2182,6 +2349,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	actualModel, thinking, nameEffort := ParseModelThinkingAndEffort(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
 	applyOpenAIModelNameEffort(&req, nameEffort)
+	noteAPIKeyMeta(r.Context(), "openai", clientModel, req.Model, req.Stream)
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
@@ -2206,6 +2374,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
+	acc := newAPIKeyUsageAcc(estimatedInputTokens)
+	defer noteLeaseUsageOnExit(ctx, acc)
+
 	// 获取 thinking 输出格式配置
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat
 
@@ -2215,6 +2386,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
 	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
+		acc.markProviderStarted()
 		var upstreamStopReason string
 		var toolCalls []ToolCall
 		var toolCallIndex int
@@ -2498,6 +2670,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 				realInputTokens = int(pct * float64(getContextWindowSize(model)) / 100.0)
 			},
 		}
+		callback = observeKiroCallback(acc, callback)
 
 		measure := func() (int, int, string, bool) {
 			return rawContentBuilder.Len(), len(toolCalls), upstreamStopReason, rawReasoningBuilder.Len() > 0
@@ -2523,6 +2696,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			thinkingSource = thinkingSourceUnknown
 			thinkingStarted = false
 			eventThinkingOpen = false
+			acc.resetObserved()
 		}
 
 		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset,
@@ -2570,7 +2744,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
 		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
 
-		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
+		h.recordAccountedSuccess(ctx, apiKeyID, accountedInput, accountedOutput, credits, upstreamInput, outputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		// See the claude tails: accounted values, not the always-0 upstream vars.
@@ -2645,10 +2819,13 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 	// Non-stream: fully buffered, so the guard is never committed and a late
 	// upstream error can still retry (invariant #7). No committed-failure branch.
 	reqStart := time.Now()
+	acc := newAPIKeyUsageAcc(estimatedInputTokens)
+	defer noteLeaseUsageOnExit(ctx, acc)
 	guard := &streamGuard{}
 	ex := newChatExecutor(h.pool, h.ensureValidToken, h.handleAccountFailure, model)
 
 	attempt := func(ctx context.Context, account *config.Account) attemptOutcome {
+		acc.markProviderStarted()
 		var content string
 		var reasoningContent string
 		var toolUses []KiroToolUse
@@ -2675,6 +2852,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 				upstreamStopReason = reason
 			},
 		}
+		callback = observeKiroCallback(acc, callback)
 
 		measure := func() (int, int, string, bool) {
 			return len(content), len(toolUses), upstreamStopReason, reasoningContent != ""
@@ -2689,6 +2867,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			credits = 0
 			realInputTokens = 0
 			upstreamStopReason = ""
+			acc.resetObserved()
 		}
 
 		// Fully buffered: nothing reaches the client until the response is
@@ -2726,7 +2905,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 		accountedInput, clientInput := usageSplit(upstreamInput, estimatedInputTokens, legacyInput)
 		accountedOutput, clientOutput := usageSplit(outputTokens, estimatedOutput, estimatedOutput)
 
-		h.recordSuccessForApiKey(apiKeyID, accountedInput, accountedOutput, credits)
+		h.recordAccountedSuccess(ctx, apiKeyID, accountedInput, accountedOutput, credits, upstreamInput, outputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, accountedInput+accountedOutput, credits)
 		// See the claude tails: accounted values, not the always-0 upstream vars.
@@ -2752,6 +2931,9 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 }
 
 func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, message string) {
+	if ctx := leaseContextFromWriter(w); ctx != nil {
+		noteAPIKeyHTTPStatus(ctx, status, errType, message)
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -3100,6 +3282,15 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/reset-usage") && r.Method == "POST":
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/reset-usage")
 		h.apiResetApiKeyUsage(w, r, id)
+	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/rotate") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/rotate")
+		h.apiRotateApiKey(w, r, id)
+	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/portal-token") && r.Method == "POST":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/portal-token")
+		h.apiCreatePortalToken(w, r, id)
+	case strings.HasPrefix(path, "/api-keys/") && strings.HasSuffix(path, "/portal-token") && r.Method == "DELETE":
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/api-keys/"), "/portal-token")
+		h.apiDeletePortalToken(w, r, id)
 	case strings.HasPrefix(path, "/api-keys/") && r.Method == "GET":
 		h.apiGetApiKey(w, r, strings.TrimPrefix(path, "/api-keys/"))
 	case strings.HasPrefix(path, "/api-keys/") && r.Method == "PUT":

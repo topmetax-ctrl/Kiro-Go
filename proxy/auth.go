@@ -2,9 +2,13 @@ package proxy
 
 import (
 	"context"
+	"kiro-go/apikey"
 	"kiro-go/config"
 	"net/http"
 	"strings"
+	"unicode"
+
+	"github.com/google/uuid"
 )
 
 // apiKeyContextKey is an unexported type used as the context key for the matched ApiKeyEntry
@@ -15,6 +19,8 @@ type apiKeyContextKey struct{}
 // pipeline so the metrics funnel can attribute traffic per source IP without
 // threading the IP through every function signature.
 type clientIPContextKey struct{}
+
+type requestIDContextKey struct{}
 
 // authError describes why authentication failed. status is the HTTP status code to send.
 type authError struct {
@@ -41,6 +47,46 @@ func extractProvidedKey(r *http.Request) string {
 	return ""
 }
 
+func shouldReserveRequest(r *http.Request) bool {
+	switch r.URL.Path {
+	case "/v1/messages", "/messages", "/anthropic/v1/messages",
+		"/v1/chat/completions", "/chat/completions",
+		"/v1/responses", "/responses":
+		return true
+	default:
+		return false
+	}
+}
+
+func apiKeyRecordToEntry(rec apikey.Record) *config.ApiKeyEntry {
+	e := &config.ApiKeyEntry{
+		ID:            rec.Key.ID,
+		Name:          rec.Key.Name,
+		Enabled:       rec.Key.Enabled,
+		Migrated:      rec.Key.Migrated,
+		CreatedAt:     rec.Key.CreatedAt.Unix(),
+		TokenLimit:    rec.Quota.TokenLimit,
+		CreditLimit:   rec.Quota.CreditLimit,
+		TokensUsed:    rec.Usage.TotalTokens,
+		CreditsUsed:   rec.Usage.Credits,
+		RequestsCount: rec.Usage.RequestsTotal,
+	}
+	if rec.Key.LastUsedAt != nil {
+		e.LastUsedAt = rec.Key.LastUsedAt.Unix()
+	}
+	return e
+}
+
+func mapAPIKeyAuthErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if ae, ok := err.(*apikey.AuthError); ok {
+		return newAuthError(ae.Status, ae.Code, ae.Message)
+	}
+	return newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
+}
+
 // authenticate validates an incoming request against the configured API keys.
 //
 // Master switch: config.RequireApiKey. When false, requests pass without checking
@@ -48,21 +94,25 @@ func extractProvidedKey(r *http.Request) string {
 // affecting public deployments).
 //
 // When RequireApiKey is true:
-//  1. If ApiKeys is non-empty, the provided key MUST match an enabled, in-quota
-//     entry. Returns the matched entry (a copy) so callers can attribute usage.
+//  1. If the v2 store has keys (or the in-memory config list does), the provided
+//     key MUST match an enabled, in-quota entry.
 //  2. Else if the legacy single ApiKey field is set, the provided key MUST match it.
-//  3. Else (switch on but nothing configured) → fail-closed: every request is rejected.
-//     This prevents the prior bug where toggling auth on without keys silently
-//     left the service open.
-//
-// Returns (entry, nil) on success. entry is nil when the legacy single-key path
-// is used or when the master switch is off.
+//  3. Else → fail-closed.
 func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 	if !config.IsApiKeyRequired() {
 		return nil, nil
 	}
 
 	provided := extractProvidedKey(r)
+	reserve := shouldReserveRequest(r)
+
+	if h.keys != nil && h.keys.HasKeys() {
+		rec, err := h.keys.Authenticate(provided, reserve)
+		if err != nil {
+			return nil, mapAPIKeyAuthErr(err)
+		}
+		return apiKeyRecordToEntry(rec), nil
+	}
 
 	if config.HasApiKeys() {
 		if provided == "" {
@@ -87,7 +137,6 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 	// Legacy single-key path.
 	expected := config.GetApiKey()
 	if expected == "" {
-		// Auth required but nothing configured → fail closed.
 		return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "API key authentication is required but no keys are configured")
 	}
 	if provided == "" || provided != expected {
@@ -96,8 +145,6 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 	return nil, nil
 }
 
-// withApiKeyContext attaches the matched entry to the request context so downstream
-// handlers (recordSuccess, etc.) can credit usage against the correct key.
 func withApiKeyContext(r *http.Request, entry *config.ApiKeyEntry) *http.Request {
 	if entry == nil {
 		return r
@@ -106,7 +153,6 @@ func withApiKeyContext(r *http.Request, entry *config.ApiKeyEntry) *http.Request
 	return r.WithContext(ctx)
 }
 
-// apiKeyIDFromContext returns the matched API key ID stored in ctx, or empty string.
 func apiKeyIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
@@ -117,8 +163,6 @@ func apiKeyIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-// withClientIPContext attaches the caller's source IP to the request context.
-// An empty IP returns r unchanged so no context allocation happens.
 func withClientIPContext(r *http.Request, ip string) *http.Request {
 	if ip == "" {
 		return r
@@ -126,8 +170,6 @@ func withClientIPContext(r *http.Request, ip string) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), clientIPContextKey{}, ip))
 }
 
-// clientIPFromContext returns the source IP stored by withClientIPContext, or
-// empty string when the request carried none.
 func clientIPFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
@@ -136,4 +178,41 @@ func clientIPFromContext(ctx context.Context) string {
 		return v
 	}
 	return ""
+}
+
+func withRequestIDContext(r *http.Request, id string) *http.Request {
+	if id == "" {
+		return r
+	}
+	return r.WithContext(context.WithValue(r.Context(), requestIDContextKey{}, id))
+}
+
+func requestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(requestIDContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func requestIDFromRequest(r *http.Request) string {
+	v := strings.TrimSpace(r.Header.Get("X-Request-Id"))
+	if v == "" {
+		v = strings.TrimSpace(r.Header.Get("X-Request-ID"))
+	}
+	if v != "" && len(v) <= 128 && isRequestIDSafe(v) {
+		return v
+	}
+	return uuid.NewString()
+}
+
+func isRequestIDSafe(s string) bool {
+	for _, r := range s {
+		if r > unicode.MaxASCII || (!unicode.IsPrint(r) && r != ' ') {
+			return false
+		}
+	}
+	return true
 }
