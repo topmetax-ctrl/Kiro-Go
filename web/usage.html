@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="no-referrer" />
+  <title>API Usage</title>
+  <link rel="stylesheet" href="/usage/usage.css" />
+</head>
+<body>
+  <div class="wrap">
+    <div id="gate" class="gate card">
+      <div class="gate-tools">
+        <select id="gateLang" class="lang-select" aria-label="" data-i18n-aria-label="portal.lang"></select>
+      </div>
+      <h1 data-i18n="portal.title">View API Usage</h1>
+      <p class="muted" data-i18n="portal.subtitle">Enter your API key. It is sent over HTTPS and never stored in the browser.</p>
+      <div id="gateError" class="banner hidden" role="alert"></div>
+      <label class="muted" for="gateKey" data-i18n="portal.keyLabel">API Key</label>
+      <input type="password" id="gateKey" autocomplete="off" />
+      <div class="gate-actions">
+        <button class="primary" id="gateBtn" type="button" data-i18n="portal.view">View Usage</button>
+      </div>
+    </div>
+
+    <div id="dash" class="hidden">
+      <header class="header">
+        <div>
+          <h1 id="dashName">—</h1>
+          <div class="muted mono" id="dashMasked"></div>
+          <div class="meta-row">
+            <span id="dashStatus" class="status-pill"></span>
+            <span id="dashExpiry" class="muted"></span>
+            <span id="dashReset" class="muted"></span>
+          </div>
+        </div>
+        <div class="header-tools">
+          <div id="liveState" class="live" aria-live="polite">
+            <span id="liveDot" class="live-dot off"></span>
+            <span id="liveLabel"></span>
+          </div>
+          <select id="dashLang" class="lang-select" aria-label="" data-i18n-aria-label="portal.lang"></select>
+          <button type="button" id="signOutBtn" data-i18n="portal.signOut">Sign out</button>
+        </div>
+      </header>
+
+      <div id="dashError" class="banner hidden" role="alert"></div>
+      <div id="notice" class="notice hidden" role="status"></div>
+
+      <section id="summaryCards" class="cards" aria-label="" data-i18n-aria-label="portal.summary"></section>
+
+      <div class="toolbar" id="rangeBar"></div>
+      <div id="customRange" class="custom-range hidden">
+        <label class="muted" for="customFrom" data-i18n="portal.customFrom">From</label>
+        <input type="datetime-local" id="customFrom" />
+        <label class="muted" for="customTo" data-i18n="portal.customTo">To</label>
+        <input type="datetime-local" id="customTo" />
+        <button type="button" id="customApply" class="primary" data-i18n="portal.apply">Apply</button>
+      </div>
+
+      <div class="toolbar filters">
+        <input id="filterModel" type="text" data-i18n-placeholder="portal.model" autocomplete="off" />
+        <select id="filterEndpoint"></select>
+        <select id="filterStatus"></select>
+        <select id="filterStreaming"></select>
+        <select id="filterError"></select>
+        <button type="button" id="clearFilters" data-i18n="portal.clearFilters">Clear filters</button>
+      </div>
+
+      <section class="chart-panel card">
+        <div class="chart-head">
+          <select id="metricSel"></select>
+          <span id="chartMeta" class="muted"></span>
+        </div>
+        <svg class="chart" id="chart" viewBox="0 0 800 180" preserveAspectRatio="none" role="img"></svg>
+      </section>
+
+      <section class="history">
+        <h2 data-i18n="portal.historyTitle">Request history</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th data-i18n="portal.col.time">Timestamp</th>
+                <th data-i18n="portal.col.request">Request ID</th>
+                <th data-i18n="portal.col.endpoint">Endpoint</th>
+                <th data-i18n="portal.col.model">Model</th>
+                <th data-i18n="portal.col.status">Status</th>
+                <th data-i18n="portal.col.in">Input</th>
+                <th data-i18n="portal.col.out">Output</th>
+                <th data-i18n="portal.col.total">Total</th>
+                <th data-i18n="portal.col.credits">Credits</th>
+                <th data-i18n="portal.col.latency">Latency</th>
+                <th data-i18n="portal.col.ttfb">TTFB</th>
+                <th data-i18n="portal.col.stream">Streaming</th>
+                <th data-i18n="portal.col.error">Error</th>
+              </tr>
+            </thead>
+            <tbody id="eventRows"></tbody>
+          </table>
+        </div>
+        <div class="toolbar">
+          <button type="button" id="loadMore" class="hidden" data-i18n="portal.loadMore">Load more</button>
+        </div>
+      </section>
+    </div>
+  </div>
+  <script src="/usage/usage.js"></script>
+</body>
+</html>
