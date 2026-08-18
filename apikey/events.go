@@ -1,6 +1,7 @@
 package apikey
 
 import (
+	"database/sql"
 	"strings"
 	"time"
 )
@@ -23,16 +24,10 @@ func sanitizeError(s string) string {
 	return s
 }
 
-func (s *Service) ListEvents(keyID string, q EventQuery) ([]PublicEvent, int, error) {
-	if keyID == "" {
-		return nil, 0, ErrNotFound
-	}
-	if q.Limit <= 0 {
-		q.Limit = 50
-	}
-	if q.Limit > 200 {
-		q.Limit = 200
-	}
+const eventSelectCols = `id,request_id,key_id,ts,endpoint,client_model,effective_model,status_code,status,
+		input_tokens,output_tokens,total_tokens,credits,latency_ms,ttfb_ms,ttfb_known,stream,error_code,usage_source,usage_estimated`
+
+func (q EventQuery) where(keyID string) (string, []interface{}) {
 	var parts []string
 	var args []interface{}
 	parts = append(parts, "key_id=?")
@@ -46,9 +41,8 @@ func (s *Service) ListEvents(keyID string, q EventQuery) ([]PublicEvent, int, er
 		args = append(args, q.To.Unix())
 	}
 	if q.Model != "" {
-		parts = append(parts, "(client_model LIKE ? OR effective_model LIKE ?)")
-		like := "%" + q.Model + "%"
-		args = append(args, like, like)
+		parts = append(parts, "(client_model=? OR effective_model=?)")
+		args = append(args, q.Model, q.Model)
 	}
 	if q.Endpoint != "" {
 		parts = append(parts, "endpoint=?")
@@ -66,57 +60,172 @@ func (s *Service) ListEvents(keyID string, q EventQuery) ([]PublicEvent, int, er
 		parts = append(parts, "error_code=?")
 		args = append(args, q.ErrorCode)
 	}
-	where := strings.Join(parts, " AND ")
-	var total int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM request_events WHERE `+where, args...).Scan(&total); err != nil {
-		return nil, 0, err
+	return strings.Join(parts, " AND "), args
+}
+
+func (s *Service) ListEvents(keyID string, q EventQuery) (EventPage, error) {
+	if keyID == "" {
+		return EventPage{}, ErrNotFound
 	}
-	order := "ts DESC"
-	if q.SortAsc {
-		order = "ts ASC"
+	if q.Limit <= 0 {
+		q.Limit = DefaultEventPage
 	}
-	rows, err := s.db.Query(`SELECT id,request_id,ts,endpoint,client_model,effective_model,status_code,status,
-		input_tokens,output_tokens,total_tokens,credits,latency_ms,ttfb_ms,stream,error_code,usage_source,usage_estimated
-		FROM request_events WHERE `+where+` ORDER BY `+order+` LIMIT ? OFFSET ?`,
-		append(args, q.Limit, q.Offset)...)
+	if q.Limit > MaxEventPage {
+		q.Limit = MaxEventPage
+	}
+
+	now := s.now().UTC()
+	from, to := now.Add(-24*time.Hour), now
+	if q.From != nil {
+		from = q.From.UTC()
+	}
+	if q.To != nil {
+		to = q.To.UTC()
+	}
+	var truncated bool
+	from, to, truncated = s.clipHistoryRange(from, to)
+	q.From, q.To = &from, &to
+
+	where, args := q.where(keyID)
+	if q.Cursor != "" {
+		ts, id, err := DecodeCursor(q.Cursor)
+		if err != nil {
+			return EventPage{}, err
+		}
+		where += " AND (ts < ? OR (ts = ? AND id < ?))"
+		args = append(args, ts, ts, id)
+	}
+
+	rows, err := s.db.Query(`SELECT `+eventSelectCols+` FROM request_events WHERE `+where+
+		` ORDER BY ts DESC, id DESC LIMIT ?`, append(args, q.Limit+1)...)
 	if err != nil {
-		return nil, 0, err
+		return EventPage{}, err
 	}
 	defer rows.Close()
+	items, err := scanEvents(rows, keyID)
+	if err != nil {
+		return EventPage{}, err
+	}
+	page := EventPage{
+		QueryMeta: s.queryMeta(from, to, ResolutionRaw, 0, SourceEvents, truncated),
+	}
+	if len(items) > q.Limit {
+		page.HasMore = true
+		items = items[:q.Limit]
+		last := items[len(items)-1]
+		page.NextCursor = EncodeCursor(last.Timestamp.Unix(), last.EventID)
+	}
+	page.Items = items
+	return page, nil
+}
+
+func (s *Service) eventByID(id int64) (PublicEvent, error) {
+	row := s.db.QueryRow(`SELECT `+eventSelectCols+` FROM request_events WHERE id=?`, id)
+	return scanEvent(row)
+}
+
+func scanEvents(rows *sql.Rows, keyID string) ([]PublicEvent, error) {
 	var out []PublicEvent
 	for rows.Next() {
-		var ev PublicEvent
-		var ts int64
-		var stream, estimated int
-		if err := rows.Scan(&ev.EventID, &ev.RequestID, &ts, &ev.Endpoint, &ev.ClientModel, &ev.EffectiveModel, &ev.StatusCode, &ev.Status,
-			&ev.InputTokens, &ev.OutputTokens, &ev.TotalTokens, &ev.Credits, &ev.LatencyMs, &ev.TTFBMs, &stream, &ev.ErrorCode,
-			&ev.UsageSource, &estimated); err != nil {
-			return nil, 0, err
+		ev, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
 		}
-		ev.Timestamp = time.Unix(ts, 0).UTC()
-		ev.Streaming = stream == 1
-		ev.UsageEstimated = estimated == 1
-		ev.ApiKeyID = keyID
-		ev.Model = ev.EffectiveModel
-		if ev.Model == "" {
-			ev.Model = ev.ClientModel
+		if keyID != "" {
+			ev.ApiKeyID = keyID
 		}
 		out = append(out, ev)
 	}
-	return out, total, nil
+	return out, rows.Err()
 }
 
-func (s *Service) UsageSeries(keyID string, from, to time.Time) ([]HourBucket, error) {
+type eventScanner interface {
+	Scan(dest ...interface{}) error
+}
+
+func scanEvent(sc eventScanner) (PublicEvent, error) {
+	var ev PublicEvent
+	var ts, ttfb int64
+	var ttfbKnown, stream, estimated int
+	var keyID string
+	if err := sc.Scan(&ev.EventID, &ev.RequestID, &keyID, &ts, &ev.Endpoint, &ev.ClientModel, &ev.EffectiveModel, &ev.StatusCode, &ev.Status,
+		&ev.InputTokens, &ev.OutputTokens, &ev.TotalTokens, &ev.Credits, &ev.LatencyMs, &ttfb, &ttfbKnown, &stream, &ev.ErrorCode,
+		&ev.UsageSource, &estimated); err != nil {
+		return PublicEvent{}, err
+	}
+	ev.ApiKeyID = keyID
+	ev.Timestamp = time.Unix(ts, 0).UTC()
+	ev.Streaming = stream == 1
+	ev.UsageEstimated = estimated == 1
+	ev.TTFBMs = ttfbPointer(ttfb, ttfbKnown == 1)
+	ev.Model = ev.EffectiveModel
+	if ev.Model == "" {
+		ev.Model = ev.ClientModel
+	}
+	return ev, nil
+}
+
+func (s *Service) UsageSeries(keyID string, q EventQuery) (SeriesResult, error) {
 	if keyID == "" {
-		return nil, ErrNotFound
+		return SeriesResult{}, ErrNotFound
 	}
-	if to.IsZero() {
-		to = s.now().UTC()
+	now := s.now().UTC()
+	from, to := now.Add(-24*time.Hour), now
+	if q.From != nil {
+		from = q.From.UTC()
 	}
-	if from.IsZero() {
-		from = to.Add(-24 * time.Hour)
+	if q.To != nil {
+		to = q.To.UTC()
 	}
-	rows, err := s.db.Query(`SELECT hour_utc,requests,requests_success,requests_failed,requests_cancelled,
+	if !from.Before(to) {
+		return SeriesResult{}, errInvalidRange("from must be before to")
+	}
+
+	truncated := false
+	filtered := q.hasDimensionFilter()
+	rawFrom := s.rawAvailableFrom(now)
+	hourFrom := s.hourlyAvailableFrom(now)
+	fromInRaw := !from.Before(rawFrom)
+	span := to.Sub(from)
+	resolution, bucket, source := planSeries(span, filtered, fromInRaw)
+
+	if source == SourceEvents {
+		if from.Before(rawFrom) {
+			from = rawFrom
+			truncated = true
+		}
+	} else if from.Before(hourFrom) {
+		from = hourFrom
+		truncated = true
+	}
+	if !from.Before(to) {
+		return SeriesResult{
+			Points:    nil,
+			Metrics:   AllowedSeriesMetrics,
+			QueryMeta: s.queryMeta(from, to, resolution, bucket, source, true),
+		}, nil
+	}
+
+	var points []SeriesPoint
+	var err error
+	if source == SourceHourly {
+		points, err = s.seriesFromHourly(keyID, from, to)
+	} else {
+		points, err = s.seriesFromEvents(keyID, q, from, to, bucket)
+	}
+	if err != nil {
+		return SeriesResult{}, err
+	}
+	points = fillSeriesGaps(points, from, to, bucket)
+	return SeriesResult{
+		Points:    points,
+		Metrics:   AllowedSeriesMetrics,
+		QueryMeta: s.queryMeta(from, to, resolution, bucket, source, truncated),
+	}, nil
+}
+
+func (s *Service) seriesFromHourly(keyID string, from, to time.Time) ([]SeriesPoint, error) {
+	rows, err := s.db.Query(`SELECT hour_utc,requests,requests_success,requests_failed,requests_cancelled,requests_rejected,
 		input_tokens,output_tokens,total_tokens,credits,latency_ms_sum,ttfb_ms_sum,ttfb_count
 		FROM usage_hourly WHERE key_id=? AND hour_utc>=? AND hour_utc<=? ORDER BY hour_utc ASC`,
 		keyID, from.Truncate(time.Hour).Unix(), to.Unix())
@@ -124,24 +233,107 @@ func (s *Service) UsageSeries(keyID string, from, to time.Time) ([]HourBucket, e
 		return nil, err
 	}
 	defer rows.Close()
-	var out []HourBucket
+	var out []SeriesPoint
 	for rows.Next() {
-		var b HourBucket
-		var hour, latSum, ttfbSum, ttfbN int64
-		if err := rows.Scan(&hour, &b.Requests, &b.RequestsSuccess, &b.RequestsFailed, &b.RequestsCancelled,
-			&b.InputTokens, &b.OutputTokens, &b.TotalTokens, &b.Credits, &latSum, &ttfbSum, &ttfbN); err != nil {
+		var hour, req, succ, fail, cancel, rej, in, outTok, tot, latSum, ttfbSum, ttfbN int64
+		var credits float64
+		if err := rows.Scan(&hour, &req, &succ, &fail, &cancel, &rej, &in, &outTok, &tot, &credits, &latSum, &ttfbSum, &ttfbN); err != nil {
 			return nil, err
 		}
-		b.Hour = time.Unix(hour, 0).UTC()
-		if b.Requests > 0 {
-			b.LatencyMsAvg = float64(latSum) / float64(b.Requests)
-		}
-		if ttfbN > 0 {
-			b.TTFBMsAvg = float64(ttfbSum) / float64(ttfbN)
-		}
-		out = append(out, b)
+		out = append(out, packPoint(hour, req, succ, fail, cancel, rej, in, outTok, tot, credits, latSum, ttfbSum, ttfbN))
 	}
-	return out, nil
+	return out, rows.Err()
+}
+
+func (s *Service) seriesFromEvents(keyID string, q EventQuery, from, to time.Time, bucket time.Duration) ([]SeriesPoint, error) {
+	sec := int64(bucket / time.Second)
+	if sec <= 0 {
+		sec = 60
+	}
+	q.From, q.To = &from, &to
+	where, args := q.where(keyID)
+	rows, err := s.db.Query(`SELECT (ts / ?) * ? AS bucket,
+		COUNT(*),
+		SUM(CASE WHEN status IN ('success','failed','cancelled') THEN 1 ELSE 0 END),
+		SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END),
+		SUM(input_tokens), SUM(output_tokens), SUM(total_tokens), SUM(credits),
+		SUM(latency_ms),
+		SUM(CASE WHEN ttfb_known=1 OR ttfb_ms>0 THEN ttfb_ms ELSE 0 END),
+		SUM(CASE WHEN ttfb_known=1 OR ttfb_ms>0 THEN 1 ELSE 0 END)
+		FROM request_events WHERE `+where+` GROUP BY bucket ORDER BY bucket ASC`,
+		append([]interface{}{sec, sec}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SeriesPoint
+	for rows.Next() {
+		var bucketT, attempted, quota, succ, fail, cancel, rej, in, outTok, tot, latSum, ttfbSum, ttfbN int64
+		var credits float64
+		if err := rows.Scan(&bucketT, &attempted, &quota, &succ, &fail, &cancel, &rej, &in, &outTok, &tot, &credits, &latSum, &ttfbSum, &ttfbN); err != nil {
+			return nil, err
+		}
+		_ = attempted
+		out = append(out, packPoint(bucketT, quota, succ, fail, cancel, rej, in, outTok, tot, credits, latSum, ttfbSum, ttfbN))
+	}
+	return out, rows.Err()
+}
+
+func packPoint(t, quota, succ, fail, cancel, rej, in, out, tot int64, credits float64, latSum, ttfbSum, ttfbN int64) SeriesPoint {
+	p := SeriesPoint{
+		T:                     t,
+		RequestsQuotaConsumed: quota,
+		RequestsSuccess:       succ,
+		RequestsFailed:        fail,
+		RequestsCancelled:     cancel,
+		RequestsRejected:      rej,
+		RequestsAttempted:     quota + rej,
+		InputTokens:           in,
+		OutputTokens:          out,
+		TotalTokens:           tot,
+		Credits:               credits,
+	}
+	if p.RequestsAttempted > 0 {
+		r := float64(succ) / float64(p.RequestsAttempted)
+		p.SuccessRate = &r
+	}
+	if quota > 0 {
+		avg := float64(latSum) / float64(quota)
+		p.AvgLatencyMs = &avg
+	}
+	if ttfbN > 0 {
+		avg := float64(ttfbSum) / float64(ttfbN)
+		p.AvgTtfbMs = &avg
+	}
+	return p
+}
+
+func fillSeriesGaps(points []SeriesPoint, from, to time.Time, bucket time.Duration) []SeriesPoint {
+	if bucket <= 0 {
+		return points
+	}
+	start := from.UTC().Truncate(bucket).Unix()
+	end := to.UTC().Unix()
+	step := int64(bucket / time.Second)
+	if step <= 0 {
+		return points
+	}
+	byT := make(map[int64]SeriesPoint, len(points))
+	for _, p := range points {
+		byT[p.T] = p
+	}
+	var out []SeriesPoint
+	for t := start; t <= end; t += step {
+		if p, ok := byT[t]; ok {
+			out = append(out, p)
+		} else {
+			out = append(out, SeriesPoint{T: t})
+		}
+	}
+	return out
 }
 
 func (s *Service) Summary(keyID string) (Summary, error) {
@@ -197,7 +389,7 @@ func (s *Service) Cleanup() (events int, hours int, err error) {
 
 // ToPublic maps a live metrics-like event into the portal DTO. Internal fields
 // must already have been stripped by the caller; this only shapes the payload.
-func ToPublic(requestID string, ts time.Time, endpoint, model string, statusCode int, status string, inTok, outTok int64, credits float64, latency, ttfb int64, stream bool, errorCode string) PublicEvent {
+func ToPublic(requestID string, ts time.Time, endpoint, model string, statusCode int, status string, inTok, outTok int64, credits float64, latency, ttfb int64, ttfbKnown, stream bool, errorCode string) PublicEvent {
 	return PublicEvent{
 		RequestID:      requestID,
 		Timestamp:      ts.UTC(),
@@ -212,8 +404,27 @@ func ToPublic(requestID string, ts time.Time, endpoint, model string, statusCode
 		TotalTokens:    inTok + outTok,
 		Credits:        credits,
 		LatencyMs:      latency,
-		TTFBMs:         ttfb,
+		TTFBMs:         ttfbPointer(ttfb, ttfbKnown),
 		Streaming:      stream,
 		ErrorCode:      errorCode,
 	}
+}
+
+// ExplainQueryPlan is for tests and ops evidence. It does not change data.
+func (s *Service) ExplainQueryPlan(query string, args ...interface{}) ([]string, error) {
+	rows, err := s.db.Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var sel, ord, from int
+		var detail string
+		if err := rows.Scan(&sel, &ord, &from, &detail); err != nil {
+			return nil, err
+		}
+		out = append(out, detail)
+	}
+	return out, rows.Err()
 }

@@ -1880,6 +1880,7 @@ func (h *Handler) commitAPIKeyOutcome(ctx context.Context, outcome, endpoint, mo
 		StatusCode:     status,
 		LatencyMs:      latencyMs,
 		TTFBMs:         ttfbMs,
+		TTFBKnown:      ttfbMs > 0,
 		Stream:         stream,
 		ErrorCode:      classifyStoredError(status, errCode, errMsg),
 		SanitizedError: errMsg,

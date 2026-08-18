@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS request_events (
   credits REAL NOT NULL DEFAULT 0,
   latency_ms INTEGER NOT NULL DEFAULT 0,
   ttfb_ms INTEGER NOT NULL DEFAULT 0,
+  ttfb_known INTEGER NOT NULL DEFAULT 0,
   stream INTEGER NOT NULL DEFAULT 0,
   cancelled INTEGER NOT NULL DEFAULT 0,
   error_code TEXT NOT NULL DEFAULT '',
@@ -92,6 +93,7 @@ CREATE TABLE IF NOT EXISTS request_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_key_ts ON request_events(key_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_events_key_ts_id ON request_events(key_id, ts DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_events_key_status_ts ON request_events(key_id, status, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_events_key_model_ts ON request_events(key_id, effective_model, ts DESC);
 
@@ -139,6 +141,8 @@ type Service struct {
 	now          func() time.Time
 	retain       time.Duration
 	hourlyRetain time.Duration
+	hub          *portalHub
+	handoffHook  func(phase string)
 }
 
 // Open creates (or opens) the SQLite store and applies schema migrations.
@@ -207,6 +211,7 @@ func Open(dbPath string, pepper []byte, opts Options) (*Service, error) {
 		now:          now,
 		retain:       retain,
 		hourlyRetain: 365 * 24 * time.Hour,
+		hub:          newPortalHub(),
 	}
 	return s, nil
 }
@@ -229,6 +234,15 @@ func ensureSchemaVersion(db *sql.DB) error {
 		if _, err := db.Exec(`INSERT INTO schema_migrations(version) VALUES (2)`); err != nil {
 			return fmt.Errorf("record schema version 2: %w", err)
 		}
+		v = 2
+	}
+	if v < 3 {
+		if err := migrateV3(db); err != nil {
+			return fmt.Errorf("migrate v3: %w", err)
+		}
+		if _, err := db.Exec(`INSERT INTO schema_migrations(version) VALUES (3)`); err != nil {
+			return fmt.Errorf("record schema version 3: %w", err)
+		}
 	}
 	return nil
 }
@@ -238,6 +252,21 @@ func migrateV2(db *sql.DB) error {
 		`ALTER TABLE request_events ADD COLUMN usage_source TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE request_events ADD COLUMN usage_estimated INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_hourly ADD COLUMN requests_rejected INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func migrateV3(db *sql.DB) error {
+	stmts := []string{
+		`ALTER TABLE request_events ADD COLUMN ttfb_known INTEGER NOT NULL DEFAULT 0`,
+		`CREATE INDEX IF NOT EXISTS idx_events_key_ts_id ON request_events(key_id, ts DESC, id DESC)`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {

@@ -62,13 +62,81 @@ Secure when TLS). **No `keyId` query parameter is honored.**
 | DELETE | `/portal/api/session` | cookie | clears cookie |
 | GET | `/portal/api/me` | cookie | name, masked, status, expiry |
 | GET | `/portal/api/summary` | cookie | cards + remaining + next reset |
-| GET | `/portal/api/usage?range=` | cookie | hourly series |
-| GET | `/portal/api/events` | cookie | paged history |
-| GET | `/portal/api/events/stream` | cookie | SSE public events |
+| GET | `/portal/api/usage` | cookie | chart series (see filter + resolution) |
+| GET | `/portal/api/events` | cookie | cursor-paged raw history |
+| GET | `/portal/api/events/stream` | cookie | replayable SSE public events |
+
+### Unified filter query
+
+`range`, `from`, `to`, `model`, `endpoint`, `status`, `streaming`,
+`error_code` apply to **usage, events, and SSE**. `keyId` / `apiKeyId`
+are ignored. The key is always the portal session principal.
+
+| Param | Notes |
+|---|---|
+| `range` | `LIVE` `1H` `6H` `24H` `7D` `30D` `CUSTOM` (default `24H` on history/charts) |
+| `from` `to` | unix seconds UTC; required for `CUSTOM`; `from < to`; max 365 days |
+| `model` | exact match on `client_model` or `effective_model` |
+| `endpoint` | exact (`openai` / `claude` / `responses`) |
+| `status` | `success` `failed` `cancelled` `rejected` |
+| `streaming` | `true`/`false` (`stream` accepted as alias) |
+| `error_code` | public taxonomy (`error` accepted as alias) |
+| `metric` | chart allowlist only; never interpolated into SQL |
+| `cursor` `limit` | history keyset pagination (`limit` default 50, max 200) |
+| `after` / `Last-Event-ID` | SSE replay cursor = `eventId` |
+
+Timestamps in the API are UTC. The frontend may display local time.
+
+### Raw vs aggregate
+
+`request_events` is the raw store (~30 days). `usage_hourly` is the
+aggregate store (~365 days). Request history never pretends to have
+row-level data past raw retention. Charts pick a resolution:
+
+| Span | Unfiltered | Dimension filter |
+|---|---|---|
+| ≤ 6h inside raw window | 1m from `request_events` | 1m from `request_events` |
+| ≤ 24h inside raw window | 5m from `request_events` | 5m from `request_events` |
+| ≤ 7d | 1h from `usage_hourly` | 15m from `request_events` (clipped to raw) |
+| longer | 1h from `usage_hourly` | 1h from `request_events` (clipped to raw) |
+
+Responses include `resolution`, `bucketSeconds`, `source`, `truncated`,
+`rawAvailableFrom`, `dataRetention`.
+
+Chart metrics allowlist: `requests_attempted`, `requests_quota_consumed`,
+`input_tokens`, `output_tokens`, `total_tokens`, `credits`,
+`success_rate`, `latency`, `ttfb`. All series are returned; `metric=`
+only validates.
+
+History pagination is `ORDER BY ts DESC, id DESC` with an opaque cursor
+encoding `(ts, id)`. `event_id` is SQLite AUTOINCREMENT, so it is a
+stable identity. UUID `requestId` is not used as a cursor.
+
+### SSE
+
+```
+id: 105
+event: request
+data: {public event}
+
+: ping
+```
+
+Reconnect sends `Last-Event-ID`. Handoff is subscribe-first, then
+high-water, then replay `(lastId, highWater]`, then live with
+`eventId` dedupe. A slow client is disconnected (bounded buffer) and
+must replay. Session is re-checked every 5s; logout, disable, token
+revoke, and TTL close the stream. Heartbeats are SSE comments, not
+fake request events.
+
+`ttfbMs` is nullable. Unknown is `null`, never `0`. `0` means a
+measured zero.
 
 Portal JSON errors: `{error,code}` with codes `invalid_api_key`,
 `api_key_disabled`, `api_key_expired`, `invalid_portal_token`,
-`portal_token_expired`, `portal_session_expired`, `internal_error`.
+`portal_token_expired`, `portal_session_expired`, `invalid_range`,
+`range_too_large`, `invalid_cursor`, `invalid_metric`, `invalid_filter`,
+`internal_error`.
 
 `GET /usage` serves `web/usage.html`.  
 `GET /usage/p/{token}` exchanges the portal token for a session and 302s to

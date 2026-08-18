@@ -13,7 +13,6 @@ import (
 
 	"kiro-go/apikey"
 	"kiro-go/config"
-	"kiro-go/metrics"
 	accountpool "kiro-go/pool"
 )
 
@@ -93,11 +92,11 @@ func (env *reservationEnv) usage() apikey.Usage {
 }
 
 func (env *reservationEnv) events() []apikey.PublicEvent {
-	items, _, err := env.svc.ListEvents(env.rec.Key.ID, apikey.EventQuery{Limit: 50})
+	page, err := env.svc.ListEvents(env.rec.Key.ID, apikey.EventQuery{Limit: 50})
 	if err != nil {
 		panic(err)
 	}
-	return items
+	return page.Items
 }
 
 func assertReservedZero(t *testing.T, env *reservationEnv) {
@@ -509,8 +508,8 @@ func TestPortalSSEIsolatedAndReconnect(t *testing.T) {
 
 	cookies := open()
 	body := readStream(cookies, "alice-live", func() {
-		metrics.Record(metrics.Event{ApiKeyID: b.Key.ID, Ok: true, RequestID: "bob-live", InputTokens: 99, Status: 200})
-		metrics.Record(metrics.Event{ApiKeyID: a.Key.ID, Ok: true, RequestID: "alice-live", InputTokens: 3, Status: 200})
+		_ = svc.Commit(b.Key.ID, apikey.CommitInput{RequestID: "bob-live", Outcome: apikey.OutcomeSuccess, Endpoint: "openai", StatusCode: 200})
+		_ = svc.Commit(a.Key.ID, apikey.CommitInput{RequestID: "alice-live", Outcome: apikey.OutcomeSuccess, Endpoint: "openai", StatusCode: 200})
 	})
 	if strings.Contains(body, "bob-secret") || strings.Contains(body, "bob-live") {
 		t.Fatalf("alice SSE leaked bob event: %s", body)
@@ -520,8 +519,8 @@ func TestPortalSSEIsolatedAndReconnect(t *testing.T) {
 	}
 
 	body2 := readStream(cookies, "alice-live-2", func() {
-		metrics.Record(metrics.Event{ApiKeyID: b.Key.ID, Ok: true, RequestID: "bob-live-2", InputTokens: 5, Status: 200})
-		metrics.Record(metrics.Event{ApiKeyID: a.Key.ID, Ok: true, RequestID: "alice-live-2", InputTokens: 4, Status: 200})
+		_ = svc.Commit(b.Key.ID, apikey.CommitInput{RequestID: "bob-live-2", Outcome: apikey.OutcomeSuccess, Endpoint: "openai", StatusCode: 200})
+		_ = svc.Commit(a.Key.ID, apikey.CommitInput{RequestID: "alice-live-2", Outcome: apikey.OutcomeSuccess, Endpoint: "openai", StatusCode: 200})
 	})
 	if strings.Contains(body2, "bob-live") || strings.Contains(body2, "bob-secret") {
 		t.Fatalf("reconnect leaked bob: %s", body2)

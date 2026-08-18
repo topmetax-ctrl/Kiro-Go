@@ -229,6 +229,7 @@ type CommitInput struct {
 	StatusCode     int
 	LatencyMs      int64
 	TTFBMs         int64
+	TTFBKnown      bool // true even when TTFBMs is 0; unknown must stay unset
 	Stream         bool
 	ErrorCode      string
 	SanitizedError string
@@ -237,6 +238,7 @@ type CommitInput struct {
 }
 
 type EventQuery struct {
+	Range     string
 	From      *time.Time
 	To        *time.Time
 	Model     string
@@ -244,8 +246,10 @@ type EventQuery struct {
 	Status    string
 	Stream    *bool
 	ErrorCode string
+	Cursor    string
+	Metric    string
 	SortAsc   bool
-	Offset    int
+	Offset    int // ignored; cursor pagination is the contract
 	Limit     int
 }
 
@@ -265,11 +269,95 @@ type PublicEvent struct {
 	TotalTokens    int64     `json:"totalTokens"`
 	Credits        float64   `json:"credits"`
 	LatencyMs      int64     `json:"latencyMs"`
-	TTFBMs         int64     `json:"ttfbMs,omitempty"`
+	TTFBMs         *int64    `json:"ttfbMs"`
 	Streaming      bool      `json:"streaming"`
 	ErrorCode      string    `json:"errorCode,omitempty"`
 	UsageSource    string    `json:"usageSource,omitempty"`
 	UsageEstimated bool      `json:"usageEstimated,omitempty"`
+}
+
+// PortalView strips identity that the session already implies so a captured
+// payload cannot be replayed as a cross-key locator.
+func (e PublicEvent) PortalView() PublicEvent {
+	e.ApiKeyID = ""
+	return e
+}
+
+const (
+	Resolution1m  = "1m"
+	Resolution5m  = "5m"
+	Resolution15m = "15m"
+	Resolution1h  = "1h"
+	ResolutionRaw = "raw"
+
+	SourceEvents = "request_events"
+	SourceHourly = "usage_hourly"
+
+	MaxPortalRange   = 365 * 24 * time.Hour
+	MaxEventReplay   = 500
+	portalSubBuffer  = 64
+	DefaultEventPage = 50
+	MaxEventPage     = 200
+)
+
+// AllowedSeriesMetrics is the chart allowlist. The query planner never
+// interpolates a client metric string into SQL.
+var AllowedSeriesMetrics = []string{
+	"requests_attempted",
+	"requests_quota_consumed",
+	"input_tokens",
+	"output_tokens",
+	"total_tokens",
+	"credits",
+	"success_rate",
+	"latency",
+	"ttfb",
+}
+
+type RetentionMeta struct {
+	RawEventsDays int `json:"rawEventsDays"`
+	HourlyDays    int `json:"hourlyDays"`
+}
+
+type QueryMeta struct {
+	From             int64         `json:"from"`
+	To               int64         `json:"to"`
+	Resolution       string        `json:"resolution"`
+	BucketSeconds    int64         `json:"bucketSeconds,omitempty"`
+	Source           string        `json:"source,omitempty"`
+	Truncated        bool          `json:"truncated"`
+	RawAvailableFrom int64         `json:"rawAvailableFrom"`
+	DataRetention    RetentionMeta `json:"dataRetention"`
+}
+
+type EventPage struct {
+	Items      []PublicEvent `json:"items"`
+	NextCursor string        `json:"nextCursor,omitempty"`
+	HasMore    bool          `json:"hasMore"`
+	QueryMeta
+}
+
+type SeriesPoint struct {
+	T                     int64    `json:"t"`
+	RequestsAttempted     int64    `json:"requestsAttempted"`
+	RequestsQuotaConsumed int64    `json:"requestsQuotaConsumed"`
+	RequestsSuccess       int64    `json:"requestsSuccess"`
+	RequestsFailed        int64    `json:"requestsFailed"`
+	RequestsCancelled     int64    `json:"requestsCancelled"`
+	RequestsRejected      int64    `json:"requestsRejected"`
+	InputTokens           int64    `json:"inputTokens"`
+	OutputTokens          int64    `json:"outputTokens"`
+	TotalTokens           int64    `json:"totalTokens"`
+	Credits               float64  `json:"credits"`
+	SuccessRate           *float64 `json:"successRate"`
+	AvgLatencyMs          *float64 `json:"avgLatencyMs"`
+	AvgTtfbMs             *float64 `json:"avgTtfbMs"`
+}
+
+type SeriesResult struct {
+	Points  []SeriesPoint `json:"points"`
+	Metrics []string      `json:"metrics"`
+	QueryMeta
 }
 
 type HourBucket struct {

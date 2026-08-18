@@ -214,15 +214,15 @@ func TestFailedChargesKnownUsage(t *testing.T) {
 	if got.Usage.TotalTokens != 16 || got.Usage.RequestsFailed != 1 {
 		t.Fatalf("failed usage %+v", got.Usage)
 	}
-	evs, n, err := s.ListEvents(rec.Key.ID, EventQuery{Limit: 5})
-	if err != nil || n != 1 {
-		t.Fatalf("events n=%d err=%v", n, err)
+	page, err := s.ListEvents(rec.Key.ID, EventQuery{Limit: 5})
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("events n=%d err=%v", len(page.Items), err)
 	}
-	if err := ValidatePublicEvent(evs[0]); err != nil {
-		t.Fatalf("contract: %v %+v", err, evs[0])
+	if err := ValidatePublicEvent(page.Items[0]); err != nil {
+		t.Fatalf("contract: %v %+v", err, page.Items[0])
 	}
-	if evs[0].ClientModel == "" || evs[0].UsageSource != UsageSourceStreamObserved {
-		t.Fatalf("event fields %+v", evs[0])
+	if page.Items[0].ClientModel == "" || page.Items[0].UsageSource != UsageSourceStreamObserved {
+		t.Fatalf("event fields %+v", page.Items[0])
 	}
 }
 
@@ -255,9 +255,9 @@ func TestCommitRejectedReleasesReservation(t *testing.T) {
 	if _, err := s.Authenticate(secret, true); err != nil {
 		t.Fatalf("slot should be free after rejected settle: %v", err)
 	}
-	evs, n, err := s.ListEvents(rec.Key.ID, EventQuery{Limit: 10})
-	if err != nil || n != 1 || evs[0].Status != OutcomeRejected || evs[0].StatusCode != 503 {
-		t.Fatalf("event n=%d evs=%+v err=%v", n, evs, err)
+	page, err := s.ListEvents(rec.Key.ID, EventQuery{Limit: 10})
+	if err != nil || len(page.Items) != 1 || page.Items[0].Status != OutcomeRejected || page.Items[0].StatusCode != 503 {
+		t.Fatalf("event n=%d evs=%+v err=%v", len(page.Items), page.Items, err)
 	}
 }
 
@@ -297,11 +297,11 @@ func TestPortalIsolationAndSession(t *testing.T) {
 	if err != nil || got.Key.ID != a.Key.ID {
 		t.Fatalf("session record: %v", err)
 	}
-	events, _, err := s.ListEvents(got.Key.ID, EventQuery{Limit: 10})
+	page, err := s.ListEvents(got.Key.ID, EventQuery{Limit: 10})
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
-	for _, ev := range events {
+	for _, ev := range page.Items {
 		if ev.InputTokens == 99 {
 			t.Fatalf("leaked key B event")
 		}

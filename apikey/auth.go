@@ -242,18 +242,28 @@ func (s *Service) Commit(keyID string, in CommitInput) error {
 			source = UsageSourceEstimator
 		}
 	}
-	_, err = tx.Exec(`INSERT INTO request_events(
+	ttfbKnown := 0
+	ttfbVal := in.TTFBMs
+	if in.TTFBKnown {
+		ttfbKnown = 1
+	} else if in.TTFBMs > 0 {
+		ttfbKnown = 1
+	} else {
+		ttfbVal = 0
+	}
+	res, err := tx.Exec(`INSERT INTO request_events(
 		request_id,key_id,ts,endpoint,client_model,effective_model,status_code,status,
-		input_tokens,output_tokens,total_tokens,credits,latency_ms,ttfb_ms,stream,cancelled,error_code,sanitized_error,
+		input_tokens,output_tokens,total_tokens,credits,latency_ms,ttfb_ms,ttfb_known,stream,cancelled,error_code,sanitized_error,
 		usage_source,usage_estimated)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		in.RequestID, keyID, now.Unix(), in.Endpoint, in.ClientModel, in.EffectiveModel, in.StatusCode, outcome,
-		addIn, addOut, addTokens, addCredits, in.LatencyMs, in.TTFBMs, boolInt(in.Stream), boolInt(outcome == OutcomeCancelled),
+		addIn, addOut, addTokens, addCredits, in.LatencyMs, ttfbVal, ttfbKnown, boolInt(in.Stream), boolInt(outcome == OutcomeCancelled),
 		in.ErrorCode, sanitizeError(in.SanitizedError), source, boolInt(in.UsageEstimated))
 	if err != nil {
 		IncEventPersistError()
 		return err
 	}
+	eventID, _ := res.LastInsertId()
 
 	hour := now.Truncate(time.Hour).Unix()
 	var hs, hf, hc, hr, hourReq int64
@@ -273,8 +283,8 @@ func (s *Service) Commit(keyID string, in CommitInput) error {
 		hourReq = 1
 	}
 	ttfbInc, ttfbN := int64(0), int64(0)
-	if in.TTFBMs > 0 {
-		ttfbInc = in.TTFBMs
+	if ttfbKnown == 1 {
+		ttfbInc = ttfbVal
 		ttfbN = 1
 	}
 	_, err = tx.Exec(`INSERT INTO usage_hourly(key_id,hour_utc,requests,requests_success,requests_failed,requests_cancelled,requests_rejected,
@@ -302,5 +312,10 @@ func (s *Service) Commit(keyID string, in CommitInput) error {
 		return err
 	}
 	IncSettlement(outcome)
+	if eventID > 0 {
+		if ev, loadErr := s.eventByID(eventID); loadErr == nil {
+			s.publishPortal(ev)
+		}
+	}
 	return nil
 }

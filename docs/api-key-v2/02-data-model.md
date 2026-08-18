@@ -71,10 +71,13 @@ Lifetime row is always maintained. Period row is maintained when reset ≠ lifet
 
 Metadata only. No prompt, messages, tools, completion, Authorization, or secret.
 
-Columns: `id INTEGER PK` (exposed as `eventId`), `request_id`, `key_id`, `ts`, `endpoint`,
+Columns: `id INTEGER PK` (exposed as `eventId`; AUTOINCREMENT, used as the
+stable cursor and SSE id), `request_id`, `key_id`, `ts`, `endpoint`,
 `client_model`, `effective_model`, `status_code`, `status`, `input_tokens`,
-`output_tokens`, `total_tokens`, `credits`, `latency_ms`, `ttfb_ms`, `stream`,
-`cancelled`, `error_code`, `sanitized_error`, `usage_source`, `usage_estimated`.
+`output_tokens`, `total_tokens`, `credits`, `latency_ms`, `ttfb_ms`,
+`ttfb_known` (1 = measured, including 0 ms; 0 + `ttfb_ms=0` = unavailable),
+`stream`, `cancelled`, `error_code`, `sanitized_error`, `usage_source`,
+`usage_estimated`.
 
 `requests_attempted` is derived: success+failed+cancelled+rejected.
 `requests_quota_consumed` = `requests_total`.
@@ -82,6 +85,7 @@ Columns: `id INTEGER PK` (exposed as `eventId`), `request_id`, `key_id`, `ts`, `
 Indexes:
 
 - `request_events(key_id, ts DESC)`
+- `request_events(key_id, ts DESC, id DESC)` — cursor pages
 - `request_events(key_id, status, ts DESC)`
 - `request_events(key_id, effective_model, ts DESC)`
 

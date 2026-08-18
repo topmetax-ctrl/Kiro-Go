@@ -39,6 +39,17 @@ func (s *Service) CreatePortalToken(keyID string, ttl time.Duration) (string, Po
 
 func (s *Service) RevokePortalToken(keyID string) error {
 	_, err := s.db.Exec(`UPDATE portal_tokens SET revoked_at=? WHERE key_id=?`, s.now().UTC().Unix(), keyID)
+	if err != nil {
+		return err
+	}
+	return s.CloseSessionsForKey(keyID)
+}
+
+func (s *Service) CloseSessionsForKey(keyID string) error {
+	if keyID == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`DELETE FROM portal_sessions WHERE key_id=?`, keyID)
 	return err
 }
 
@@ -125,7 +136,30 @@ func (s *Service) SessionRecord(sessionPlain string) (Record, error) {
 	if exp < s.now().UTC().Unix() {
 		return Record{}, ErrSession
 	}
-	return s.Get(keyID)
+	rec, err := s.Get(keyID)
+	if err != nil {
+		return Record{}, err
+	}
+	if !rec.Key.Enabled {
+		return Record{}, ErrSession
+	}
+	return rec, nil
+}
+
+// SessionExpiry returns when the portal cookie must stop being accepted.
+func (s *Service) SessionExpiry(sessionPlain string) (time.Time, error) {
+	if sessionPlain == "" {
+		return time.Time{}, ErrSession
+	}
+	var exp int64
+	err := s.db.QueryRow(`SELECT expires_at FROM portal_sessions WHERE id_digest=?`, Digest(sessionPlain, s.pepper)).Scan(&exp)
+	if err == sql.ErrNoRows {
+		return time.Time{}, ErrSession
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(exp, 0).UTC(), nil
 }
 
 func (s *Service) CloseSession(sessionPlain string) error {

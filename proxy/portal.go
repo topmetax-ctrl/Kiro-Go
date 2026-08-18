@@ -2,14 +2,20 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"kiro-go/apikey"
 	"kiro-go/config"
-	"kiro-go/metrics"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+)
+
+// Overridable in tests so heartbeat / re-auth do not wait production intervals.
+var (
+	portalSSEPing   = 25 * time.Second
+	portalSSEReauth = 5 * time.Second
 )
 
 const portalCookieName = "portal_session"
@@ -120,6 +126,13 @@ func (h *Handler) portalSessionRecord(r *http.Request) (apikey.Record, error) {
 }
 
 func writePortalErr(w http.ResponseWriter, err error) {
+	var qe *apikey.QueryError
+	if errors.As(err, &qe) {
+		apikey.IncPortalQueryError()
+		w.WriteHeader(qe.Status)
+		json.NewEncoder(w).Encode(map[string]string{"error": qe.Message, "code": qe.Code})
+		return
+	}
 	if ae, ok := err.(*apikey.AuthError); ok {
 		w.WriteHeader(ae.Status)
 		json.NewEncoder(w).Encode(map[string]string{"error": ae.Message, "code": ae.Machine})
@@ -132,6 +145,25 @@ func writePortalErr(w http.ResponseWriter, err error) {
 	}
 	w.WriteHeader(http.StatusUnauthorized)
 	json.NewEncoder(w).Encode(map[string]string{"error": err.Error(), "code": "invalid_api_key"})
+}
+
+func writePortalDataErr(w http.ResponseWriter, err error) {
+	var qe *apikey.QueryError
+	if errors.As(err, &qe) {
+		writePortalErr(w, err)
+		return
+	}
+	apikey.IncPortalQueryError()
+	w.WriteHeader(http.StatusInternalServerError)
+	json.NewEncoder(w).Encode(map[string]string{"error": "internal error", "code": "internal_error"})
+}
+
+func portalSessionID(r *http.Request) string {
+	c, err := r.Cookie(portalCookieName)
+	if err != nil {
+		return ""
+	}
+	return c.Value
 }
 
 func (h *Handler) portalOpenSession(w http.ResponseWriter, r *http.Request) {
@@ -260,40 +292,29 @@ func (h *Handler) portalUsage(w http.ResponseWriter, r *http.Request) {
 		writePortalErr(w, err)
 		return
 	}
-	from, to := portalRange(r.URL.Query().Get("range"), r.URL.Query().Get("from"), r.URL.Query().Get("to"))
-	series, err := h.keys.UsageSeries(rec.Key.ID, from, to)
+	q, err := apikey.ParseEventQuery(r.URL.Query(), time.Now().UTC())
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error(), "code": "internal_error"})
+		writePortalErr(w, err)
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]interface{}{"range": r.URL.Query().Get("range"), "from": from.Unix(), "to": to.Unix(), "points": series})
-}
-
-func portalRange(named, fromS, toS string) (time.Time, time.Time) {
-	now := time.Now().UTC()
-	to := now
-	from := now.Add(-24 * time.Hour)
-	switch strings.ToUpper(named) {
-	case "LIVE", "1H":
-		from = now.Add(-1 * time.Hour)
-	case "6H":
-		from = now.Add(-6 * time.Hour)
-	case "24H", "":
-		from = now.Add(-24 * time.Hour)
-	case "7D":
-		from = now.Add(-7 * 24 * time.Hour)
-	case "30D":
-		from = now.Add(-30 * 24 * time.Hour)
-	case "CUSTOM":
-		if n, err := strconv.ParseInt(fromS, 10, 64); err == nil && n > 0 {
-			from = time.Unix(n, 0).UTC()
-		}
-		if n, err := strconv.ParseInt(toS, 10, 64); err == nil && n > 0 {
-			to = time.Unix(n, 0).UTC()
-		}
+	series, err := h.keys.UsageSeries(rec.Key.ID, q)
+	if err != nil {
+		writePortalDataErr(w, err)
+		return
 	}
-	return from, to
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"range":            q.Range,
+		"from":             series.From,
+		"to":               series.To,
+		"resolution":       series.Resolution,
+		"bucketSeconds":    series.BucketSeconds,
+		"source":           series.Source,
+		"truncated":        series.Truncated,
+		"rawAvailableFrom": series.RawAvailableFrom,
+		"dataRetention":    series.DataRetention,
+		"metrics":          series.Metrics,
+		"points":           series.Points,
+	})
 }
 
 func (h *Handler) portalEvents(w http.ResponseWriter, r *http.Request) {
@@ -302,35 +323,31 @@ func (h *Handler) portalEvents(w http.ResponseWriter, r *http.Request) {
 		writePortalErr(w, err)
 		return
 	}
-	q := r.URL.Query()
-	eq := apikey.EventQuery{
-		Model:     q.Get("model"),
-		Endpoint:  q.Get("endpoint"),
-		Status:    q.Get("status"),
-		ErrorCode: q.Get("error"),
-	}
-	if v := q.Get("limit"); v != "" {
-		eq.Limit, _ = strconv.Atoi(v)
-	}
-	if v := q.Get("offset"); v != "" {
-		eq.Offset, _ = strconv.Atoi(v)
-	}
-	if v := q.Get("stream"); v == "1" || v == "true" {
-		t := true
-		eq.Stream = &t
-	} else if v == "0" || v == "false" {
-		f := false
-		eq.Stream = &f
-	}
-	from, to := portalRange(q.Get("range"), q.Get("from"), q.Get("to"))
-	eq.From, eq.To = &from, &to
-	items, total, err := h.keys.ListEvents(rec.Key.ID, eq)
+	q, err := apikey.ParseEventQuery(r.URL.Query(), time.Now().UTC())
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error(), "code": "internal_error"})
+		writePortalErr(w, err)
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]interface{}{"items": items, "total": total, "offset": eq.Offset, "limit": eq.Limit})
+	page, err := h.keys.ListEvents(rec.Key.ID, q)
+	if err != nil {
+		writePortalDataErr(w, err)
+		return
+	}
+	items := make([]apikey.PublicEvent, len(page.Items))
+	for i, ev := range page.Items {
+		items[i] = ev.PortalView()
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"items":            items,
+		"nextCursor":       page.NextCursor,
+		"hasMore":          page.HasMore,
+		"from":             page.From,
+		"to":               page.To,
+		"resolution":       page.Resolution,
+		"truncated":        page.Truncated,
+		"rawAvailableFrom": page.RawAvailableFrom,
+		"dataRetention":    page.DataRetention,
+	})
 }
 
 func (h *Handler) portalEventStream(w http.ResponseWriter, r *http.Request) {
@@ -339,55 +356,109 @@ func (h *Handler) portalEventStream(w http.ResponseWriter, r *http.Request) {
 		writePortalErr(w, err)
 		return
 	}
-	keyID := rec.Key.ID
+	sid := portalSessionID(r)
+	filter, err := apikey.ParseEventStreamQuery(r.URL.Query(), time.Now().UTC())
+	if err != nil {
+		writePortalErr(w, err)
+		return
+	}
+	lastID := parseLastEventID(r)
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		w.WriteHeader(500)
+		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Streaming not supported", "code": "internal_error"})
 		return
 	}
+	stream, err := h.keys.OpenPortalStream(rec.Key.ID, lastID, filter)
+	if err != nil {
+		writePortalDataErr(w, err)
+		return
+	}
+	defer stream.Cancel()
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
+	seen := make(map[int64]struct{}, len(stream.Replay)+16)
 	writePub := func(ev apikey.PublicEvent) {
-		data, _ := json.Marshal(ev)
-		fmt.Fprintf(w, "data: %s\n\n", data)
+		if ev.EventID != 0 {
+			if _, dup := seen[ev.EventID]; dup {
+				return
+			}
+			seen[ev.EventID] = struct{}{}
+			if len(seen) > 4096 {
+				for id := range seen {
+					if id <= stream.HighWater {
+						delete(seen, id)
+					}
+				}
+			}
+		}
+		if !filter.Match(ev) {
+			return
+		}
+		data, _ := json.Marshal(ev.PortalView())
+		fmt.Fprintf(w, "id: %d\nevent: request\ndata: %s\n\n", ev.EventID, data)
+		flusher.Flush()
 	}
 
-	recent, _, _ := h.keys.ListEvents(keyID, apikey.EventQuery{Limit: 20})
-	for i := len(recent) - 1; i >= 0; i-- {
-		writePub(recent[i])
+	fmt.Fprintf(w, ": connected\n\n")
+	flusher.Flush()
+	for _, ev := range stream.Replay {
+		writePub(ev)
 	}
 	flusher.Flush()
 
-	ch, cancel := metrics.Subscribe()
-	defer cancel()
-	ping := time.NewTicker(25 * time.Second)
+	exp, expErr := h.keys.SessionExpiry(sid)
+	deadline := time.Now().Add(12 * time.Hour)
+	if expErr == nil && exp.Before(deadline) {
+		deadline = exp
+	}
+	life := time.NewTimer(time.Until(deadline))
+	defer life.Stop()
+
+	ping := time.NewTicker(portalSSEPing)
 	defer ping.Stop()
+	reauth := time.NewTicker(portalSSEReauth)
+	defer reauth.Stop()
+
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-life.C:
+			fmt.Fprintf(w, "event: session\ndata: {\"code\":\"portal_session_expired\"}\n\n")
+			flusher.Flush()
+			return
+		case <-reauth.C:
+			if _, err := h.keys.SessionRecord(sid); err != nil {
+				fmt.Fprintf(w, "event: session\ndata: {\"code\":\"portal_session_expired\"}\n\n")
+				flusher.Flush()
+				return
+			}
 		case <-ping.C:
 			fmt.Fprintf(w, ": ping\n\n")
 			flusher.Flush()
-		case ev, ok := <-ch:
+		case ev, ok := <-stream.Live:
 			if !ok {
 				return
 			}
-			if ev.ApiKeyID != keyID {
-				continue
-			}
-			status := apikey.OutcomeFailed
-			if ev.Ok {
-				status = apikey.OutcomeSuccess
-			} else if ev.Canceled {
-				status = apikey.OutcomeCancelled
-			}
-			writePub(apikey.ToPublic(ev.RequestID, time.UnixMilli(ev.TimeMs), ev.Endpoint, ev.ClientModel, ev.Status, status, ev.InputTokens, ev.OutputTokens, ev.CostUSD, ev.LatencyMs, ev.TTFBMs, ev.Stream, ""))
-			flusher.Flush()
+			writePub(ev)
 		}
 	}
+}
+
+func parseLastEventID(r *http.Request) int64 {
+	if v := strings.TrimSpace(r.Header.Get("Last-Event-ID")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	if v := strings.TrimSpace(r.URL.Query().Get("after")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
 }

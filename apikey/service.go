@@ -140,6 +140,9 @@ func (s *Service) Update(id string, in UpdateInput) (Record, error) {
 	if err := tx.Commit(); err != nil {
 		return Record{}, err
 	}
+	if !enabled {
+		_ = s.CloseSessionsForKey(id)
+	}
 	return s.Get(id)
 }
 

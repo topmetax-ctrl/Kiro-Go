@@ -210,8 +210,9 @@ func mergeCommitInput(dst *apikey.CommitInput, src apikey.CommitInput) {
 	if src.LatencyMs != 0 {
 		dst.LatencyMs = src.LatencyMs
 	}
-	if src.TTFBMs != 0 {
+	if src.TTFBKnown && !dst.TTFBKnown {
 		dst.TTFBMs = src.TTFBMs
+		dst.TTFBKnown = true
 	}
 	if src.Stream {
 		dst.Stream = true
@@ -317,6 +318,29 @@ func wrapLeaseWriter(w http.ResponseWriter, ctx context.Context) http.ResponseWr
 		return w
 	}
 	return &leaseResponseWriter{ResponseWriter: w, ctx: ctx}
+}
+
+func (w *leaseResponseWriter) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		noteAPIKeyTTFB(w.ctx)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+// noteAPIKeyTTFB records time from lease start to first client output.
+// 0 ms is a valid measurement and is stored as known.
+func noteAPIKeyTTFB(ctx context.Context) {
+	l := leaseFromContext(ctx)
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.settled || l.input.TTFBKnown {
+		return
+	}
+	l.input.TTFBMs = time.Since(l.start).Milliseconds()
+	l.input.TTFBKnown = true
 }
 
 func (w *leaseResponseWriter) Flush() {

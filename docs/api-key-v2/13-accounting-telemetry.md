@@ -43,3 +43,11 @@ Credits are never estimated. They are recorded only from a Kiro `meteringEvent`.
 `apikey.UnsettledReservations()` counts handler exits that reserved but never
 `Note()`d an outcome. Production expectation: 0. Panic recovery Notes
 `internal_error` so that path does not increment the counter.
+
+Portal data-plane counters (process-local, same style):
+
+- `PortalSSEConnectionsActive` / `PortalSSEConnectionsTotal`
+- `PortalSSEReplays` / `PortalSSEReplayedEvents`
+- `PortalSSESlowClients`
+- `PortalQueryErrors`
+- `EventPersistErrors`

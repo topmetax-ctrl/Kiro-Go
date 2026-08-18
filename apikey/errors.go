@@ -54,3 +54,33 @@ func errRequestQuota() *AuthError {
 func errNoKeysConfigured() *AuthError {
 	return &AuthError{Status: http.StatusUnauthorized, Code: "authentication_error", Machine: "invalid_api_key", Message: "API key authentication is required but no keys are configured"}
 }
+
+// QueryError is a 4xx portal data-plane error. It is never used as an
+// authentication failure.
+type QueryError struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+func (e *QueryError) Error() string { return e.Message }
+
+func errInvalidRange(msg string) *QueryError {
+	return &QueryError{Status: http.StatusBadRequest, Code: "invalid_range", Message: msg}
+}
+
+func errRangeTooLarge(msg string) *QueryError {
+	return &QueryError{Status: http.StatusBadRequest, Code: "range_too_large", Message: msg}
+}
+
+func errInvalidCursor(msg string) *QueryError {
+	return &QueryError{Status: http.StatusBadRequest, Code: "invalid_cursor", Message: msg}
+}
+
+func errInvalidMetric(msg string) *QueryError {
+	return &QueryError{Status: http.StatusBadRequest, Code: "invalid_metric", Message: msg}
+}
+
+func errInvalidFilter(msg string) *QueryError {
+	return &QueryError{Status: http.StatusBadRequest, Code: "invalid_filter", Message: msg}
+}
