@@ -59,6 +59,59 @@ func GetUsageRetentionDays() int {
 	return cfg.UsageRetentionDays
 }
 
+// LegacyPlaintextRetained is true unless an operator has finalized scrubbing.
+// nil (unset) keeps rollback plaintext, matching the V1 default.
+func LegacyPlaintextRetained() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.LegacyPlaintextRetention == nil {
+		return true
+	}
+	return *cfg.LegacyPlaintextRetention
+}
+
+// FinalizeLegacyPlaintext scrubs apiKeys[].key after verify succeeds for every
+// non-empty secret. It is irreversible for older binaries and must be invoked
+// explicitly — startup never flips the default. Save() already writes a .bak.
+func FinalizeLegacyPlaintext(verify func(id, secret string) error) (int, error) {
+	if verify == nil {
+		return 0, errors.New("verify callback is required")
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return 0, errors.New("config not initialized")
+	}
+	type pair struct{ id, secret string }
+	var pending []pair
+	for _, e := range cfg.ApiKeys {
+		secret := strings.TrimSpace(e.Key)
+		if secret == "" {
+			continue
+		}
+		pending = append(pending, pair{e.ID, secret})
+	}
+	for _, p := range pending {
+		if err := verify(p.id, p.secret); err != nil {
+			return 0, err
+		}
+	}
+	n := 0
+	for i := range cfg.ApiKeys {
+		if strings.TrimSpace(cfg.ApiKeys[i].Key) == "" {
+			continue
+		}
+		cfg.ApiKeys[i].Key = ""
+		n++
+	}
+	off := false
+	cfg.LegacyPlaintextRetention = &off
+	if err := saveLocked(); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 func IsPortalEnabled() bool {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
