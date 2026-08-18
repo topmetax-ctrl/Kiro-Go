@@ -321,16 +321,44 @@ func TestSeriesPlannerAndAllowlist(t *testing.T) {
 func TestExplainUsesKeyTsIndex(t *testing.T) {
 	s := testService(t)
 	rec, _, _ := s.Create(CreateInput{Name: "x", Enabled: true})
-	_ = s.Commit(rec.Key.ID, CommitInput{Outcome: OutcomeSuccess, Endpoint: "openai", StatusCode: 200})
-	plans, err := s.ExplainQueryPlan(
-		`SELECT id FROM request_events WHERE key_id=? AND (ts < ? OR (ts = ? AND id < ?)) ORDER BY ts DESC, id DESC LIMIT 6`,
-		rec.Key.ID, time.Now().Unix(), time.Now().Unix(), int64(1<<20))
-	if err != nil {
-		t.Fatal(err)
+	_ = s.Commit(rec.Key.ID, CommitInput{Outcome: OutcomeSuccess, Endpoint: "openai", StatusCode: 200, ClientModel: "m", EffectiveModel: "m"})
+	now := time.Now().Unix()
+	cases := []struct {
+		name  string
+		query string
+		args  []interface{}
+	}{
+		{
+			name:  "cursor",
+			query: `SELECT id FROM request_events WHERE key_id=? AND (ts < ? OR (ts = ? AND id < ?)) ORDER BY ts DESC, id DESC LIMIT 6`,
+			args:  []interface{}{rec.Key.ID, now, now, int64(1 << 20)},
+		},
+		{
+			name:  "status",
+			query: `SELECT id FROM request_events WHERE key_id=? AND status=? ORDER BY ts DESC, id DESC LIMIT 50`,
+			args:  []interface{}{rec.Key.ID, OutcomeSuccess},
+		},
+		{
+			name:  "model",
+			query: `SELECT id FROM request_events WHERE key_id=? AND (client_model=? OR effective_model=?) ORDER BY ts DESC, id DESC LIMIT 50`,
+			args:  []interface{}{rec.Key.ID, "m", "m"},
+		},
+		{
+			name:  "lookup",
+			query: `SELECT id FROM api_keys WHERE secret_digest=?`,
+			args:  []interface{}{"not-a-real-digest"},
+		},
 	}
-	joined := strings.Join(plans, " | ")
-	if !strings.Contains(joined, "idx_events_key_ts") && !strings.Contains(strings.ToLower(joined), "using index") {
-		t.Fatalf("expected index use, got %s", joined)
+	for _, tc := range cases {
+		plans, err := s.ExplainQueryPlan(tc.query, tc.args...)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		joined := strings.Join(plans, " | ")
+		if !strings.Contains(strings.ToLower(joined), "using index") && !strings.Contains(joined, "idx_") {
+			t.Fatalf("%s expected index use, got %s", tc.name, joined)
+		}
+		t.Logf("%s: %s", tc.name, joined)
 	}
 }
 
