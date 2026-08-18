@@ -4809,3 +4809,22 @@ body.modal-open .scroll-nav {
   color: #d97706;
   cursor: help;
 }
+
+.ak-status {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+.ak-status-active { background: rgba(34, 197, 94, 0.15); color: #16a34a; }
+.ak-status-disabled { background: rgba(127, 127, 127, 0.15); color: #6b7280; }
+.ak-status-expired { background: rgba(245, 158, 11, 0.18); color: #d97706; }
+.ak-status-exhausted { background: rgba(239, 68, 68, 0.15); color: #ef4444; }
+.ak-row-80 td:nth-child(5) { color: #d97706; }
+.ak-row-90 td:nth-child(5) { color: #ea580c; }
+.ak-row-100 td:nth-child(5) { color: #dc2626; font-weight: 600; }
+.api-key-advanced { margin: 0.75rem 0; }
+.api-key-advanced summary { cursor: pointer; font-weight: 600; }
+#tabApikeys .table-wrap { overflow-x: auto; }
+#tabApikeys .stats-table { min-width: 960px; }

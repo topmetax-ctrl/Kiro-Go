@@ -170,6 +170,7 @@
     renderStatsTable();
     renderStatsCompare();
     renderStatsTrend(statsTrendLast.buckets, statsTrendLast.unit);
+    renderApiKeys();
     // Inline stats and any expanded detail panels are innerHTML-built, so they
     // need an explicit re-render to pick up the new locale.
     renderProviderInlineStats();
@@ -2255,8 +2256,11 @@
   }
   // Multi API Key management
   let apiKeysCache = [];
+  let apiKeysTotal = 0;
   let apiKeyEditingId = '';
   let apiKeyModalSubmitting = false;
+  let apiKeyLastPortalUrl = '';
+  let apiKeysQuery = { q: '', status: '', quota: '', usage: '', sort: 'created_desc', offset: 0, limit: 50 };
 
   let upstreamCache = { providers: [], routes: [] };
   let upstreamEditingId = '';
@@ -2287,15 +2291,36 @@
   async function loadApiKeys() {
     const list = $('apiKeysList');
     if (!list) return;
+    const loading = $('apiKeysLoading');
+    const errEl = $('apiKeysError');
+    if (loading) loading.classList.remove('hidden');
+    if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
     try {
-      const res = await api('/api-keys');
+      const q = apiKeysQuery;
+      const params = new URLSearchParams();
+      if (q.q) params.set('q', q.q);
+      if (q.status) params.set('status', q.status);
+      if (q.quota) params.set('quota', q.quota);
+      if (q.usage) params.set('usage', q.usage);
+      if (q.sort) params.set('sort', q.sort);
+      params.set('offset', String(q.offset || 0));
+      params.set('limit', String(q.limit || 50));
+      const res = await api('/api-keys?' + params.toString());
       if (!res.ok) throw new Error('http ' + res.status);
       const d = await res.json();
       apiKeysCache = Array.isArray(d.apiKeys) ? d.apiKeys : [];
+      apiKeysTotal = typeof d.total === 'number' ? d.total : apiKeysCache.length;
       renderApiKeys();
     } catch (e) {
       apiKeysCache = [];
-      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.loadFailed')) + '</div>';
+      apiKeysTotal = 0;
+      if (errEl) {
+        errEl.textContent = t('apiKeys.loadFailed');
+        errEl.classList.remove('hidden');
+      }
+      renderApiKeys();
+    } finally {
+      if (loading) loading.classList.add('hidden');
     }
   }
 
@@ -2326,52 +2351,133 @@
     return '<div class="text-xs muted-text">' + escapeHtml(label) + ': ' + escapeHtml(fmt(used)) + ' / ' + escapeHtml(fmt(limit)) + '</div>' + usageBar(used, limit);
   }
 
+  function apiKeyStatusBadge(item) {
+    const st = item.status || (item.enabled ? 'active' : 'disabled');
+    const map = { active: 'apiKeys.statusActive', disabled: 'apiKeys.statusDisabled', expired: 'apiKeys.statusExpired', exhausted: 'apiKeys.statusExhausted' };
+    const cls = 'ak-status ak-status-' + st;
+    return '<span class="' + cls + '">' + escapeHtml(t(map[st] || 'apiKeys.statusActive')) + '</span>';
+  }
+
+  function apiKeyQuotaLabel(item) {
+    const parts = [];
+    if (item.creditLimit > 0) parts.push(t('apiKeys.credits'));
+    if (item.tokenLimit > 0) parts.push(t('apiKeys.tokens'));
+    if (item.requestLimit > 0) parts.push(t('apiKeys.requests'));
+    return parts.length ? parts.join(' + ') : t('apiKeys.unlimited');
+  }
+
+  function apiKeyUsedLabel(item) {
+    if (item.creditLimit > 0) return formatNumber(item.creditsUsed || 0) + ' / ' + formatNumber(item.creditLimit);
+    if (item.tokenLimit > 0) return formatNumber(item.tokensUsed || 0) + ' / ' + formatNumber(item.tokenLimit);
+    if (item.requestLimit > 0) return formatNumber(item.requestsCount || 0) + ' / ' + formatNumber(item.requestLimit);
+    return formatNumber(item.tokensUsed || 0);
+  }
+
+  function apiKeyRemainLabel(item) {
+    if (item.creditsRemaining != null) return formatNumber(item.creditsRemaining);
+    if (item.tokensRemaining != null) return formatNumber(item.tokensRemaining);
+    if (item.requestsRemaining != null) return formatNumber(item.requestsRemaining);
+    return '—';
+  }
+
+  function fmtUnixLocal(sec) {
+    if (!sec) return '—';
+    try { return new Date(sec * 1000).toLocaleString(); } catch (e) { return '—'; }
+  }
+
   function renderApiKeys() {
     const list = $('apiKeysList');
     if (!list) return;
     if (!apiKeysCache.length) {
-      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.empty')) + '</div>';
+      list.innerHTML = '<tr><td colspan="11" class="muted-text" style="padding:0.75rem;">' + escapeHtml(t('apiKeys.empty')) + '</td></tr>';
+      renderApiKeysPager();
       return;
     }
-    const html = apiKeysCache.map(item => {
+    list.innerHTML = apiKeysCache.map(item => {
       const id = escapeAttr(item.id || '');
-      const name = item.name ? escapeHtml(item.name) : '<span class="muted-text">' + escapeHtml(t('apiKeys.unnamed')) + '</span>';
-      const masked = escapeHtml(item.keyMasked || '');
-      const migrated = item.migrated
-        ? '<span class="text-xs" style="background:rgba(59,130,246,0.15);color:#3b82f6;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.migrated')) + '</span>'
-        : '';
-      const disabled = !item.enabled
-        ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.disabled')) + '</span>'
-        : '';
-      const tokensLine = usageLine(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0);
-      const creditsLine = usageLine(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0);
-      const requestsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.requests')) + ': ' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</div>';
-      return '<div class="card" data-apikey-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
-        '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
-          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
-            '<span class="font-semibold">' + name + '</span>' +
-            migrated +
-            disabled +
-            '<span class="text-xs muted-text font-mono">' + masked + '</span>' +
-          '</div>' +
-          '<div class="flex items-center gap-2">' +
-            '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
-              '<input type="checkbox" data-apikey-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
-              '<span class="slider"></span>' +
-            '</label>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="edit" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionEdit')) + '</button>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="reset" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionReset')) + '</button>' +
-            '<button class="btn btn-danger btn-sm" type="button" data-apikey-action="delete" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionDelete')) + '</button>' +
-          '</div>' +
-        '</div>' +
-        '<div style="margin-top:0.5rem;display:grid;gap:0.35rem;">' +
-          tokensLine +
-          creditsLine +
-          requestsLine +
-        '</div>' +
-      '</div>';
+      const name = item.name ? escapeHtml(item.name) : escapeHtml(t('apiKeys.unnamed'));
+      const warn = usageWarnClass(item);
+      return '<tr data-apikey-id="' + id + '"' + (warn ? ' class="' + warn + '"' : '') + '>' +
+        '<td>' + name + '</td>' +
+        '<td class="font-mono text-xs">' + escapeHtml(item.keyMasked || '') + '</td>' +
+        '<td>' + apiKeyStatusBadge(item) + '</td>' +
+        '<td>' + escapeHtml(apiKeyQuotaLabel(item)) + '</td>' +
+        '<td>' + escapeHtml(apiKeyUsedLabel(item)) + usageBar(primaryUsed(item), primaryLimit(item)) + '</td>' +
+        '<td>' + escapeHtml(apiKeyRemainLabel(item)) + '</td>' +
+        '<td>' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</td>' +
+        '<td class="text-xs">' + escapeHtml(fmtUnixLocal(item.lastUsedAt)) + '</td>' +
+        '<td class="text-xs">' + escapeHtml(fmtUnixLocal(item.expiresAt)) + '</td>' +
+        '<td class="text-xs">' + escapeHtml(fmtUnixLocal(item.createdAt)) + '</td>' +
+        '<td><div class="flex items-center gap-1" style="flex-wrap:wrap;">' +
+          '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
+            '<input type="checkbox" data-apikey-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
+            '<span class="slider"></span></label>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="edit" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionEdit')) + '</button>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="rotate" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionRotate')) + '</button>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="portal" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionPortal')) + '</button>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="reset" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionReset')) + '</button>' +
+          '<button class="btn btn-danger btn-sm" type="button" data-apikey-action="delete" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionDelete')) + '</button>' +
+        '</div></td></tr>';
     }).join('');
-    list.innerHTML = html;
+    renderApiKeysPager();
+  }
+
+  function primaryLimit(item) {
+    if (item.creditLimit > 0) return item.creditLimit;
+    if (item.tokenLimit > 0) return item.tokenLimit;
+    if (item.requestLimit > 0) return item.requestLimit;
+    return 0;
+  }
+  function primaryUsed(item) {
+    if (item.creditLimit > 0) return item.creditsUsed || 0;
+    if (item.tokenLimit > 0) return item.tokensUsed || 0;
+    if (item.requestLimit > 0) return item.requestsCount || 0;
+    return 0;
+  }
+  function usageWarnClass(item) {
+    const lim = primaryLimit(item);
+    if (!lim) return '';
+    const ratio = primaryUsed(item) / lim;
+    if (ratio >= 1) return 'ak-row-100';
+    if (ratio >= 0.9) return 'ak-row-90';
+    if (ratio >= 0.8) return 'ak-row-80';
+    return '';
+  }
+
+  function renderApiKeysPager() {
+    const el = $('apiKeysPager');
+    if (!el) return;
+    const limit = apiKeysQuery.limit || 50;
+    const offset = apiKeysQuery.offset || 0;
+    const page = Math.floor(offset / limit) + 1;
+    const pages = Math.max(1, Math.ceil((apiKeysTotal || 0) / limit));
+    el.innerHTML = '<span class="text-xs muted-text">' + escapeHtml(t('apiKeys.pageOf', page, pages, apiKeysTotal || 0)) + '</span>' +
+      '<button class="btn btn-outline btn-sm" type="button" id="apiKeysPrev"' + (offset <= 0 ? ' disabled' : '') + '>' + escapeHtml(t('apiKeys.prev')) + '</button>' +
+      '<button class="btn btn-outline btn-sm" type="button" id="apiKeysNext"' + (offset + limit >= apiKeysTotal ? ' disabled' : '') + '>' + escapeHtml(t('apiKeys.next')) + '</button>';
+    const prev = $('apiKeysPrev');
+    const next = $('apiKeysNext');
+    if (prev) prev.onclick = () => { apiKeysQuery.offset = Math.max(0, offset - limit); loadApiKeys(); };
+    if (next) next.onclick = () => { apiKeysQuery.offset = offset + limit; loadApiKeys(); };
+  }
+
+  function syncLimitByUI() {
+    const by = $('apiKeyForm_limitBy') ? $('apiKeyForm_limitBy').value : 'unlimited';
+    const grp = $('apiKeyForm_amountGroup');
+    if (grp) grp.classList.toggle('hidden', by === 'unlimited');
+    const box = $('apiKeyForm_presets');
+    if (!box) return;
+    const presets = by === 'credits' ? [1, 5, 10, 20, 50, 100]
+      : by === 'tokens' ? [100000, 500000, 1000000, 5000000, 10000000]
+      : by === 'requests' ? [100, 1000, 5000, 10000] : [];
+    box.innerHTML = presets.map(n => '<button type="button" class="btn btn-outline btn-sm" data-preset="' + n + '">' + escapeHtml(formatPreset(n, by)) + '</button>').join('');
+  }
+  function formatPreset(n, by) {
+    if (by === 'tokens') {
+      if (n >= 1000000) return (n / 1000000) + 'M';
+      if (n >= 1000) return (n / 1000) + 'K';
+    }
+    if (n >= 1000) return (n / 1000) + 'K';
+    return String(n);
   }
 
   function openApiKeyModal(entry) {
@@ -2380,16 +2486,44 @@
     titleEl.textContent = t(apiKeyEditingId ? 'apiKeys.modalTitleEdit' : 'apiKeys.modalTitleCreate');
     $('apiKeyForm_name').value = entry ? (entry.name || '') : '';
     const keyEl = $('apiKeyForm_key');
+    const keyGroup = $('apiKeyForm_keyGroup');
     if (apiKeyEditingId) {
       keyEl.value = entry.keyMasked || '';
       keyEl.readOnly = true;
+      if (keyGroup) keyGroup.classList.add('hidden');
     } else {
       keyEl.value = '';
       keyEl.readOnly = false;
+      if (keyGroup) keyGroup.classList.remove('hidden');
     }
     $('apiKeyForm_enabled').checked = entry ? !!entry.enabled : true;
     $('apiKeyForm_tokenLimit').value = entry ? String(entry.tokenLimit || 0) : '0';
     $('apiKeyForm_creditLimit').value = entry ? String(entry.creditLimit || 0) : '0';
+    if ($('apiKeyForm_requestLimit')) $('apiKeyForm_requestLimit').value = entry ? String(entry.requestLimit || 0) : '0';
+    if ($('apiKeyForm_resetPolicy')) $('apiKeyForm_resetPolicy').value = (entry && entry.resetPolicy) || 'lifetime';
+    if ($('apiKeyForm_enforcement')) $('apiKeyForm_enforcement').value = (entry && entry.enforcementMode) || 'soft';
+    let by = 'unlimited';
+    if (entry) {
+      if (entry.creditLimit > 0) by = 'credits';
+      else if (entry.tokenLimit > 0) by = 'tokens';
+      else if (entry.requestLimit > 0) by = 'requests';
+    }
+    if ($('apiKeyForm_limitBy')) $('apiKeyForm_limitBy').value = by;
+    if ($('apiKeyForm_amount')) {
+      $('apiKeyForm_amount').value = by === 'credits' ? (entry && entry.creditLimit || 0)
+        : by === 'tokens' ? (entry && entry.tokenLimit || 0)
+        : by === 'requests' ? (entry && entry.requestLimit || 0) : 0;
+    }
+    if ($('apiKeyForm_expires')) {
+      if (entry && entry.expiresAt) {
+        const d = new Date(entry.expiresAt * 1000);
+        const pad = n => String(n).padStart(2, '0');
+        $('apiKeyForm_expires').value = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+      } else {
+        $('apiKeyForm_expires').value = '';
+      }
+    }
+    syncLimitByUI();
     apiKeyModalSubmitting = false;
     $('apiKeyModalSaveBtn').disabled = false;
     openDialog('apiKeyModal');
@@ -2410,14 +2544,27 @@
     try {
       const name = $('apiKeyForm_name').value.trim();
       const enabled = $('apiKeyForm_enabled').checked;
-      const tokenLimit = parseInt($('apiKeyForm_tokenLimit').value, 10);
-      const creditLimit = parseFloat($('apiKeyForm_creditLimit').value);
+      let tokenLimit = parseInt($('apiKeyForm_tokenLimit').value, 10);
+      let creditLimit = parseFloat($('apiKeyForm_creditLimit').value);
+      let requestLimit = $('apiKeyForm_requestLimit') ? parseInt($('apiKeyForm_requestLimit').value, 10) : 0;
+      const by = $('apiKeyForm_limitBy') ? $('apiKeyForm_limitBy').value : 'unlimited';
+      const amount = parseFloat($('apiKeyForm_amount') ? $('apiKeyForm_amount').value : '0');
+      if (by === 'unlimited') { tokenLimit = 0; creditLimit = 0; requestLimit = 0; }
+      else if (by === 'credits') { creditLimit = isNaN(amount) ? 0 : amount; tokenLimit = 0; requestLimit = 0; }
+      else if (by === 'tokens') { tokenLimit = isNaN(amount) ? 0 : amount; creditLimit = 0; requestLimit = 0; }
+      else if (by === 'requests') { requestLimit = isNaN(amount) ? 0 : amount; tokenLimit = 0; creditLimit = 0; }
       const payload = {
         name: name,
         enabled: enabled,
         tokenLimit: isNaN(tokenLimit) || tokenLimit < 0 ? 0 : tokenLimit,
-        creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit
+        creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit,
+        requestLimit: isNaN(requestLimit) || requestLimit < 0 ? 0 : requestLimit,
+        resetPolicy: $('apiKeyForm_resetPolicy') ? $('apiKeyForm_resetPolicy').value : 'lifetime',
+        enforcementMode: $('apiKeyForm_enforcement') ? $('apiKeyForm_enforcement').value : 'soft'
       };
+      const exp = $('apiKeyForm_expires') && $('apiKeyForm_expires').value;
+      if (exp) payload.expiresAt = Math.floor(new Date(exp).getTime() / 1000);
+      else payload.expiresAt = 0;
       let res, d;
       if (apiKeyEditingId) {
         res = await api('/api-keys/' + encodeURIComponent(apiKeyEditingId), { method: 'PUT', body: JSON.stringify(payload) });
@@ -2435,7 +2582,7 @@
         toast(t('apiKeys.created'), 'success');
         closeApiKeyModal();
         await loadApiKeys();
-        if (d.key) showNewApiKey(d.key);
+        if (d.key) showNewApiKey(d.key, d.id);
       }
     } catch (e) {
       toast((e && e.message) || t('common.saveFailed'), 'error');
@@ -2493,8 +2640,24 @@
     }
   }
 
-  function showNewApiKey(plaintext) {
+  async function showNewApiKey(plaintext, id) {
     $('apiKeyShowValue').value = plaintext || '';
+    apiKeyLastPortalUrl = '';
+    const openBtn = $('apiKeyShowPortalBtn');
+    const copyBtn = $('apiKeyShowPortalCopyBtn');
+    if (openBtn) openBtn.classList.add('hidden');
+    if (copyBtn) copyBtn.classList.add('hidden');
+    if (id) {
+      try {
+        const res = await api('/api-keys/' + encodeURIComponent(id) + '/portal-token', { method: 'POST', body: '{}' });
+        const d = await res.json().catch(() => ({}));
+        if (res.ok && d.url) {
+          apiKeyLastPortalUrl = d.url;
+          if (openBtn) openBtn.classList.remove('hidden');
+          if (copyBtn) copyBtn.classList.remove('hidden');
+        }
+      } catch (e) { /* portal optional */ }
+    }
     openDialog('apiKeyShowModal');
     setTimeout(() => {
       const el = $('apiKeyShowValue');
@@ -2505,6 +2668,7 @@
   function closeShowApiKeyModal() {
     closeDialog('apiKeyShowModal');
     $('apiKeyShowValue').value = '';
+    apiKeyLastPortalUrl = '';
   }
 
   async function copyNewApiKey() {
@@ -2532,6 +2696,8 @@
         if (action === 'edit') openApiKeyModal(entry);
         else if (action === 'delete') deleteApiKeyEntry(id, name);
         else if (action === 'reset') resetApiKeyUsageEntry(id, name);
+        else if (action === 'rotate') rotateApiKeyEntry(id, name);
+        else if (action === 'portal') sharePortalLink(id);
       });
       list.addEventListener('change', e => {
         const cb = e.target.closest('input[data-apikey-action="toggle"]');
@@ -2555,8 +2721,66 @@
     if (showCloseX) showCloseX.addEventListener('click', closeShowApiKeyModal);
     const copyBtn = $('apiKeyShowCopyBtn');
     if (copyBtn) copyBtn.addEventListener('click', copyNewApiKey);
+    const portalOpen = $('apiKeyShowPortalBtn');
+    if (portalOpen) portalOpen.addEventListener('click', () => { if (apiKeyLastPortalUrl) window.open(apiKeyLastPortalUrl, '_blank'); });
+    const portalCopy = $('apiKeyShowPortalCopyBtn');
+    if (portalCopy) portalCopy.addEventListener('click', async () => {
+      if (!apiKeyLastPortalUrl) return;
+      try { await copyText(apiKeyLastPortalUrl); toast(t('apiKeys.copySuccess'), 'success'); } catch (e) { toast(t('common.failed'), 'error'); }
+    });
+    const limitBy = $('apiKeyForm_limitBy');
+    if (limitBy) limitBy.addEventListener('change', syncLimitByUI);
+    const presets = $('apiKeyForm_presets');
+    if (presets) presets.addEventListener('click', e => {
+      const btn = e.target.closest('[data-preset]');
+      if (!btn || !$('apiKeyForm_amount')) return;
+      $('apiKeyForm_amount').value = btn.dataset.preset;
+    });
+    ['apiKeysSearch', 'apiKeysFilterStatus', 'apiKeysFilterQuota', 'apiKeysFilterUsage', 'apiKeysSort'].forEach(id => {
+      const el = $(id);
+      if (!el) return;
+      const apply = () => {
+        apiKeysQuery.q = $('apiKeysSearch') ? $('apiKeysSearch').value.trim() : '';
+        apiKeysQuery.status = $('apiKeysFilterStatus') ? $('apiKeysFilterStatus').value : '';
+        apiKeysQuery.quota = $('apiKeysFilterQuota') ? $('apiKeysFilterQuota').value : '';
+        apiKeysQuery.usage = $('apiKeysFilterUsage') ? $('apiKeysFilterUsage').value : '';
+        apiKeysQuery.sort = $('apiKeysSort') ? $('apiKeysSort').value : 'created_desc';
+        apiKeysQuery.offset = 0;
+        loadApiKeys();
+      };
+      el.addEventListener(el.tagName === 'INPUT' ? 'input' : 'change', apply);
+    });
     bindDialogBackdropClose('apiKeyModal', closeApiKeyModal);
     bindDialogBackdropClose('apiKeyShowModal', closeShowApiKeyModal);
+  }
+
+  async function rotateApiKeyEntry(id, name) {
+    const ok = await confirmAction(t('apiKeys.confirmRotate', name || t('apiKeys.unnamed')), {
+      title: t('apiKeys.actionRotate'), confirmText: t('apiKeys.actionRotate'), variant: 'danger'
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(id) + '/rotate', { method: 'POST' });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      toast(t('apiKeys.rotated'), 'success');
+      await loadApiKeys();
+      if (d.key) showNewApiKey(d.key, id);
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  async function sharePortalLink(id) {
+    try {
+      const res = await api('/api-keys/' + encodeURIComponent(id) + '/portal-token', { method: 'POST', body: '{}' });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || !d.url) throw new Error(d.error || t('common.failed'));
+      await copyText(d.url);
+      toast(t('apiKeys.portalCopied'), 'success');
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
   }
 
   // ==================== Upstream forwarding ====================
@@ -6879,6 +7103,7 @@
     else closeForwarding();
     if (tab === 'stats') openStats();
     if (tab === 'logs') loadLogs();
+    if (tab === 'apikeys') loadApiKeys();
     setSidebar(false);
     // Console scrolls in its own overflow pane; every other tab scrolls the page.
     scrollNavSetTarget(tab === 'console' ? $('consoleOutput') : null);
