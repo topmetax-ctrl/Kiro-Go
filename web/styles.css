@@ -384,6 +384,7 @@ input[type="email"],
 input[type="search"],
 input[type="url"],
 input[type="tel"],
+input[type="datetime-local"],
 textarea,
 select {
   font-family: inherit;
@@ -403,6 +404,10 @@ textarea {
   min-height: 5rem;
   resize: none;
   line-height: 1.5;
+}
+input[type="datetime-local"] {
+  height: auto;
+  min-height: 2.25rem;
 }
 /* File inputs are not part of the shared input selector above: the native
    control has its own intrinsic height and a browser-drawn button, so the fixed
@@ -4824,7 +4829,197 @@ body.modal-open .scroll-nav {
 .ak-row-80 td:nth-child(5) { color: #d97706; }
 .ak-row-90 td:nth-child(5) { color: #ea580c; }
 .ak-row-100 td:nth-child(5) { color: #dc2626; font-weight: 600; }
-.api-key-advanced { margin: 0.75rem 0; }
-.api-key-advanced summary { cursor: pointer; font-weight: 600; }
 #tabApikeys .table-wrap { overflow-x: auto; }
 #tabApikeys .stats-table { min-width: 960px; }
+#tabApikeys .toolbar {
+  gap: 0.65rem;
+  padding-bottom: 1rem;
+}
+
+/* Add / Edit API Key modal */
+.api-key-modal {
+  width: min(34rem, 92vw);
+}
+.api-key-modal .modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1.45rem;
+  padding: 1.5rem 1.6rem 1.25rem;
+}
+.api-key-modal .form-group {
+  margin-bottom: 0;
+}
+.api-key-modal .form-group label {
+  margin-bottom: 0.55rem;
+}
+.api-key-modal input[type="datetime-local"] {
+  height: auto;
+  min-height: 2.25rem;
+}
+.ak-identity {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 1rem 1.15rem;
+  align-items: end;
+}
+@media (max-width: 520px) {
+  .ak-identity {
+    grid-template-columns: 1fr;
+  }
+}
+.ak-switch-row {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 0.55rem;
+  min-width: 5.5rem;
+}
+.ak-switch-caption {
+  display: block;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--foreground);
+}
+.ak-switch-label {
+  display: inline-flex !important;
+  align-items: center;
+  margin-bottom: 0 !important;
+  min-height: 2.25rem;
+  cursor: pointer;
+}
+.ak-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  padding: 1.15rem 1.2rem 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--muted);
+}
+.ak-preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin: 0 0 0.85rem;
+}
+.ak-preset {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 3.35rem;
+  height: 1.85rem;
+  padding: 0 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--foreground);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+}
+.ak-preset:hover {
+  background: var(--background);
+  border-color: var(--border-focus);
+}
+.ak-preset:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.ak-preset.is-active {
+  background: var(--foreground);
+  color: var(--background);
+  border-color: var(--foreground);
+}
+.api-key-advanced {
+  margin: 0;
+  padding: 0.15rem 0 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+}
+.api-key-advanced summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.8125rem;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.85rem 1rem;
+  user-select: none;
+}
+.api-key-advanced summary::-webkit-details-marker {
+  display: none;
+}
+.api-key-advanced summary::before {
+  content: "";
+  width: 0.4rem;
+  height: 0.4rem;
+  border-right: 1.5px solid var(--foreground);
+  border-bottom: 1.5px solid var(--foreground);
+  transform: rotate(-45deg);
+  transition: transform 0.15s ease;
+}
+.api-key-advanced[open] summary::before {
+  transform: rotate(45deg);
+}
+.api-key-advanced[open] summary {
+  border-bottom: 1px solid var(--border);
+}
+.ak-advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1rem 1.1rem 1.15rem;
+}
+.ak-advanced-body .form-group {
+  margin-bottom: 0;
+}
+.api-key-modal > .modal-footer {
+  margin-top: 0;
+  padding: 1rem 1.5rem 1.25rem;
+}
+.ak-show-key {
+  margin-top: 1rem;
+}
+.ak-show-value {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  letter-spacing: 0.01em;
+}
+.api-key-batch-modal {
+  width: min(44rem, 94vw);
+}
+.ak-batch-table-wrap {
+  max-height: min(22rem, 55vh);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  margin-top: 1rem;
+}
+.ak-batch-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+.ak-batch-table th,
+.ak-batch-table td {
+  padding: 0.55rem 0.7rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+.ak-batch-table th {
+  color: var(--muted-foreground);
+  font-weight: 550;
+  background: var(--muted);
+  position: sticky;
+  top: 0;
+}
+.ak-batch-key {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  word-break: break-all;
+}

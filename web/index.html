@@ -589,6 +589,10 @@
           <div class="card-header">
             <span class="card-title" data-i18n="apiKeys.listTitle"></span>
             <div class="card-actions">
+              <button class="btn btn-outline btn-sm" id="batchApiKeyBtn" type="button">
+                <i class="fa-solid fa-layer-group"></i>
+                <span data-i18n="apiKeys.batchAdd"></span>
+              </button>
               <button class="btn btn-primary btn-sm" id="addApiKeyBtn" type="button">
                 <i class="fa-solid fa-plus"></i>
                 <span data-i18n="apiKeys.add"></span>
@@ -1149,81 +1153,93 @@
   </div>
 
   <div id="apiKeyModal" class="modal">
-    <div class="modal-content">
+    <div class="modal-content api-key-modal">
       <div class="modal-header">
         <span class="modal-title" id="apiKeyModalTitle" data-i18n="apiKeys.modalTitleCreate"></span>
         <button class="modal-close" id="apiKeyModalClose" type="button" aria-label=""
           data-i18n-aria-label="common.close">&times;</button>
       </div>
       <div class="modal-body">
+        <div class="ak-identity">
+          <div class="form-group ak-grow">
+            <label for="apiKeyForm_name" data-i18n="apiKeys.formName"></label>
+            <input type="text" id="apiKeyForm_name" data-i18n-placeholder="apiKeys.formNamePlaceholder" />
+          </div>
+          <div class="form-group ak-switch-row">
+            <span class="ak-switch-caption" data-i18n="apiKeys.formEnabled"></span>
+            <label class="ak-switch-label">
+              <span class="switch"><input type="checkbox" id="apiKeyForm_enabled" checked /><span class="slider"></span></span>
+            </label>
+          </div>
+        </div>
+          <div class="form-group hidden" id="apiKeyForm_countGroup">
+            <label for="apiKeyForm_count" data-i18n="apiKeys.formCount"></label>
+            <input type="number" id="apiKeyForm_count" min="1" max="100" step="1" value="10" />
+            <small data-i18n="apiKeys.formCountHint"></small>
+          </div>
+          <div class="form-group" id="apiKeyForm_keyGroup">
+            <label for="apiKeyForm_key" data-i18n="apiKeys.formKey"></label>
+            <input type="text" id="apiKeyForm_key" data-i18n-placeholder="apiKeys.formKeyPlaceholder" spellcheck="false" autocomplete="off" />
+          </div>
+        <div class="ak-panel">
+          <div class="form-group">
+            <label for="apiKeyForm_limitBy" data-i18n="apiKeys.limitBy"></label>
+            <select id="apiKeyForm_limitBy">
+              <option value="unlimited" data-i18n="apiKeys.unlimited"></option>
+              <option value="credits" data-i18n="apiKeys.credits"></option>
+              <option value="tokens" data-i18n="apiKeys.tokens"></option>
+              <option value="requests" data-i18n="apiKeys.requests"></option>
+            </select>
+          </div>
+          <div class="form-group hidden" id="apiKeyForm_amountGroup">
+            <label for="apiKeyForm_amount" data-i18n="apiKeys.amount"></label>
+            <div class="ak-preset-row" id="apiKeyForm_presets"></div>
+            <input type="number" id="apiKeyForm_amount" min="0" step="1" value="0" />
+            <small data-i18n="apiKeys.limitHint"></small>
+          </div>
+        </div>
         <div class="form-group">
-          <label data-i18n="apiKeys.formName"></label>
-          <input type="text" id="apiKeyForm_name" data-i18n-placeholder="apiKeys.formNamePlaceholder" />
-        </div>
-        <div class="form-group" id="apiKeyForm_keyGroup">
-          <label data-i18n="apiKeys.formKey"></label>
-          <input type="text" id="apiKeyForm_key" data-i18n-placeholder="apiKeys.formKeyPlaceholder" />
-        </div>
-        <div class="form-group">
-          <label class="flex items-center gap-2">
-            <span class="switch"><input type="checkbox" id="apiKeyForm_enabled" checked /><span class="slider"></span></span>
-            <span data-i18n="apiKeys.formEnabled"></span>
-          </label>
-        </div>
-        <div class="form-group">
-          <label data-i18n="apiKeys.limitBy"></label>
-          <select id="apiKeyForm_limitBy">
-            <option value="unlimited" data-i18n="apiKeys.unlimited"></option>
-            <option value="credits" data-i18n="apiKeys.credits"></option>
-            <option value="tokens" data-i18n="apiKeys.tokens"></option>
-            <option value="requests" data-i18n="apiKeys.requests"></option>
-          </select>
-        </div>
-        <div class="form-group hidden" id="apiKeyForm_amountGroup">
-          <label data-i18n="apiKeys.amount"></label>
-          <div class="flex items-center gap-2" id="apiKeyForm_presets"></div>
-          <input type="number" id="apiKeyForm_amount" min="0" step="1" value="0" />
-        </div>
-        <div class="form-group">
-          <label data-i18n="apiKeys.expiration"></label>
+          <label for="apiKeyForm_expires" data-i18n="apiKeys.expiration"></label>
           <input type="datetime-local" id="apiKeyForm_expires" />
         </div>
         <details id="apiKeyForm_advanced" class="api-key-advanced">
           <summary data-i18n="apiKeys.advanced"></summary>
-          <div class="form-group">
-            <label data-i18n="apiKeys.limitTokens"></label>
-            <input type="number" id="apiKeyForm_tokenLimit" min="0" step="1" value="0" />
-          </div>
-          <div class="form-group">
-            <label data-i18n="apiKeys.limitCredits"></label>
-            <input type="number" id="apiKeyForm_creditLimit" min="0" step="0.01" value="0" />
-          </div>
-          <div class="form-group">
-            <label data-i18n="apiKeys.limitRequests"></label>
-            <input type="number" id="apiKeyForm_requestLimit" min="0" step="1" value="0" />
-          </div>
-          <div class="form-group">
-            <label data-i18n="apiKeys.resetPolicy"></label>
-            <select id="apiKeyForm_resetPolicy">
-              <option value="lifetime" data-i18n="apiKeys.resetLifetime"></option>
-              <option value="daily" data-i18n="apiKeys.resetDaily"></option>
-              <option value="weekly" data-i18n="apiKeys.resetWeekly"></option>
-              <option value="monthly" data-i18n="apiKeys.resetMonthly"></option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label data-i18n="apiKeys.enforcement"></label>
-            <select id="apiKeyForm_enforcement">
-              <option value="soft" data-i18n="apiKeys.enforceSoft"></option>
-              <option value="strict" data-i18n="apiKeys.enforceStrict"></option>
-            </select>
-            <small data-i18n="apiKeys.enforceHint"></small>
+          <div class="ak-advanced-body">
+            <div class="form-group">
+              <label for="apiKeyForm_tokenLimit" data-i18n="apiKeys.limitTokens"></label>
+              <input type="number" id="apiKeyForm_tokenLimit" min="0" step="1" value="0" />
+            </div>
+            <div class="form-group">
+              <label for="apiKeyForm_creditLimit" data-i18n="apiKeys.limitCredits"></label>
+              <input type="number" id="apiKeyForm_creditLimit" min="0" step="0.01" value="0" />
+            </div>
+            <div class="form-group">
+              <label for="apiKeyForm_requestLimit" data-i18n="apiKeys.limitRequests"></label>
+              <input type="number" id="apiKeyForm_requestLimit" min="0" step="1" value="0" />
+            </div>
+            <div class="form-group">
+              <label for="apiKeyForm_resetPolicy" data-i18n="apiKeys.resetPolicy"></label>
+              <select id="apiKeyForm_resetPolicy">
+                <option value="lifetime" data-i18n="apiKeys.resetLifetime"></option>
+                <option value="daily" data-i18n="apiKeys.resetDaily"></option>
+                <option value="weekly" data-i18n="apiKeys.resetWeekly"></option>
+                <option value="monthly" data-i18n="apiKeys.resetMonthly"></option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="apiKeyForm_enforcement" data-i18n="apiKeys.enforcement"></label>
+              <select id="apiKeyForm_enforcement">
+                <option value="soft" data-i18n="apiKeys.enforceSoft"></option>
+                <option value="strict" data-i18n="apiKeys.enforceStrict"></option>
+              </select>
+              <small data-i18n="apiKeys.enforceHint"></small>
+            </div>
           </div>
         </details>
-        <div class="modal-footer">
-          <button class="btn btn-secondary" id="apiKeyModalCancelBtn" type="button" data-i18n="apiKeys.cancelBtn"></button>
-          <button class="btn btn-primary" id="apiKeyModalSaveBtn" type="button" data-i18n="apiKeys.saveBtn"></button>
-        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="apiKeyModalCancelBtn" type="button" data-i18n="apiKeys.cancelBtn"></button>
+        <button class="btn btn-primary" id="apiKeyModalSaveBtn" type="button" data-i18n="apiKeys.saveBtn"></button>
       </div>
     </div>
   </div>
@@ -1374,8 +1390,8 @@
       </div>
       <div class="modal-body">
         <p class="confirm-message" data-i18n="apiKeys.showWarning"></p>
-        <div class="form-group">
-          <input type="text" id="apiKeyShowValue" readonly />
+        <div class="form-group ak-show-key">
+          <input type="text" id="apiKeyShowValue" class="ak-show-value" readonly spellcheck="false" />
         </div>
         <div class="modal-footer" style="flex-wrap:wrap;">
           <button class="btn btn-outline" id="apiKeyShowCopyBtn" type="button" data-i18n="apiKeys.copyBtn"></button>
@@ -1383,6 +1399,36 @@
           <button class="btn btn-outline hidden" id="apiKeyShowPortalCopyBtn" type="button" data-i18n="apiKeys.copyPortal"></button>
           <button class="btn btn-primary" id="apiKeyShowCloseBtn" type="button" data-i18n="apiKeys.closeBtn"></button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="apiKeyBatchResultModal" class="modal">
+    <div class="modal-content api-key-batch-modal">
+      <div class="modal-header">
+        <span class="modal-title" data-i18n="apiKeys.batchShowTitle"></span>
+        <button class="modal-close" id="apiKeyBatchResultClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="confirm-message" data-i18n="apiKeys.batchShowWarning"></p>
+        <div class="ak-batch-table-wrap">
+          <table class="ak-batch-table">
+            <thead>
+              <tr>
+                <th data-i18n="apiKeys.colName"></th>
+                <th data-i18n="apiKeys.colKey"></th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="apiKeyBatchResultRows"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-footer" style="flex-wrap:wrap;">
+        <button class="btn btn-outline" id="apiKeyBatchCopyAllBtn" type="button" data-i18n="apiKeys.copyAllBtn"></button>
+        <button class="btn btn-outline" id="apiKeyBatchCsvBtn" type="button" data-i18n="apiKeys.downloadCsvBtn"></button>
+        <button class="btn btn-primary" id="apiKeyBatchResultCloseBtn" type="button" data-i18n="apiKeys.closeBtn"></button>
       </div>
     </div>
   </div>

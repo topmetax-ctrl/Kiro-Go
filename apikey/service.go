@@ -3,6 +3,7 @@ package apikey
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -10,14 +11,31 @@ import (
 )
 
 func (s *Service) Create(in CreateInput) (Record, string, error) {
+	now := s.now().UTC()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Record{}, "", err
+	}
+	defer tx.Rollback()
+	id, secret, err := s.insertKeyTx(tx, in, now)
+	if err != nil {
+		return Record{}, "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return Record{}, "", err
+	}
+	rec, err := s.Get(id)
+	return rec, secret, err
+}
+
+func (s *Service) insertKeyTx(tx *sql.Tx, in CreateInput, now time.Time) (string, string, error) {
 	secret := strings.TrimSpace(in.Key)
 	if secret == "" {
 		secret = GenerateSecret()
 	}
 	if secret == "" {
-		return Record{}, "", ErrEmptySecret
+		return "", "", ErrEmptySecret
 	}
-	now := s.now().UTC()
 	id := uuid.NewString()
 	prefix, last4 := SplitDisplay(secret)
 	digest := Digest(secret, s.pepper)
@@ -29,40 +47,95 @@ func (s *Service) Create(in CreateInput) (Record, string, error) {
 		pEnd = nil
 	}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		return Record{}, "", err
-	}
-	defer tx.Rollback()
-
-	_, err = tx.Exec(`INSERT INTO api_keys(id,name,secret_digest,key_prefix,key_last4,enabled,migrated,created_at,updated_at,expires_at)
+	_, err := tx.Exec(`INSERT INTO api_keys(id,name,secret_digest,key_prefix,key_last4,enabled,migrated,created_at,updated_at,expires_at)
 		VALUES(?,?,?,?,?,?,0,?,?,?)`,
 		id, strings.TrimSpace(in.Name), digest, prefix, last4, boolInt(in.Enabled), now.Unix(), now.Unix(), unixOrZero(in.ExpiresAt))
 	if err != nil {
 		if isUniqueErr(err) {
-			return Record{}, "", ErrDuplicate
+			return "", "", ErrDuplicate
 		}
-		return Record{}, "", err
+		return "", "", err
 	}
 	_, err = tx.Exec(`INSERT INTO api_key_quotas(key_id,token_limit,credit_limit,request_limit,reset_policy,period_start,period_end,enforcement_mode)
 		VALUES(?,?,?,?,?,?,?,?)`,
 		id, in.TokenLimit, in.CreditLimit, in.RequestLimit, policy, pStart.Unix(), unixOrZero(pEnd), enforce)
 	if err != nil {
-		return Record{}, "", err
+		return "", "", err
 	}
 	if err := ensureUsageTx(tx, id, PeriodLifetime); err != nil {
-		return Record{}, "", err
+		return "", "", err
 	}
 	if policy != ResetLifetime {
 		if err := ensureUsageTx(tx, id, periodKey(policy, now)); err != nil {
-			return Record{}, "", err
+			return "", "", err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return Record{}, "", err
+	return id, secret, nil
+}
+
+// FormatBatchName builds "prefix-01" (zero-padded). Empty prefix becomes "key".
+func FormatBatchName(prefix string, index, count int) string {
+	if index < 1 {
+		index = 1
 	}
-	rec, err := s.Get(id)
-	return rec, secret, err
+	width := 2
+	if n := len(strconv.Itoa(count)); n > width {
+		width = n
+	}
+	suffix := fmt.Sprintf("%0*d", width, index)
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		prefix = "key"
+	}
+	if len(prefix) > 80 {
+		prefix = prefix[:80]
+	}
+	return prefix + "-" + suffix
+}
+
+func (s *Service) CreateBatch(count int, in CreateInput) ([]IssuedKey, error) {
+	if count < 1 || count > MaxBatchCreate {
+		return nil, ErrBatchCount
+	}
+	in.Key = ""
+	prefix := strings.TrimSpace(in.Name)
+	now := s.now().UTC()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	type pair struct{ id, secret string }
+	pairs := make([]pair, 0, count)
+	for i := 1; i <= count; i++ {
+		item := in
+		item.Name = FormatBatchName(prefix, i, count)
+		var id, secret string
+		var ierr error
+		for attempt := 0; attempt < 4; attempt++ {
+			id, secret, ierr = s.insertKeyTx(tx, item, now)
+			if ierr == nil || ierr != ErrDuplicate {
+				break
+			}
+		}
+		if ierr != nil {
+			return nil, ierr
+		}
+		pairs = append(pairs, pair{id, secret})
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	out := make([]IssuedKey, 0, count)
+	for _, p := range pairs {
+		rec, err := s.Get(p.id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, IssuedKey{Record: rec, Secret: p.secret})
+	}
+	return out, nil
 }
 
 func (s *Service) Get(id string) (Record, error) {

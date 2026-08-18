@@ -5,27 +5,39 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="referrer" content="no-referrer" />
   <title>API Usage</title>
-  <link rel="stylesheet" href="/usage/usage.css" />
+  <link rel="stylesheet" href="/usage/usage.css?v=20260818e" />
 </head>
 <body>
-  <div class="wrap">
-    <div id="gate" class="gate card">
-      <div class="gate-tools">
-        <select id="gateLang" class="lang-select" aria-label="" data-i18n-aria-label="portal.lang"></select>
+  <div id="gate" class="gate-screen">
+    <header class="portal-topbar">
+      <select id="gateLang" class="lang-select" aria-label="" data-i18n-aria-label="portal.lang"></select>
+    </header>
+    <main class="gate-main">
+      <div class="gate-card">
+        <h1 data-i18n="portal.title">View API Usage</h1>
+        <p class="lede" data-i18n="portal.subtitle">Enter your API key over HTTPS. The key is never stored in the browser.</p>
+        <div id="gateError" class="banner hidden" role="alert"></div>
+        <label class="field-label" for="gateKey" data-i18n="portal.keyLabel">API Key</label>
+        <div class="input-affix">
+          <input type="password" id="gateKey" autocomplete="off" spellcheck="false" data-i18n-placeholder="portal.keyPlaceholder" />
+          <button type="button" class="affix-btn" id="gateKeyToggle" aria-label="" data-i18n-aria-label="portal.showKey" data-shown="false">
+            <svg class="ico-eye" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 5c5.2 0 9.3 3.4 10.6 7-1.3 3.6-5.4 7-10.6 7S2.7 15.6 1.4 12C2.7 8.4 6.8 5 12 5zm0 2C8.1 7 4.9 9.3 3.6 12 4.9 14.7 8.1 17 12 17s7.1-2.3 8.4-5C19.1 9.3 15.9 7 12 7zm0 2.2a2.8 2.8 0 1 1 0 5.6 2.8 2.8 0 0 1 0-5.6z"/></svg>
+          </button>
+        </div>
+        <label class="remember-row" for="gateRemember">
+          <input type="checkbox" id="gateRemember" />
+          <span class="remember-box" aria-hidden="true"></span>
+          <span class="remember-label" data-i18n="portal.remember">Remember this key</span>
+        </label>
+        <button class="primary gate-submit" id="gateBtn" type="button" data-i18n="portal.view">View Usage</button>
       </div>
-      <h1 data-i18n="portal.title">View API Usage</h1>
-      <p class="muted" data-i18n="portal.subtitle">Enter your API key. It is sent over HTTPS and never stored in the browser.</p>
-      <div id="gateError" class="banner hidden" role="alert"></div>
-      <label class="muted" for="gateKey" data-i18n="portal.keyLabel">API Key</label>
-      <input type="password" id="gateKey" autocomplete="off" />
-      <div class="gate-actions">
-        <button class="primary" id="gateBtn" type="button" data-i18n="portal.view">View Usage</button>
-      </div>
-    </div>
+    </main>
+  </div>
 
-    <div id="dash" class="hidden">
+  <div id="dash" class="dash-screen hidden">
+    <div class="wrap">
       <header class="header">
-        <div>
+        <div class="header-copy">
           <h1 id="dashName">—</h1>
           <div class="muted mono" id="dashMasked"></div>
           <div class="meta-row">
@@ -40,7 +52,7 @@
             <span id="liveLabel"></span>
           </div>
           <select id="dashLang" class="lang-select" aria-label="" data-i18n-aria-label="portal.lang"></select>
-          <button type="button" id="signOutBtn" data-i18n="portal.signOut">Sign out</button>
+          <button type="button" id="signOutBtn" class="signout" data-i18n="portal.signOut">Log out key</button>
         </div>
       </header>
 
@@ -49,7 +61,7 @@
 
       <section id="summaryCards" class="cards" aria-label="" data-i18n-aria-label="portal.summary"></section>
 
-      <div class="toolbar" id="rangeBar"></div>
+      <div class="toolbar range-bar" id="rangeBar"></div>
       <div id="customRange" class="custom-range hidden">
         <label class="muted" for="customFrom" data-i18n="portal.customFrom">From</label>
         <input type="datetime-local" id="customFrom" />
@@ -99,12 +111,12 @@
             <tbody id="eventRows"></tbody>
           </table>
         </div>
-        <div class="toolbar">
+        <div class="toolbar history-more">
           <button type="button" id="loadMore" class="hidden" data-i18n="portal.loadMore">Load more</button>
         </div>
       </section>
     </div>
   </div>
-  <script src="/usage/usage.js"></script>
+  <script src="/usage/usage.js?v=20260818e"></script>
 </body>
 </html>

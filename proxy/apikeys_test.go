@@ -325,7 +325,15 @@ func TestAuthenticateMasterSwitchOffPassesThrough(t *testing.T) {
 		t.Fatalf("expected open access without entry, got entry=%v err=%v", entry, err)
 	}
 	if entry, err := h.authenticate(newAuthTestRequest(t, "Authorization", "Bearer sk-anything")); err != nil || entry != nil {
-		t.Fatalf("expected provided key to be ignored when gate is off, got entry=%v err=%v", entry, err)
+		t.Fatalf("expected unknown key to stay anonymous when gate is off, got entry=%v err=%v", entry, err)
+	}
+	created, err := config.AddApiKey(config.ApiKeyEntry{Name: "counted", Key: "sk-counted", Enabled: true})
+	if err != nil {
+		t.Fatalf("seed counted: %v", err)
+	}
+	entry, err := h.authenticate(newAuthTestRequest(t, "Authorization", "Bearer sk-counted"))
+	if err != nil || entry == nil || entry.ID != created.ID {
+		t.Fatalf("expected presented key to be attributed while gate is off, got entry=%v err=%v", entry, err)
 	}
 }
 

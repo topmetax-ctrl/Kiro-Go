@@ -66,7 +66,7 @@ func (h *Handler) exchangePortalToken(w http.ResponseWriter, r *http.Request, to
 		http.Redirect(w, r, "/usage?error=invalid", http.StatusSeeOther)
 		return
 	}
-	h.setPortalCookie(w, r, sid)
+	h.setPortalCookie(w, r, sid, apikey.DefaultSessionTTL)
 	http.Redirect(w, r, "/usage", http.StatusSeeOther)
 }
 
@@ -102,17 +102,20 @@ func (h *Handler) handlePortal(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Handler) setPortalCookie(w http.ResponseWriter, r *http.Request, sid string) {
+func (h *Handler) setPortalCookie(w http.ResponseWriter, r *http.Request, sid string, persistTTL time.Duration) {
 	secure := config.IsTLSEnabled() || r.TLS != nil
-	http.SetCookie(w, &http.Cookie{
+	c := &http.Cookie{
 		Name:     portalCookieName,
 		Value:    sid,
 		Path:     portalCookiePath,
-		MaxAge:   int((12 * time.Hour).Seconds()),
 		HttpOnly: true,
 		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
-	})
+	}
+	if persistTTL > 0 {
+		c.MaxAge = int(persistTTL.Seconds())
+	}
+	http.SetCookie(w, c)
 }
 
 func (h *Handler) clearPortalCookie(w http.ResponseWriter, r *http.Request) {
@@ -178,20 +181,27 @@ func portalSessionID(r *http.Request) string {
 
 func (h *Handler) portalOpenSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Key string `json:"key"`
+		Key      string `json:"key"`
+		Remember bool   `json:"remember"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON", "code": "invalid_api_key"})
 		return
 	}
-	sid, rec, err := h.keys.OpenSessionByKey(req.Key)
+	ttl := apikey.DefaultSessionTTL
+	persist := time.Duration(0)
+	if req.Remember {
+		ttl = apikey.RememberSessionTTL
+		persist = ttl
+	}
+	sid, rec, err := h.keys.OpenSessionByKeyTTL(req.Key, ttl)
 	if err != nil {
 		writePortalErr(w, err)
 		return
 	}
-	h.setPortalCookie(w, r, sid)
-	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "name": rec.Key.Name, "keyMasked": rec.Masked()})
+	h.setPortalCookie(w, r, sid, persist)
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "name": rec.Key.Name, "keyMasked": rec.Masked(), "remember": req.Remember})
 }
 
 func (h *Handler) portalOpenSessionToken(w http.ResponseWriter, r *http.Request) {
@@ -208,7 +218,7 @@ func (h *Handler) portalOpenSessionToken(w http.ResponseWriter, r *http.Request)
 		writePortalErr(w, err)
 		return
 	}
-	h.setPortalCookie(w, r, sid)
+	h.setPortalCookie(w, r, sid, apikey.DefaultSessionTTL)
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "name": rec.Key.Name, "keyMasked": rec.Masked()})
 }
 

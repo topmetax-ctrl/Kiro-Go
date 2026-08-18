@@ -40,10 +40,18 @@
     return text;
   }
 
+  const EYE = '<svg class="ico-eye" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 5c5.2 0 9.3 3.4 10.6 7-1.3 3.6-5.4 7-10.6 7S2.7 15.6 1.4 12C2.7 8.4 6.8 5 12 5zm0 2C8.1 7 4.9 9.3 3.6 12 4.9 14.7 8.1 17 12 17s7.1-2.3 8.4-5C19.1 9.3 15.9 7 12 7zm0 2.2a2.8 2.8 0 1 1 0 5.6 2.8 2.8 0 0 1 0-5.6z"/></svg>';
+  const EYE_OFF = '<svg class="ico-eye" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M2.1 3.5 3.5 2.1 21.9 20.5 20.5 21.9l-3.1-3.1A11.4 11.4 0 0 1 12 19C6.8 19 2.7 15.6 1.4 12c.6-1.6 1.7-3.1 3.2-4.3L2.1 3.5zM12 7c3.9 0 7.1 2.3 8.4 5-.6 1.4-1.6 2.6-2.9 3.6l-1.8-1.8A3.8 3.8 0 0 0 12 8.2c-.3 0-.6 0-.9.1L9.1 6.3C10 7.1 11 7 12 7zm-3.8 5.2 4.6 4.6A3.8 3.8 0 0 1 8.2 12.2z"/></svg>';
+
   function applyI18n() {
     qsa('[data-i18n]').forEach((el) => { el.textContent = t(el.dataset.i18n); });
     qsa('[data-i18n-placeholder]').forEach((el) => { el.placeholder = t(el.dataset.i18nPlaceholder); });
     qsa('[data-i18n-aria-label]').forEach((el) => { el.setAttribute('aria-label', t(el.dataset.i18nAriaLabel)); });
+    const toggle = $('gateKeyToggle');
+    if (toggle) {
+      const shown = toggle.dataset.shown === 'true';
+      toggle.setAttribute('aria-label', shown ? t('portal.hideKey') : t('portal.showKey'));
+    }
     document.title = t('portal.title');
     document.documentElement.lang = lang;
   }
@@ -107,7 +115,7 @@
   function readQuery() {
     const u = new URLSearchParams(location.search);
     const q = {
-      range: (u.get('range') || '24H').toUpperCase(),
+      range: (u.get('range') || 'LIVE').toUpperCase(),
       from: u.get('from') || '',
       to: u.get('to') || '',
       model: u.get('model') || '',
@@ -117,7 +125,7 @@
       error_code: u.get('error_code') || '',
       metric: u.get('metric') || 'requests_attempted'
     };
-    if (RANGES.indexOf(q.range) < 0) q.range = '24H';
+    if (RANGES.indexOf(q.range) < 0) q.range = 'LIVE';
     if (METRICS.indexOf(q.metric) < 0) q.metric = 'requests_attempted';
     return q;
   }
@@ -355,7 +363,7 @@
     const series = state.series;
     const metric = state.query.metric;
     if (!series || !series.points || !series.points.length) {
-      svg.innerHTML = '<text x="20" y="90" fill="currentColor" font-size="14">' + escapeHtml(t('portal.empty')) + '</text>';
+      svg.innerHTML = '<text x="400" y="96" text-anchor="middle" fill="currentColor" opacity="0.45" font-size="14">' + escapeHtml(t('portal.empty')) + '</text>';
       $('chartMeta').textContent = '';
       return;
     }
@@ -363,12 +371,19 @@
     const pts = series.points.map((p) => ({ t: p.t, v: pointValue(p, metric) }))
       .filter((p) => !nullable || p.v != null);
     if (!pts.length) {
-      svg.innerHTML = '<text x="20" y="90" fill="currentColor" font-size="14">' + escapeHtml(t('portal.empty')) + '</text>';
+      svg.innerHTML = '<text x="400" y="96" text-anchor="middle" fill="currentColor" opacity="0.45" font-size="14">' + escapeHtml(t('portal.empty')) + '</text>';
       return;
     }
     const w = 800, h = 180, pad = 18;
     const ys = pts.map((p) => Number(p.v) || 0);
-    const max = Math.max(1e-9, ...ys);
+    const max = Math.max(0, ...ys);
+    if (max <= 0) {
+      svg.innerHTML = '<text x="400" y="96" text-anchor="middle" fill="currentColor" opacity="0.45" font-size="14">' + escapeHtml(t('portal.empty')) + '</text>';
+      const bits = [t('portal.resolution', series.resolution || ''), series.source || ''];
+      $('chartMeta').textContent = bits.filter(Boolean).join(' · ');
+      renderRetention(series);
+      return;
+    }
     const step = (w - pad * 2) / Math.max(1, pts.length - 1);
     let d = '';
     pts.forEach((p, i) => {
@@ -702,7 +717,9 @@
       banner('gateError', '');
       const key = $('gateKey').value.trim();
       if (!key) { banner('gateError', t('portal.keyRequired')); return; }
-      const res = await api('/session', { method: 'POST', body: JSON.stringify({ key }) });
+      const remember = !!( $('gateRemember') && $('gateRemember').checked );
+      localStorage.setItem('kiro_portal_remember', remember ? '1' : '0');
+      const res = await api('/session', { method: 'POST', body: JSON.stringify({ key, remember }) });
       const d = await readJSON(res);
       $('gateKey').value = '';
       if (!res.ok) { banner('gateError', errMessage(d, t('portal.err.invalid_api_key'))); return; }
@@ -711,10 +728,22 @@
     $('gateKey').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') $('gateBtn').click();
     });
+    const keyToggle = $('gateKeyToggle');
+    if (keyToggle) {
+      keyToggle.addEventListener('click', () => {
+        const f = $('gateKey');
+        const willShow = f.type === 'password';
+        f.type = willShow ? 'text' : 'password';
+        keyToggle.dataset.shown = String(willShow);
+        keyToggle.setAttribute('aria-label', willShow ? t('portal.hideKey') : t('portal.showKey'));
+        keyToggle.innerHTML = willShow ? EYE_OFF : EYE;
+      });
+    }
     $('signOutBtn').onclick = async () => {
       await api('/session', { method: 'DELETE' });
       closeStream();
       state.sse = SSE.OFFLINE;
+      if ($('gateKey')) $('gateKey').value = '';
       show($('dash'), false);
       show($('gate'), true);
     };
@@ -779,6 +808,8 @@
     await loadI18n();
     fillControls();
     wire();
+    const rememberEl = $('gateRemember');
+    if (rememberEl) rememberEl.checked = localStorage.getItem('kiro_portal_remember') === '1';
     if (new URLSearchParams(location.search).get('error') === 'invalid') {
       banner('gateError', t('portal.invalid'));
     }

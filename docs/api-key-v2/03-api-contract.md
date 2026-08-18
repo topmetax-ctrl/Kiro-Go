@@ -39,6 +39,7 @@ in V1. Request limits are always reserved exactly when set.
 | Method | Path | Body / result |
 |---|---|---|
 | POST | `/admin/api/api-keys/{id}/rotate` | `{success,id,key,apiKey}` |
+| POST | `/admin/api/api-keys/batch` | `{count,name?,…quota}` → `{success,count,keys:[{id,name,key,apiKey}]}` once; `count` 1–100 |
 | POST | `/admin/api/api-keys/{id}/portal-token` | `{success,token,url,expiresAt}` once |
 | DELETE | `/admin/api/api-keys/{id}/portal-token` | `{success:true}` |
 
@@ -57,7 +58,7 @@ Secure when TLS). **No `keyId` query parameter is honored.**
 
 | Method | Path | Auth | Result |
 |---|---|---|---|
-| POST | `/portal/api/session` | body `{key}` | sets cookie, `{ok:true}` |
+| POST | `/portal/api/session` | body `{key,remember?}` | sets cookie, `{ok:true}`. `remember=true` persists 30 days; otherwise a session cookie (server TTL 12h) |
 | POST | `/portal/api/session/token` | body `{token}` | same (used by `/usage/p/…` exchange) |
 | DELETE | `/portal/api/session` | cookie | clears cookie |
 | GET | `/portal/api/me` | cookie | name, masked, status, expiry |
@@ -74,7 +75,7 @@ are ignored. The key is always the portal session principal.
 
 | Param | Notes |
 |---|---|
-| `range` | `LIVE` `1H` `6H` `24H` `7D` `30D` `CUSTOM` (default `24H` on history/charts) |
+| `range` | `LIVE` `1H` `6H` `24H` `7D` `30D` `CUSTOM` (default `LIVE` on the portal; API still defaults empty range to 24H) |
 | `from` `to` | unix seconds UTC; required for `CUSTOM`; `from < to`; max 365 days |
 | `model` | exact match on `client_model` or `effective_model` |
 | `endpoint` | exact (`openai` / `claude` / `responses`) |

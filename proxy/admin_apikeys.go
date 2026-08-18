@@ -233,6 +233,93 @@ func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type apiKeyBatchCreateRequest struct {
+	apiKeyCreateRequest
+	Count int `json:"count"`
+}
+
+func (h *Handler) apiCreateApiKeyBatch(w http.ResponseWriter, r *http.Request) {
+	var req apiKeyBatchCreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	if req.Count < 1 || req.Count > apikey.MaxBatchCreate {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": apikey.ErrBatchCount.Error()})
+		return
+	}
+
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	if h.keys != nil {
+		in := apikey.CreateInput{
+			Name: req.Name, Enabled: enabled,
+			TokenLimit: req.TokenLimit, CreditLimit: req.CreditLimit, RequestLimit: req.RequestLimit,
+			ResetPolicy: req.ResetPolicy, EnforcementMode: req.EnforcementMode,
+		}
+		if req.ExpiresAt != nil && *req.ExpiresAt > 0 {
+			t := time.Unix(*req.ExpiresAt, 0).UTC()
+			in.ExpiresAt = &t
+		}
+		issued, err := h.keys.CreateBatch(req.Count, in)
+		if err != nil {
+			status := http.StatusBadRequest
+			if err != apikey.ErrBatchCount && err != apikey.ErrDuplicate && err != apikey.ErrEmptySecret && err != apikey.ErrInvalidInput {
+				status = http.StatusInternalServerError
+			}
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		keys := make([]map[string]interface{}, len(issued))
+		for i, item := range issued {
+			keys[i] = map[string]interface{}{
+				"id":     item.Record.Key.ID,
+				"name":   item.Record.Key.Name,
+				"key":    item.Secret,
+				"apiKey": toApiKeyViewRecord(item.Record, false),
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"count":   len(keys),
+			"keys":    keys,
+		})
+		return
+	}
+
+	out := make([]map[string]interface{}, 0, req.Count)
+	for i := 1; i <= req.Count; i++ {
+		keyValue := config.GenerateApiKeyValue()
+		entry, err := config.AddApiKey(config.ApiKeyEntry{
+			Name: apikey.FormatBatchName(req.Name, i, req.Count),
+			Key:  keyValue, Enabled: enabled,
+			TokenLimit: req.TokenLimit, CreditLimit: req.CreditLimit,
+		})
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		out = append(out, map[string]interface{}{
+			"id":     entry.ID,
+			"name":   entry.Name,
+			"key":    entry.Key,
+			"apiKey": toApiKeyView(entry),
+		})
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"count":   len(out),
+		"keys":    out,
+	})
+}
+
 type apiKeyUpdateRequest struct {
 	Name            *string  `json:"name,omitempty"`
 	Key             *string  `json:"key,omitempty"`

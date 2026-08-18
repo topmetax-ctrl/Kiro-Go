@@ -89,9 +89,9 @@ func mapAPIKeyAuthErr(err error) error {
 
 // authenticate validates an incoming request against the configured API keys.
 //
-// Master switch: config.RequireApiKey. When false, requests pass without checking
-// any keys, even if entries exist (so the admin UI can hold draft keys without
-// affecting public deployments).
+// Master switch: config.RequireApiKey. When false, missing or unknown keys still
+// pass (open access). A known, enabled key is still bound so the usage portal
+// can attribute traffic without forcing the gate on.
 //
 // When RequireApiKey is true:
 //  1. If the v2 store has keys (or the in-memory config list does), the provided
@@ -100,7 +100,7 @@ func mapAPIKeyAuthErr(err error) error {
 //  3. Else → fail-closed.
 func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 	if !config.IsApiKeyRequired() {
-		return nil, nil
+		return h.bindOptionalAPIKey(r)
 	}
 
 	provided := extractProvidedKey(r)
@@ -143,6 +143,44 @@ func (h *Handler) authenticate(r *http.Request) (*config.ApiKeyEntry, error) {
 		return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "Invalid or missing API key")
 	}
 	return nil, nil
+}
+
+// bindOptionalAPIKey attributes a presented key while the master gate is off.
+// Unknown or missing keys stay anonymous. A known disabled / expired / exhausted
+// key still fails so the caller sees the same identity they sent.
+func (h *Handler) bindOptionalAPIKey(r *http.Request) (*config.ApiKeyEntry, error) {
+	provided := extractProvidedKey(r)
+	if provided == "" {
+		return nil, nil
+	}
+	reserve := shouldReserveRequest(r)
+	if h.keys != nil && h.keys.HasKeys() {
+		if _, err := h.keys.Lookup(provided); err != nil {
+			return nil, nil
+		}
+		rec, err := h.keys.Authenticate(provided, reserve)
+		if err != nil {
+			return nil, mapAPIKeyAuthErr(err)
+		}
+		return apiKeyRecordToEntry(rec), nil
+	}
+	if !config.HasApiKeys() {
+		return nil, nil
+	}
+	entry := config.FindApiKeyByValue(provided)
+	if entry == nil {
+		return nil, nil
+	}
+	if !entry.Enabled {
+		return nil, newAuthError(http.StatusUnauthorized, "authentication_error", "API key disabled")
+	}
+	if overToken, overCredit := config.ApiKeyOverLimit(*entry); overToken || overCredit {
+		if overToken {
+			return nil, newAuthError(http.StatusTooManyRequests, "rate_limit_error", "token limit exceeded")
+		}
+		return nil, newAuthError(http.StatusTooManyRequests, "rate_limit_error", "credit limit exceeded")
+	}
+	return entry, nil
 }
 
 func withApiKeyContext(r *http.Request, entry *config.ApiKeyEntry) *http.Request {

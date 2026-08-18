@@ -6,7 +6,10 @@ import (
 	"time"
 )
 
-const defaultSessionTTL = 12 * time.Hour
+const (
+	DefaultSessionTTL  = 12 * time.Hour
+	RememberSessionTTL = 30 * 24 * time.Hour
+)
 
 func (s *Service) CreatePortalToken(keyID string, ttl time.Duration) (string, PortalTokenInfo, error) {
 	if _, err := s.Get(keyID); err != nil {
@@ -67,6 +70,10 @@ func (s *Service) HasPortalToken(keyID string) bool {
 }
 
 func (s *Service) OpenSessionByKey(secret string) (string, Record, error) {
+	return s.OpenSessionByKeyTTL(secret, DefaultSessionTTL)
+}
+
+func (s *Service) OpenSessionByKeyTTL(secret string, ttl time.Duration) (string, Record, error) {
 	rec, err := s.Lookup(secret)
 	if err != nil {
 		return "", Record{}, err
@@ -77,7 +84,7 @@ func (s *Service) OpenSessionByKey(secret string) (string, Record, error) {
 	if rec.Key.ExpiresAt != nil && !rec.Key.ExpiresAt.After(s.now().UTC()) {
 		return "", Record{}, errExpired()
 	}
-	sid, err := s.createSession(rec.Key.ID)
+	sid, err := s.createSession(rec.Key.ID, ttl)
 	return sid, rec, err
 }
 
@@ -107,17 +114,27 @@ func (s *Service) OpenSessionByPortalToken(token string) (string, Record, error)
 	if err != nil {
 		return "", Record{}, err
 	}
-	sid, err := s.createSession(keyID)
+	sid, err := s.createSession(keyID, DefaultSessionTTL)
 	return sid, rec, err
 }
 
-func (s *Service) createSession(keyID string) (string, error) {
+func clampSessionTTL(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return DefaultSessionTTL
+	}
+	if ttl > RememberSessionTTL {
+		return RememberSessionTTL
+	}
+	return ttl
+}
+
+func (s *Service) createSession(keyID string, ttl time.Duration) (string, error) {
 	plain := GenerateSessionID()
 	if plain == "" {
 		return "", ErrEmptySecret
 	}
 	now := s.now().UTC()
-	exp := now.Add(defaultSessionTTL)
+	exp := now.Add(clampSessionTTL(ttl))
 	_, err := s.db.Exec(`INSERT INTO portal_sessions(id_digest,key_id,created_at,expires_at) VALUES(?,?,?,?)`,
 		Digest(plain, s.pepper), keyID, now.Unix(), exp.Unix())
 	if err != nil {

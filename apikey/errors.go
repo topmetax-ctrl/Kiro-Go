@@ -14,6 +14,7 @@ var (
 	ErrSession      = errors.New("portal session expired")
 	ErrPortalToken  = errors.New("invalid portal token")
 	ErrUnavailable  = errors.New("api key store unavailable")
+	ErrBatchCount   = errors.New("batch count must be between 1 and 100")
 )
 
 // AuthError is returned by Authenticate / OpenSession. Status and Code match

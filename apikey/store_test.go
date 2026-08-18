@@ -450,3 +450,63 @@ func TestCleanupRetention(t *testing.T) {
 		t.Fatalf("expected to delete old event, n=%d", n)
 	}
 }
+
+func TestFormatBatchName(t *testing.T) {
+	if got := FormatBatchName("team", 1, 10); got != "team-01" {
+		t.Fatalf("got %q", got)
+	}
+	if got := FormatBatchName("", 3, 100); got != "key-003" {
+		t.Fatalf("empty prefix got %q", got)
+	}
+}
+
+func TestCreateBatch(t *testing.T) {
+	s := testService(t)
+	issued, err := s.CreateBatch(3, CreateInput{Name: "vip", Enabled: true, TokenLimit: 500})
+	if err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if len(issued) != 3 {
+		t.Fatalf("count %d", len(issued))
+	}
+	if issued[0].Record.Key.Name != "vip-01" || issued[2].Record.Key.Name != "vip-03" {
+		t.Fatalf("names %q %q", issued[0].Record.Key.Name, issued[2].Record.Key.Name)
+	}
+	seen := map[string]bool{}
+	for _, item := range issued {
+		if item.Secret == "" || seen[item.Secret] {
+			t.Fatalf("bad secret %q", item.Secret)
+		}
+		seen[item.Secret] = true
+		got, err := s.Lookup(item.Secret)
+		if err != nil || got.Key.ID != item.Record.Key.ID || got.Quota.TokenLimit != 500 {
+			t.Fatalf("lookup: %v %+v", err, got)
+		}
+	}
+	if _, err := s.CreateBatch(0, CreateInput{Enabled: true}); err != ErrBatchCount {
+		t.Fatalf("want ErrBatchCount, got %v", err)
+	}
+	if _, err := s.CreateBatch(MaxBatchCreate+1, CreateInput{Enabled: true}); err != ErrBatchCount {
+		t.Fatalf("want ErrBatchCount for overflow, got %v", err)
+	}
+}
+
+func TestOpenSessionByKeyTTL(t *testing.T) {
+	s := testService(t)
+	_, secret, err := s.Create(CreateInput{Name: "mem", Enabled: true})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	sid, _, err := s.OpenSessionByKeyTTL(secret, RememberSessionTTL)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	exp, err := s.SessionExpiry(sid)
+	if err != nil {
+		t.Fatalf("expiry: %v", err)
+	}
+	remain := time.Until(exp)
+	if remain < 29*24*time.Hour || remain > 31*24*time.Hour {
+		t.Fatalf("remember ttl %v", remain)
+	}
+}

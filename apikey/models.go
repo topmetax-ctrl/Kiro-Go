@@ -158,6 +158,15 @@ func (r Record) Masked() string {
 	return MaskFromParts(r.Key.KeyPrefix, r.Key.KeyLast4)
 }
 
+// MaxBatchCreate is the hard cap for POST /admin/api/api-keys/batch.
+const MaxBatchCreate = 100
+
+// IssuedKey is a newly created key plus the plaintext secret (shown once).
+type IssuedKey struct {
+	Record Record
+	Secret string
+}
+
 // CreateInput is the admin create payload. Empty Key generates a new secret.
 type CreateInput struct {
 	Name            string

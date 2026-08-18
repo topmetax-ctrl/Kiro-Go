@@ -6,6 +6,7 @@ See [03-api-contract.md](03-api-contract.md) for envelopes and field lists.
 
 - `GET /admin/api/api-keys?q&status&quota&usage&sort&offset&limit`
 - `POST /admin/api/api-keys`
+- `POST /admin/api/api-keys/batch` `{count,name?,enabled?,tokenLimit?,creditLimit?,requestLimit?,expiresAt?,resetPolicy?,enforcementMode?}`
 - `GET|PUT|DELETE /admin/api/api-keys/{id}`
 - `POST /admin/api/api-keys/{id}/reset-usage`
 - `POST /admin/api/api-keys/{id}/rotate`
@@ -13,7 +14,7 @@ See [03-api-contract.md](03-api-contract.md) for envelopes and field lists.
 
 ## Portal (cookie `portal_session`, Path=/portal)
 
-- `POST /portal/api/session` `{key}`
+- `POST /portal/api/session` `{key,remember?}`
 - `POST /portal/api/session/token` `{token}`
 - `DELETE /portal/api/session`
 - `GET /portal/api/me`

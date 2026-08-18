@@ -2258,8 +2258,10 @@
   let apiKeysCache = [];
   let apiKeysTotal = 0;
   let apiKeyEditingId = '';
+  let apiKeyModalMode = 'create';
   let apiKeyModalSubmitting = false;
   let apiKeyLastPortalUrl = '';
+  let apiKeyBatchSecrets = [];
   let apiKeysQuery = { q: '', status: '', quota: '', usage: '', sort: 'created_desc', offset: 0, limit: 50 };
 
   let upstreamCache = { providers: [], routes: [] };
@@ -2467,35 +2469,74 @@
     const box = $('apiKeyForm_presets');
     if (!box) return;
     const presets = by === 'credits' ? [1, 5, 10, 20, 50, 100]
-      : by === 'tokens' ? [100000, 500000, 1000000, 5000000, 10000000]
+      : by === 'tokens' ? [
+        { n: 5000000, label: '5' },
+        { n: 10000000, label: '10m' },
+        { n: 50000000, label: '50' },
+        { n: 100000000, label: '100' },
+        { n: 200000000, label: '200' },
+        { n: 1000000000, label: '1b' },
+        { n: 2000000000, label: '2b' }
+      ]
       : by === 'requests' ? [100, 1000, 5000, 10000] : [];
-    box.innerHTML = presets.map(n => '<button type="button" class="btn btn-outline btn-sm" data-preset="' + n + '">' + escapeHtml(formatPreset(n, by)) + '</button>').join('');
+    box.innerHTML = presets.map((item) => {
+      const n = typeof item === 'object' ? item.n : item;
+      const label = typeof item === 'object' ? item.label : formatPreset(n, by);
+      return '<button type="button" class="ak-preset" data-preset="' + n + '">' + escapeHtml(label) + '</button>';
+    }).join('');
   }
   function formatPreset(n, by) {
     if (by === 'tokens') {
-      if (n >= 1000000) return (n / 1000000) + 'M';
-      if (n >= 1000) return (n / 1000) + 'K';
+      if (n >= 1000000000) return (n / 1000000000) + 'b';
+      if (n >= 1000000) return (n / 1000000) + 'm';
+      if (n >= 1000) return (n / 1000) + 'k';
     }
     if (n >= 1000) return (n / 1000) + 'K';
     return String(n);
   }
 
-  function openApiKeyModal(entry) {
-    apiKeyEditingId = entry ? (entry.id || '') : '';
+  function syncApiKeyModalMode() {
+    const batch = apiKeyModalMode === 'batch';
     const titleEl = $('apiKeyModalTitle');
-    titleEl.textContent = t(apiKeyEditingId ? 'apiKeys.modalTitleEdit' : 'apiKeys.modalTitleCreate');
+    if (titleEl) {
+      titleEl.textContent = t(apiKeyEditingId ? 'apiKeys.modalTitleEdit' : (batch ? 'apiKeys.modalTitleBatch' : 'apiKeys.modalTitleCreate'));
+    }
+    const nameLabel = document.querySelector('label[for="apiKeyForm_name"]');
+    if (nameLabel) {
+      nameLabel.setAttribute('data-i18n', batch ? 'apiKeys.formNamePrefix' : 'apiKeys.formName');
+      nameLabel.textContent = t(batch ? 'apiKeys.formNamePrefix' : 'apiKeys.formName');
+    }
+    const nameInput = $('apiKeyForm_name');
+    if (nameInput) {
+      nameInput.setAttribute('data-i18n-placeholder', batch ? 'apiKeys.formNamePrefixPlaceholder' : 'apiKeys.formNamePlaceholder');
+      nameInput.placeholder = t(batch ? 'apiKeys.formNamePrefixPlaceholder' : 'apiKeys.formNamePlaceholder');
+    }
+    const countGroup = $('apiKeyForm_countGroup');
+    if (countGroup) countGroup.classList.toggle('hidden', !batch);
+    const saveBtn = $('apiKeyModalSaveBtn');
+    if (saveBtn) {
+      saveBtn.setAttribute('data-i18n', batch ? 'apiKeys.batchCreateBtn' : 'apiKeys.saveBtn');
+      saveBtn.textContent = t(batch ? 'apiKeys.batchCreateBtn' : 'apiKeys.saveBtn');
+    }
+  }
+
+  function openApiKeyModal(entry, mode) {
+    apiKeyEditingId = entry ? (entry.id || '') : '';
+    apiKeyModalMode = mode || (entry ? 'edit' : 'create');
     $('apiKeyForm_name').value = entry ? (entry.name || '') : '';
     const keyEl = $('apiKeyForm_key');
     const keyGroup = $('apiKeyForm_keyGroup');
-    if (apiKeyEditingId) {
-      keyEl.value = entry.keyMasked || '';
-      keyEl.readOnly = true;
+    if (apiKeyEditingId || apiKeyModalMode === 'batch') {
+      keyEl.value = entry ? (entry.keyMasked || '') : '';
+      keyEl.readOnly = !!apiKeyEditingId;
       if (keyGroup) keyGroup.classList.add('hidden');
     } else {
       keyEl.value = '';
       keyEl.readOnly = false;
       if (keyGroup) keyGroup.classList.remove('hidden');
     }
+    if ($('apiKeyForm_count')) $('apiKeyForm_count').value = '10';
+    syncApiKeyModalMode();
     $('apiKeyForm_enabled').checked = entry ? !!entry.enabled : true;
     $('apiKeyForm_tokenLimit').value = entry ? String(entry.tokenLimit || 0) : '0';
     $('apiKeyForm_creditLimit').value = entry ? String(entry.creditLimit || 0) : '0';
@@ -2532,6 +2573,7 @@
   function closeApiKeyModal() {
     closeDialog('apiKeyModal');
     apiKeyEditingId = '';
+    apiKeyModalMode = 'create';
     apiKeyModalSubmitting = false;
     $('apiKeyModalSaveBtn').disabled = false;
   }
@@ -2573,6 +2615,17 @@
         toast(t('apiKeys.updated'), 'success');
         closeApiKeyModal();
         await loadApiKeys();
+      } else if (apiKeyModalMode === 'batch') {
+        const count = parseInt($('apiKeyForm_count') ? $('apiKeyForm_count').value : '0', 10);
+        if (!count || count < 1 || count > 100) throw new Error(t('apiKeys.batchInvalidCount'));
+        payload.count = count;
+        res = await api('/api-keys/batch', { method: 'POST', body: JSON.stringify(payload) });
+        d = await res.json().catch(() => ({}));
+        if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+        toast(t('apiKeys.batchCreated', d.count || count), 'success');
+        closeApiKeyModal();
+        await loadApiKeys();
+        showBatchApiKeys(Array.isArray(d.keys) ? d.keys : []);
       } else {
         const keyVal = $('apiKeyForm_key').value.trim();
         if (keyVal) payload.key = keyVal;
@@ -2671,6 +2724,70 @@
     apiKeyLastPortalUrl = '';
   }
 
+  function csvCell(v) {
+    const s = v == null ? '' : String(v);
+    if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  }
+
+  function showBatchApiKeys(rows) {
+    apiKeyBatchSecrets = (rows || []).map((row) => ({
+      name: row && row.name ? String(row.name) : '',
+      key: row && row.key ? String(row.key) : ''
+    })).filter((row) => row.key);
+    const tbody = $('apiKeyBatchResultRows');
+    if (tbody) {
+      tbody.innerHTML = apiKeyBatchSecrets.map((row, idx) => {
+        return '<tr>' +
+          '<td>' + escapeHtml(row.name || t('apiKeys.unnamed')) + '</td>' +
+          '<td class="ak-batch-key">' + escapeHtml(row.key) + '</td>' +
+          '<td><button class="btn btn-outline btn-sm" type="button" data-batch-copy="' + idx + '">' + escapeHtml(t('apiKeys.copyBtn')) + '</button></td>' +
+          '</tr>';
+      }).join('') || '<tr><td colspan="3" class="muted-text">' + escapeHtml(t('apiKeys.empty')) + '</td></tr>';
+    }
+    openDialog('apiKeyBatchResultModal');
+  }
+
+  function closeBatchResultModal() {
+    closeDialog('apiKeyBatchResultModal');
+    apiKeyBatchSecrets = [];
+    const tbody = $('apiKeyBatchResultRows');
+    if (tbody) tbody.innerHTML = '';
+  }
+
+  async function copyBatchSecret(idx) {
+    const row = apiKeyBatchSecrets[idx];
+    if (!row || !row.key) return;
+    try {
+      await copyText(row.key);
+      toast(t('apiKeys.copySuccess'), 'success');
+    } catch (e) {
+      toast(t('common.failed'), 'error');
+    }
+  }
+
+  async function copyAllBatchSecrets() {
+    if (!apiKeyBatchSecrets.length) return;
+    const text = apiKeyBatchSecrets.map((row) => (row.name ? row.name + '\t' : '') + row.key).join('\n');
+    try {
+      await copyText(text);
+      toast(t('apiKeys.copySuccess'), 'success');
+    } catch (e) {
+      toast(t('common.failed'), 'error');
+    }
+  }
+
+  function downloadBatchCsv() {
+    if (!apiKeyBatchSecrets.length) return;
+    const lines = ['name,key'].concat(apiKeyBatchSecrets.map((row) => csvCell(row.name) + ',' + csvCell(row.key)));
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'api-keys.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
   async function copyNewApiKey() {
     const val = $('apiKeyShowValue').value;
     if (!val) return;
@@ -2708,7 +2825,9 @@
       });
     }
     const addBtn = $('addApiKeyBtn');
-    if (addBtn) addBtn.addEventListener('click', () => openApiKeyModal(null));
+    if (addBtn) addBtn.addEventListener('click', () => openApiKeyModal(null, 'create'));
+    const batchBtn = $('batchApiKeyBtn');
+    if (batchBtn) batchBtn.addEventListener('click', () => openApiKeyModal(null, 'batch'));
     const saveBtn = $('apiKeyModalSaveBtn');
     if (saveBtn) saveBtn.addEventListener('click', submitApiKeyModal);
     const cancelBtn = $('apiKeyModalCancelBtn');
@@ -2735,6 +2854,9 @@
       const btn = e.target.closest('[data-preset]');
       if (!btn || !$('apiKeyForm_amount')) return;
       $('apiKeyForm_amount').value = btn.dataset.preset;
+      presets.querySelectorAll('.ak-preset').forEach((el) => {
+        el.classList.toggle('is-active', el === btn);
+      });
     });
     ['apiKeysSearch', 'apiKeysFilterStatus', 'apiKeysFilterQuota', 'apiKeysFilterUsage', 'apiKeysSort'].forEach(id => {
       const el = $(id);
@@ -2752,6 +2874,21 @@
     });
     bindDialogBackdropClose('apiKeyModal', closeApiKeyModal);
     bindDialogBackdropClose('apiKeyShowModal', closeShowApiKeyModal);
+    bindDialogBackdropClose('apiKeyBatchResultModal', closeBatchResultModal);
+    const batchRows = $('apiKeyBatchResultRows');
+    if (batchRows) batchRows.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-batch-copy]');
+      if (!btn) return;
+      copyBatchSecret(parseInt(btn.getAttribute('data-batch-copy'), 10));
+    });
+    const batchCopyAll = $('apiKeyBatchCopyAllBtn');
+    if (batchCopyAll) batchCopyAll.addEventListener('click', copyAllBatchSecrets);
+    const batchCsv = $('apiKeyBatchCsvBtn');
+    if (batchCsv) batchCsv.addEventListener('click', downloadBatchCsv);
+    const batchClose = $('apiKeyBatchResultCloseBtn');
+    if (batchClose) batchClose.addEventListener('click', closeBatchResultModal);
+    const batchCloseX = $('apiKeyBatchResultClose');
+    if (batchCloseX) batchCloseX.addEventListener('click', closeBatchResultModal);
   }
 
   async function rotateApiKeyEntry(id, name) {
