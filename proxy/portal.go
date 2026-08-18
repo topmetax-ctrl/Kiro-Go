@@ -46,7 +46,17 @@ func (h *Handler) handleUsagePage(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "web/"+rel)
 }
 
+func redactHTTPPath(path string) string {
+	if strings.HasPrefix(path, "/usage/p/") {
+		return "/usage/p/[redacted]"
+	}
+	return path
+}
+
 func (h *Handler) exchangePortalToken(w http.ResponseWriter, r *http.Request, token string) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	if h.keys == nil {
 		http.Error(w, "portal unavailable", http.StatusServiceUnavailable)
 		return

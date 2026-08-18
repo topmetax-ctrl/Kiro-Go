@@ -639,7 +639,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Debug-level request trace for fine-grained visibility
-	logger.Debugf("[HTTP] %s %s from %s", r.Method, path, r.RemoteAddr)
+	logger.Debugf("[HTTP] %s %s from %s", r.Method, redactHTTPPath(path), r.RemoteAddr)
 
 	// CORS - 完整的头部支持
 	w.Header().Set("Access-Control-Allow-Origin", "*")
