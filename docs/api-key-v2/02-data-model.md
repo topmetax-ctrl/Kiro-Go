@@ -10,13 +10,16 @@ Chosen from SQLite documentation for a single-writer process:
 - `busy_timeout=5000` — wait 5s on lock instead of immediate SQLITE_BUSY
 - `foreign_keys=ON`
 - `synchronous=NORMAL` — safe with WAL on local disk
-- `SetMaxOpenConns(1)` — serialize writes; revisit after the 10k-key bench
+- `SetMaxOpenConns(1)` — serialize writes; **kept** after P5/P7 measurement
+  (see `11-performance-results.md`)
 
 ## Tables
 
 ### schema_migrations
 
-`version INTEGER PRIMARY KEY` — applied in order. V1 = `1`.
+`version INTEGER PRIMARY KEY` — applied in order. Current schema version is
+`3` (`ttfb_known` + `idx_events_key_ts_id`). V2 added `usage_source` /
+`usage_estimated` and hourly `requests_rejected`.
 
 ### api_keys
 

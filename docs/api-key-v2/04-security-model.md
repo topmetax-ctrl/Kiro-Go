@@ -34,7 +34,7 @@ the digest (when operators use the env override) requires both artifacts.
 | Name | `portal_session` | distinct from `admin_password` |
 | HttpOnly | yes | JS cannot read it |
 | SameSite | Lax | allow top-level GET from share link; block CSRF POST from other sites |
-| Secure | if TLS (`IsTLSEnabled` or `r.TLS`) | production HTTPS; localhost HTTP stays usable |
+| Secure | if TLS (`IsTLSEnabled` or `r.TLS`) | production HTTPS on the process; localhost HTTP stays usable. TLS-terminating reverse proxies do not flip this flag (`TrustProxy` is IP-only; see `08-operations.md`) |
 | Path | `/portal` | not sent to `/v1/*` |
 | Max-Age | 12h | short-lived |
 

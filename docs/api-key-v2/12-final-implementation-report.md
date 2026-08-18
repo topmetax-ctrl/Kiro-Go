@@ -48,7 +48,9 @@ error messages, admin CRUD JSON names, `sk-` format, `/v1/models` open.
 Legacy plaintext retained until operator finalization; admin auth unchanged;
 soft token overrun; `enforcement_mode=strict` is stored but does not
 hard-limit tokens/credits; replay cap 500 with `sync_required`; SSE revoke
-≤ 5s; single SQLite connection.
+≤ 5s; single SQLite connection; `Secure` cookie is process-TLS only
+(reverse-proxy TLS does not flip it); keys created or rotated after upgrade
+are SQLite-only and do not survive rollback to an older binary.
 
 ## 8. V2 later
 

@@ -52,10 +52,24 @@ binaries cannot authenticate those keys after finalization.
 
 ## Rollback
 
+Works **only while `legacyPlaintextRetention` remains enabled** (the default).
+
 1. Stop new binary.
 2. Start previous binary. It reads `config.json` keys (still valid).
 3. Usage after the upgrade is in SQLite and **will not** appear in the old UI.
    Pre-upgrade counters in config are the snapshot at first import.
+
+Post-upgrade **creates and rotates are SQLite-only**. They are not mirrored
+back into `apiKeys[].key`. After rollback:
+
+- keys that existed at first import still authenticate with their **import-time**
+  secret;
+- keys created on the RC binary do not exist for the old binary;
+- a rotated key authenticates on the old binary with the **pre-rotate** secret
+  still stored in `config.json`, not the new secret.
+
+After `FinalizeLegacyPlaintext`, rollback to an older binary cannot
+authenticate those keys. That step is irreversible for the old binary.
 
 ## Failure modes
 

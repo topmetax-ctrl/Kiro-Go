@@ -1,8 +1,13 @@
 # 00 — Current-state audit
 
-Evidence-only. Source of truth is the tree at `feat/api-key-v2` (branched from
-`dadfb59`). Client API keys are distinct from upstream provider keys and from
-`Account.KiroApiKey`.
+> **Historical P0 document.** This is the pre-implementation audit of the
+> plaintext `config.json` API-key system as it existed at branch point
+> `dadfb59`. It is **not** the RC architecture. For the shipped design see
+> `01-architecture.md`, `04-security-model.md`, and
+> `12-final-implementation-report.md`.
+
+Evidence-only snapshot of that older tree. Client API keys are distinct from
+upstream provider keys and from `Account.KiroApiKey`.
 
 ## Module
 

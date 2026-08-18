@@ -161,7 +161,6 @@ Portal JSON errors: `{error,code}` with codes `invalid_api_key`,
 {
   "eventId": 1,
   "requestId": "...",
-  "apiKeyId": "...",
   "timestamp": "2026-08-18T05:00:00Z",
   "endpoint": "openai",
   "clientModel": "claude-sonnet-4.5",
@@ -189,5 +188,10 @@ Public `errorCode` taxonomy: `validation_error`, `authentication_failed`,
 `client_cancelled`, `server_timeout`, `internal_error`,
 `unsettled_reservation`.
 
-Never includes provider, account, route, credentials, prompt, or raw upstream
-errors.
+Portal responses omit `apiKeyId` (`PortalView` clears it). Never includes
+provider, account, route, credentials, prompt, or raw upstream errors.
+
+`ttfbMs` is time to the first byte written to the client (including a fast
+error envelope). Unknown is `null`. A measured zero is `0`. Admissions that
+never reached a provider can still show `0` if the 4xx/5xx body was written
+in the same millisecond.
