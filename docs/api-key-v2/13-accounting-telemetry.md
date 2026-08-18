@@ -44,10 +44,23 @@ Credits are never estimated. They are recorded only from a Kiro `meteringEvent`.
 `Note()`d an outcome. Production expectation: 0. Panic recovery Notes
 `internal_error` so that path does not increment the counter.
 
-Portal data-plane counters (process-local, same style):
+Portal and API-key counters (process-local, same style; no high-cardinality
+labels such as apiKeyID or requestID):
 
-- `PortalSSEConnectionsActive` / `PortalSSEConnectionsTotal`
-- `PortalSSEReplays` / `PortalSSEReplayedEvents`
-- `PortalSSESlowClients`
-- `PortalQueryErrors`
+- `AuthOK` / `AuthFail`
+- `QuotaRejectTokens` / `QuotaRejectCredits` / `QuotaRejectRequests`
+- `ReservationsActive` — in-flight reserved slots in this process
+- `UnsettledReservations` — must stay 0
 - `EventPersistErrors`
+- `PortalSessionsActive`
+- `PortalSSEConnectionsActive` / `PortalSSEConnectionsTotal`
+- `PortalSSEReconnects`
+- `PortalSSEReplays` / `PortalSSEReplayedEvents`
+- `PortalSSEReplayTruncated`
+- `PortalSSESlowClients`
+- `PortalQueryTotal` / `PortalQueryErrors` / last `PortalQueryDurationMs`
+- `PortalSessionReauthFailures` — SSE noticed a dead session (max ~5s)
+- `UsageCleanupDurationMs` / `UsageCleanupRows`
+- `SQLiteBusyErrors` / `SQLiteWriteErrors`
+
+`ObservabilitySnapshot()` dumps these for tests and diagnostics.

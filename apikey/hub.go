@@ -122,6 +122,9 @@ func (s *Service) OpenPortalStream(keyID string, lastEventID int64, filter Event
 	}
 	var replay []PublicEvent
 	var truncated bool
+	if lastEventID > 0 {
+		IncPortalSSEReconnect()
+	}
 	if lastEventID > 0 && hw > lastEventID {
 		replay, truncated, err = s.ReplayEvents(keyID, lastEventID, hw, filter, MaxEventReplay)
 		if err != nil {

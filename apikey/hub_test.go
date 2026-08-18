@@ -201,6 +201,43 @@ func TestSlowClientDisconnectsWithoutBlockingCommit(t *testing.T) {
 	}
 }
 
+func TestMultipleSlowClientsDoNotBlockCommit(t *testing.T) {
+	ResetObservabilityForTest()
+	s := testService(t)
+	rec, _, _ := s.Create(CreateInput{Name: "slow-n", Enabled: true})
+	var cancels []func()
+	for i := 0; i < 3; i++ {
+		_, cancel := s.SubscribePortal(rec.Key.ID)
+		cancels = append(cancels, cancel)
+	}
+	defer func() {
+		for _, c := range cancels {
+			c()
+		}
+	}()
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < portalSubBuffer+12; i++ {
+			if err := s.Commit(rec.Key.ID, CommitInput{
+				RequestID: fmt.Sprintf("n-%d", i), Outcome: OutcomeSuccess,
+				Endpoint: "openai", StatusCode: 200,
+			}); err != nil {
+				t.Errorf("commit: %v", err)
+				break
+			}
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("multiple slow clients blocked Commit")
+	}
+	if PortalSSESlowClients() < 1 {
+		t.Fatalf("slow clients %d", PortalSSESlowClients())
+	}
+}
+
 func TestSubscriberCleanup(t *testing.T) {
 	ResetObservabilityForTest()
 	s := testService(t)

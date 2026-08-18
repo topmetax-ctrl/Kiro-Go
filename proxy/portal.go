@@ -226,12 +226,15 @@ func (h *Handler) portalMe(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) portalSummary(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	rec, err := h.portalSessionRecord(r)
 	if err != nil {
 		writePortalErr(w, err)
 		return
 	}
 	sum, err := h.keys.Summary(rec.Key.ID)
+	apikey.IncPortalQuery()
+	apikey.NotePortalQueryDuration(time.Since(started))
 	if err != nil {
 		writePortalErr(w, err)
 		return
@@ -288,6 +291,7 @@ func unixOrNil(t *time.Time) interface{} {
 }
 
 func (h *Handler) portalUsage(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	rec, err := h.portalSessionRecord(r)
 	if err != nil {
 		writePortalErr(w, err)
@@ -299,6 +303,8 @@ func (h *Handler) portalUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	series, err := h.keys.UsageSeries(rec.Key.ID, q)
+	apikey.IncPortalQuery()
+	apikey.NotePortalQueryDuration(time.Since(started))
 	if err != nil {
 		writePortalDataErr(w, err)
 		return
@@ -319,6 +325,7 @@ func (h *Handler) portalUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) portalEvents(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	rec, err := h.portalSessionRecord(r)
 	if err != nil {
 		writePortalErr(w, err)
@@ -330,6 +337,8 @@ func (h *Handler) portalEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page, err := h.keys.ListEvents(rec.Key.ID, q)
+	apikey.IncPortalQuery()
+	apikey.NotePortalQueryDuration(time.Since(started))
 	if err != nil {
 		writePortalDataErr(w, err)
 		return
@@ -449,6 +458,7 @@ func (h *Handler) portalEventStream(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-reauth.C:
 			if _, err := h.keys.SessionRecord(sid); err != nil {
+				apikey.IncPortalSessionReauthFailure()
 				fmt.Fprintf(w, "event: session\ndata: {\"code\":\"portal_session_expired\"}\n\n")
 				flusher.Flush()
 				return

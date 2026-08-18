@@ -49,8 +49,15 @@ func (s *Service) CloseSessionsForKey(keyID string) error {
 	if keyID == "" {
 		return nil
 	}
-	_, err := s.db.Exec(`DELETE FROM portal_sessions WHERE key_id=?`, keyID)
-	return err
+	res, err := s.db.Exec(`DELETE FROM portal_sessions WHERE key_id=?`, keyID)
+	if err != nil {
+		ObserveSQL(err, true)
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		DecPortalSession(n)
+	}
+	return nil
 }
 
 func (s *Service) HasPortalToken(keyID string) bool {
@@ -114,8 +121,10 @@ func (s *Service) createSession(keyID string) (string, error) {
 	_, err := s.db.Exec(`INSERT INTO portal_sessions(id_digest,key_id,created_at,expires_at) VALUES(?,?,?,?)`,
 		Digest(plain, s.pepper), keyID, now.Unix(), exp.Unix())
 	if err != nil {
+		ObserveSQL(err, true)
 		return "", err
 	}
+	IncPortalSession()
 	return plain, nil
 }
 
@@ -166,6 +175,13 @@ func (s *Service) CloseSession(sessionPlain string) error {
 	if sessionPlain == "" {
 		return nil
 	}
-	_, err := s.db.Exec(`DELETE FROM portal_sessions WHERE id_digest=?`, Digest(sessionPlain, s.pepper))
-	return err
+	res, err := s.db.Exec(`DELETE FROM portal_sessions WHERE id_digest=?`, Digest(sessionPlain, s.pepper))
+	if err != nil {
+		ObserveSQL(err, true)
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		DecPortalSession(n)
+	}
+	return nil
 }

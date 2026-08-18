@@ -35,6 +35,12 @@ Set `"portalEnabled": false` in `config.json` and restart. `/usage` and
 
 ## Strip legacy plaintext (optional, after confidence)
 
+Portal SSE re-checks the session every 5 seconds. Revoke/disable/logout
+make new HTTP calls fail immediately; an already-open stream closes on
+the next re-auth tick (propagation ≤ 5s). That bound is intentional:
+per-event session lookups would serialize the hot path on the single
+SQLite connection.
+
 Set `"legacyPlaintextRetention": false` is reserved; V1 still keeps
 `apiKeys[].key` so an old binary can boot. Manual strip: edit config and
 remove `key` fields only after you no longer need rollback.

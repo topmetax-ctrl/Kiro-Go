@@ -34,48 +34,65 @@ func (s *Service) Lookup(secret string) (Record, error) {
 // limit is configured.
 func (s *Service) Authenticate(secret string, reserve bool) (Record, error) {
 	if s == nil {
+		IncAuth(false)
 		return Record{}, ErrUnavailable
 	}
 	if !s.HasKeys() {
+		IncAuth(false)
 		return Record{}, errNoKeysConfigured()
 	}
 	rec, err := s.Lookup(secret)
 	if err != nil {
+		IncAuth(false)
 		return Record{}, err
 	}
 	now := s.now().UTC()
 	if !rec.Key.Enabled {
+		IncAuth(false)
 		return Record{}, errDisabled()
 	}
 	if rec.Key.ExpiresAt != nil && !rec.Key.ExpiresAt.After(now) {
+		IncAuth(false)
 		return Record{}, errExpired()
 	}
 	overToken, overCredit, overRequest := rec.OverLimit()
 	if overToken {
 		_ = s.addRejected(rec.Key.ID)
+		IncAuth(false)
+		IncQuotaReject("tokens")
 		return Record{}, errTokenQuota()
 	}
 	if overCredit {
 		_ = s.addRejected(rec.Key.ID)
+		IncAuth(false)
+		IncQuotaReject("credits")
 		return Record{}, errCreditQuota()
 	}
 	if overRequest {
 		_ = s.addRejected(rec.Key.ID)
+		IncAuth(false)
+		IncQuotaReject("requests")
 		return Record{}, errRequestQuota()
 	}
 	if reserve {
 		if err := s.reserve(rec.Key.ID, rec.Quota); err != nil {
 			if ae, ok := err.(*AuthError); ok {
 				_ = s.addRejected(rec.Key.ID)
+				IncAuth(false)
+				IncQuotaReject("requests")
 				return Record{}, ae
 			}
+			ObserveSQL(err, true)
+			IncAuth(false)
 			return Record{}, err
 		}
 		rec, err = s.Get(rec.Key.ID)
 		if err != nil {
+			IncAuth(false)
 			return Record{}, err
 		}
 	}
+	IncAuth(true)
 	return rec, nil
 }
 
@@ -116,7 +133,12 @@ func (s *Service) reserve(id string, q Quota) error {
 		_, _ = tx.Exec(`UPDATE api_key_usage SET requests_reserved = requests_reserved + 1
 			WHERE key_id=? AND period=?`, id, PeriodLifetime)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		ObserveSQL(err, true)
+		return err
+	}
+	IncReservationsActive()
+	return nil
 }
 
 func (s *Service) addRejected(id string) error {
@@ -260,6 +282,7 @@ func (s *Service) Commit(keyID string, in CommitInput) error {
 		addIn, addOut, addTokens, addCredits, in.LatencyMs, ttfbVal, ttfbKnown, boolInt(in.Stream), boolInt(outcome == OutcomeCancelled),
 		in.ErrorCode, sanitizeError(in.SanitizedError), source, boolInt(in.UsageEstimated))
 	if err != nil {
+		ObserveSQL(err, true)
 		IncEventPersistError()
 		return err
 	}
@@ -308,8 +331,12 @@ func (s *Service) Commit(keyID string, in CommitInput) error {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
+		ObserveSQL(err, true)
 		IncEventPersistError()
 		return err
+	}
+	if rec.Usage.RequestsReserved > 0 {
+		DecReservationsActive()
 	}
 	IncSettlement(outcome)
 	if eventID > 0 {

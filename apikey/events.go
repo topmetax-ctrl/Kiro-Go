@@ -364,6 +364,11 @@ func (s *Service) Summary(keyID string) (Summary, error) {
 
 // Cleanup deletes expired raw events and old hourly buckets in small batches.
 func (s *Service) Cleanup() (events int, hours int, err error) {
+	start := time.Now()
+	defer func() {
+		NoteCleanup(time.Since(start), events+hours)
+		ObserveSQL(err, err != nil)
+	}()
 	now := s.now().UTC()
 	eventCut := now.Add(-s.retain).Unix()
 	hourCut := now.Add(-s.hourlyRetain).Unix()
@@ -389,7 +394,11 @@ func (s *Service) Cleanup() (events int, hours int, err error) {
 			break
 		}
 	}
-	_, _ = s.db.Exec(`DELETE FROM portal_sessions WHERE expires_at < ?`, now.Unix())
+	if res, e := s.db.Exec(`DELETE FROM portal_sessions WHERE expires_at < ?`, now.Unix()); e == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			DecPortalSession(n)
+		}
+	}
 	return events, hours, nil
 }
 
