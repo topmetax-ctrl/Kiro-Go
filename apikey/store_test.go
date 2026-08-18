@@ -60,6 +60,56 @@ func TestCreateLookupRotateDelete(t *testing.T) {
 	}
 }
 
+func TestRestartPreservesKeysEventsAndReservedZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "apikeys.db")
+	pepper := []byte("test-pepper-32-bytes-long!!!!!!")
+	s1, err := Open(path, pepper, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, secret, err := s1.Create(CreateInput{Name: "persist", Enabled: true, RequestLimit: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s1.Authenticate(secret, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.Commit(rec.Key.ID, CommitInput{Outcome: OutcomeSuccess, Endpoint: "openai", RequestID: "keep", StatusCode: 200, InputTokens: 7}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s1.Close()
+
+	s2, err := Open(path, pepper, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+	got, err := s2.Lookup(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Usage.RequestsReserved != 0 {
+		t.Fatalf("reserved leaked across restart: %d", got.Usage.RequestsReserved)
+	}
+	page, err := s2.ListEvents(got.Key.ID, EventQuery{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, ev := range page.Items {
+		if ev.RequestID == "keep" && ev.InputTokens == 7 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("event missing after restart: %+v", page.Items)
+	}
+	if UnsettledReservations() != 0 {
+		t.Fatalf("unsettled %d", UnsettledReservations())
+	}
+}
+
 func TestImportLegacyIdempotent(t *testing.T) {
 	s := testService(t)
 	entries := []LegacyKey{{
