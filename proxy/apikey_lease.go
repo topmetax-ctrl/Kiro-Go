@@ -314,7 +314,7 @@ func wrapLeaseWriter(w http.ResponseWriter, ctx context.Context) http.ResponseWr
 	if _, ok := w.(*leaseResponseWriter); ok {
 		return w
 	}
-	if leaseFromContext(ctx) == nil {
+	if ctx == nil {
 		return w
 	}
 	return &leaseResponseWriter{ResponseWriter: w, ctx: ctx}

@@ -16,6 +16,8 @@ const (
 	ErrorProviderRateLimited  = "provider_rate_limited"
 	ErrorProviderError        = "provider_error"
 	ErrorProviderTimeout      = "provider_timeout"
+	ErrorProviderUnavailable  = "provider_unavailable"
+	ErrorProviderRejected     = "provider_rejected"
 	ErrorClientCancelled      = "client_cancelled"
 	ErrorServerTimeout        = "server_timeout"
 	ErrorInternal             = "internal_error"
@@ -34,6 +36,8 @@ var knownErrorCodes = map[string]struct{}{
 	ErrorProviderRateLimited:  {},
 	ErrorProviderError:        {},
 	ErrorProviderTimeout:      {},
+	ErrorProviderUnavailable:  {},
+	ErrorProviderRejected:     {},
 	ErrorClientCancelled:      {},
 	ErrorServerTimeout:        {},
 	ErrorInternal:             {},
@@ -79,9 +83,6 @@ func ClassifyPublicError(status int, errType, message string) string {
 		return ErrorServerTimeout
 	}
 	if status == 429 {
-		if typ == "rate_limit_error" {
-			return ErrorProviderRateLimited
-		}
 		return ErrorProviderRateLimited
 	}
 	if typ == "invalid_request_error" || status == 400 || status == 404 || status == 422 {
@@ -91,7 +92,7 @@ func ClassifyPublicError(status int, errType, message string) string {
 		return ErrorProviderTimeout
 	}
 	if status == 503 {
-		return ErrorProviderError
+		return ErrorProviderUnavailable
 	}
 	if status >= 500 {
 		return ErrorProviderError

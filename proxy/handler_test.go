@@ -511,6 +511,121 @@ func TestMergeUniqueModelsPreservesUnionAcrossAccounts(t *testing.T) {
 	}
 }
 
+func TestHandleModelsListsEnabledForwardingNamesOnly(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdateUpstreamConfig(
+		[]config.UpstreamProvider{{ID: "u1", Name: "9router", Enabled: true}},
+		[]config.ModelRoute{
+			{
+				ID: "on", Model: "claude-sonnet-5", Enabled: true,
+				Targets: []config.RouteTarget{{
+					UpstreamID: "u1", TargetModel: "runapi/claude-sonnet-5-secret", Enabled: true,
+				}},
+			},
+			{
+				ID: "off", Model: "claude-opus-5", Enabled: false,
+				Targets: []config.RouteTarget{{UpstreamID: "u1", TargetModel: "hidden-opus", Enabled: true}},
+			},
+		},
+	); err != nil {
+		t.Fatalf("UpdateUpstreamConfig: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	(&Handler{}).handleModels(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	raw := rec.Body.String()
+
+	var body struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Object != "list" {
+		t.Fatalf("object %q", body.Object)
+	}
+	if len(body.Data) != 1 || body.Data[0].ID != "claude-sonnet-5" {
+		t.Fatalf("want only claude-sonnet-5, got %+v", body.Data)
+	}
+	for _, leak := range []string{"runapi/claude-sonnet-5-secret", "hidden-opus", "9router", "claude-opus-5", "auto", "gpt-4o", "claude-sonnet-4.6"} {
+		if strings.Contains(raw, leak) {
+			t.Errorf("listing leaked %q: %s", leak, raw)
+		}
+	}
+}
+
+func TestHandleModelsKiroCatalogListsAccountFallback(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdatePublicModelCatalog(config.PublicModelCatalogKiro); err != nil {
+		t.Fatalf("UpdatePublicModelCatalog: %v", err)
+	}
+	if err := config.UpdateUpstreamConfig(
+		[]config.UpstreamProvider{{ID: "u1", Enabled: true}},
+		[]config.ModelRoute{{
+			ID: "on", Model: "claude-sonnet-5", Enabled: true,
+			Targets: []config.RouteTarget{{UpstreamID: "u1", Enabled: true}},
+		}},
+	); err != nil {
+		t.Fatalf("UpdateUpstreamConfig: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	(&Handler{}).handleModels(rec, req)
+	raw := rec.Body.String()
+	if !strings.Contains(raw, "claude-sonnet-4.6") {
+		t.Fatalf("kiro catalog missing account fallback: %s", raw)
+	}
+	if !strings.Contains(raw, "auto") {
+		t.Fatalf("kiro catalog missing alias: %s", raw)
+	}
+}
+
+func TestRejectUnconfiguredModelHidesKiroCatalog(t *testing.T) {
+	cfgFile := t.TempDir() + "/config.json"
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdateUpstreamConfig(
+		[]config.UpstreamProvider{{ID: "u1", Name: "9router", Enabled: true}},
+		[]config.ModelRoute{{
+			ID: "on", Model: "claude-sonnet-5", Enabled: true,
+			Targets: []config.RouteTarget{{UpstreamID: "u1", Enabled: true}},
+		}},
+	); err != nil {
+		t.Fatalf("UpdateUpstreamConfig: %v", err)
+	}
+
+	h := &Handler{}
+	rec := httptest.NewRecorder()
+	if !h.rejectUnconfiguredModel(rec, "claude-sonnet-4.6", false) {
+		t.Fatal("expected Kiro account model to be rejected")
+	}
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "9router") {
+		t.Fatalf("error leaked provider: %s", rec.Body.String())
+	}
+
+	if h.rejectUnconfiguredModel(httptest.NewRecorder(), "claude-sonnet-5", false) {
+		t.Fatal("configured forwarding model must still be accepted")
+	}
+}
+
 func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	models := buildAnthropicModelsResponse([]ModelInfo{{
 		ModelId:    "claude-sonnet-4.5",
@@ -738,5 +853,84 @@ func TestOpenAIStreamPreservesUpstreamMaxTokensFinishReason(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"finish_reason":"length"`) {
 		t.Fatalf("expected finish_reason=length, got %s", rec.Body.String())
+	}
+}
+
+// An upstream that implements only Anthropic's /messages must probe OK. Which path
+// a real request takes is decided by the client API the caller hit, not by the
+// provider, so reporting the OpenAI 404 would label a working target broken.
+func TestUpstreamTestFallsBackToAnthropicShape(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.URL.Path)
+		if r.URL.Path == "/messages" {
+			if r.Header.Get("anthropic-version") == "" {
+				t.Errorf("anthropic probe missing anthropic-version header")
+			}
+			w.WriteHeader(200)
+			w.Write([]byte(`{"id":"msg_1"}`))
+			return
+		}
+		w.WriteHeader(404)
+		w.Write([]byte(`{"error":"not found"}`))
+	}))
+	defer srv.Close()
+
+	body, _ := json.Marshal(map[string]string{"baseUrl": srv.URL, "model": "claude-opus-5"})
+	rec := httptest.NewRecorder()
+	(&Handler{}).apiUpstreamTest(rec, httptest.NewRequest("POST", "/admin/api/upstream-test", bytes.NewReader(body)))
+
+	var got struct {
+		OK     bool   `json:"ok"`
+		Status int    `json:"status"`
+		Path   string `json:"path"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.OK || got.Status != 200 {
+		t.Fatalf("want ok on the anthropic shape, got %+v", got)
+	}
+	if got.Path != "/messages" {
+		t.Errorf("want the answering path reported, got %q", got.Path)
+	}
+	if len(seen) != 2 || seen[0] != "/chat/completions" || seen[1] != "/messages" {
+		t.Errorf("want openai probed then anthropic, got %v", seen)
+	}
+}
+
+// The fallback is only for "this API is not served here". A 401 is the upstream
+// answering on a path it owns, so it must be reported as-is — a second probe would
+// mask a credential problem behind a different path's error.
+func TestUpstreamTestReportsAuthFailureWithoutFallback(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.URL.Path)
+		w.WriteHeader(401)
+		w.Write([]byte(`{"error":"invalid api key"}`))
+	}))
+	defer srv.Close()
+
+	body, _ := json.Marshal(map[string]string{"baseUrl": srv.URL, "model": "m"})
+	rec := httptest.NewRecorder()
+	(&Handler{}).apiUpstreamTest(rec, httptest.NewRequest("POST", "/admin/api/upstream-test", bytes.NewReader(body)))
+
+	var got struct {
+		OK     bool   `json:"ok"`
+		Status int    `json:"status"`
+		Path   string `json:"path"`
+		Error  string `json:"error"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.OK || got.Status != 401 {
+		t.Fatalf("want the 401 surfaced, got %+v", got)
+	}
+	if !strings.Contains(got.Error, "invalid api key") {
+		t.Errorf("want the upstream's own message, got %q", got.Error)
+	}
+	if len(seen) != 1 || seen[0] != "/chat/completions" {
+		t.Errorf("want exactly one probe, got %v", seen)
 	}
 }

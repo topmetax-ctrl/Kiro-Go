@@ -687,7 +687,7 @@ endpointLoop:
 				case KiroErrQuota:
 					logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
 				default:
-					logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
+					logger.Warnf("[KiroAPI] Endpoint %s error status=%d category=%s", ep.Name, upstreamErr.StatusCode, upstreamErr.Category)
 				}
 
 				// Authentication errors and payment errors are not retried across endpoints.

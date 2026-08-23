@@ -108,7 +108,7 @@ func TestForwardRedactsUpstreamError(t *testing.T) {
 	if strings.Contains(body, "127.0.0.1") || strings.Contains(body, "dial") || strings.Contains(body, "connection refused") {
 		t.Fatalf("client-facing error leaked internal detail: %s", body)
 	}
-	if !strings.Contains(body, "upstream request failed") {
+	if !strings.Contains(body, "temporarily unavailable") && !strings.Contains(body, "upstream request failed") {
 		t.Fatalf("expected generic error message, got: %s", body)
 	}
 }

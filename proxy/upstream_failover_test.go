@@ -126,7 +126,8 @@ func TestForwardFailsOverOnConnectionError(t *testing.T) {
 
 // 401/403/400 mean the request or credential is wrong, not that the provider is
 // unhealthy. Retrying would multiply the same error and hide the real cause, so
-// the first such response is surfaced immediately and verbatim.
+// the first such response is surfaced immediately — as a public error, never
+// the upstream body, and never as a client-auth 401.
 func TestForwardDoesNotFailOverOnAuthError(t *testing.T) {
 	for _, status := range []int{400, 401, 403, 404} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
@@ -149,11 +150,14 @@ func TestForwardDoesNotFailOverOnAuthError(t *testing.T) {
 			if backupHits != 0 {
 				t.Errorf("backup was tried %d times; %d must not fail over", backupHits, status)
 			}
-			if rec.Code != status {
-				t.Errorf("status = %d, want %d passed through", rec.Code, status)
+			if strings.Contains(rec.Body.String(), "nope") {
+				t.Errorf("raw upstream body leaked: %s", rec.Body.String())
 			}
-			if got := rec.Body.String(); got != `{"error":{"message":"nope"}}` {
-				t.Errorf("body = %q, want the upstream's own error shape", got)
+			if rec.Code == http.StatusUnauthorized && status != 0 {
+				t.Errorf("upstream %d must not become client 401", status)
+			}
+			if rec.Code == 200 {
+				t.Errorf("unexpected success")
 			}
 		})
 	}
@@ -196,10 +200,9 @@ func TestForwardDoesNotRetryAfterStreamStarted(t *testing.T) {
 	}
 }
 
-// When the LAST target also fails with a retryable status, the client must get
-// the upstream's own error body — the pre-multi-target contract. Withholding it
-// is only correct while a backup remains.
-func TestForwardLastTargetRelaysUpstreamErrorBody(t *testing.T) {
+// When the LAST target also fails with a retryable status, the client gets one
+// public error (the last attempt's mapping). Raw upstream text stays internal.
+func TestForwardLastTargetSendsPublicError(t *testing.T) {
 	metrics.Reset()
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(503)
@@ -216,10 +219,14 @@ func TestForwardLastTargetRelaysUpstreamErrorBody(t *testing.T) {
 	rec := forwardOnce(t, "m", false)
 
 	if rec.Code != 429 {
-		t.Fatalf("status = %d, want the last target's 429", rec.Code)
+		t.Fatalf("status = %d, want the last target's mapped 429", rec.Code)
 	}
-	if got := rec.Body.String(); got != `{"error":{"type":"rate_limit_error","message":"second exhausted"}}` {
-		t.Fatalf("body = %q, want the last upstream's verbatim error", got)
+	got := rec.Body.String()
+	if strings.Contains(got, "second exhausted") || strings.Contains(got, "first down") {
+		t.Fatalf("raw upstream leaked: %s", got)
+	}
+	if !strings.Contains(got, "rate limited") && !strings.Contains(got, "provider_rate_limited") {
+		t.Fatalf("expected public rate-limit error, got %s", got)
 	}
 }
 

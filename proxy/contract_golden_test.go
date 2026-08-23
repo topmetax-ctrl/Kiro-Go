@@ -298,7 +298,7 @@ func TestOpenAINonStreamExhaustionTail(t *testing.T) {
 		}
 	})
 
-	t.Run("all_accounts_fail_500", func(t *testing.T) {
+	t.Run("all_accounts_fail_502", func(t *testing.T) {
 		h, attempts := goldenUpstream(t, goldenAccounts("a1"), func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "temporary upstream failure", http.StatusInternalServerError)
 		})
@@ -307,8 +307,8 @@ func TestOpenAINonStreamExhaustionTail(t *testing.T) {
 		if *attempts < 1 {
 			t.Fatalf("expected the single account to be attempted at least once")
 		}
-		if rec.Code != http.StatusInternalServerError {
-			t.Fatalf("expected 500 when accounts existed but all failed, got %d", rec.Code)
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("expected 502 when accounts existed but all failed, got %d body=%s", rec.Code, rec.Body.String())
 		}
 	})
 }

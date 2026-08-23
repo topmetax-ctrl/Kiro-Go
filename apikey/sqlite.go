@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -132,6 +132,29 @@ CREATE TABLE IF NOT EXISTS portal_sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON portal_sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS provider_error_details (
+  request_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  provider_id TEXT NOT NULL DEFAULT '',
+  provider_name TEXT NOT NULL DEFAULT '',
+  account_id TEXT NOT NULL DEFAULT '',
+  endpoint TEXT NOT NULL DEFAULT '',
+  client_model TEXT NOT NULL DEFAULT '',
+  effective_model TEXT NOT NULL DEFAULT '',
+  upstream_status INTEGER NOT NULL DEFAULT 0,
+  upstream_code TEXT NOT NULL DEFAULT '',
+  upstream_message TEXT NOT NULL DEFAULT '',
+  upstream_request_id TEXT NOT NULL DEFAULT '',
+  retry_after TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT '',
+  public_code TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  detail_truncated INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (request_id, attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_provider_errors_created ON provider_error_details(created_at);
 `
 
 // Service is the API-key domain store. It is safe for concurrent use.
@@ -243,6 +266,15 @@ func ensureSchemaVersion(db *sql.DB) error {
 		if _, err := db.Exec(`INSERT INTO schema_migrations(version) VALUES (3)`); err != nil {
 			return fmt.Errorf("record schema version 3: %w", err)
 		}
+		v = 3
+	}
+	if v < 4 {
+		if err := migrateV4(db); err != nil {
+			return fmt.Errorf("migrate v4: %w", err)
+		}
+		if _, err := db.Exec(`INSERT INTO schema_migrations(version) VALUES (4)`); err != nil {
+			return fmt.Errorf("record schema version 4: %w", err)
+		}
 	}
 	return nil
 }
@@ -258,6 +290,39 @@ func migrateV2(db *sql.DB) error {
 			if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func migrateV4(db *sql.DB) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS provider_error_details (
+  request_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  provider_id TEXT NOT NULL DEFAULT '',
+  provider_name TEXT NOT NULL DEFAULT '',
+  account_id TEXT NOT NULL DEFAULT '',
+  endpoint TEXT NOT NULL DEFAULT '',
+  client_model TEXT NOT NULL DEFAULT '',
+  effective_model TEXT NOT NULL DEFAULT '',
+  upstream_status INTEGER NOT NULL DEFAULT 0,
+  upstream_code TEXT NOT NULL DEFAULT '',
+  upstream_message TEXT NOT NULL DEFAULT '',
+  upstream_request_id TEXT NOT NULL DEFAULT '',
+  retry_after TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT '',
+  public_code TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  detail_truncated INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (request_id, attempt)
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_provider_errors_created ON provider_error_details(created_at)`,
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			return err
 		}
 	}
 	return nil

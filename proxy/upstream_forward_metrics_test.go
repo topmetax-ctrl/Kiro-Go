@@ -210,9 +210,12 @@ func TestForwardRecordsUpstreamErrorMessage(t *testing.T) {
 	setupPricedForwardRoute(t, upstream.URL, "gpt-forward", 0, 0)
 	rec := forwardRequest(t, "", "gpt-forward")
 
-	// The client must still receive the upstream body untouched.
-	if got := rec.Body.String(); got != `{"error":{"type":"rate_limit_error","message":"daily quota exhausted"}}` {
-		t.Fatalf("error body altered: %q", got)
+	got := rec.Body.String()
+	if strings.Contains(got, "daily quota exhausted") {
+		t.Fatalf("client received raw upstream text: %q", got)
+	}
+	if rec.Code != 429 {
+		t.Fatalf("status=%d", rec.Code)
 	}
 
 	d, ok := metrics.ProviderDetailFor("up-1", 60)
@@ -222,8 +225,8 @@ func TestForwardRecordsUpstreamErrorMessage(t *testing.T) {
 	if len(d.RecentErrs) != 1 {
 		t.Fatalf("recent errors = %+v, want 1", d.RecentErrs)
 	}
-	if got := d.RecentErrs[0].Message; got != "rate_limit_error: daily quota exhausted" {
-		t.Fatalf("error message = %q, want the upstream's own text", got)
+	if got := d.RecentErrs[0].Message; !strings.Contains(got, "daily quota exhausted") {
+		t.Fatalf("admin error message = %q, want the upstream diagnostic", got)
 	}
 }
 

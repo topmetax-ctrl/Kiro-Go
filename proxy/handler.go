@@ -15,6 +15,7 @@ import (
 	"kiro-go/logger"
 	"kiro-go/metrics"
 	"kiro-go/pool"
+	"kiro-go/providererr"
 	"kiro-go/search"
 	"net"
 	"net/http"
@@ -516,30 +517,32 @@ func (h *Handler) validateApiKey(r *http.Request) bool {
 // authenticateForClaude runs authenticate and writes a Claude-style error on failure.
 // Returns the request with the matched API key injected into context, or nil if auth failed.
 func (h *Handler) authenticateForClaude(w http.ResponseWriter, r *http.Request) *http.Request {
+	r = withRequestIDContext(withClientIPContext(r, clientIP(r)), requestIDFromRequest(r))
 	entry, err := h.authenticate(r)
 	if err != nil {
 		ae, _ := err.(*authError)
 		if ae == nil {
 			ae = newAuthError(http.StatusUnauthorized, "authentication_error", err.Error())
 		}
-		h.sendClaudeError(w, ae.status, ae.code, ae.message)
+		h.sendClaudeError(wrapLeaseWriter(w, r.Context()), ae.status, ae.code, ae.message)
 		return nil
 	}
-	return withRequestIDContext(withClientIPContext(withApiKeyContext(r, entry), clientIP(r)), requestIDFromRequest(r))
+	return withApiKeyContext(r, entry)
 }
 
 // authenticateForOpenAI runs authenticate and writes an OpenAI-style error on failure.
 func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) *http.Request {
+	r = withRequestIDContext(withClientIPContext(r, clientIP(r)), requestIDFromRequest(r))
 	entry, err := h.authenticate(r)
 	if err != nil {
 		ae, _ := err.(*authError)
 		if ae == nil {
 			ae = newAuthError(http.StatusUnauthorized, "authentication_error", err.Error())
 		}
-		h.sendOpenAIError(w, ae.status, ae.code, ae.message)
+		h.sendOpenAIError(wrapLeaseWriter(w, r.Context()), ae.status, ae.code, ae.message)
 		return nil
 	}
-	return withRequestIDContext(withClientIPContext(withApiKeyContext(r, entry), clientIP(r)), requestIDFromRequest(r))
+	return withApiKeyContext(r, entry)
 }
 
 // clientIP resolves the request's client IP. Forwarded-IP headers are only
@@ -762,37 +765,88 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// handleModels 模型列表
+// handleModels lists the public model catalog. The operator picks the source
+// in Settings: forwarding routes only, the Kiro account catalog, or both.
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
-	// 尝试用缓存的真实模型列表
-	cached := h.modelCache.Snapshot()
-	if len(cached) == 0 {
-		h.modelCache.RefreshAll()
-		cached = h.modelCache.Snapshot()
+	var models []map[string]interface{}
+	switch config.GetPublicModelCatalog() {
+	case config.PublicModelCatalogKiro:
+		models = h.kiroCatalogModels()
+	case config.PublicModelCatalogBoth:
+		models = mergeModelListings(forwardingCatalogModels(), h.kiroCatalogModels())
+	default:
+		models = forwardingCatalogModels()
 	}
-
-	thinkingCfg := config.GetThinkingConfig()
-	thinkingSuffix := thinkingCfg.Suffix
-	advertiseEffort := thinkingCfg.AdvertiseEffortModels
-
-	models := buildAnthropicModelsResponse(cached, thinkingSuffix, advertiseEffort)
-	if len(models) == 0 {
-		models = fallbackAnthropicModels(thinkingSuffix, advertiseEffort)
-	}
-
-	// 添加别名模型
-	models = append(models,
-		buildModelInfo("auto", "kiro-proxy", true),
-		buildModelInfo("gpt-4o", "kiro-proxy", true),
-		buildModelInfo("gpt-4", "kiro-proxy", true),
-	)
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"object": "list",
 		"data":   models,
 	})
-	return
+}
+
+func forwardingCatalogModels() []map[string]interface{} {
+	names := config.AdvertisedRouteModels()
+	models := make([]map[string]interface{}, 0, len(names))
+	for _, name := range names {
+		models = append(models, buildModelInfo(name, "kiro-proxy", true))
+	}
+	return models
+}
+
+func (h *Handler) kiroCatalogModels() []map[string]interface{} {
+	var cached []ModelInfo
+	if h.modelCache != nil {
+		cached = h.modelCache.Snapshot()
+		if len(cached) == 0 {
+			h.modelCache.RefreshAll()
+			cached = h.modelCache.Snapshot()
+		}
+	}
+	thinkingCfg := config.GetThinkingConfig()
+	models := buildAnthropicModelsResponse(cached, thinkingCfg.Suffix, thinkingCfg.AdvertiseEffortModels)
+	if len(models) == 0 {
+		models = fallbackAnthropicModels(thinkingCfg.Suffix, thinkingCfg.AdvertiseEffortModels)
+	}
+	return append(models,
+		buildModelInfo("auto", "kiro-proxy", true),
+		buildModelInfo("gpt-4o", "kiro-proxy", true),
+		buildModelInfo("gpt-4", "kiro-proxy", true),
+	)
+}
+
+func mergeModelListings(first, second []map[string]interface{}) []map[string]interface{} {
+	seen := make(map[string]bool, len(first)+len(second))
+	out := make([]map[string]interface{}, 0, len(first)+len(second))
+	for _, list := range [][]map[string]interface{}{first, second} {
+		for _, m := range list {
+			id, _ := m["id"].(string)
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// rejectUnconfiguredModel answers 404 when the public catalog is locked to
+// forwarding routes and the client asked for a name that is not one of them.
+func (h *Handler) rejectUnconfiguredModel(w http.ResponseWriter, model string, isClaudeRoute bool) bool {
+	if config.GetPublicModelCatalog() != config.PublicModelCatalogForwarding {
+		return false
+	}
+	if route, _ := config.ResolveRoute(model); route != nil {
+		return false
+	}
+	msg := "model not found: " + strings.TrimSpace(model)
+	if isClaudeRoute {
+		h.sendClaudeError(w, http.StatusNotFound, "not_found_error", msg)
+	} else {
+		h.sendOpenAIError(w, http.StatusNotFound, "invalid_request_error", msg)
+	}
+	return true
 }
 
 // apiDiscoverAccountProfiles GET /admin/api/accounts/{id}/profiles
@@ -972,6 +1026,9 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/messages", true, userText) {
 		// Capture (write) for the forward path is handled inside tryForwardUpstream
 		// (non-stream only), since only it can tee the upstream response body.
+		return
+	}
+	if h.rejectUnconfiguredModel(w, req.Model, true) {
 		return
 	}
 
@@ -1516,9 +1573,18 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 					return attemptHandled()
 				}
 				h.recordFailure()
+				pub := classifyGoError(err, requestIDFromContext(ctx), "search", "claude", model, "", "", "").Public()
+				var mixed *MixedToolUseError
+				msg := pub.MessageOrDefault()
+				typ := providererr.EnvelopeType(pub.Code, true)
+				if errors.As(err, &mixed) {
+					msg = mixed.Error()
+					typ = "invalid_request_error"
+				}
 				h.sendSSE(w, flusher, "error", map[string]interface{}{
-					"type":  "error",
-					"error": map[string]string{"type": "api_error", "message": err.Error()},
+					"type":       "error",
+					"error":      map[string]string{"type": typ, "message": msg},
+					"request_id": pub.RequestID,
 				})
 				return attemptHandled()
 			}
@@ -1711,10 +1777,15 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	// lives here in the per-protocol renderer.
 	onCommitted := func(account *config.Account, err error) {
 		h.handleAccountFailure(account, err)
+		pub := h.recordUpstreamFailure(ctx, "claude", model, account.ID, "", "", err)
 		h.recordFailureWithDetails(ctx, "claude", model, account.ID, err)
 		h.sendSSE(w, flusher, "error", map[string]interface{}{
-			"type":  "error",
-			"error": map[string]string{"type": "api_error", "message": err.Error()},
+			"type": "error",
+			"error": map[string]string{
+				"type":    providererr.EnvelopeType(pub.Code, true),
+				"message": pub.MessageOrDefault(),
+			},
+			"request_id": pub.RequestID,
 		})
 	}
 
@@ -1723,8 +1794,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			h.sendClaudeError(w, 503, "api_error", "No available accounts")
 			return
 		}
+		pub := h.recordUpstreamFailure(ctx, "claude", model, "", "", "", lastErr)
 		h.recordFailureWithDetails(ctx, "claude", model, "", lastErr)
-		h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+		h.sendPublicClaudeError(w, pub)
 	}
 
 	ex.Run(ctx, guard, attempt, onCommitted, onExhausted)
@@ -1920,8 +1992,10 @@ func (h *Handler) recordFailureWithDetails(ctx context.Context, endpoint, model,
 		return
 	}
 
-	errMsg := err.Error()
-	errType := classifyError(errMsg)
+	in := classifyGoError(err, requestIDFromContext(ctx), endpoint, endpoint, model, accountID, "", "")
+	h.persistProviderError(in)
+	errMsg := in.AdminSummary()
+	errType := classifyError(err.Error())
 
 	entry := RequestLog{
 		Time:      time.Now().Unix(),
@@ -1945,7 +2019,8 @@ func (h *Handler) recordFailureWithDetails(ctx context.Context, endpoint, model,
 		ApiKeyID:  apiKeyIDFromContext(ctx),
 		RequestID: requestIDFromContext(ctx),
 	})
-	h.commitAPIKeyOutcome(ctx, apikey.OutcomeFailed, endpoint, model, errType, errMsg, kiroStatusFor(kiroMetric{ErrorType: errType}), 0, 0, 0, 0, 0, false, false)
+	pub := in.Public()
+	h.commitAPIKeyOutcome(ctx, apikey.OutcomeFailed, endpoint, model, pub.Code, pub.Message, pub.HTTPStatus, 0, 0, 0, 0, 0, false, false)
 }
 
 // recordSuccessLogSplit records a successful request in the request logs and in
@@ -2261,8 +2336,9 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			h.sendClaudeError(w, 503, "api_error", "No available accounts")
 			return
 		}
+		pub := h.recordUpstreamFailure(ctx, "claude", model, "", "", "", lastErr)
 		h.recordFailureWithDetails(ctx, "claude", model, "", lastErr)
-		h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+		h.sendPublicClaudeError(w, pub)
 	}
 
 	ex.Run(ctx, guard, attempt, nil, onExhausted)
@@ -2272,15 +2348,21 @@ func (h *Handler) sendClaudeError(w http.ResponseWriter, status int, errType, me
 	if ctx := leaseContextFromWriter(w); ctx != nil {
 		noteAPIKeyHTTPStatus(ctx, status, errType, message)
 	}
+	rid := requestIDFromWriter(w)
+	setRequestIDHeader(w, rid)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	body := map[string]interface{}{
 		"type": "error",
 		"error": map[string]string{
 			"type":    errType,
 			"message": message,
 		},
-	})
+	}
+	if rid != "" {
+		body["request_id"] = rid
+	}
+	json.NewEncoder(w).Encode(body)
 }
 
 // sendClaudeErrorForWebSearch maps a non-account web_search runner error to a
@@ -2298,15 +2380,17 @@ func (h *Handler) sendClaudeErrorForWebSearch(w http.ResponseWriter, err error) 
 	case errors.As(err, &cfgErr):
 		h.sendClaudeError(w, 500, "api_error", cfgErr.Error())
 	case errors.As(err, &provErr):
-		// Auth against the provider is a server misconfiguration from the client's
-		// perspective; rate/timeout/5xx are upstream unavailability.
+		// Auth against the search provider is a server misconfiguration; do not
+		// surface provider kind or raw error text to the client.
 		if provErr.Kind == search.ErrAuth {
 			h.sendClaudeError(w, 500, "api_error", "web_search provider authentication failed")
 		} else {
-			h.sendClaudeError(w, 502, "api_error", "web_search provider unavailable: "+string(provErr.Kind))
+			pub := classifyGoError(err, requestIDFromWriter(w), "search", "claude", "", "", "", "").Public()
+			h.sendPublicClaudeError(w, pub)
 		}
 	default:
-		h.sendClaudeError(w, 502, "api_error", "web_search failed: "+err.Error())
+		pub := classifyGoError(err, requestIDFromWriter(w), "search", "claude", "", "", "", "").Public()
+		h.sendPublicClaudeError(w, pub)
 	}
 }
 
@@ -2338,6 +2422,9 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// Forward to an external upstream when the (raw, un-normalized) client model
 	// matches an enabled route. Passthrough bypasses the Kiro pool entirely.
 	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/chat/completions", false, "") {
+		return
+	}
+	if h.rejectUnconfiguredModel(w, req.Model, false) {
 		return
 	}
 
@@ -2792,11 +2879,14 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		if !isStreamIntegrityError(err) {
 			h.handleAccountFailure(account, err)
 		}
+		pub := h.recordUpstreamFailure(ctx, "openai", model, account.ID, "", "", err)
 		h.recordFailureWithDetails(ctx, "openai", model, account.ID, err)
 		data, _ := json.Marshal(map[string]interface{}{
-			"error": map[string]string{
-				"message": err.Error(),
-				"type":    "server_error",
+			"error": map[string]interface{}{
+				"message":    pub.MessageOrDefault(),
+				"type":       providererr.EnvelopeType(pub.Code, false),
+				"code":       pub.Code,
+				"request_id": pub.RequestID,
 			},
 		})
 		fmt.Fprintf(w, "data: %s\n\n", data)
@@ -2808,8 +2898,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 			return
 		}
+		pub := h.recordUpstreamFailure(ctx, "openai", model, "", "", "", lastErr)
 		h.recordFailureWithDetails(ctx, "openai", model, "", lastErr)
-		h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+		h.sendPublicOpenAIError(w, pub)
 	}
 
 	ex.Run(ctx, guard, attempt, onCommitted, onExhausted)
@@ -2924,8 +3015,9 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 			return
 		}
+		pub := h.recordUpstreamFailure(ctx, "openai", model, "", "", "", lastErr)
 		h.recordFailureWithDetails(ctx, "openai", model, "", lastErr)
-		h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+		h.sendPublicOpenAIError(w, pub)
 	}
 
 	ex.Run(ctx, guard, attempt, nil, onExhausted)
@@ -2935,13 +3027,19 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 	if ctx := leaseContextFromWriter(w); ctx != nil {
 		noteAPIKeyHTTPStatus(ctx, status, errType, message)
 	}
+	rid := requestIDFromWriter(w)
+	setRequestIDHeader(w, rid)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
+	errObj := map[string]interface{}{
+		"type":    errType,
+		"message": message,
+	}
+	if rid != "" {
+		errObj["request_id"] = rid
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"error": map[string]interface{}{
-			"type":    errType,
-			"message": message,
-		},
+		"error": errObj,
 	})
 }
 
@@ -3256,8 +3354,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiResetProviderStats(w, r)
 	case path == "/forward-stats/reset" && r.Method == "POST":
 		h.apiResetForwardStats(w, r)
-	case path == "/forward-events" && r.Method == "GET":
-		h.apiGetForwardEvents(w, r)
+	case path == "/provider-errors" && r.Method == "GET":
+		h.apiGetProviderError(w, r)
+	case strings.HasPrefix(path, "/provider-errors/") && r.Method == "GET":
+		h.apiGetProviderError(w, r)
 	case path == "/forward-events/stream" && r.Method == "GET":
 		h.apiStreamForwardEvents(w, r)
 	case path == "/version" && r.Method == "GET":
@@ -5186,8 +5286,10 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"requireApiKey":   config.IsApiKeyRequired(),
 		"port":            config.GetPort(),
 		"host":            config.GetHost(),
-		"allowOverUsage":  config.GetAllowOverUsage(),
-		"maxPayloadBytes": config.GetMaxPayloadBytes(),
+		"allowOverUsage":      config.GetAllowOverUsage(),
+		"maxPayloadBytes":     config.GetMaxPayloadBytes(),
+		"publicModelCatalog":  config.GetPublicModelCatalogRaw(),
+		"resolvedModelCatalog": config.GetPublicModelCatalog(),
 	})
 }
 
@@ -5606,49 +5708,120 @@ func (h *Handler) apiUpstreamTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One body satisfies both APIs — model + max_tokens + a single user message is
+	// valid for OpenAI's /chat/completions and Anthropic's /messages alike — so the
+	// shapes differ only in path and version header.
 	payload, _ := json.Marshal(map[string]interface{}{
 		"model":      req.Model,
 		"max_tokens": 1,
 		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
 	})
-	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
-	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(payload))
-	if err != nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json")
-	if apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
-		httpReq.Header.Set("X-Api-Key", apiKey)
-	}
 
+	// Bounded: GetClientForProxy carries a 5-minute timeout meant for relayed SSE
+	// streams, and an operator clicking Test on a black-holing host must not wait
+	// that long — twice, now that two shapes may be tried.
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
 	client := GetClientForProxy(proxyURL)
-	start := time.Now()
-	resp, err := client.Do(httpReq)
+
+	status, latency, body, path, err := probeUpstream(ctx, client, baseURL, apiKey, payload)
 	if err != nil {
 		w.WriteHeader(200)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"ok":    false,
 			"error": err.Error(),
+			"path":  path,
 		})
 		return
+	}
+
+	result := map[string]interface{}{
+		"ok":        status >= 200 && status < 300,
+		"status":    status,
+		"latencyMs": latency,
+		// Which API answered. A target that only speaks one of the two shapes still
+		// forwards fine for clients hitting that side, so the operator needs to see
+		// WHICH one the probe got through on, not just that something did.
+		"path": path,
+	}
+	if status < 200 || status >= 300 {
+		result["error"] = string(body)
+	}
+	json.NewEncoder(w).Encode(result)
+}
+
+// probeUpstream sends the minimal probe to an upstream and returns the outcome of
+// the attempt that decided it, including which path answered.
+//
+// It tries OpenAI's /chat/completions first and falls back to Anthropic's
+// /messages, because the path a REAL request takes is chosen by the client API the
+// caller hit, not by the provider: tryForwardUpstream appends "/messages" for a
+// Claude-API request and "/chat/completions" for an OpenAI one (see its subPath
+// argument). An upstream that implements only one of the two is perfectly usable
+// for the half it serves, so probing a single shape and reporting its 404 would
+// call a working target broken.
+//
+// The fallback is deliberately narrow. Only 404/405 — "this API is not served
+// here" — moves on; a 401, 429 or 5xx is the upstream answering on a path it does
+// own, and must be reported as-is rather than masked by a second probe. A
+// transport error stops immediately: nothing answered, so the path is not the
+// question.
+func probeUpstream(ctx context.Context, client *http.Client, baseURL, apiKey string, payload []byte) (int, int64, []byte, string, error) {
+	shapes := []struct {
+		path  string
+		extra map[string]string
+	}{
+		{path: "/chat/completions"},
+		{path: "/messages", extra: map[string]string{"anthropic-version": "2023-06-01"}},
+	}
+	var (
+		status  int
+		latency int64
+		body    []byte
+		path    string
+		err     error
+	)
+	for _, shape := range shapes {
+		path = shape.path
+		status, latency, body, err = probeUpstreamOnce(ctx, client, baseURL, apiKey, shape.path, payload, shape.extra)
+		if err != nil {
+			return status, latency, body, path, err
+		}
+		if status >= 200 && status < 300 {
+			return status, latency, body, path, nil
+		}
+		if status != http.StatusNotFound && status != http.StatusMethodNotAllowed {
+			return status, latency, body, path, nil
+		}
+	}
+	return status, latency, body, path, err
+}
+
+// probeUpstreamOnce sends one probe. A non-2xx status is NOT an error here: only
+// the caller knows whether that status means "try the other shape".
+func probeUpstreamOnce(ctx context.Context, client *http.Client, baseURL, apiKey, path string, payload []byte, extra map[string]string) (int, int64, []byte, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(baseURL, "/")+path, bytes.NewReader(payload))
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	for k, v := range extra {
+		httpReq.Header.Set(k, v)
+	}
+	if apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		httpReq.Header.Set("X-Api-Key", apiKey)
+	}
+	start := time.Now()
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return 0, time.Since(start).Milliseconds(), nil, err
 	}
 	defer resp.Body.Close()
 	latency := time.Since(start).Milliseconds()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-
-	result := map[string]interface{}{
-		"ok":        resp.StatusCode >= 200 && resp.StatusCode < 300,
-		"status":    resp.StatusCode,
-		"latencyMs": latency,
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		result["error"] = string(body)
-	}
-	json.NewEncoder(w).Encode(result)
+	return resp.StatusCode, latency, body, nil
 }
 
 // apiGetPublicIP probes an external service to discover the machine's public
@@ -6092,8 +6265,9 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		ApiKey          *string `json:"apiKey,omitempty"`
 		RequireApiKey   *bool   `json:"requireApiKey,omitempty"`
 		Password        string  `json:"password,omitempty"`
-		AllowOverUsage  *bool   `json:"allowOverUsage,omitempty"`
-		MaxPayloadBytes *int    `json:"maxPayloadBytes,omitempty"`
+		AllowOverUsage     *bool   `json:"allowOverUsage,omitempty"`
+		MaxPayloadBytes    *int    `json:"maxPayloadBytes,omitempty"`
+		PublicModelCatalog *string `json:"publicModelCatalog,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -6123,6 +6297,14 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if req.MaxPayloadBytes != nil {
 		if err := config.UpdateMaxPayloadBytes(*req.MaxPayloadBytes); err != nil {
 			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	if req.PublicModelCatalog != nil {
+		if err := config.UpdatePublicModelCatalog(*req.PublicModelCatalog); err != nil {
+			w.WriteHeader(400)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}

@@ -62,16 +62,8 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 				accountID = account.ID
 			}
 			h.recordFailureWithDetails(ctx, "claude", req.Model, accountID, err)
-			status := 502
-			errType := "api_error"
-			if isAuthErrorMessage(err.Error()) {
-				status = 401
-				errType = "authentication_error"
-			} else if isQuotaErrorMessage(err.Error()) {
-				status = 429
-				errType = "rate_limit_error"
-			}
-			h.sendClaudeError(w, status, errType, err.Error())
+			pub := classifyGoError(err, requestIDFromContext(ctx), "kiro", "claude", req.Model, accountID, "", "").Public()
+			h.sendPublicClaudeError(w, pub)
 			return
 		}
 		if account != nil {
@@ -87,7 +79,8 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 			if searchErr != nil {
 				logger.Warnf("[WebSearchLoop] MCP search failed: %v", searchErr)
 				h.recordFailureWithDetails(ctx, "claude", req.Model, lastAccountID, searchErr)
-				h.sendClaudeError(w, 502, "api_error", "Web search failed: "+searchErr.Error())
+				pub := classifyGoError(searchErr, requestIDFromContext(ctx), "search", "claude", req.Model, lastAccountID, "", "").Public()
+				h.sendPublicClaudeError(w, pub)
 				return
 			}
 			searchCount += roundSearchN
@@ -111,7 +104,8 @@ func (h *Handler) runWebSearchLoop(ctx context.Context, w http.ResponseWriter, r
 			if sErr != nil {
 				logger.Warnf("[WebSearchLoop] final-round MCP search failed: %v", sErr)
 				h.recordFailureWithDetails(ctx, "claude", req.Model, lastAccountID, sErr)
-				h.sendClaudeError(w, 502, "api_error", "Web search failed: "+sErr.Error())
+				pub := classifyGoError(sErr, requestIDFromContext(ctx), "search", "claude", req.Model, lastAccountID, "", "").Public()
+				h.sendPublicClaudeError(w, pub)
 				return
 			}
 			searched[i] = results

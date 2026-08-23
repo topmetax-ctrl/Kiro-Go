@@ -2019,6 +2019,7 @@
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
     $('maxPayloadBytes').value = String(d.maxPayloadBytes || 2000000);
+    if ($('publicModelCatalog')) $('publicModelCatalog').value = d.publicModelCatalog || '';
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadMemoryConfig(), loadApiKeys(), loadUpstreams(), loadSecurityConfig(), loadKiroGoModels()]);
     refreshCustomSelects();
   }
@@ -2218,6 +2219,13 @@
       toast((e && e.message) || t('common.saveFailed'), 'error');
     }
   }
+  async function saveModelCatalogConfig() {
+    const publicModelCatalog = $('publicModelCatalog').value;
+    const res = await api('/settings', { method: 'POST', body: JSON.stringify({ publicModelCatalog }) });
+    const d = await res.json().catch(() => ({}));
+    if (res.ok && d.success !== false) toast(t('settings.modelCatalogSaved'), 'success');
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
   async function saveOverUsageConfig() {
     const allowOverUsage = $('allowOverUsage').checked;
     const maxPayloadBytes = parseInt($('maxPayloadBytes').value, 10);
@@ -2286,6 +2294,21 @@
   // choice is a view preference, so it lives in localStorage; which providers are
   // hidden is config, and lives on the server.
   let showHiddenProviders = localStorage.getItem('kiro_show_hidden_providers') === '1';
+  // Same split for hidden route targets, one level down: the flag on the target is
+  // config (it rides along with the route, and with export/import), the
+  // expanded/collapsed choice is a per-browser view preference.
+  //
+  // Unlike providers, targets are an ORDERED chain, so hidden rows are elided in
+  // place behind a run marker instead of being gathered at the bottom: a chain
+  // that silently reads as contiguous when it is not would misdescribe the tier
+  // above/below relationships the editor is built to show.
+  let showHiddenRouteTargets = localStorage.getItem('kiro_show_hidden_route_targets') === '1';
+  // Per-target probe results, keyed by "providerId|model" rather than by row index.
+  // A probe describes a provider+model PAIR, so reordering or hiding rows must not
+  // carry a verdict onto a different target, and two rows aiming at the same pair
+  // legitimately share one result. Cleared when the modal opens: a verdict from a
+  // previous editing session would be presented as if it were current.
+  let routeTargetTests = {};
   // Model names served by this kiro-go instance (from /v1/models), used to
   // suggest Target Model values in the route modal. Still free-text + optional.
   let kiroGoModels = [];
@@ -3086,20 +3109,37 @@
       // never tried. The modal marks those rows unreachable; this view has to agree
       // or the two descriptions of one config contradict each other.
       const poolAt = targets.findIndex(tg => tg.upstreamId === KIRO_POOL_ID && tg.enabled !== false);
+      // Targets hidden in the editor collapse into a single "+N" chip here instead
+      // of being listed: this view and the modal describe ONE config, so a target
+      // the operator tidied out of the editor must not reappear in full — but
+      // hiding never stops it being routed, so the chip has to say it is there.
+      const hiddenTargets = targets.filter(tg => tg.hidden);
+      const shown = [];
+      targets.forEach((tg, i) => {
+        if (tg.hidden) return;
+        const nm = escapeHtml(providerName(tg.upstreamId));
+        const rewrite = tg.targetModel ? '<span class="muted-text">:' + escapeHtml(tg.targetModel) + '</span>' : '';
+        const dead = poolAt >= 0 && i > poolAt;
+        const off = (tg.enabled === false || dead)
+          ? ' style="text-decoration:line-through;opacity:0.5;"'
+          : (i === 0 ? ' style="font-weight:600;"' : ' style="opacity:0.65;"');
+        const tip = dead
+          ? ' title="' + escapeAttr(t('upstreams.routeTargetUnreachableHint')) + '"'
+          : '';
+        shown.push('<span class="text-xs font-mono"' + off + tip + '>' + nm + rewrite + '</span>');
+      });
+      const hiddenChip = hiddenTargets.length
+        ? '<span class="text-xs muted-text" title="' +
+            escapeAttr(t('upstreams.routeChainHiddenHint',
+              hiddenTargets.map(tg => providerName(tg.upstreamId)).join(', ')) +
+              // Same caveat as the editor's run marker: the chain reads top-first, so
+              // a hidden targets[0] means the target actually serving the route is the
+              // one not shown.
+              (targets[0] && targets[0].hidden ? ' · ' + t('upstreams.routeTargetHiddenPrimary') : '')) + '">' +
+            escapeHtml(t('upstreams.routeChainHidden', String(hiddenTargets.length))) + '</span>'
+        : '';
       const chain = targets.length
-        ? targets.map((tg, i) => {
-            const nm = escapeHtml(providerName(tg.upstreamId));
-            const rewrite = tg.targetModel ? '<span class="muted-text">:' + escapeHtml(tg.targetModel) + '</span>' : '';
-            const dead = poolAt >= 0 && i > poolAt;
-            const off = (tg.enabled === false || dead)
-              ? ' style="text-decoration:line-through;opacity:0.5;"'
-              : (i === 0 ? ' style="font-weight:600;"' : ' style="opacity:0.65;"');
-            const tip = dead
-              ? ' title="' + escapeAttr(t('upstreams.routeTargetUnreachableHint')) + '"'
-              : '';
-            return (i > 0 ? '<span class="muted-text text-xs">&rsaquo;</span>' : '') +
-              '<span class="text-xs font-mono"' + off + tip + '>' + nm + rewrite + '</span>';
-          }).join(' ')
+        ? shown.join(' <span class="muted-text text-xs">&rsaquo;</span> ')
         : '<span class="text-xs" style="color:#ef4444;">' + escapeHtml(t('upstreams.routeNoTargets')) + '</span>';
       const count = targets.length > 1
         ? '<span class="text-xs muted-text" title="' + escapeAttr(t('upstreams.routeFailoverHint')) + '">(' + targets.length + ')</span>'
@@ -3110,6 +3150,7 @@
             '<span class="font-semibold font-mono">' + model + '</span>' +
             '<span class="muted-text text-xs">&rarr;</span>' +
             chain +
+            hiddenChip +
             count +
             disabled +
           '</div>' +
@@ -3453,6 +3494,7 @@
     $('routeForm_enabled').checked = entry ? !!entry.enabled : true;
     // draftFromTargets copies as it derives sameTier, so Cancel discards target
     // edits; the cache is only touched on save.
+    routeTargetTests = {};
     routeTargetDraft = entry ? draftFromTargets(routeTargets(entry)) : [newRouteTarget()];
     if (!routeTargetDraft.length) routeTargetDraft = [newRouteTarget()];
     // A stored route can carry a pool target sharing a tier — written by an older
@@ -3476,7 +3518,7 @@
     const first = upstreamCache.providers[0];
     return {
       upstreamId: (first && first.id) || KIRO_POOL_ID,
-      targetModel: '', priority: 0, weight: 1, enabled: true, sameTier: false
+      targetModel: '', priority: 0, weight: 1, enabled: true, hidden: false, sameTier: false
     };
   }
 
@@ -3494,6 +3536,7 @@
         priority: tg.priority || 0,
         weight: tg.weight > 0 ? tg.weight : 1,
         enabled: tg.enabled !== false,
+        hidden: !!tg.hidden,
         sameTier: !!prev && (prev.priority || 0) === (tg.priority || 0)
       };
     });
@@ -3536,15 +3579,35 @@
     });
   }
 
-  // swapDraftRows backs the ↑/↓ buttons, which are also the keyboard-accessible
-  // path to what dragging does.
-  function swapDraftRows(a, b) {
-    if (!routeTargetDraft[a] || !routeTargetDraft[b]) return;
-    const flags = draftTierFlags();
-    const tmp = routeTargetDraft[a];
-    routeTargetDraft[a] = routeTargetDraft[b];
-    routeTargetDraft[b] = tmp;
-    applyPositionalTiers(flags);
+  // renderedTargetIndexes is the draft filtered down to the rows the operator can
+  // actually see: hidden rows drop out of it while their run is collapsed.
+  // Everything that means "the row above/below" reads this rather than the raw
+  // draft — otherwise the ↑ next to a visible row would swap it with an invisible
+  // one and read as a button that does nothing.
+  function renderedTargetIndexes() {
+    const out = [];
+    routeTargetDraft.forEach((tg, i) => {
+      if (showHiddenRouteTargets || !tg.hidden) out.push(i);
+    });
+    return out;
+  }
+
+  // moveRenderedRow backs the ↑/↓ buttons, which are also the keyboard-accessible
+  // path to what dragging does. dir is -1 (up) or +1 (down) counted in RENDERED
+  // positions, so one press always moves the row exactly one visible slot,
+  // stepping over a whole collapsed run when that is what sits between. Returns
+  // whether anything moved.
+  function moveRenderedRow(from, dir) {
+    const order = renderedTargetIndexes();
+    const at = order.indexOf(from);
+    if (at < 0) return false;
+    const neighbour = order[at + dir];
+    if (neighbour === undefined) return false;
+    // moveDraftRow takes a gap index: moving up lands in the neighbour's slot,
+    // moving down lands just past it. It also restores the tier flags by position,
+    // which is what keeps "same tier as above" attached to the slot instead of
+    // riding along with the row.
+    return moveDraftRow(from, dir > 0 ? neighbour + 1 : neighbour);
   }
 
   // moveDraftRow relocates one row to an insertion slot, as produced by a drop.
@@ -3588,8 +3651,43 @@
     // moving the pool row back down revives them — but they are marked, because a
     // silently dead target is worse than a visibly dead one.
     const poolRow = routeTargetDraft.findIndex(tg => tg.upstreamId === KIRO_POOL_ID);
-    box.innerHTML = routeTargetDraft.map((tg, i) => {
+    // Rendered order drives the ↑/↓ enabled state below; it equals the draft while
+    // hidden rows are expanded.
+    const rendered = renderedTargetIndexes();
+    const renderedAt = {};
+    rendered.forEach((idx, pos) => { renderedAt[idx] = pos; });
+    // The marker names what stands behind it: how many targets, how many of those
+    // are still enabled — the case where "out of sight" is easiest to misread as
+    // "off" — and, in the tooltip, which providers. That tooltip is also what
+    // explains an "unreachable" badge whose cause (a Kiro Pool row) is hidden.
+    const hiddenRunMarker = (start, end) => {
+      const run = routeTargetDraft.slice(start, end);
+      const live = run.filter(tg => tg.enabled !== false).length;
+      // "Which target serves this route" is the question the editor exists to
+      // answer, so a run that swallowed the top tier has to say so — otherwise
+      // collapsing (or reordering across a collapsed run) leaves the primary
+      // invisible with nothing on screen admitting it.
+      let hasPrimary = false;
+      for (let j = start; j < end; j++) {
+        if (tiers[j] === 0) hasPrimary = true;
+      }
+      const label = t('upstreams.routeTargetHiddenRun', String(run.length)) +
+        (live ? ' · ' + t('upstreams.routeTargetHiddenLiveCount', String(live)) : '') +
+        (hasPrimary ? ' · ' + t('upstreams.routeTargetHiddenPrimary') : '');
+      const action = showHiddenRouteTargets
+        ? t('upstreams.routeTargetHiddenCollapse')
+        : t('upstreams.routeTargetHiddenShow');
+      const names = run.map(tg => routeProviderLabel(tg.upstreamId) || tg.upstreamId).join(', ');
+      return '<button class="route-target-hidden-run" type="button" data-target-toggle-hidden="1"' +
+        ' aria-expanded="' + (showHiddenRouteTargets ? 'true' : 'false') + '"' +
+        ' title="' + escapeAttr(t('upstreams.routeTargetHiddenNames', names)) + '">' +
+        '<span>' + escapeHtml(label) + '</span>' +
+        '<span class="route-target-hidden-run-action">' + escapeHtml(action) + '</span>' +
+      '</button>';
+    };
+    const targetRow = (tg, i) => {
       const isPool = tg.upstreamId === KIRO_POOL_ID;
+      const pos = renderedAt[i] === undefined ? -1 : renderedAt[i];
       const unreachable = poolRow >= 0 && i > poolRow;
       const tier = tiers[i];
       // The pool is never a weighted member of a tier: it terminates the chain
@@ -3627,6 +3725,31 @@
             ' title="' + escapeAttr(t('upstreams.routeTargetUnreachableHint')) + '">' +
             escapeHtml(t('upstreams.routeTargetUnreachable')) + '</span>'
         : '';
+      // A hidden target that is still enabled keeps serving traffic from a slot it
+      // no longer visibly occupies. The badge says so on the row rather than
+      // letting the eye icon imply "off" — the same reasoning, and the same pair of
+      // strings-per-state shape, as the hidden-provider badge.
+      const hiddenBadge = tg.hidden
+        ? '<span class="text-xs" style="background:rgba(148,163,184,0.18);color:var(--muted-foreground);padding:1px 6px;border-radius:4px;"' +
+            ' title="' + escapeAttr(t(tg.enabled === false ? 'upstreams.routeTargetHiddenHint' : 'upstreams.routeTargetHiddenLive')) + '">' +
+            escapeHtml(t('upstreams.hidden')) + '</span>'
+        : '';
+      const hideIcon = tg.hidden ? 'fa-eye' : 'fa-eye-slash';
+      const hideTitle = tg.hidden ? t('upstreams.actionUnhide') : t('upstreams.actionHide');
+      // The probe is keyed by what this row will actually send, so the slot follows
+      // the row's own provider+model pair and a verdict cannot outlive an edit that
+      // changed either half.
+      const probeModel = routeTargetProbeModel(tg);
+      const testKey = tg.upstreamId + '|' + probeModel;
+      // The pool is answered locally instead of being relayed to, so there is no
+      // endpoint to probe; with no model name on either side there is nothing to ask
+      // for. Both are disabled-with-a-reason rather than hidden, so the button does
+      // not silently come and go.
+      const testTitle = isPool
+        ? t('upstreams.routeTargetTestPoolHint')
+        : (probeModel ? t('upstreams.routeTargetTestHint', probeModel) : t('upstreams.routeTargetTestNoModel'));
+      const testSlot = '<span class="route-target-test text-xs font-mono" data-target-test-for="' +
+        escapeAttr(testKey) + '"></span>';
       // The row is only made draggable on mousedown over the handle (see the
       // dragstart wiring), so dragging never starts from the text inputs and
       // ordinary text selection inside them keeps working.
@@ -3641,14 +3764,22 @@
         '<input type="text" data-target-field="upstreamProvider" data-index="' + i + '" list="routeProviderList"' +
           ' autocomplete="off" value="' + escapeAttr(routeProviderLabel(tg.upstreamId)) + '" style="flex:1;min-width:9rem;"' +
           ' placeholder="' + escapeAttr(t('upstreams.providerSearchPlaceholder')) + '" />';
-      return '<div class="card route-target-row" draggable="false" data-target-index="' + i + '" style="margin-top:0.5rem;padding:0.5rem;">' +
+      return '<div class="card route-target-row' + (tg.hidden ? ' is-hidden-target' : '') + '" draggable="false"' +
+        ' data-target-index="' + i + '" style="margin-top:0.5rem;padding:0.5rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
-          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' + handle + badge + tierToggle + shareLabel + poolNote + deadNote + '</div>' +
+          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' + handle + badge + hiddenBadge + tierToggle + shareLabel + poolNote + deadNote + testSlot + '</div>' +
           '<div class="flex items-center gap-1">' +
             '<button class="btn btn-outline btn-sm" type="button" data-target-action="up" data-index="' + i + '"' +
-              (i === 0 ? ' disabled' : '') + ' title="' + escapeAttr(t('upstreams.routeTargetUp')) + '">&uarr;</button>' +
+              (pos > 0 ? '' : ' disabled') + ' title="' + escapeAttr(t('upstreams.routeTargetUp')) + '">&uarr;</button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-target-action="down" data-index="' + i + '"' +
-              (i === routeTargetDraft.length - 1 ? ' disabled' : '') + ' title="' + escapeAttr(t('upstreams.routeTargetDown')) + '">&darr;</button>' +
+              (pos >= 0 && pos < rendered.length - 1 ? '' : ' disabled') + ' title="' + escapeAttr(t('upstreams.routeTargetDown')) + '">&darr;</button>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-target-action="test" data-index="' + i + '"' +
+              (isPool || !probeModel ? ' disabled' : '') +
+              ' title="' + escapeAttr(testTitle) + '" aria-label="' + escapeAttr(t('upstreams.test')) + '">' +
+              '<i class="fa-solid fa-bolt" aria-hidden="true"></i></button>' +
+            '<button class="btn btn-outline btn-sm" type="button" data-target-action="hide" data-index="' + i + '"' +
+              ' title="' + escapeAttr(hideTitle) + '" aria-label="' + escapeAttr(hideTitle) + '">' +
+              '<i class="fa-solid ' + hideIcon + '" aria-hidden="true"></i></button>' +
             '<button class="btn btn-danger btn-sm" type="button" data-target-action="remove" data-index="' + i + '"' +
               (routeTargetDraft.length <= 1 ? ' disabled' : '') + '>&times;</button>' +
           '</div>' +
@@ -3676,7 +3807,41 @@
           '</label>' +
         '</div>' +
       '</div>';
-    }).join('');
+    };
+    // Hidden rows are elided as a run, with the marker standing exactly where they
+    // sit, so the visible chain never claims two rows are adjacent when they are
+    // not — "same tier as above" and the pool's end-of-chain rule are both stated
+    // relative to the row above, and a silently closed gap would misdescribe both.
+    // Expanding keeps the marker as that run's header, which is what makes the
+    // collapse reversible from the same control.
+    let html = '';
+    for (let i = 0; i < routeTargetDraft.length;) {
+      if (!showHiddenRouteTargets && routeTargetDraft[i].hidden) {
+        const start = i;
+        while (i < routeTargetDraft.length && routeTargetDraft[i].hidden) i++;
+        html += hiddenRunMarker(start, i);
+        continue;
+      }
+      if (showHiddenRouteTargets && routeTargetDraft[i].hidden &&
+          (i === 0 || !routeTargetDraft[i - 1].hidden)) {
+        let end = i;
+        while (end < routeTargetDraft.length && routeTargetDraft[end].hidden) end++;
+        html += hiddenRunMarker(i, end);
+      }
+      html += targetRow(routeTargetDraft[i], i);
+      i++;
+    }
+    // Hiding every target would otherwise leave the editor looking empty, which
+    // reads as "this route lost its targets" rather than "they are collapsed".
+    if (!rendered.length) {
+      html += '<div class="muted-text text-xs" style="padding:0.5rem 0;">' +
+        escapeHtml(t('upstreams.routeTargetAllHidden')) + '</div>';
+    }
+    box.innerHTML = html;
+    // The row markup ships its verdict slot empty, so restore what has been probed
+    // this session: reorder / hide / provider change all rebuild this list, and a
+    // result that vanished on the next click would read as "the test was lost".
+    Object.keys(routeTargetTests).forEach(paintRouteTargetTest);
     // Fill each row's model dropdown from its own provider, fetching quietly the
     // first time a provider's model list is needed.
     routeTargetDraft.forEach(tg => ensureProviderModels(tg.upstreamId));
@@ -3686,6 +3851,69 @@
     closeDialog('modelRouteModal');
     routeEditingId = '';
     routeTargetDraft = [];
+    routeTargetTests = {};
+  }
+
+  // The model a target will ACTUALLY send: its rewrite when set, otherwise the
+  // client model, because an empty Target Model means "keep the original name"
+  // (see the field's own note). Probing anything else would test a request the
+  // forwarder never makes.
+  function routeTargetProbeModel(tg) {
+    const rewrite = ((tg && tg.targetModel) || '').trim();
+    if (rewrite) return rewrite;
+    const el = $('routeForm_model');
+    return el ? el.value.trim() : '';
+  }
+
+  // Paint one verdict into every row aiming at that pair WITHOUT re-rendering the
+  // list: a probe can land while the operator is typing in a sibling field, and a
+  // full re-render would take the caret with it.
+  function paintRouteTargetTest(key) {
+    const st = routeTargetTests[key];
+    const sel = '[data-target-test-for="' + (window.CSS && CSS.escape ? CSS.escape(key) : key) + '"]';
+    qsa(sel).forEach(el => {
+      el.textContent = !st ? '' : (st.state === 'testing' ? t('upstreams.testing') : st.text);
+      el.style.color = st && st.state === 'ok' ? 'var(--success, #22c55e)'
+        : st && st.state === 'fail' ? 'var(--danger, #ef4444)' : '';
+      el.title = (st && st.detail) || '';
+    });
+  }
+
+  // Send the same one-token probe the models browser uses (POST /upstream-test),
+  // but aimed at the pair THIS row will forward. Creds are resolved server-side
+  // from the provider id, so the masked key the admin UI holds is not a problem.
+  async function testRouteTarget(i) {
+    const tg = routeTargetDraft[i];
+    if (!tg || tg.upstreamId === KIRO_POOL_ID) return;
+    const model = routeTargetProbeModel(tg);
+    if (!model) { toast(t('upstreams.routeTargetTestNoModel'), 'error'); return; }
+    const key = tg.upstreamId + '|' + model;
+    const p = upstreamCache.providers.find(x => x.id === tg.upstreamId);
+    routeTargetTests[key] = { state: 'testing' };
+    paintRouteTargetTest(key);
+    try {
+      const res = await api('/upstream-test', {
+        method: 'POST',
+        body: JSON.stringify({ id: tg.upstreamId, baseUrl: p ? p.baseUrl : '', proxyURL: p ? p.proxyURL : '', model })
+      });
+      const d = await res.json().catch(() => ({}));
+      // Which path answered matters: the server probes OpenAI's /chat/completions and
+      // falls back to Anthropic's /messages, and a target that only speaks one shape
+      // still forwards fine for the clients that use it.
+      const via = d.path ? t('upstreams.routeTargetTestVia', d.path) : '';
+      routeTargetTests[key] = d.ok
+        ? { state: 'ok', text: '✓ ' + t('upstreams.testOk', String(d.latencyMs || 0)), detail: via }
+        : {
+            state: 'fail',
+            text: '✗ ' + (d.status ? ('HTTP ' + d.status) : t('upstreams.testFail')),
+            // The upstream's own error body, on the tooltip: "HTTP 404" alone does not
+            // say whether the model name or the base URL is the wrong one.
+            detail: (via ? via + ' — ' : '') + String(d.error || '').slice(0, 400)
+          };
+    } catch (e) {
+      routeTargetTests[key] = { state: 'fail', text: '✗ ' + t('upstreams.testFail'), detail: (e && e.message) || '' };
+    }
+    paintRouteTargetTest(key);
   }
 
   async function submitRouteModal() {
@@ -3714,7 +3942,11 @@
         targetModel: (tg.targetModel || '').trim(),
         priority: tier,
         weight: tg.weight > 0 ? tg.weight : 1,
-        enabled: tg.enabled !== false
+        enabled: tg.enabled !== false,
+        // Presentation-only, but it belongs in the saved route: the operator's
+        // tidy-up of a long chain should survive a reload and follow the config
+        // through export/import, exactly like a hidden provider.
+        hidden: !!tg.hidden
       };
     });
     if (!targets.length) { toast(t('upstreams.providerRequired'), 'error'); return; }
@@ -3985,6 +4217,17 @@
     if (rtClose) rtClose.addEventListener('click', closeRouteModal);
     // Target rows are re-rendered on every structural change, so both listeners
     // are delegated from the stable container rather than bound per row.
+    // The Client Model is the probe model for every row that does not rewrite it, so
+    // editing it re-aims those rows: re-render to re-key their verdict slots (which
+    // drops results that were true for the old name) and to flip their Test button
+    // between enabled and "nothing to probe". The caret is in a field outside the
+    // list, so rebuilding the rows cannot steal it.
+    const routeModelInput = $('routeForm_model');
+    if (routeModelInput) {
+      routeModelInput.addEventListener('input', () => {
+        if (isDialogOpen('modelRouteModal') && routeTargetDraft.length) renderRouteTargets();
+      });
+    }
     const rtTargets = $('routeTargetsList');
     if (rtTargets) {
       rtTargets.addEventListener('click', e => {
@@ -3996,14 +4239,35 @@
         if (action === 'remove') {
           if (routeTargetDraft.length <= 1) return;
           routeTargetDraft.splice(i, 1);
-        } else if (action === 'up' && i > 0) {
-          swapDraftRows(i, i - 1);
-        } else if (action === 'down' && i < routeTargetDraft.length - 1) {
-          swapDraftRows(i, i + 1);
+        } else if (action === 'up') {
+          if (!moveRenderedRow(i, -1)) return;
+        } else if (action === 'down') {
+          if (!moveRenderedRow(i, 1)) return;
+        } else if (action === 'test') {
+          // No re-render: testRouteTarget paints its own slot, and rebuilding the list
+          // here would drop the caret out of whatever field is being edited.
+          testRouteTarget(i);
+          return;
+        } else if (action === 'hide') {
+          // Draft-only, like every other field in this modal: Cancel discards it,
+          // Save persists it with the route. Writing through immediately — the way
+          // the provider list's Hide does — would also commit whatever half-finished
+          // target edits are sitting next to it.
+          routeTargetDraft[i].hidden = !routeTargetDraft[i].hidden;
         } else {
           return;
         }
         normalizeDraftTiers();
+        renderRouteTargets();
+      });
+      // The hidden-run disclosure. Delegated from the stable container because the
+      // markers are re-rendered on every list change, and it flips ALL runs at once:
+      // one preference, mirroring the provider list's single "show hidden" toggle,
+      // instead of per-run state the operator has to keep track of.
+      rtTargets.addEventListener('click', e => {
+        if (!e.target.closest('[data-target-toggle-hidden]')) return;
+        showHiddenRouteTargets = !showHiddenRouteTargets;
+        localStorage.setItem('kiro_show_hidden_route_targets', showHiddenRouteTargets ? '1' : '0');
         renderRouteTargets();
       });
       // Field edits write straight into the draft. Text inputs use 'input' so a
@@ -4054,7 +4318,18 @@
           renderRouteTargets();
           return;
         }
-        else routeTargetDraft[i][field] = el.value;
+        else {
+          routeTargetDraft[i][field] = el.value;
+          // A verdict belongs to the pair that was probed. Once the model text moves,
+          // the row aims somewhere else, so drop the stale ✓/✗ instead of letting it
+          // vouch for a target nobody tested. (The map keeps it under the old key, so
+          // undoing the edit brings the result back.)
+          if (field === 'targetModel') {
+            const row = el.closest('.route-target-row');
+            const slot = row && row.querySelector('[data-target-test-for]');
+            if (slot) { slot.textContent = ''; slot.title = ''; slot.style.color = ''; }
+          }
+        }
       };
       rtTargets.addEventListener('change', applyField);
       rtTargets.addEventListener('input', applyField);
@@ -5293,7 +5568,7 @@
   }
 
   // toggleForwardEventDetail expands one event row, rendering its panel lazily.
-  function toggleForwardEventDetail(uid) {
+  async function toggleForwardEventDetail(uid) {
     const body = $('fwdEventsBody');
     if (!body) return;
     const row = body.querySelector('tr[data-fwd-event="' + cssEscape(uid) + '"]');
@@ -5308,7 +5583,14 @@
     }
     const e = fwdEventStore[uid];
     if (!e) return;
-    detail.querySelector('td').innerHTML = fwdEventDetailHtml(e, uid);
+    let extra = null;
+    if (e.requestId) {
+      try {
+        const res = await api('/provider-errors?requestId=' + encodeURIComponent(e.requestId));
+        if (res.ok) extra = await res.json();
+      } catch (err) { /* admin diagnostic is optional */ }
+    }
+    detail.querySelector('td').innerHTML = fwdEventDetailHtml(e, uid, extra);
     detail.classList.remove('hidden');
     row.setAttribute('aria-expanded', 'true');
     row.classList.add('fwd-event-row--open');
@@ -5317,7 +5599,7 @@
   // fwdEventDetailHtml renders the fields the table has no room for. ErrorMsg is
   // the upstream's own reason: it is deliberately withheld from API clients (it
   // can leak upstream host/proxy topology) but this page is behind admin auth.
-  function fwdEventDetailHtml(e, uid) {
+  function fwdEventDetailHtml(e, uid, extra) {
     const isPool = e.providerId === '__kiro_pool__';
     const rows = [];
     const add = (label, value) => {
@@ -5326,6 +5608,7 @@
         '</span><span class="fwd-detail-value">' + value + '</span></div>');
     };
     add(t('forward.detailWhen'), escapeHtml(fwdFmtWhen(e.time)));
+    if (e.requestId) add(t('forward.detailRequestId'), '<span class="font-mono">' + escapeHtml(e.requestId) + '</span>');
     add(t('forward.detailEndpoint'), escapeHtml(e.endpoint || '—'));
     add(t('forward.detailClientModel'), escapeHtml(e.clientModel || '—'));
     if (e.targetModel) add(t('forward.detailTargetModel'), escapeHtml(e.targetModel));
@@ -5342,7 +5625,20 @@
     if (e.canceled) add(t('forward.detailCanceled'), t('forward.detailYes'));
 
     let err = '';
-    if (e.errorMsg) {
+    const attempts = extra && Array.isArray(extra.attempts) ? extra.attempts : [];
+    const diag = attempts.length ? attempts[attempts.length - 1] : null;
+    if (diag) {
+      if (diag.upstreamStatus) add(t('forward.detailUpstreamStatus'), String(diag.upstreamStatus));
+      if (diag.upstreamCode) add(t('forward.detailUpstreamCode'), escapeHtml(diag.upstreamCode));
+      if (diag.upstreamRequestId) add(t('forward.detailUpstreamRequestId'), '<span class="font-mono">' + escapeHtml(diag.upstreamRequestId) + '</span>');
+      if (diag.retryAfter) add(t('forward.detailRetryAfter'), escapeHtml(diag.retryAfter));
+      if (diag.publicCode) add(t('forward.detailPublicCode'), escapeHtml(diag.publicCode));
+      const raw = diag.detail || diag.upstreamMessage || '';
+      err = '<div class="fwd-detail-error"><div class="fwd-detail-label">' +
+        escapeHtml(t('forward.detailError')) +
+        (diag.detailTruncated ? ' <span class="muted-text">(' + escapeHtml(t('forward.detailTruncated')) + ')</span>' : '') +
+        '</div><pre class="fwd-detail-errtext">' + escapeHtml(raw || e.errorMsg || '') + '</pre></div>';
+    } else if (e.errorMsg) {
       err = '<div class="fwd-detail-error"><div class="fwd-detail-label">' +
         escapeHtml(t('forward.detailError')) + '</div><pre class="fwd-detail-errtext">' +
         escapeHtml(e.errorMsg) + '</pre></div>';
@@ -7387,6 +7683,8 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+    const saveModelCatalogBtn = $('saveModelCatalogBtn');
+    if (saveModelCatalogBtn) saveModelCatalogBtn.addEventListener('click', saveModelCatalogConfig);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);

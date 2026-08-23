@@ -18,6 +18,7 @@ func TestClassifyPublicError(t *testing.T) {
 		{429, "api_error", "too many requests", ErrorProviderRateLimited},
 		{499, "canceled", "client canceled", ErrorClientCancelled},
 		{500, "api_error", "upstream exploded", ErrorProviderError},
+		{503, "api_error", "temporarily down", ErrorProviderUnavailable},
 		{504, "api_error", "gateway timeout", ErrorProviderTimeout},
 	}
 	for _, tc := range cases {

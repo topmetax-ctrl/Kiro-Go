@@ -13,6 +13,7 @@ package config
 // about priorities or weights itself.
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -73,42 +74,7 @@ func ResolveRoute(model string) (*ModelRoute, []ResolvedTarget) {
 		if !r.Enabled || strings.TrimSpace(r.Model) != target {
 			continue
 		}
-		for _, t := range r.Targets {
-			if !t.Enabled || strings.TrimSpace(t.UpstreamID) == "" {
-				continue
-			}
-			// The Kiro Pool sentinel is a special target that does not match any
-			// configured upstream. When it appears, create a synthetic ResolvedTarget
-			// so the forwarder recognizes it and falls through to the pool instead of
-			// surfacing an "upstream not found" error. This lets the pool participate
-			// in multi-target failover: 9aws P0 -> xpiki P0 -> Kiro Pool P1.
-			//
-			// Matched on the TRIMMED id, like the emptiness check above. A hand-edited
-			// bundle carrying " __kiro_pool__" passes import validation (which trims),
-			// so comparing the raw value here would drop the target and silently
-			// delete the operator's pool fallback.
-			if IsKiroPoolTarget(t.UpstreamID) {
-				// Normalize the stored id so every later comparison — the forwarder's
-				// sentinel check, the cooldown barrier — sees the canonical form.
-				t.UpstreamID = KiroPoolTargetID
-				eligible = append(eligible, ResolvedTarget{
-					Target: t,
-					Provider: UpstreamProvider{
-						ID:      KiroPoolTargetID,
-						Name:    KiroPoolTargetName,
-						Enabled: true,
-					},
-				})
-				continue
-			}
-			for j := range cfg.Upstreams {
-				up := cfg.Upstreams[j]
-				if up.ID == t.UpstreamID && up.Enabled {
-					eligible = append(eligible, ResolvedTarget{Target: t, Provider: up})
-					break
-				}
-			}
-		}
+		eligible = eligibleTargetsForRoute(r, cfg.Upstreams)
 		if len(eligible) > 0 {
 			routeCopy := r
 			matched = &routeCopy
@@ -124,6 +90,167 @@ func ResolveRoute(model string) (*ModelRoute, []ResolvedTarget) {
 		return nil, nil
 	}
 	return matched, orderTargets(eligible)
+}
+
+// Public catalog modes for GET /v1/models. Empty (auto) resolves at read time.
+const (
+	PublicModelCatalogAuto       = ""
+	PublicModelCatalogForwarding = "forwarding"
+	PublicModelCatalogKiro       = "kiro"
+	PublicModelCatalogBoth       = "both"
+)
+
+// NormalizePublicModelCatalog accepts a stored or posted value. Unknown
+// strings are rejected so a typo cannot silently fall back to auto.
+func NormalizePublicModelCatalog(raw string) (string, bool) {
+	switch strings.TrimSpace(strings.ToLower(raw)) {
+	case PublicModelCatalogAuto, "auto":
+		return PublicModelCatalogAuto, true
+	case PublicModelCatalogForwarding, "routes":
+		return PublicModelCatalogForwarding, true
+	case PublicModelCatalogKiro, "accounts":
+		return PublicModelCatalogKiro, true
+	case PublicModelCatalogBoth:
+		return PublicModelCatalogBoth, true
+	default:
+		return "", false
+	}
+}
+
+// GetPublicModelCatalog returns the resolved catalog mode (never empty).
+// Auto becomes "forwarding" when any route is enabled, otherwise "kiro".
+func GetPublicModelCatalog() string {
+	cfgLock.RLock()
+	raw := ""
+	if cfg != nil {
+		raw = cfg.PublicModelCatalog
+	}
+	cfgLock.RUnlock()
+	mode, ok := NormalizePublicModelCatalog(raw)
+	if !ok {
+		mode = PublicModelCatalogAuto
+	}
+	if mode != PublicModelCatalogAuto {
+		return mode
+	}
+	if HasEnabledModelRoutes() {
+		return PublicModelCatalogForwarding
+	}
+	return PublicModelCatalogKiro
+}
+
+// GetPublicModelCatalogRaw returns the stored value (empty = auto).
+func GetPublicModelCatalogRaw() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return ""
+	}
+	mode, ok := NormalizePublicModelCatalog(cfg.PublicModelCatalog)
+	if !ok {
+		return ""
+	}
+	return mode
+}
+
+// UpdatePublicModelCatalog persists a catalog mode. Pass "" or "auto" to
+// restore the implicit default.
+func UpdatePublicModelCatalog(raw string) error {
+	mode, ok := NormalizePublicModelCatalog(raw)
+	if !ok {
+		return fmt.Errorf("invalid publicModelCatalog %q", raw)
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.PublicModelCatalog = mode
+	return Save()
+}
+
+// HasEnabledModelRoutes reports whether any client-facing forwarding route is
+// switched on. Auto catalog mode uses this to pick forwarding vs kiro.
+func HasEnabledModelRoutes() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	for i := range cfg.ModelRoutes {
+		if cfg.ModelRoutes[i].Enabled && strings.TrimSpace(cfg.ModelRoutes[i].Model) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// AdvertisedRouteModels returns the client-facing names of enabled forwarding
+// routes that have at least one usable target. Names are unique, in config
+// order. Target rewrite names and provider identities are never included —
+// /v1/models must not leak what sits behind a route.
+func AdvertisedRouteModels() []string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0)
+	for i := range cfg.ModelRoutes {
+		r := cfg.ModelRoutes[i]
+		name := strings.TrimSpace(r.Model)
+		if !r.Enabled || name == "" || seen[name] {
+			continue
+		}
+		if len(eligibleTargetsForRoute(r, cfg.Upstreams)) == 0 {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
+}
+
+// eligibleTargetsForRoute returns the usable targets of one route. A target is
+// usable when it is enabled and either names the built-in Kiro pool or an
+// enabled provider. Caller must hold cfgLock (or pass a snapshot of providers).
+func eligibleTargetsForRoute(r ModelRoute, providers []UpstreamProvider) []ResolvedTarget {
+	var eligible []ResolvedTarget
+	for _, t := range r.Targets {
+		if !t.Enabled || strings.TrimSpace(t.UpstreamID) == "" {
+			continue
+		}
+		// The Kiro Pool sentinel is a special target that does not match any
+		// configured upstream. When it appears, create a synthetic ResolvedTarget
+		// so the forwarder recognizes it and falls through to the pool instead of
+		// surfacing an "upstream not found" error. This lets the pool participate
+		// in multi-target failover: 9aws P0 -> xpiki P0 -> Kiro Pool P1.
+		//
+		// Matched on the TRIMMED id, like the emptiness check above. A hand-edited
+		// bundle carrying " __kiro_pool__" passes import validation (which trims),
+		// so comparing the raw value here would drop the target and silently
+		// delete the operator's pool fallback.
+		if IsKiroPoolTarget(t.UpstreamID) {
+			// Normalize the stored id so every later comparison — the forwarder's
+			// sentinel check, the cooldown barrier — sees the canonical form.
+			t.UpstreamID = KiroPoolTargetID
+			eligible = append(eligible, ResolvedTarget{
+				Target: t,
+				Provider: UpstreamProvider{
+					ID:      KiroPoolTargetID,
+					Name:    KiroPoolTargetName,
+					Enabled: true,
+				},
+			})
+			continue
+		}
+		for j := range providers {
+			up := providers[j]
+			if up.ID == t.UpstreamID && up.Enabled {
+				eligible = append(eligible, ResolvedTarget{Target: t, Provider: up})
+				break
+			}
+		}
+	}
+	return eligible
 }
 
 // orderTargets sorts eligible targets into try-order: Priority ascending, and

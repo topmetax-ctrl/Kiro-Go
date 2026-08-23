@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -232,6 +233,137 @@ func TestResolveRouteIgnoresHidden(t *testing.T) {
 
 // The two flags are independent, so Hidden must not rescue a disabled provider
 // either — the failure mode in the opposite direction.
+func TestAdvertisedRouteModelsListsEnabledClientNamesOnly(t *testing.T) {
+	makeCfg(t,
+		[]UpstreamProvider{
+			{ID: "u1", Name: "9router", Enabled: true},
+			{ID: "u2", Name: "off", Enabled: false},
+		},
+		[]ModelRoute{
+			{
+				ID: "on", Model: "claude-sonnet-5", Enabled: true,
+				Targets: []RouteTarget{{
+					UpstreamID: "u1", TargetModel: "runapi/claude-sonnet-5-secret", Enabled: true,
+				}},
+			},
+			{
+				ID: "off-route", Model: "claude-opus-5", Enabled: false,
+				Targets: []RouteTarget{{UpstreamID: "u1", TargetModel: "hidden-opus", Enabled: true}},
+			},
+			{
+				ID: "dead", Model: "dead-model", Enabled: true,
+				Targets: []RouteTarget{{UpstreamID: "u2", Enabled: true}},
+			},
+			{
+				ID: "dup", Model: "claude-sonnet-5", Enabled: true,
+				Targets: []RouteTarget{{UpstreamID: "u1", TargetModel: "other-rewrite", Enabled: true}},
+			},
+			{
+				ID: "pool", Model: "gpt-5.6-terra", Enabled: true,
+				Targets: []RouteTarget{{UpstreamID: KiroPoolTargetID, Enabled: true}},
+			},
+		},
+	)
+
+	got := AdvertisedRouteModels()
+	want := []string{"claude-sonnet-5", "gpt-5.6-terra"}
+	if len(got) != len(want) {
+		t.Fatalf("want %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("want %v, got %v", want, got)
+		}
+	}
+	joined := strings.Join(got, "\n")
+	for _, leak := range []string{"runapi/claude-sonnet-5-secret", "hidden-opus", "other-rewrite", "9router", "dead-model", "claude-opus-5"} {
+		if strings.Contains(joined, leak) {
+			t.Errorf("advertised list leaked %q: %v", leak, got)
+		}
+	}
+}
+
+func TestGetPublicModelCatalogAutoPicksForwardingWhenRoutesExist(t *testing.T) {
+	makeCfg(t,
+		[]UpstreamProvider{{ID: "u1", Enabled: true}},
+		[]ModelRoute{{
+			ID: "r1", Model: "claude-sonnet-5", Enabled: true,
+			Targets: []RouteTarget{{UpstreamID: "u1", Enabled: true}},
+		}},
+	)
+	if got := GetPublicModelCatalog(); got != PublicModelCatalogForwarding {
+		t.Fatalf("auto with routes: got %q", got)
+	}
+}
+
+func TestGetPublicModelCatalogAutoPicksKiroWhenNoRoutes(t *testing.T) {
+	makeCfg(t, nil, nil)
+	if got := GetPublicModelCatalog(); got != PublicModelCatalogKiro {
+		t.Fatalf("auto without routes: got %q", got)
+	}
+}
+
+func TestNormalizePublicModelCatalog(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"", PublicModelCatalogAuto, true},
+		{"auto", PublicModelCatalogAuto, true},
+		{"forwarding", PublicModelCatalogForwarding, true},
+		{"routes", PublicModelCatalogForwarding, true},
+		{"kiro", PublicModelCatalogKiro, true},
+		{"both", PublicModelCatalogBoth, true},
+		{"nope", "", false},
+	}
+	for _, tc := range cases {
+		got, ok := NormalizePublicModelCatalog(tc.in)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("%q: got (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestHasEnabledModelRoutes(t *testing.T) {
+	makeCfg(t,
+		[]UpstreamProvider{{ID: "u1", Enabled: true}},
+		[]ModelRoute{{
+			ID: "r1", Model: "claude-sonnet-5", Enabled: true,
+			Targets: []RouteTarget{{UpstreamID: "u1", Enabled: true}},
+		}},
+	)
+	if !HasEnabledModelRoutes() {
+		t.Fatal("expected enabled routes")
+	}
+}
+
+func TestHasEnabledModelRoutesIgnoresDisabled(t *testing.T) {
+	makeCfg(t,
+		[]UpstreamProvider{{ID: "u1", Enabled: true}},
+		[]ModelRoute{{
+			ID: "r1", Model: "claude-sonnet-4.6", Enabled: false,
+			Targets: []RouteTarget{{UpstreamID: "u1", Enabled: true}},
+		}},
+	)
+	if HasEnabledModelRoutes() {
+		t.Fatal("disabled routes must not lock the public catalog")
+	}
+}
+
+func TestAdvertisedRouteModelsEmptyWhenNoneUsable(t *testing.T) {
+	makeCfg(t,
+		[]UpstreamProvider{{ID: "u1", Enabled: false}},
+		[]ModelRoute{{
+			ID: "r1", Model: "m", Enabled: true,
+			Targets: []RouteTarget{{UpstreamID: "u1", TargetModel: "behind", Enabled: true}},
+		}},
+	)
+	if got := AdvertisedRouteModels(); len(got) != 0 {
+		t.Fatalf("want empty list, got %v", got)
+	}
+}
+
 func TestResolveRouteHiddenDoesNotOverrideDisabled(t *testing.T) {
 	makeCfg(t,
 		[]UpstreamProvider{
@@ -252,5 +384,60 @@ func TestResolveRouteHiddenDoesNotOverrideDisabled(t *testing.T) {
 	}
 	if targets[0].Provider.Name != "live-and-hidden" {
 		t.Errorf("want live-and-hidden, got %s", targets[0].Provider.Name)
+	}
+}
+
+// RouteTarget.Hidden is the per-target counterpart of UpstreamProvider.Hidden:
+// it declutters the route editor and nothing else. Resolution must ignore it, or
+// tidying a long fallback chain would silently reroute live traffic.
+func TestResolveRouteIgnoresTargetHidden(t *testing.T) {
+	makeCfg(t,
+		[]UpstreamProvider{
+			{ID: "u1", Name: "primary", Enabled: true},
+			{ID: "u2", Name: "fallback", Enabled: true},
+		},
+		[]ModelRoute{{
+			ID: "r1", Model: "m", Enabled: true,
+			Targets: []RouteTarget{
+				{UpstreamID: "u1", Priority: 0, Enabled: true, Hidden: true},
+				{UpstreamID: "u2", Priority: 1, Enabled: true},
+			},
+		}},
+	)
+	route, targets := ResolveRoute("m")
+	if route == nil {
+		t.Fatal("hiding a target must not unroute the model")
+	}
+	if len(targets) != 2 {
+		t.Fatalf("want both targets eligible, got %d: %+v", len(targets), targets)
+	}
+	if targets[0].Provider.Name != "primary" {
+		t.Errorf("hidden target must keep its priority-0 slot, got %s", targets[0].Provider.Name)
+	}
+}
+
+// The mirror of TestResolveRouteHiddenDoesNotOverrideDisabled, one level down:
+// Hidden and Enabled stay independent on a target too, so unhiding never
+// resurrects a target the operator parked by disabling it.
+func TestResolveRouteTargetHiddenDoesNotOverrideDisabled(t *testing.T) {
+	makeCfg(t,
+		[]UpstreamProvider{
+			{ID: "u1", Name: "parked", Enabled: true},
+			{ID: "u2", Name: "live", Enabled: true},
+		},
+		[]ModelRoute{{
+			ID: "r1", Model: "m", Enabled: true,
+			Targets: []RouteTarget{
+				{UpstreamID: "u1", Priority: 0, Enabled: false, Hidden: true},
+				{UpstreamID: "u2", Priority: 1, Enabled: true, Hidden: true},
+			},
+		}},
+	)
+	_, targets := ResolveRoute("m")
+	if len(targets) != 1 {
+		t.Fatalf("want only the enabled target, got %d: %+v", len(targets), targets)
+	}
+	if targets[0].Provider.Name != "live" {
+		t.Errorf("want live, got %s", targets[0].Provider.Name)
 	}
 }

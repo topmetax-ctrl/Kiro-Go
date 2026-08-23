@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"kiro-go/apikey"
 	"kiro-go/config"
+	"kiro-go/providererr"
 	"net/http"
 	"strings"
 	"time"
@@ -40,6 +42,9 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	// Forward to an external upstream when the client model matches an enabled
 	// route. Uses the raw client body (passthrough), bypassing the Kiro pool.
 	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/responses", false, "") {
+		return
+	}
+	if h.rejectUnconfiguredModel(w, req.Model, false) {
 		return
 	}
 
@@ -288,8 +293,9 @@ func (h *Handler) handleResponsesNonStream(
 			h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 			return
 		}
+		pub := h.recordUpstreamFailure(ctx, "responses", model, "", "", "", lastErr)
 		h.recordFailure()
-		h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+		h.sendPublicOpenAIError(w, pub)
 	}
 
 	ex.Run(ctx, guard, attempt, nil, onExhausted)
@@ -684,16 +690,17 @@ func (h *Handler) handleResponsesStream(
 		return attemptHandled()
 	}
 
-	sendResponseFailed := func(status int, message string) {
-		noteAPIKeyHTTPStatus(ctx, status, "server_error", message)
+	sendResponseFailed := func(pub providererr.PublicError) {
+		noteAPIKeyHTTPStatus(ctx, pub.HTTPStatus, providererr.EnvelopeType(pub.Code, false), pub.MessageOrDefault())
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
 			"response": map[string]interface{}{
 				"id":     respID,
 				"status": "failed",
 				"error": map[string]string{
-					"type":    "server_error",
-					"message": message,
+					"type":    providererr.EnvelopeType(pub.Code, false),
+					"message": pub.MessageOrDefault(),
+					"code":    pub.Code,
 				},
 			},
 		})
@@ -704,7 +711,8 @@ func (h *Handler) handleResponsesStream(
 	// handleAccountFailure on the committed branch (only the uncommitted retry
 	// branch did), so onCommitted must not either.
 	onCommitted := func(_ *config.Account, err error) {
-		sendResponseFailed(http.StatusInternalServerError, err.Error())
+		pub := h.recordUpstreamFailure(ctx, "responses", model, "", "", "", err)
+		sendResponseFailed(pub)
 		h.recordFailure()
 	}
 
@@ -713,11 +721,16 @@ func (h *Handler) handleResponsesStream(
 			// No account was ever usable: emit response.failed with no recordFailure,
 			// matching the pre-refactor tail. The API-key lease still settles as
 			// rejected so the reservation cannot leak or fake-exhaust quota.
-			sendResponseFailed(http.StatusServiceUnavailable, "No available accounts")
+			sendResponseFailed(providererr.PublicError{
+				Code:       apikey.ErrorNoAvailableAccounts,
+				Message:    "No available accounts",
+				HTTPStatus: http.StatusServiceUnavailable,
+			})
 			return
 		}
 		h.recordFailure()
-		sendResponseFailed(http.StatusInternalServerError, lastErr.Error())
+		pub := h.recordUpstreamFailure(ctx, "responses", model, "", "", "", lastErr)
+		sendResponseFailed(pub)
 	}
 
 	ex.Run(ctx, guard, attempt, onCommitted, onExhausted)

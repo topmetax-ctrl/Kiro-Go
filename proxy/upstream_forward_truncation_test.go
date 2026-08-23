@@ -40,8 +40,8 @@ func TestForwardTruncatedThinkingStreamSurfacesError(t *testing.T) {
 	if !strings.Contains(out, "event: error") {
 		t.Errorf("no SSE error frame appended; client would hang silently.\ngot: %q", out)
 	}
-	if !strings.Contains(out, "truncated response") {
-		t.Errorf("error frame lacks a diagnosable reason.\ngot: %q", out)
+	if !strings.Contains(out, "An upstream service error occurred.") {
+		t.Errorf("error frame lacks a public error message.\ngot: %q", out)
 	}
 
 	// The provider must be charged a failure, not a 200 success — otherwise this

@@ -2782,6 +2782,72 @@ img.brand-icon {
 .provider-hidden-toggle .fa-solid {
   font-size: 0.65rem;
 }
+/* A hidden route target keeps its slot in the chain — hiding is presentation-only
+   and never changes priority — so it is dimmed and dashed like a hidden provider
+   rather than restyled or made to look disabled. */
+.route-target-row.is-hidden-target {
+  opacity: 0.7;
+  border-style: dashed;
+  background: color-mix(in srgb, var(--card) 92%, var(--muted-foreground) 8%);
+}
+.route-target-row.is-hidden-target:hover,
+.route-target-row.is-hidden-target:focus-within {
+  opacity: 1;
+  background: var(--card);
+}
+/* The hidden-run marker stands exactly where its targets sit, so the visible chain
+   never looks contiguous when it is not. Dashed rules — the provider divider uses
+   solid — read as "rows elided here" rather than "section boundary". */
+.route-target-hidden-run {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  margin-top: 0.5rem;
+  padding: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--muted-foreground);
+  font-size: 0.7rem;
+  white-space: nowrap;
+}
+.route-target-hidden-run::before,
+.route-target-hidden-run::after {
+  content: '';
+  flex: 1;
+  /* Tied to the label's own colour rather than var(--border): the border token is
+     a ~15% alpha hairline, which a 1px dashed line renders as nothing in either
+     theme, and an elision marker nobody can see defeats the point. */
+  border-top: 1px dashed color-mix(in srgb, var(--muted-foreground) 45%, transparent);
+}
+.route-target-hidden-run:hover {
+  color: var(--foreground);
+}
+.route-target-hidden-run:hover::before,
+.route-target-hidden-run:hover::after {
+  border-top-color: color-mix(in srgb, var(--muted-foreground) 75%, transparent);
+}
+/* Five controls now share a target row's header — reorder ×2, probe, hide, remove —
+   in a modal about 600px wide. The default .btn-sm side padding made that cluster
+   wide enough to wrap onto its own line, so the icon-only buttons get a squarer box. */
+.route-target-row .btn-sm {
+  padding: 0 0.55rem;
+  min-width: 2rem;
+}
+/* The probe verdict shares the row's notes cluster. Painted in place rather than
+   through a re-render, so it must not reflow the header when it lands — and it
+   collapses to nothing while empty instead of leaving a gap from the flex gap. */
+.route-target-test {
+  white-space: nowrap;
+}
+.route-target-test:empty {
+  display: none;
+}
+.route-target-hidden-run-action {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 .fwd-stats-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);

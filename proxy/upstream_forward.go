@@ -3,12 +3,12 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"kiro-go/apikey"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"kiro-go/metrics"
+	"kiro-go/providererr"
 	"net/http"
 	"strings"
 	"time"
@@ -147,10 +147,9 @@ func retryableUpstreamStatus(status int) bool {
 // "served after failover".
 //
 // moreTargets tells this attempt whether a backup exists. It only affects
-// retryable non-2xx handling: with a backup left the error body is withheld (so
-// the next target inherits an unwritten ResponseWriter), and without one it is
-// relayed verbatim, preserving the pre-multi-target contract that clients receive
-// the upstream's own error shape.
+// retryable non-2xx handling: with a backup left the error is withheld so the
+// next target inherits an unwritten ResponseWriter; without one the client
+// receives a public provider error, never the raw upstream body.
 func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body []byte, model string, stream bool, subPath string, isClaudeRoute bool, captureUserText string, route *config.ModelRoute, rt config.ResolvedTarget, attempt int, moreTargets bool) forwardOutcome {
 	up := rt.Provider
 	apiKeyID := apiKeyIDFromContext(r.Context())
@@ -174,7 +173,6 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 	// a half-delivered turn for a complete one. truncatedHadContent only shapes the
 	// message: it says whether any answer text made it out before the stream died.
 	var streamTruncated bool
-	var truncatedHadContent bool
 
 	// recordMetric is called once, at the end of the attempt (after the body/stream
 	// finishes), so LatencyMs reflects the full relay — not just time-to-headers.
@@ -273,8 +271,16 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 			return forwardOutcome{canceled: true, status: 499}
 		}
 		logger.Warnf("[Forward] upstream request to %s failed: %v", up.Name, err)
-		// Transport-level failure: the classic failover case.
-		return failed(502, "upstream request failed", "upstream do: "+err.Error(), true)
+		netErr := providererr.FromNetwork(err)
+		netErr.RequestID = requestIDFromContext(r.Context())
+		netErr.ProviderID, netErr.ProviderName = up.ID, up.Name
+		netErr.ClientModel, netErr.EffectiveModel = model, model
+		netErr.Source = "forward"
+		netErr.Endpoint = forwardEndpointKind(isClaudeRoute)
+		netErr.Attempt = attempt
+		h.persistProviderError(netErr)
+		pub := netErr.Public()
+		return failed(pub.HTTPStatus, pub.MessageOrDefault(), netErr.AdminSummary(), true)
 	}
 	defer resp.Body.Close()
 
@@ -285,44 +291,46 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 
 	ok := resp.StatusCode == 200
 
-	// Retryable non-2xx WITH a backup available: drain a bounded prefix of the error
-	// body for the log and return WITHOUT writing anything to the client, so the
-	// next target gets a clean response writer. When this is the last target we
-	// fall through instead and relay the body verbatim — a client that is about to
-	// receive an error deserves the upstream's own error shape, which is what the
-	// single-target code always did.
-	if !ok && moreTargets && retryableUpstreamStatus(resp.StatusCode) {
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorBodyLimit))
-		upstreamErrMsg = upstreamErrorSummary(errBody)
-		logger.Warnf("[Forward] %s returned %d: %s", up.Name, resp.StatusCode, upstreamErrMsg)
-		return failed(resp.StatusCode, "upstream request failed", upstreamErrMsg, true)
+	if !ok {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, providererr.MaxParseBytes))
+		in := providererr.FromHTTP(resp.StatusCode, errBody, resp.Header)
+		in.RequestID = requestIDFromContext(r.Context())
+		in.ProviderID, in.ProviderName = up.ID, up.Name
+		in.ClientModel, in.EffectiveModel = model, strings.TrimSpace(rt.Target.TargetModel)
+		if in.EffectiveModel == "" {
+			in.EffectiveModel = model
+		}
+		in.Source = "forward"
+		in.Endpoint = forwardEndpointKind(isClaudeRoute)
+		in.Attempt = attempt
+		in.LatencyMs = time.Since(start).Milliseconds()
+		h.persistProviderError(in)
+		pub := in.Public()
+		upstreamErrMsg = in.AdminSummary()
+		logger.Warnf("[Forward] %s returned %d category=%s request=%s", up.Name, resp.StatusCode, in.Category, in.RequestID)
+
+		if moreTargets && retryableUpstreamStatus(resp.StatusCode) {
+			return failed(pub.HTTPStatus, pub.MessageOrDefault(), upstreamErrMsg, true)
+		}
+
+		h.recordFailure()
+		h.sendPublicForwardError(w, isClaudeRoute, pub)
+		recordMetric(resp.StatusCode, false, upstreamErrMsg)
+		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, pub.Code, pub.Message, pub.HTTPStatus, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
+		return forwardOutcome{committed: true, status: pub.HTTPStatus, clientMsg: pub.MessageOrDefault(), internalMsg: upstreamErrMsg}
 	}
 
 	// From here on we are committed to this target: everything below writes to the
 	// client, so the outcome is committed=true regardless of how the relay ends.
-
-	// A non-200 upstream response is an error body (usually JSON), not an SSE
-	// stream — copy it through verbatim regardless of the client's stream flag.
+	// Non-2xx already returned above; 200 streams pass through the SSE public filter.
 	var relayErr error
 	switch {
 	case stream && resp.StatusCode == 200:
-		// Stream forward: relay bytes verbatim, teeing them through a usage scanner
-		// that watches for the trailing usage frame. The client is written first and
-		// the scanner observes afterwards, so accounting cannot delay or alter the
-		// relay. Capture is intentionally skipped here (we do not buffer a whole
-		// stream); inject still applied at the call site.
 		scanner := &usageScanner{}
-		relayErr = h.streamUpstreamResponse(w, resp, scanner)
+		relayErr = h.streamUpstreamResponse(w, resp, scanner, isClaudeRoute, requestIDFromContext(r.Context()))
 		usage = scanner.Counts()
-		// A stream that ended without any terminal frame is a truncation, even
-		// though the read returned a clean io.EOF. Without this check the relay
-		// below records a 200 success and the client is left with a stream that
-		// simply stops — the failure is invisible to both sides. Only meaningful
-		// when the read itself succeeded and the client is still connected: a
-		// relayErr or a canceled context already explains the short stream.
 		if relayErr == nil && r.Context().Err() == nil && scanner.Truncated() {
 			streamTruncated = true
-			truncatedHadContent = scanner.hadContent()
 		}
 	case ok && captureUserText != "" && config.MemoryCaptureEnabled() && resp.Header.Get("Content-Encoding") == "":
 		// Non-stream success with capture on: buffer the body so we can BOTH relay it
@@ -353,21 +361,6 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 		}
 		usage = usageFromJSONBody(bodyBytes)
 		relayErr = writeUpstreamResponseBytes(w, resp, bodyBytes)
-	case !ok && resp.Header.Get("Content-Encoding") == "":
-		// A non-2xx we are surfacing to the client: either non-retryable
-		// (400/401/403/404...) or retryable on the last target. Buffer the body so the
-		// upstream's own explanation ("invalid api key", "rate limited") can be
-		// attached to the recorded event. Without this the admin panel shows a bare
-		// status code with no reason, which is the first thing an operator needs. The
-		// body is still relayed byte-for-byte; only a short prefix is kept for the log.
-		bodyBytes, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			logger.Warnf("[Forward] error-body read failed: %v", readErr)
-			relayErr = readErr
-			break
-		}
-		upstreamErrMsg = upstreamErrorSummary(bodyBytes)
-		relayErr = writeUpstreamResponseBytes(w, resp, bodyBytes)
 	default:
 		relayErr = copyUpstreamResponse(w, resp)
 	}
@@ -379,15 +372,17 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 	// bytes, which the client already has; this cannot un-send them, only explain
 	// why nothing more is coming.
 	if streamTruncated {
-		reason := "upstream stream ended without a terminal event (truncated response)"
-		if !truncatedHadContent {
-			reason = "upstream stream ended before any answer content (truncated response)"
+		pub := providererr.PublicError{
+			Code:       providererr.CodeError,
+			Message:    providererr.MsgError,
+			RequestID:  requestIDFromContext(r.Context()),
+			HTTPStatus: 502,
 		}
-		logger.Warnf("[Forward] %s: %s", up.Name, reason)
-		h.sendForwardStreamError(w, isClaudeRoute, reason)
+		logger.Warnf("[Forward] %s: truncated stream request=%s", up.Name, pub.RequestID)
+		h.sendForwardStreamError(w, isClaudeRoute, pub.Message)
 		h.recordFailure()
-		recordMetric(resp.StatusCode, false, reason)
-		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, apikey.ErrorProviderError, reason, resp.StatusCode, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
+		recordMetric(resp.StatusCode, false, "truncated stream")
+		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, pub.Code, pub.Message, resp.StatusCode, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
 		return forwardOutcome{committed: true, status: resp.StatusCode}
 	}
 
@@ -405,9 +400,6 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 		}
 		noteAPIKeyUsage(r.Context(), int64(inTok), int64(outTok), 0, src, src == apikey.UsageSourceEstimator)
 		h.recordSuccessForApiKey(r.Context(), apiKeyID, inTok, outTok, 0)
-	} else if !ok {
-		h.recordFailure()
-		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, apikey.ClassifyPublicError(resp.StatusCode, "api_error", upstreamErrMsg), upstreamErrMsg, resp.StatusCode, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
 	}
 
 	// Record the metric at the very end, so LatencyMs covers the full relay
@@ -429,10 +421,6 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 	internalErr := ""
 	if relayErr != nil {
 		internalErr = relayErr.Error()
-	} else if !ok {
-		// The relay itself succeeded; the failure is the upstream's, so report what
-		// the upstream said rather than leaving the reason blank.
-		internalErr = upstreamErrMsg
 	}
 	recordMetric(resp.StatusCode, ok && relayErr == nil, internalErr)
 	return forwardOutcome{committed: true, status: resp.StatusCode}
@@ -452,31 +440,16 @@ func (h *Handler) sendForwardStreamError(w http.ResponseWriter, isClaudeRoute bo
 	if !ok {
 		return
 	}
+	pub := providererr.PublicError{
+		Code:      providererr.CodeError,
+		Message:   message,
+		RequestID: requestIDFromWriter(w),
+	}
+	d := providererr.DialectOpenAI
 	if isClaudeRoute {
-		payload, err := json.Marshal(map[string]interface{}{
-			"type": "error",
-			"error": map[string]string{
-				"type":    "api_error",
-				"message": message,
-			},
-		})
-		if err != nil {
-			return
-		}
-		fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
-		flusher.Flush()
-		return
+		d = providererr.DialectClaude
 	}
-	payload, err := json.Marshal(map[string]interface{}{
-		"error": map[string]string{
-			"type":    "server_error",
-			"message": message,
-		},
-	})
-	if err != nil {
-		return
-	}
-	fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", payload)
+	_, _ = w.Write(providererr.EncodeSSEError(pub, d))
 	flusher.Flush()
 }
 
@@ -641,7 +614,7 @@ func copyForwardableResponseHeaders(w http.ResponseWriter, resp *http.Response) 
 // been written and flushed to the client. It is used to extract token usage from
 // the trailing usage frame; it can neither modify nor delay the relay, and its
 // writes never fail the request.
-func (h *Handler) streamUpstreamResponse(w http.ResponseWriter, resp *http.Response, observer io.Writer) error {
+func (h *Handler) streamUpstreamResponse(w http.ResponseWriter, resp *http.Response, observer io.Writer, isClaude bool, requestID string) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
@@ -652,17 +625,36 @@ func (h *Handler) streamUpstreamResponse(w http.ResponseWriter, resp *http.Respo
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	d := providererr.DialectOpenAI
+	if isClaude {
+		d = providererr.DialectClaude
+	}
+	filter := &ssePublicFilter{
+		dst:     w,
+		flusher: flusher,
+		dialect: d,
+		pub: providererr.PublicError{
+			Code:      providererr.CodeError,
+			Message:   providererr.MsgError,
+			RequestID: requestID,
+		},
+		onRewrite: func(raw string) {
+			in := providererr.FromHTTP(http.StatusInternalServerError, []byte(raw), nil)
+			in.RequestID = requestID
+			in.Source = "forward-stream"
+			h.persistProviderError(in)
+		},
+	}
+	defer func() { _ = filter.Close() }()
+
 	buf := make([]byte, 16*1024)
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
-			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+			if _, writeErr := filter.Write(buf[:n]); writeErr != nil {
 				return writeErr
 			}
-			flusher.Flush()
 			if observer != nil {
-				// Errors are impossible for usageScanner and irrelevant in any
-				// case: the client already has these bytes.
 				_, _ = observer.Write(buf[:n])
 			}
 		}

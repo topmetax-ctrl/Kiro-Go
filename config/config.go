@@ -297,6 +297,19 @@ type RouteTarget struct {
 	Priority    int    `json:"priority"`              // Lower is preferred; 0 is the top tier
 	Weight      int    `json:"weight,omitempty"`      // Share within its tier; <=0 is treated as 1
 	Enabled     bool   `json:"enabled"`               // Whether this target may be selected
+
+	// Hidden collapses this target out of the route editor's list once a route
+	// accumulates enough parked alternatives to be unreadable. Same contract as
+	// UpstreamProvider.Hidden: presentation-only, deliberately independent of
+	// Enabled, and never read by eligibleTargetsForRoute — a hidden target keeps
+	// its slot in the priority order and keeps receiving traffic.
+	//
+	// It has to be independent here for the same reason it does on a provider, and
+	// one more: parking an alternative by disabling it is exactly the documented
+	// "switch provider without losing the old setup" gesture, so an operator who
+	// tidies the list must not silently disable a live target, nor re-enable a
+	// parked one by unhiding it.
+	Hidden bool `json:"hidden,omitempty"`
 }
 
 // ModelRoute maps a client-supplied model name to one or more upstream targets.
@@ -413,6 +426,15 @@ type Config struct {
 	// Off by default: it multiplies the list size, and clients that own a level
 	// picker (9router) do not need the variants advertised to use them.
 	AdvertiseEffortModels bool `json:"advertiseEffortModels,omitempty"`
+
+	// PublicModelCatalog controls what GET /v1/models advertises and whether
+	// names missing from that list may still fall through to the Kiro pool.
+	//
+	//   ""            — auto: forwarding routes when any are enabled, else kiro
+	//   "forwarding"  — only enabled forwarding route names; unlisted models 404
+	//   "kiro"        — Kiro account catalog + aliases (historical listing)
+	//   "both"        — forwarding names first, then the Kiro catalog; no 404 lock
+	PublicModelCatalog string `json:"publicModelCatalog,omitempty"`
 
 	// Endpoint configuration: "auto", "kiro", "codewhisperer", or "amazonq"
 	PreferredEndpoint string `json:"preferredEndpoint,omitempty"`

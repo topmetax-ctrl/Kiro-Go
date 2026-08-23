@@ -2,6 +2,7 @@ package apikey
 
 import (
 	"database/sql"
+	"kiro-go/providererr"
 	"strings"
 	"time"
 )
@@ -11,11 +12,13 @@ func sanitizeError(s string) string {
 	if s == "" {
 		return ""
 	}
-	lower := strings.ToLower(s)
-	// Drop anything that looks like a secret or credential blob.
-	if strings.Contains(lower, "authorization") || strings.Contains(lower, "api-key") ||
-		strings.Contains(lower, "api_key") || strings.Contains(lower, "sk-") ||
-		strings.Contains(lower, "bearer ") {
+	switch s {
+	case providererr.MsgRateLimited, providererr.MsgTimeout, providererr.MsgUnavailable,
+		providererr.MsgRejected, providererr.MsgError, providererr.MsgInternal, providererr.MsgCancelled:
+		return s
+	}
+	s = providererr.Redact(s)
+	if providererr.LooksLikeCredential(s) {
 		return "upstream error"
 	}
 	if len(s) > 240 {
@@ -398,6 +401,9 @@ func (s *Service) Cleanup() (events int, hours int, err error) {
 		if n, _ := res.RowsAffected(); n > 0 {
 			DecPortalSession(n)
 		}
+	}
+	if _, e := s.cleanupProviderErrors(eventCut); e != nil {
+		return events, hours, e
 	}
 	return events, hours, nil
 }

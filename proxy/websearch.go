@@ -523,17 +523,8 @@ func (h *Handler) handleWebSearchRequest(ctx context.Context, w http.ResponseWri
 			accountID = account.ID
 		}
 		h.recordFailureWithDetails(ctx, "claude", req.Model, accountID, err)
-		// Prefer a real error over a silent empty body (issue #120 symptom).
-		status := 502
-		errType := "api_error"
-		if isAuthErrorMessage(err.Error()) {
-			status = 401
-			errType = "authentication_error"
-		} else if isQuotaErrorMessage(err.Error()) {
-			status = 429
-			errType = "rate_limit_error"
-		}
-		h.sendClaudeError(w, status, errType, "Web search failed: "+err.Error())
+		pub := classifyGoError(err, requestIDFromContext(ctx), "search", "claude", req.Model, accountID, "", "").Public()
+		h.sendPublicClaudeError(w, pub)
 		return
 	}
 
