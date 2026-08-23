@@ -118,12 +118,30 @@ func (h *Handler) tryForwardUpstream(r *http.Request, w http.ResponseWriter, bod
 // clientMsg/status/internalMsg carry what to tell the client if this turns out
 // to be the last attempt.
 type forwardOutcome struct {
-	committed   bool
-	retryable   bool
-	canceled    bool
-	status      int
-	clientMsg   string
-	internalMsg string
+	committed bool
+	retryable bool
+	canceled  bool
+	status    int
+	// upstreamStatus is the HTTP status the UPSTREAM returned, before the public
+	// error mapping folds a 401 into 502 or reshapes a 503. The connection loop
+	// needs the original to tell "auth failed on every key" apart from a generic
+	// provider outage; 0 means no response ever arrived.
+	upstreamStatus int
+	clientMsg      string
+	internalMsg    string
+}
+
+// providerLevelFailure reports whether this outcome implicates the PROVIDER — its
+// endpoint, capacity or reachability — rather than only the credential that was
+// tried. It is what allows the route to move to a backup provider once every key
+// here is exhausted; an all-keys auth failure stays private to this provider's
+// credentials, and replaying those dead keys against every backup would just
+// multiply the failure and delay the real error reaching the client.
+func (o forwardOutcome) providerLevelFailure() bool {
+	if o.upstreamStatus != 0 {
+		return retryableUpstreamStatus(o.upstreamStatus)
+	}
+	return o.retryable
 }
 
 // retryableUpstreamStatus reports whether an upstream HTTP status is worth trying
@@ -153,12 +171,110 @@ func retryableUpstreamStatus(status int) bool {
 func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body []byte, model string, stream bool, subPath string, isClaudeRoute bool, captureUserText string, route *config.ModelRoute, rt config.ResolvedTarget, attempt int, moreTargets bool) forwardOutcome {
 	up := rt.Provider
 	apiKeyID := apiKeyIDFromContext(r.Context())
-	start := time.Now()
+	begin := time.Now()
 
 	// Live concurrency gauge: released when this function returns, whatever the
 	// outcome, so the in-flight count cannot leak on an early error return.
 	releaseInFlight := metrics.BeginInFlight(up.ID, up.Name)
 	defer releaseInFlight()
+
+	// recordPreflightMetric files the event for failures that happen before any
+	// connection is chosen, where forwardOneConnection's recordMetric cannot see
+	// them. Without this a malformed body would vanish from the dashboard entirely
+	// even though the request did reach this route and fail here.
+	recordPreflightMetric := func(status int, errMsg string) {
+		metrics.Record(metrics.Event{
+			ClientModel:  model,
+			TargetModel:  strings.TrimSpace(rt.Target.TargetModel),
+			RouteID:      route.ID,
+			ProviderID:   up.ID,
+			ProviderName: up.Name,
+			Endpoint:     forwardEndpointKind(isClaudeRoute),
+			ClientIP:     clientIPFromContext(r.Context()),
+			ApiKeyID:     apiKeyID,
+			RequestID:    requestIDFromContext(r.Context()),
+			Status:       status,
+			LatencyMs:    time.Since(begin).Milliseconds(),
+			Canceled:     status == 499,
+			ErrorMsg:     errMsg,
+			Attempt:      attempt,
+		})
+	}
+
+	// Optionally rewrite the "model" field before forwarding. A malformed body is
+	// not retryable — every provider (and every key) would reject it identically.
+	payload := body
+	if tm := strings.TrimSpace(rt.Target.TargetModel); tm != "" {
+		var m map[string]interface{}
+		if err := json.Unmarshal(body, &m); err != nil {
+			recordPreflightMetric(400, "invalid_request_error: "+err.Error())
+			return forwardOutcome{status: 400, clientMsg: "invalid request body", internalMsg: "invalid_request_error: " + err.Error()}
+		}
+		m["model"] = tm
+		rewritten, err := json.Marshal(m)
+		if err != nil {
+			recordPreflightMetric(500, "failed to rewrite model: "+err.Error())
+			return forwardOutcome{status: 500, clientMsg: "failed to prepare upstream request", internalMsg: "failed to rewrite model: " + err.Error()}
+		}
+		payload = rewritten
+	}
+
+	conns := orderProviderConnections(up, time.Now())
+	if len(conns) == 0 {
+		if len(config.ResolvedConnections(up)) > 0 {
+			recordPreflightMetric(502, "no enabled connections")
+			return forwardOutcome{
+				retryable:   moreTargets,
+				status:      502,
+				clientMsg:   "upstream request failed",
+				internalMsg: "no enabled connections",
+			}
+		}
+		conns = []config.UpstreamConnection{{
+			ApiKey:  up.ApiKey,
+			Enabled: true,
+			Name:    "legacy",
+		}}
+	}
+
+	var last forwardOutcome
+	var sawNonAuth bool
+	var sawProviderRetryable bool
+	for i, conn := range conns {
+		moreConns := i+1 < len(conns)
+		outcome := h.forwardOneConnection(r, w, payload, model, stream, subPath, isClaudeRoute, captureUserText, route, rt, attempt, moreTargets, moreConns, conn, apiKeyID)
+		last = outcome
+		if outcome.committed || outcome.canceled {
+			return outcome
+		}
+		if !outcome.retryable {
+			return outcome
+		}
+		if !isAuthStatus(outcome.upstreamStatus) {
+			sawNonAuth = true
+		}
+		if outcome.providerLevelFailure() {
+			sawProviderRetryable = true
+		}
+		if moreConns {
+			logger.Warnf("[Forward] %s via %s/%s failed (%s); trying next connection",
+				model, up.Name, conn.Name, outcome.internalMsg)
+		}
+	}
+	// Exhausted every key on this provider. 401/403 on every key is a credential
+	// problem for THIS provider — do not walk the rest of the route. 429/5xx/net
+	// may be shared by this endpoint and are still worth a backup provider.
+	if !sawNonAuth {
+		last.retryable = false
+	} else {
+		last.retryable = sawProviderRetryable
+	}
+	return last
+}
+
+func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, payload []byte, model string, stream bool, subPath string, isClaudeRoute bool, captureUserText string, route *config.ModelRoute, rt config.ResolvedTarget, attempt int, moreTargets, moreConns bool, conn config.UpstreamConnection, apiKeyID string) forwardOutcome {
+	up := rt.Provider
+	start := time.Now()
 
 	// Token usage and TTFB are filled in as the relay progresses; recordMetric
 	// reads whatever was learned by the time it runs.
@@ -180,55 +296,49 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 	// the eventual success against their respective providers.
 	recordMetric := func(status int, ok bool, errMsg string) {
 		ev := metrics.Event{
-			ClientModel:  model,
-			TargetModel:  strings.TrimSpace(rt.Target.TargetModel),
-			RouteID:      route.ID,
-			ProviderID:   up.ID,
-			ProviderName: up.Name,
-			Endpoint:     forwardEndpointKind(isClaudeRoute),
-			ClientIP:     clientIPFromContext(r.Context()),
-			ApiKeyID:     apiKeyID,
-			RequestID:    requestIDFromContext(r.Context()),
-			Status:       status,
-			LatencyMs:    time.Since(start).Milliseconds(),
-			TTFBMs:       ttfb.Milliseconds(),
-			InputTokens:  usage.Input,
-			OutputTokens: usage.Output,
-			CostUSD:      up.CostUSD(usage.Input, usage.Output),
-			Stream:       stream,
-			Canceled:     status == 499,
-			Ok:           ok,
-			ErrorMsg:     errMsg,
-			Attempt:      attempt,
+			ClientModel:    model,
+			TargetModel:    strings.TrimSpace(rt.Target.TargetModel),
+			RouteID:        route.ID,
+			ProviderID:     up.ID,
+			ProviderName:   up.Name,
+			ConnectionID:   conn.ID,
+			ConnectionName: conn.Name,
+			Endpoint:       forwardEndpointKind(isClaudeRoute),
+			ClientIP:       clientIPFromContext(r.Context()),
+			ApiKeyID:       apiKeyID,
+			RequestID:      requestIDFromContext(r.Context()),
+			Status:         status,
+			LatencyMs:      time.Since(start).Milliseconds(),
+			TTFBMs:         ttfb.Milliseconds(),
+			InputTokens:    usage.Input,
+			OutputTokens:   usage.Output,
+			CostUSD:        up.CostUSD(usage.Input, usage.Output),
+			Stream:         stream,
+			Canceled:       status == 499,
+			Ok:             ok,
+			ErrorMsg:       errMsg,
+			Attempt:        attempt,
 		}
 		metrics.Record(ev)
+		if status == 499 {
+			return
+		}
+		if ok {
+			recordConnectionSuccess(up.ID, conn.ID)
+			return
+		}
+		recordConnectionFailure(up.ID, conn.ID, status, time.Now())
 	}
 
 	// failed records a failure that produced no client output. The caller decides
 	// whether to retry or to surface clientMsg. The raw upstream error is never
 	// used as clientMsg: it can leak upstream host/IP/proxy topology.
-	failed := func(status int, clientMsg, internalMsg string, retryable bool) forwardOutcome {
+	failed := func(status, upstreamStatus int, clientMsg, internalMsg string, retryable bool) forwardOutcome {
 		recordMetric(status, false, internalMsg)
 		return forwardOutcome{
-			retryable: retryable, status: status,
+			retryable: retryable, status: status, upstreamStatus: upstreamStatus,
 			clientMsg: clientMsg, internalMsg: internalMsg,
 		}
-	}
-
-	// Optionally rewrite the "model" field before forwarding. A malformed body is
-	// not retryable — every provider would reject it identically.
-	payload := body
-	if tm := strings.TrimSpace(rt.Target.TargetModel); tm != "" {
-		var m map[string]interface{}
-		if err := json.Unmarshal(body, &m); err != nil {
-			return failed(400, "invalid request body", "invalid_request_error: "+err.Error(), false)
-		}
-		m["model"] = tm
-		rewritten, err := json.Marshal(m)
-		if err != nil {
-			return failed(500, "failed to prepare upstream request", "failed to rewrite model: "+err.Error(), false)
-		}
-		payload = rewritten
 	}
 
 	url := strings.TrimRight(up.BaseURL, "/") + subPath
@@ -237,13 +347,13 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 	req, err := http.NewRequestWithContext(r.Context(), "POST", url, bytes.NewReader(payload))
 	if err != nil {
 		// A bad BaseURL is this target's problem alone, so another target may work.
-		return failed(500, "failed to prepare upstream request", "build request: "+err.Error(), true)
+		return failed(500, 0, "failed to prepare upstream request", "build request: "+err.Error(), true)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "*/*")
-	if up.ApiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+up.ApiKey)
-		req.Header.Set("X-Api-Key", up.ApiKey)
+	if conn.ApiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+conn.ApiKey)
+		req.Header.Set("X-Api-Key", conn.ApiKey)
 	}
 	if isClaudeRoute {
 		req.Header.Set("anthropic-version", "2023-06-01")
@@ -259,7 +369,7 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 	}
 	client := GetForwardClientForProxy(proxyURL)
 
-	logger.Infof("[Forward] %s -> %s (%s)", model, up.Name, url)
+	logger.Infof("[Forward] %s -> %s/%s (%s)", model, up.Name, conn.Name, url)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -280,7 +390,7 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 		netErr.Attempt = attempt
 		h.persistProviderError(netErr)
 		pub := netErr.Public()
-		return failed(pub.HTTPStatus, pub.MessageOrDefault(), netErr.AdminSummary(), true)
+		return failed(pub.HTTPStatus, 0, pub.MessageOrDefault(), netErr.AdminSummary(), true)
 	}
 	defer resp.Body.Close()
 
@@ -292,6 +402,10 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 	ok := resp.StatusCode == 200
 
 	if !ok {
+		// Non-2xx. Classify through the provider error boundary FIRST, whatever happens
+		// next: the operator log wants every rejection recorded with its category, and
+		// the client must end up with the classified public error — never the raw
+		// upstream body, which can carry host, proxy or account detail.
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, providererr.MaxParseBytes))
 		in := providererr.FromHTTP(resp.StatusCode, errBody, resp.Header)
 		in.RequestID = requestIDFromContext(r.Context())
@@ -307,10 +421,17 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 		h.persistProviderError(in)
 		pub := in.Public()
 		upstreamErrMsg = in.AdminSummary()
-		logger.Warnf("[Forward] %s returned %d category=%s request=%s", up.Name, resp.StatusCode, in.Category, in.RequestID)
+		logger.Warnf("[Forward] %s/%s returned %d category=%s request=%s", up.Name, conn.Name, resp.StatusCode, in.Category, in.RequestID)
 
-		if moreTargets && retryableUpstreamStatus(resp.StatusCode) {
-			return failed(pub.HTTPStatus, pub.MessageOrDefault(), upstreamErrMsg, true)
+		// With another attempt available anywhere — a sibling key on this provider, or
+		// a backup provider on the route — return WITHOUT writing to the client, so the
+		// next attempt inherits a clean ResponseWriter. On the very last attempt fall
+		// through instead: a client about to receive an error still gets a proper
+		// classified error shape, just not a retryable one.
+		canRetryConn := retryableConnectionStatus(resp.StatusCode) && moreConns
+		canRetryProv := retryableUpstreamStatus(resp.StatusCode) && moreTargets
+		if canRetryConn || canRetryProv {
+			return failed(pub.HTTPStatus, resp.StatusCode, pub.MessageOrDefault(), upstreamErrMsg, true)
 		}
 
 		h.recordFailure()

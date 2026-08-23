@@ -1277,7 +1277,7 @@
           <input type="text" id="upstreamForm_baseUrl" placeholder="http://localhost:20128/v1" />
           <small data-i18n="upstreams.baseUrlHint"></small>
         </div>
-        <div class="form-group">
+        <div class="form-group" id="upstreamForm_apiKeyGroup">
           <label data-i18n="upstreams.apiKey"></label>
           <input type="text" id="upstreamForm_apiKey" data-i18n-placeholder="upstreams.apiKeyPlaceholder" />
           <small data-i18n="upstreams.apiKeyHint"></small>
@@ -1307,6 +1307,71 @@
           <button class="btn btn-secondary" id="upstreamModalCancelBtn" type="button" data-i18n="upstreams.cancelBtn"></button>
           <button class="btn btn-primary" id="upstreamModalSaveBtn" type="button" data-i18n="upstreams.saveBtn"></button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="upstreamConnModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span class="modal-title" id="upstreamConnModalTitle" data-i18n="upstreams.connModalCreate"></span>
+        <button class="modal-close" id="upstreamConnModalClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label data-i18n="upstreams.connName"></label>
+          <input type="text" id="upstreamConnForm_name" data-i18n-placeholder="upstreams.connNamePlaceholder" />
+        </div>
+        <div class="form-group">
+          <label data-i18n="upstreams.apiKey"></label>
+          <input type="text" id="upstreamConnForm_apiKey" data-i18n-placeholder="upstreams.connApiKeyPlaceholder" />
+          <small id="upstreamConnForm_apiKeyHint" data-i18n="upstreams.connApiKeyHint"></small>
+        </div>
+        <div class="form-group">
+          <label class="flex items-center gap-2">
+            <span class="switch"><input type="checkbox" id="upstreamConnForm_enabled" checked /><span class="slider"></span></span>
+            <span data-i18n="upstreams.formEnabled"></span>
+          </label>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="upstreamConnModalCancelBtn" type="button" data-i18n="upstreams.cancelBtn"></button>
+          <button class="btn btn-primary" id="upstreamConnModalSaveBtn" type="button" data-i18n="upstreams.saveBtn"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="upstreamBulkModal" class="modal">
+    <div class="modal-content" style="max-width:720px;">
+      <div class="modal-header">
+        <span class="modal-title" data-i18n="upstreams.bulkModalTitle"></span>
+        <button class="modal-close" id="upstreamBulkModalClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="help-block" data-i18n="upstreams.bulkDesc"></p>
+        <div class="form-group">
+          <label data-i18n="upstreams.bulkPaste"></label>
+          <textarea id="upstreamBulkText" class="font-mono" rows="8"
+            data-i18n-placeholder="upstreams.bulkPlaceholder"></textarea>
+        </div>
+        <div class="form-group">
+          <label data-i18n="upstreams.bulkNaming"></label>
+          <label class="flex items-center gap-2"><input type="radio" name="upstreamBulkNaming" value="first_non_key" checked />
+            <span data-i18n="upstreams.bulkNamingFirst"></span></label>
+          <label class="flex items-center gap-2"><input type="radio" name="upstreamBulkNaming" value="join_non_key" />
+            <span data-i18n="upstreams.bulkNamingJoin"></span></label>
+          <label class="flex items-center gap-2"><input type="radio" name="upstreamBulkNaming" value="key_n" />
+            <span data-i18n="upstreams.bulkNamingKeyN"></span></label>
+        </div>
+        <div id="upstreamBulkSummary" class="text-xs muted-text" style="margin:0.5rem 0;"></div>
+        <div id="upstreamBulkPreview" class="upstream-bulk-preview"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="upstreamBulkCancelBtn" type="button" data-i18n="upstreams.cancelBtn"></button>
+        <button class="btn btn-outline" id="upstreamBulkAnalyzeBtn" type="button" data-i18n="upstreams.bulkAnalyze"></button>
+        <button class="btn btn-primary" id="upstreamBulkImportBtn" type="button" data-i18n="upstreams.bulkImportBtn" disabled></button>
       </div>
     </div>
   </div>

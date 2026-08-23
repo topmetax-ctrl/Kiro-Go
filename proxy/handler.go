@@ -3332,6 +3332,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiExportUpstreams(w, r)
 	case path == "/upstreams/import" && r.Method == "POST":
 		h.apiImportUpstreams(w, r)
+	case strings.HasPrefix(path, "/upstreams/") && h.handleUpstreamConnectionAPI(w, r, path):
+		return
 	case path == "/upstreams" && r.Method == "GET":
 		h.apiGetUpstreams(w, r)
 	case path == "/upstreams" && r.Method == "POST":
@@ -5282,13 +5284,13 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":          config.GetApiKey(),
-		"requireApiKey":   config.IsApiKeyRequired(),
-		"port":            config.GetPort(),
-		"host":            config.GetHost(),
-		"allowOverUsage":      config.GetAllowOverUsage(),
-		"maxPayloadBytes":     config.GetMaxPayloadBytes(),
-		"publicModelCatalog":  config.GetPublicModelCatalogRaw(),
+		"apiKey":               config.GetApiKey(),
+		"requireApiKey":        config.IsApiKeyRequired(),
+		"port":                 config.GetPort(),
+		"host":                 config.GetHost(),
+		"allowOverUsage":       config.GetAllowOverUsage(),
+		"maxPayloadBytes":      config.GetMaxPayloadBytes(),
+		"publicModelCatalog":   config.GetPublicModelCatalogRaw(),
 		"resolvedModelCatalog": config.GetPublicModelCatalog(),
 	})
 }
@@ -5418,10 +5420,9 @@ func (h *Handler) apiGetUpstreams(w http.ResponseWriter, r *http.Request) {
 	if routes == nil {
 		routes = []config.ModelRoute{}
 	}
-	masked := make([]config.UpstreamProvider, len(providers))
+	masked := make([]map[string]interface{}, len(providers))
 	for i, p := range providers {
-		p.ApiKey = config.MaskApiKey(p.ApiKey)
-		masked[i] = p
+		masked[i] = publicProvider(p)
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"providers": masked,
@@ -5434,31 +5435,55 @@ func (h *Handler) apiGetUpstreams(w http.ResponseWriter, r *http.Request) {
 // masked (contains "****") is treated as "unchanged" and the previously stored
 // secret for that provider ID is preserved.
 func (h *Handler) apiUpdateUpstreams(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Providers []config.UpstreamProvider `json:"providers"`
-		Routes    []config.ModelRoute       `json:"routes"`
+	var raw struct {
+		Providers []json.RawMessage   `json:"providers"`
+		Routes    []config.ModelRoute `json:"routes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
 
 	existing, _ := config.GetUpstreamConfig()
-	existingKeyByID := make(map[string]string, len(existing))
+	existingByID := make(map[string]config.UpstreamProvider, len(existing))
 	for _, p := range existing {
-		existingKeyByID[p.ID] = p.ApiKey
+		existingByID[p.ID] = p
 	}
 
-	for i := range req.Providers {
-		p := &req.Providers[i]
+	req := struct {
+		Providers []config.UpstreamProvider
+		Routes    []config.ModelRoute
+	}{Routes: raw.Routes}
+
+	for _, blob := range raw.Providers {
+		var p config.UpstreamProvider
+		if err := json.Unmarshal(blob, &p); err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+			return
+		}
+		var probe struct {
+			Connections json.RawMessage `json:"connections"`
+		}
+		_ = json.Unmarshal(blob, &probe)
 		if p.ID == "" {
 			p.ID = config.GenerateMachineId()
 		}
-		// Preserve the stored key when the client sends back a masked value.
-		if strings.Contains(p.ApiKey, "****") {
-			p.ApiKey = existingKeyByID[p.ID]
+		stored, hasStored := existingByID[p.ID]
+		if strings.Contains(p.ApiKey, "****") && hasStored {
+			p.ApiKey = stored.ApiKey
 		}
+		// Omitted/null connections keep the stored list. An explicit array
+		// (including []) replaces it, with masked secrets restored by id.
+		if len(probe.Connections) == 0 || string(probe.Connections) == "null" {
+			if hasStored {
+				p.Connections = stored.Connections
+			}
+		} else {
+			restoreConnectionSecrets(&p, stored)
+		}
+		req.Providers = append(req.Providers, p)
 	}
 	for i := range req.Routes {
 		if req.Routes[i].ID == "" {
@@ -5472,6 +5497,27 @@ func (h *Handler) apiUpdateUpstreams(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func restoreConnectionSecrets(incoming *config.UpstreamProvider, stored config.UpstreamProvider) {
+	if incoming == nil {
+		return
+	}
+	byID := make(map[string]string, len(stored.Connections))
+	for _, c := range stored.Connections {
+		byID[c.ID] = c.ApiKey
+	}
+	for i := range incoming.Connections {
+		c := &incoming.Connections[i]
+		if c.ID == "" {
+			c.ID = config.GenerateMachineId()
+		}
+		if c.ApiKey == "" || strings.Contains(c.ApiKey, "****") {
+			if old, ok := byID[c.ID]; ok {
+				c.ApiKey = old
+			}
+		}
+	}
 }
 
 // apiExportUpstreams handles GET /admin/api/upstreams/export.
@@ -5542,7 +5588,7 @@ func (h *Handler) apiImportUpstreams(w http.ResponseWriter, r *http.Request) {
 // probe request. The admin panel may send a provider ID (referring to a stored
 // provider) with a masked/empty key, in which case the stored secret and proxy
 // are used. Explicit baseURL/apiKey in the request override the stored values.
-func resolveUpstreamCreds(id, baseURL, apiKey, proxyURL string) (string, string, string) {
+func resolveUpstreamCreds(id, connectionID, baseURL, apiKey, proxyURL string) (string, string, string) {
 	if id != "" {
 		providers, _ := config.GetUpstreamConfig()
 		for _, p := range providers {
@@ -5553,7 +5599,13 @@ func resolveUpstreamCreds(id, baseURL, apiKey, proxyURL string) (string, string,
 				baseURL = p.BaseURL
 			}
 			if apiKey == "" || strings.Contains(apiKey, "****") {
-				apiKey = p.ApiKey
+				if connectionID != "" {
+					if c, ok := config.FindConnection(p, connectionID); ok {
+						apiKey = c.ApiKey
+					}
+				} else {
+					apiKey = config.FirstEnabledAPIKey(p)
+				}
 			}
 			if proxyURL == "" {
 				proxyURL = p.ProxyURL
@@ -5581,7 +5633,7 @@ func (h *Handler) apiUpstreamModels(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
 		return
 	}
-	baseURL, apiKey, proxyURL := resolveUpstreamCreds(req.ID, req.BaseURL, req.ApiKey, req.ProxyURL)
+	baseURL, apiKey, proxyURL := resolveUpstreamCreds(req.ID, "", req.BaseURL, req.ApiKey, req.ProxyURL)
 	if strings.TrimSpace(baseURL) == "" {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "baseUrl is required"})
@@ -5685,11 +5737,12 @@ func parseModelIDs(body []byte) []string {
 // per-model test button.
 func (h *Handler) apiUpstreamTest(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID       string `json:"id"`
-		BaseURL  string `json:"baseUrl"`
-		ApiKey   string `json:"apiKey"`
-		ProxyURL string `json:"proxyURL"`
-		Model    string `json:"model"`
+		ID           string `json:"id"`
+		ConnectionID string `json:"connectionId"`
+		BaseURL      string `json:"baseUrl"`
+		ApiKey       string `json:"apiKey"`
+		ProxyURL     string `json:"proxyURL"`
+		Model        string `json:"model"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5701,7 +5754,15 @@ func (h *Handler) apiUpstreamTest(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "model is required"})
 		return
 	}
-	baseURL, apiKey, proxyURL := resolveUpstreamCreds(req.ID, req.BaseURL, req.ApiKey, req.ProxyURL)
+	h.runUpstreamTest(w, r, req.ID, req.ConnectionID, req.BaseURL, req.ApiKey, req.ProxyURL, req.Model)
+}
+
+// runUpstreamTest is the shared body behind both the per-provider test button and
+// the per-connection one. connectionID selects WHICH stored key is probed; empty
+// means "the provider's first enabled key", which is what a provider-level test
+// has always meant.
+func (h *Handler) runUpstreamTest(w http.ResponseWriter, r *http.Request, id, connectionID, baseURL, apiKey, proxyURL, model string) {
+	baseURL, apiKey, proxyURL = resolveUpstreamCreds(id, connectionID, baseURL, apiKey, proxyURL)
 	if strings.TrimSpace(baseURL) == "" {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "baseUrl is required"})
@@ -5712,7 +5773,7 @@ func (h *Handler) apiUpstreamTest(w http.ResponseWriter, r *http.Request) {
 	// valid for OpenAI's /chat/completions and Anthropic's /messages alike — so the
 	// shapes differ only in path and version header.
 	payload, _ := json.Marshal(map[string]interface{}{
-		"model":      req.Model,
+		"model":      model,
 		"max_tokens": 1,
 		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
 	})
@@ -5720,7 +5781,7 @@ func (h *Handler) apiUpstreamTest(w http.ResponseWriter, r *http.Request) {
 	// Bounded: GetClientForProxy carries a 5-minute timeout meant for relayed SSE
 	// streams, and an operator clicking Test on a black-holing host must not wait
 	// that long — twice, now that two shapes may be tried.
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), upstreamTestTimeout)
 	defer cancel()
 	client := GetClientForProxy(proxyURL)
 
@@ -5728,9 +5789,10 @@ func (h *Handler) apiUpstreamTest(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		w.WriteHeader(200)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"ok":    false,
-			"error": err.Error(),
-			"path":  path,
+			"ok":        false,
+			"error":     upstreamTestErrMsg(ctx, err),
+			"path":      path,
+			"latencyMs": latency,
 		})
 		return
 	}
@@ -5748,6 +5810,21 @@ func (h *Handler) apiUpstreamTest(w http.ResponseWriter, r *http.Request) {
 		result["error"] = string(body)
 	}
 	json.NewEncoder(w).Encode(result)
+}
+
+// upstreamTestErrMsg labels a probe that never got an answer. Our own deadline is
+// the common case and needs its own word: the transport error for it reads
+// "context deadline exceeded", which describes the mechanism and not the fact the
+// operator needs, that this upstream did not respond in time.
+func upstreamTestErrMsg(ctx context.Context, err error) string {
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(ctx.Err(), context.Canceled):
+		return "canceled"
+	default:
+		return err.Error()
+	}
 }
 
 // probeUpstream sends the minimal probe to an upstream and returns the outcome of
@@ -6262,9 +6339,9 @@ func (h *Handler) apiStreamForwardEvents(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey          *string `json:"apiKey,omitempty"`
-		RequireApiKey   *bool   `json:"requireApiKey,omitempty"`
-		Password        string  `json:"password,omitempty"`
+		ApiKey             *string `json:"apiKey,omitempty"`
+		RequireApiKey      *bool   `json:"requireApiKey,omitempty"`
+		Password           string  `json:"password,omitempty"`
 		AllowOverUsage     *bool   `json:"allowOverUsage,omitempty"`
 		MaxPayloadBytes    *int    `json:"maxPayloadBytes,omitempty"`
 		PublicModelCatalog *string `json:"publicModelCatalog,omitempty"`

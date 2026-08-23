@@ -25,11 +25,16 @@ import (
 )
 
 var (
-	ErrAccountNotFound       = errors.New("account not found")
-	ErrDuplicateAccountID    = errors.New("account ID already exists")
-	ErrDuplicateRefreshToken = errors.New("account refresh token already exists")
-	ErrDuplicateAPIKey       = errors.New("account API key already exists")
-	ErrEmptyAPIKey           = errors.New("kiroApiKey is empty")
+	ErrAccountNotFound            = errors.New("account not found")
+	ErrDuplicateAccountID         = errors.New("account ID already exists")
+	ErrDuplicateRefreshToken      = errors.New("account refresh token already exists")
+	ErrDuplicateAPIKey            = errors.New("account API key already exists")
+	ErrEmptyAPIKey                = errors.New("kiroApiKey is empty")
+	ErrUpstreamProviderNotFound   = errors.New("upstream provider not found")
+	ErrUpstreamConnectionNotFound = errors.New("upstream connection not found")
+	ErrTooManyConnections         = errors.New("too many connections")
+	ErrDuplicateConnectionKey     = errors.New("duplicate connection api key")
+	ErrEmptyConnectionKey         = errors.New("connection api key is empty")
 )
 
 // GenerateMachineId generates a UUID v4 format machine identifier.
@@ -221,9 +226,17 @@ type UpstreamProvider struct {
 	ID       string `json:"id"`                 // Unique identifier (UUID)
 	Name     string `json:"name"`               // Human-readable label
 	BaseURL  string `json:"baseUrl"`            // Base URL incl. version, e.g. https://api.xpiki.com/v1
-	ApiKey   string `json:"apiKey"`             // Bearer token sent to the upstream
+	ApiKey   string `json:"apiKey,omitempty"`   // Legacy single key; migrated into Connections on load
 	ProxyURL string `json:"proxyURL,omitempty"` // Optional per-provider outbound proxy (falls back to global)
 	Enabled  bool   `json:"enabled"`            // Whether this provider may receive forwards
+
+	// Connections are the API keys that belong to this provider. A provider is
+	// one endpoint (base URL, proxy, pricing); connections are the credentials
+	// that can be rotated, tested, and load-balanced independently.
+	Connections []UpstreamConnection `json:"connections,omitempty"`
+	// ConnectionStrategy is "primary" (always start at the first eligible key)
+	// or "round_robin". Empty is treated as round_robin.
+	ConnectionStrategy string `json:"connectionStrategy,omitempty"`
 
 	// Hidden collapses this provider out of the admin list once the list grows
 	// long enough to be unreadable. It is presentation-only and deliberately
@@ -408,11 +421,11 @@ type Config struct {
 	UsageRetentionDays int `json:"usageRetentionDays,omitempty"`
 	// LegacyPlaintextRetention defaults true: keep apiKeys[].key in this file so
 	// an older binary can still boot after rollback.
-	LegacyPlaintextRetention *bool `json:"legacyPlaintextRetention,omitempty"`
-	KiroVersion   string        `json:"kiroVersion,omitempty"`
-	SystemVersion string        `json:"systemVersion,omitempty"`
-	NodeVersion   string        `json:"nodeVersion,omitempty"`
-	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
+	LegacyPlaintextRetention *bool     `json:"legacyPlaintextRetention,omitempty"`
+	KiroVersion              string    `json:"kiroVersion,omitempty"`
+	SystemVersion            string    `json:"systemVersion,omitempty"`
+	NodeVersion              string    `json:"nodeVersion,omitempty"`
+	Accounts                 []Account `json:"accounts"` // Registered Kiro accounts
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")
@@ -918,6 +931,15 @@ migrations:
 	// Migration: legacy 1:1 model routes → ranked Targets. Idempotent; only
 	// persists when a route was actually rewritten.
 	if migrateModelRoutes(cfg.ModelRoutes) {
+		if err := saveLocked(); err != nil {
+			return err
+		}
+	}
+
+	// Migration: a provider that still has a single apiKey and no connections
+	// becomes Connections[0] = "Key 1". Idempotent: once Connections is
+	// non-empty a later Load will not mint another key.
+	if migrateProviderConnections(cfg.Upstreams) {
 		if err := saveLocked(); err != nil {
 			return err
 		}
@@ -2544,8 +2566,7 @@ func GetUpstreamConfig() ([]UpstreamProvider, []ModelRoute) {
 	if cfg == nil {
 		return nil, nil
 	}
-	providers := make([]UpstreamProvider, len(cfg.Upstreams))
-	copy(providers, cfg.Upstreams)
+	providers := cloneUpstreamProviders(cfg.Upstreams)
 	routes := make([]ModelRoute, len(cfg.ModelRoutes))
 	copy(routes, cfg.ModelRoutes)
 	return providers, routes
@@ -2562,6 +2583,7 @@ func UpdateUpstreamConfig(providers []UpstreamProvider, routes []ModelRoute) err
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	migrateModelRoutes(routes)
+	migrateProviderConnections(providers)
 	cfg.Upstreams = providers
 	cfg.ModelRoutes = routes
 	return Save()

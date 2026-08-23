@@ -50,9 +50,11 @@ const (
 	// 1: routes carry a single upstreamId/targetModel pair.
 	// 2: routes carry a ranked `targets` list. Legacy fields are still emitted, so
 	//    a v2 bundle also imports into a v1 build (it reads upstreamId and ignores
-	//    targets, losing only the backup targets). Bumping the constant is what
-	//    makes a v1 build reject a *future* v3 bundle rather than misread it.
-	UpstreamBundleSchema = 2
+	//    targets, losing only the backup targets).
+	// 3: providers carry a `connections` list (multiple API keys per endpoint).
+	//    Bumping the constant is what makes an older build reject a *future*
+	//    schema rather than misread it.
+	UpstreamBundleSchema = 3
 
 	maxBundleProviders = 200
 	maxBundleRoutes    = 2000
@@ -163,6 +165,10 @@ func ExportUpstreamBundle() UpstreamBundle {
 	if routes == nil {
 		routes = []ModelRoute{}
 	}
+	for i := range providers {
+		migrateOneProvider(&providers[i])
+		syncLegacyApiKey(&providers[i])
+	}
 	// Backfill the legacy 1:1 fields from the top target on the way out. A route
 	// created in this build has Targets but no upstreamId, and a v1 importer
 	// requires upstreamId on every route — it would reject the entire file rather
@@ -255,6 +261,10 @@ func ValidateUpstreamBundle(b *UpstreamBundle) error {
 		if err != nil || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("%w: provider %d (%s): baseUrl must be an absolute http(s) URL",
 				ErrInvalidUpstreamBundle, i+1, providerLabel(p))
+		}
+		if len(p.Connections) > maxConnectionsPerProvider {
+			return fmt.Errorf("%w: provider %d (%s): too many connections (%d, max %d)",
+				ErrInvalidUpstreamBundle, i+1, providerLabel(p), len(p.Connections), maxConnectionsPerProvider)
 		}
 		if id := strings.TrimSpace(p.ID); id != "" {
 			inBundle[id] = true
@@ -408,6 +418,7 @@ func MergeUpstreamBundle(
 		if importedID != "" {
 			idMap[importedID] = p.ID
 		}
+		migrateOneProvider(&p)
 		provByKey[key] = p.ID
 		res.Providers = append(res.Providers, p)
 		res.ProvidersAdded++

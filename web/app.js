@@ -2312,6 +2312,12 @@
   // Model names served by this kiro-go instance (from /v1/models), used to
   // suggest Target Model values in the route modal. Still free-text + optional.
   let kiroGoModels = [];
+  let connectionEditing = { providerId: '', connectionId: '' };
+  let bulkImportPid = '';
+  let bulkPreview = null;
+  let bulkResolutions = {};
+  // Per-provider sequential test runner. Results are session-only.
+  let connTest = {};
 
   async function loadApiKeys() {
     const list = $('apiKeysList');
@@ -3016,13 +3022,116 @@
             ' title="' + escapeAttr(hideTitle) + '" aria-label="' + escapeAttr(hideTitle) + '">' +
             '<i class="fa-solid ' + hideIcon + '" aria-hidden="true"></i></button>' +
           '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="details" data-id="' + id + '" aria-expanded="false">' + escapeHtml(t('stats.details')) + '</button>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="add-key" data-id="' + id + '">' + escapeHtml(t('upstreams.addApiKey')) + '</button>' +
+          '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="bulk" data-id="' + id + '">' + escapeHtml(t('upstreams.bulkImport')) + '</button>' +
           '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="load" data-id="' + id + '">' + escapeHtml(t('upstreams.loadModels')) + '</button>' +
           '<button class="btn btn-outline btn-sm" type="button" data-upstream-action="edit" data-id="' + id + '">' + escapeHtml(t('upstreams.actionEdit')) + '</button>' +
           '<button class="btn btn-danger btn-sm" type="button" data-upstream-action="delete" data-id="' + id + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
         '</div>' +
       '</div>' +
       '<div class="text-xs muted-text font-mono" data-fwd-inline-for="' + id + '" style="margin-top:0.35rem;"></div>' +
+      connectionsPanel(item) +
       '<div class="provider-detail hidden" data-provider-detail="' + id + '"></div>' +
+    '</div>';
+  }
+
+  function providerConnections(item) {
+    return (item && Array.isArray(item.connections)) ? item.connections : [];
+  }
+
+  function connTestState(pid) {
+    if (!connTest[pid]) connTest[pid] = { running: false, abort: null, model: '', results: {}, selected: null };
+    return connTest[pid];
+  }
+
+  function connHealthLabel(h) {
+    switch (h) {
+      case 'rate_limited': return t('upstreams.connHealthRateLimited');
+      case 'auth_failed': return t('upstreams.connHealthAuthFailed');
+      case 'unhealthy': return t('upstreams.connHealthUnhealthy');
+      default: return t('upstreams.connHealthOk');
+    }
+  }
+
+  function connTestLabel(res) {
+    if (!res) return '';
+    const ms = res.latencyMs != null ? '  ' + res.latencyMs + ' ms' : '';
+    switch (res.status) {
+      case 'queued': return t('upstreams.connTestQueued');
+      case 'testing': return t('upstreams.connTestTesting');
+      case 'success': return t('upstreams.connTestSuccess') + ms;
+      case 'failed': return t('upstreams.connTestFailed') + (res.http ? '  ' + res.http : '') + ms;
+      case 'timeout': return t('upstreams.connTestTimeout') + ms;
+      case 'skipped': return t('upstreams.connTestSkipped');
+      case 'stopped': return t('upstreams.connTestStopped');
+      default: return '';
+    }
+  }
+
+  function connectionsPanel(item) {
+    const id = item.id || '';
+    const conns = providerConnections(item);
+    const st = connTestState(id);
+    const models = providerModels[id] || [];
+    const testModel = st.model || models[0] || '';
+    const modelOpts = models.map(m =>
+      '<option value="' + escapeAttr(m) + '"' + (m === testModel ? ' selected' : '') + '>' + escapeHtml(m) + '</option>'
+    ).join('');
+    const rrOn = (item.connectionStrategy || 'round_robin') !== 'primary';
+    let passed = 0, failed = 0, completed = 0;
+    conns.forEach(c => {
+      const r = st.results[c.id];
+      if (!r || r.status === 'queued' || r.status === 'testing') return;
+      completed++;
+      if (r.status === 'success') passed++;
+      else if (r.status === 'failed' || r.status === 'timeout') failed++;
+    });
+    const rows = conns.map(c => {
+      const cid = escapeAttr(c.id || '');
+      const checked = !st.selected || st.selected[c.id] ? ' checked' : '';
+      const res = st.results[c.id];
+      const testLine = connTestLabel(res);
+      return '<div class="conn-row">' +
+        '<label class="conn-check"><input type="checkbox" data-conn-select="' + cid + '" data-pid="' + escapeAttr(id) + '"' + checked + ' /></label>' +
+        '<div class="conn-main">' +
+          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
+            '<span class="font-semibold">' + escapeHtml(c.name || t('upstreams.unnamed')) + '</span>' +
+            '<span class="text-xs font-mono muted-text">' + escapeHtml(c.apiKeyMasked || '****') + '</span>' +
+            '<span class="conn-health conn-health-' + escapeAttr(c.health || 'ok') + '">' + escapeHtml(connHealthLabel(c.health)) + '</span>' +
+            (testLine ? '<span class="text-xs muted-text">' + escapeHtml(testLine) + '</span>' : '') +
+          '</div>' +
+        '</div>' +
+        '<div class="flex items-center gap-2">' +
+          '<label class="switch" title="' + escapeAttr(t('upstreams.formEnabled')) + '">' +
+            '<input type="checkbox" data-conn-action="toggle" data-pid="' + escapeAttr(id) + '" data-cid="' + cid + '"' + (c.enabled ? ' checked' : '') + ' />' +
+            '<span class="slider"></span></label>' +
+          '<button class="btn btn-outline btn-xs" type="button" data-conn-action="edit" data-pid="' + escapeAttr(id) + '" data-cid="' + cid + '">' + escapeHtml(t('upstreams.actionEdit')) + '</button>' +
+          '<button class="btn btn-danger btn-xs" type="button" data-conn-action="delete" data-pid="' + escapeAttr(id) + '" data-cid="' + cid + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+    return '<div class="conn-panel" data-conn-panel="' + escapeAttr(id) + '">' +
+      '<div class="conn-panel-head">' +
+        '<span class="font-semibold text-xs">' + escapeHtml(t('upstreams.connectionsTitle')) + '</span>' +
+        '<span class="text-xs muted-text">' +
+          escapeHtml(t('upstreams.connStats', String(conns.length), String(completed), String(passed), String(failed))) +
+        '</span>' +
+      '</div>' +
+      '<div class="conn-toolbar">' +
+        '<button class="btn btn-ghost btn-xs" type="button" data-conn-action="select-all" data-pid="' + escapeAttr(id) + '">' + escapeHtml(t('upstreams.connSelectAll')) + '</button>' +
+        '<label class="text-xs">' + escapeHtml(t('upstreams.connTestModel')) +
+          ' <select data-conn-action="test-model" data-pid="' + escapeAttr(id) + '">' +
+            (modelOpts || '<option value="">' + escapeHtml(t('upstreams.connTestModelNone')) + '</option>') +
+          '</select></label>' +
+        '<label class="flex items-center gap-1 text-xs">' +
+          '<span class="switch"><input type="checkbox" data-conn-action="rr" data-pid="' + escapeAttr(id) + '"' + (rrOn ? ' checked' : '') + ' /><span class="slider"></span></span>' +
+          escapeHtml(t('upstreams.roundRobin')) +
+        '</label>' +
+        (st.running
+          ? '<button class="btn btn-outline btn-xs" type="button" data-conn-action="stop" data-pid="' + escapeAttr(id) + '">' + escapeHtml(t('upstreams.connStop')) + '</button>'
+          : '<button class="btn btn-outline btn-xs" type="button" data-conn-action="test-all" data-pid="' + escapeAttr(id) + '">' + escapeHtml(t('upstreams.connTestOneByOne')) + '</button>') +
+      '</div>' +
+      (rows || '<div class="text-xs muted-text" style="padding:0.35rem 0;">' + escapeHtml(t('upstreams.connectionsEmpty')) + '</div>') +
     '</div>';
   }
 
@@ -3182,9 +3291,17 @@
   }
 
   async function persistUpstreams() {
+    // Never POST connection secrets back: GET only has masks, and connection
+    // mutations go through the dedicated CRUD endpoints. Omitting the array
+    // tells the server to keep the stored connections.
+    const providers = upstreamCache.providers.map(p => {
+      const copy = Object.assign({}, p);
+      delete copy.connections;
+      return copy;
+    });
     const res = await api('/upstreams', {
       method: 'POST',
-      body: JSON.stringify({ providers: upstreamCache.providers, routes: upstreamCache.routes })
+      body: JSON.stringify({ providers, routes: upstreamCache.routes })
     });
     const d = await res.json().catch(() => ({}));
     if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
@@ -3195,7 +3312,9 @@
     $('upstreamModalTitle').textContent = t(upstreamEditingId ? 'upstreams.providerModalEdit' : 'upstreams.providerModalCreate');
     $('upstreamForm_name').value = entry ? (entry.name || '') : '';
     $('upstreamForm_baseUrl').value = entry ? (entry.baseUrl || '') : '';
-    $('upstreamForm_apiKey').value = entry ? (entry.apiKey || '') : '';
+    const keyGroup = $('upstreamForm_apiKeyGroup');
+    if (keyGroup) keyGroup.style.display = upstreamEditingId ? 'none' : '';
+    $('upstreamForm_apiKey').value = '';
     $('upstreamForm_proxyUrl').value = entry ? (entry.proxyURL || '') : '';
     // Prices are omitted from JSON when zero, and an empty input is what "not
     // priced" should look like — so 0 renders as blank rather than "0".
@@ -3226,7 +3345,7 @@
       if (upstreamEditingId) {
         const p = upstreamCache.providers.find(x => x.id === upstreamEditingId);
         if (p) {
-          p.name = name; p.baseUrl = baseUrl; p.apiKey = apiKey; p.proxyURL = proxyURL; p.enabled = enabled;
+          p.name = name; p.baseUrl = baseUrl; p.proxyURL = proxyURL; p.enabled = enabled;
           p.priceInPerM = priceInPerM; p.priceOutPerM = priceOutPerM;
         }
       } else {
@@ -3280,6 +3399,273 @@
       upstreamCache = prev;
       toast((e && e.message) || t('common.saveFailed'), 'error');
       renderUpstreams();
+    }
+  }
+
+  function openConnModal(pid, conn) {
+    connectionEditing = { providerId: pid, connectionId: conn ? (conn.id || '') : '' };
+    $('upstreamConnModalTitle').textContent = t(connectionEditing.connectionId ? 'upstreams.connModalEdit' : 'upstreams.connModalCreate');
+    $('upstreamConnForm_name').value = conn ? (conn.name || '') : '';
+    $('upstreamConnForm_apiKey').value = '';
+    $('upstreamConnForm_enabled').checked = conn ? !!conn.enabled : true;
+    const hint = $('upstreamConnForm_apiKeyHint');
+    if (hint) hint.textContent = t(connectionEditing.connectionId ? 'upstreams.connApiKeyHintEdit' : 'upstreams.connApiKeyHint');
+    openDialog('upstreamConnModal');
+  }
+
+  function closeConnModal() {
+    closeDialog('upstreamConnModal');
+    connectionEditing = { providerId: '', connectionId: '' };
+  }
+
+  async function submitConnModal() {
+    const pid = connectionEditing.providerId;
+    if (!pid) return;
+    const name = $('upstreamConnForm_name').value.trim();
+    const apiKey = $('upstreamConnForm_apiKey').value.trim();
+    const enabled = $('upstreamConnForm_enabled').checked;
+    try {
+      let res;
+      if (connectionEditing.connectionId) {
+        const body = { name, enabled };
+        if (apiKey) body.apiKey = apiKey;
+        res = await api('/upstreams/' + encodeURIComponent(pid) + '/connections/' + encodeURIComponent(connectionEditing.connectionId), {
+          method: 'PATCH', body: JSON.stringify(body)
+        });
+      } else {
+        if (!apiKey) { toast(t('upstreams.connApiKeyRequired'), 'error'); return; }
+        res = await api('/upstreams/' + encodeURIComponent(pid) + '/connections', {
+          method: 'POST', body: JSON.stringify({ name, apiKey, enabled })
+        });
+      }
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      toast(t('common.saved'), 'success');
+      closeConnModal();
+      await loadUpstreams();
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+
+  async function deleteConnection(pid, cid, name) {
+    const ok = await confirmAction(t('upstreams.confirmDeleteConnection', name || t('upstreams.unnamed')), {
+      title: t('upstreams.actionDelete'), confirmText: t('upstreams.actionDelete'), variant: 'danger'
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/upstreams/' + encodeURIComponent(pid) + '/connections/' + encodeURIComponent(cid), { method: 'DELETE' });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      toast(t('upstreams.deleteSuccess'), 'success');
+      await loadUpstreams();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
+    }
+  }
+
+  async function toggleConnection(pid, cid, enabled) {
+    try {
+      const res = await api('/upstreams/' + encodeURIComponent(pid) + '/connections/' + encodeURIComponent(cid), {
+        method: 'PATCH', body: JSON.stringify({ enabled })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.saveFailed'));
+      await loadUpstreams();
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+      renderProviders();
+    }
+  }
+
+  async function setRoundRobin(pid, on) {
+    const p = upstreamCache.providers.find(x => x.id === pid);
+    if (p) p.connectionStrategy = on ? 'round_robin' : 'primary';
+    try {
+      await persistUpstreams();
+      await loadUpstreams();
+    } catch (e) {
+      toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+
+  function selectedConnections(pid) {
+    const p = upstreamCache.providers.find(x => x.id === pid);
+    const conns = providerConnections(p);
+    const st = connTestState(pid);
+    if (!st.selected) return conns;
+    return conns.filter(c => st.selected[c.id]);
+  }
+
+  async function testConnectionsOneByOne(pid) {
+    const st = connTestState(pid);
+    if (st.running) return;
+    const p = upstreamCache.providers.find(x => x.id === pid);
+    const conns = selectedConnections(pid);
+    if (!conns.length) { toast(t('upstreams.connNoneSelected'), 'warning'); return; }
+    let model = st.model || (providerModels[pid] && providerModels[pid][0]) || '';
+    if (!model) {
+      try { await fetchProviderModelsSilently(pid); } catch (e) { /* optional */ }
+      model = (providerModels[pid] && providerModels[pid][0]) || '';
+    }
+    if (!model) { toast(t('upstreams.connTestModelRequired'), 'error'); return; }
+    st.model = model;
+    st.running = true;
+    st.abort = new AbortController();
+    st.results = {};
+    conns.forEach(c => { st.results[c.id] = { status: 'queued' }; });
+    renderProviders();
+    for (const c of conns) {
+      if (!st.running) break;
+      st.results[c.id] = { status: 'testing' };
+      renderProviders();
+      try {
+        const res = await api('/upstreams/' + encodeURIComponent(pid) + '/connections/' + encodeURIComponent(c.id) + '/test', {
+          method: 'POST',
+          body: JSON.stringify({ model }),
+          signal: st.abort.signal
+        });
+        const d = await res.json().catch(() => ({}));
+        if (d.error === 'timeout') st.results[c.id] = { status: 'timeout', latencyMs: d.latencyMs };
+        else if (d.ok) st.results[c.id] = { status: 'success', latencyMs: d.latencyMs };
+        else st.results[c.id] = { status: 'failed', latencyMs: d.latencyMs, http: d.status, error: d.error };
+      } catch (e) {
+        if (e && e.name === 'AbortError') {
+          st.results[c.id] = { status: 'stopped' };
+          break;
+        }
+        st.results[c.id] = { status: 'failed', error: (e && e.message) || 'error' };
+      }
+    }
+    conns.forEach(c => {
+      if (st.results[c.id] && st.results[c.id].status === 'queued') st.results[c.id] = { status: 'stopped' };
+    });
+    st.running = false;
+    st.abort = null;
+    renderProviders();
+  }
+
+  function stopConnectionTests(pid) {
+    const st = connTestState(pid);
+    st.running = false;
+    if (st.abort) st.abort.abort();
+  }
+
+  function openBulkModal(pid) {
+    bulkImportPid = pid;
+    bulkPreview = null;
+    bulkResolutions = {};
+    const box = $('upstreamBulkText');
+    if (box) box.value = '';
+    const sum = $('upstreamBulkSummary');
+    if (sum) sum.textContent = '';
+    const prev = $('upstreamBulkPreview');
+    if (prev) prev.innerHTML = '';
+    const imp = $('upstreamBulkImportBtn');
+    if (imp) imp.disabled = true;
+    openDialog('upstreamBulkModal');
+  }
+
+  function closeBulkModal() {
+    closeDialog('upstreamBulkModal');
+    bulkImportPid = '';
+    bulkPreview = null;
+    bulkResolutions = {};
+  }
+
+  function bulkNaming() {
+    const el = document.querySelector('input[name="upstreamBulkNaming"]:checked');
+    return el ? el.value : 'first_non_key';
+  }
+
+  function renderBulkPreview() {
+    const el = $('upstreamBulkPreview');
+    const sum = $('upstreamBulkSummary');
+    const imp = $('upstreamBulkImportBtn');
+    if (!el) return;
+    if (!bulkPreview) {
+      el.innerHTML = '';
+      if (sum) sum.textContent = '';
+      if (imp) imp.disabled = true;
+      return;
+    }
+    if (sum) {
+      sum.textContent = t('upstreams.bulkSummary',
+        String(bulkPreview.ready || 0), String(bulkPreview.duplicate || 0),
+        String(bulkPreview.ambiguous || 0), String(bulkPreview.invalid || 0));
+    }
+    const lines = Array.isArray(bulkPreview.lines) ? bulkPreview.lines : [];
+    el.innerHTML = '<table class="conn-preview-table"><thead><tr>' +
+      '<th>' + escapeHtml(t('upstreams.bulkColLine')) + '</th>' +
+      '<th>' + escapeHtml(t('upstreams.bulkColName')) + '</th>' +
+      '<th>' + escapeHtml(t('upstreams.bulkColKey')) + '</th>' +
+      '<th>' + escapeHtml(t('upstreams.bulkColStatus')) + '</th>' +
+      '</tr></thead><tbody>' +
+      lines.map(row => {
+        let status = row.status || '';
+        let extra = '';
+        if (status === 'ambiguous' && Array.isArray(row.candidates)) {
+          extra = row.candidates.map(c =>
+            '<button class="btn btn-outline btn-xs" type="button" data-bulk-col="' + escapeAttr(String(c.index)) + '" data-bulk-line="' + escapeAttr(String(row.line)) + '">' +
+              escapeHtml(t('upstreams.bulkChooseCol', String(c.index + 1))) + ' ' + escapeHtml(c.masked || '') +
+            '</button>'
+          ).join(' ');
+        }
+        return '<tr class="conn-preview-' + escapeAttr(status) + '">' +
+          '<td>' + escapeHtml(String(row.line || '')) + '</td>' +
+          '<td>' + escapeHtml(row.name || '') + '</td>' +
+          '<td class="font-mono">' + escapeHtml(row.keyMasked || '') + '</td>' +
+          '<td>' + escapeHtml(t('upstreams.bulkStatus_' + status) || status) + ' ' + extra + '</td>' +
+        '</tr>';
+      }).join('') +
+      '</tbody></table>';
+    if (imp) imp.disabled = !(bulkPreview.ready > 0);
+  }
+
+  async function analyzeBulkImport() {
+    if (!bulkImportPid) return;
+    const text = ($('upstreamBulkText').value || '').trim();
+    if (!text) { toast(t('upstreams.bulkEmpty'), 'error'); return; }
+    try {
+      const res = await api('/upstreams/' + encodeURIComponent(bulkImportPid) + '/connections/preview', {
+        method: 'POST',
+        body: JSON.stringify({
+          text,
+          delimiter: 'auto',
+          naming: bulkNaming(),
+          resolutions: Object.keys(bulkResolutions).map(line => ({ line: parseInt(line, 10), column: bulkResolutions[line] }))
+        })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('upstreams.bulkFailed'));
+      bulkPreview = d.preview || d;
+      renderBulkPreview();
+    } catch (e) {
+      toast((e && e.message) || t('upstreams.bulkFailed'), 'error');
+    }
+  }
+
+  async function commitBulkImport() {
+    if (!bulkImportPid) return;
+    const text = ($('upstreamBulkText').value || '').trim();
+    if (!text) { toast(t('upstreams.bulkEmpty'), 'error'); return; }
+    try {
+      const res = await api('/upstreams/' + encodeURIComponent(bulkImportPid) + '/connections/import', {
+        method: 'POST',
+        body: JSON.stringify({
+          text,
+          delimiter: 'auto',
+          naming: bulkNaming(),
+          resolutions: Object.keys(bulkResolutions).map(line => ({ line: parseInt(line, 10), column: bulkResolutions[line] }))
+        })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('upstreams.bulkFailed'));
+      toast(t('upstreams.bulkImported', String(d.added || 0), String(d.duplicate || 0), String(d.ambiguous || 0), String(d.invalid || 0)), 'success');
+      closeBulkModal();
+      await loadUpstreams();
+    } catch (e) {
+      toast((e && e.message) || t('upstreams.bulkFailed'), 'error');
     }
   }
 
@@ -4122,6 +4508,8 @@
         else if (action === 'load') loadProviderModels(id);
         else if (action === 'details') toggleProviderDetail(id, btn, provList);
         else if (action === 'hide') setProviderHidden(id, !(entry && entry.hidden));
+        else if (action === 'add-key') openConnModal(id, null);
+        else if (action === 'bulk') openBulkModal(id);
       });
       // The hidden-group disclosure. Bound here rather than on the button itself
       // because the button is re-rendered on every list change.
@@ -4147,9 +4535,57 @@
       });
       provList.addEventListener('change', e => {
         const cb = e.target.closest('input[data-upstream-action="toggle"]');
-        if (!cb) return;
-        const id = cb.dataset.id;
-        if (id) toggleProvider(id, cb.checked);
+        if (cb) {
+          const id = cb.dataset.id;
+          if (id) toggleProvider(id, cb.checked);
+          return;
+        }
+        const connToggle = e.target.closest('input[data-conn-action="toggle"]');
+        if (connToggle) {
+          toggleConnection(connToggle.dataset.pid, connToggle.dataset.cid, connToggle.checked);
+          return;
+        }
+        const rr = e.target.closest('input[data-conn-action="rr"]');
+        if (rr) {
+          setRoundRobin(rr.dataset.pid, rr.checked);
+          return;
+        }
+        const sel = e.target.closest('select[data-conn-action="test-model"]');
+        if (sel) {
+          connTestState(sel.dataset.pid).model = sel.value;
+          return;
+        }
+        const pick = e.target.closest('input[data-conn-select]');
+        if (pick) {
+          const st = connTestState(pick.dataset.pid);
+          if (!st.selected) st.selected = {};
+          providerConnections(upstreamCache.providers.find(x => x.id === pick.dataset.pid)).forEach(c => {
+            if (st.selected[c.id] === undefined) st.selected[c.id] = true;
+          });
+          st.selected[pick.dataset.connSelect] = pick.checked;
+        }
+      });
+      provList.addEventListener('click', e => {
+        const bulkCol = e.target.closest('[data-bulk-col]');
+        if (bulkCol) return;
+        const btn = e.target.closest('[data-conn-action]');
+        if (!btn) return;
+        const action = btn.dataset.connAction;
+        const pid = btn.dataset.pid;
+        if (!pid) return;
+        const p = upstreamCache.providers.find(x => x.id === pid);
+        const cid = btn.dataset.cid;
+        const conn = p ? providerConnections(p).find(c => c.id === cid) : null;
+        if (action === 'edit') openConnModal(pid, conn);
+        else if (action === 'delete') deleteConnection(pid, cid, conn ? conn.name : '');
+        else if (action === 'test-all') testConnectionsOneByOne(pid);
+        else if (action === 'stop') stopConnectionTests(pid);
+        else if (action === 'select-all') {
+          const st = connTestState(pid);
+          st.selected = {};
+          providerConnections(p).forEach(c => { st.selected[c.id] = true; });
+          renderProviders();
+        }
       });
     }
     // Per-model actions (copy / test / make route) live inside the models modal.
@@ -4428,6 +4864,31 @@
     bindDialogBackdropClose('modelRouteModal', closeRouteModal);
     bindDialogBackdropClose('upstreamModelsModal', closeModelsModal);
     bindDialogBackdropClose('upstreamImportModal', closeUpstreamImportModal);
+    bindDialogBackdropClose('upstreamConnModal', closeConnModal);
+    bindDialogBackdropClose('upstreamBulkModal', closeBulkModal);
+    const connSave = $('upstreamConnModalSaveBtn');
+    if (connSave) connSave.addEventListener('click', submitConnModal);
+    const connCancel = $('upstreamConnModalCancelBtn');
+    if (connCancel) connCancel.addEventListener('click', closeConnModal);
+    const connClose = $('upstreamConnModalClose');
+    if (connClose) connClose.addEventListener('click', closeConnModal);
+    const bulkAnalyze = $('upstreamBulkAnalyzeBtn');
+    if (bulkAnalyze) bulkAnalyze.addEventListener('click', analyzeBulkImport);
+    const bulkImport = $('upstreamBulkImportBtn');
+    if (bulkImport) bulkImport.addEventListener('click', commitBulkImport);
+    const bulkCancel = $('upstreamBulkCancelBtn');
+    if (bulkCancel) bulkCancel.addEventListener('click', closeBulkModal);
+    const bulkClose = $('upstreamBulkModalClose');
+    if (bulkClose) bulkClose.addEventListener('click', closeBulkModal);
+    const bulkPrev = $('upstreamBulkPreview');
+    if (bulkPrev) {
+      bulkPrev.addEventListener('click', e => {
+        const btn = e.target.closest('[data-bulk-col]');
+        if (!btn) return;
+        bulkResolutions[btn.dataset.bulkLine] = parseInt(btn.dataset.bulkCol, 10);
+        analyzeBulkImport();
+      });
+    }
   }
 
   // ===== Forwarding dashboard =====

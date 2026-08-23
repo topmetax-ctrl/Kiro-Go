@@ -44,28 +44,30 @@ const (
 // requests it is KiroPoolID and AccountID/AccountLabel identify the account that
 // served the request.
 type Event struct {
-	TimeMs       int64   `json:"time"`
-	ClientModel  string  `json:"clientModel"`
-	TargetModel  string  `json:"targetModel,omitempty"`
-	RouteID      string  `json:"routeId,omitempty"`
-	ProviderID   string  `json:"providerId,omitempty"`
-	ProviderName string  `json:"providerName,omitempty"`
-	AccountID    string  `json:"accountId,omitempty"`
-	AccountLabel string  `json:"accountLabel,omitempty"`
-	Endpoint     string  `json:"endpoint,omitempty"` // claude/openai/responses/websearch
-	ClientIP     string  `json:"clientIp,omitempty"` // caller's source IP; empty when not resolved
-	RequestID    string  `json:"requestId,omitempty"`
-	ApiKeyID     string  `json:"apiKeyId,omitempty"`
-	Status       int     `json:"status"`
-	LatencyMs    int64   `json:"latencyMs"`
-	TTFBMs       int64   `json:"ttfbMs,omitempty"` // time to first response byte; 0 when unknown
-	InputTokens  int64   `json:"inputTokens,omitempty"`
-	OutputTokens int64   `json:"outputTokens,omitempty"`
-	CostUSD      float64 `json:"costUsd,omitempty"`
-	Stream       bool    `json:"stream"`
-	Canceled     bool    `json:"canceled,omitempty"` // client disconnected mid-flight
-	Ok           bool    `json:"ok"`
-	ErrorMsg     string  `json:"errorMsg,omitempty"`
+	TimeMs         int64   `json:"time"`
+	ClientModel    string  `json:"clientModel"`
+	TargetModel    string  `json:"targetModel,omitempty"`
+	RouteID        string  `json:"routeId,omitempty"`
+	ProviderID     string  `json:"providerId,omitempty"`
+	ProviderName   string  `json:"providerName,omitempty"`
+	ConnectionID   string  `json:"connectionId,omitempty"`
+	ConnectionName string  `json:"connectionName,omitempty"`
+	AccountID      string  `json:"accountId,omitempty"`
+	AccountLabel   string  `json:"accountLabel,omitempty"`
+	Endpoint       string  `json:"endpoint,omitempty"` // claude/openai/responses/websearch
+	ClientIP       string  `json:"clientIp,omitempty"` // caller's source IP; empty when not resolved
+	RequestID      string  `json:"requestId,omitempty"`
+	ApiKeyID       string  `json:"apiKeyId,omitempty"`
+	Status         int     `json:"status"`
+	LatencyMs      int64   `json:"latencyMs"`
+	TTFBMs         int64   `json:"ttfbMs,omitempty"` // time to first response byte; 0 when unknown
+	InputTokens    int64   `json:"inputTokens,omitempty"`
+	OutputTokens   int64   `json:"outputTokens,omitempty"`
+	CostUSD        float64 `json:"costUsd,omitempty"`
+	Stream         bool    `json:"stream"`
+	Canceled       bool    `json:"canceled,omitempty"` // client disconnected mid-flight
+	Ok             bool    `json:"ok"`
+	ErrorMsg       string  `json:"errorMsg,omitempty"`
 	// Attempt is the zero-based index of this try within a route's ranked target
 	// list. 0 means the route's preferred provider served it; >0 means a failover
 	// happened, which is the signal that a higher-priority target is unhealthy.
