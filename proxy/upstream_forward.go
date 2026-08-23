@@ -384,6 +384,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 		netErr := providererr.FromNetwork(err)
 		netErr.RequestID = requestIDFromContext(r.Context())
 		netErr.ProviderID, netErr.ProviderName = up.ID, up.Name
+		netErr.ConnectionID, netErr.ConnectionName = conn.ID, conn.Name
 		netErr.ClientModel, netErr.EffectiveModel = model, model
 		netErr.Source = "forward"
 		netErr.Endpoint = forwardEndpointKind(isClaudeRoute)
@@ -410,6 +411,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 		in := providererr.FromHTTP(resp.StatusCode, errBody, resp.Header)
 		in.RequestID = requestIDFromContext(r.Context())
 		in.ProviderID, in.ProviderName = up.ID, up.Name
+		in.ConnectionID, in.ConnectionName = conn.ID, conn.Name
 		in.ClientModel, in.EffectiveModel = model, strings.TrimSpace(rt.Target.TargetModel)
 		if in.EffectiveModel == "" {
 			in.EffectiveModel = model

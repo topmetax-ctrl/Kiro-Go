@@ -955,6 +955,8 @@
   "forward.detailClientModel": "客户端模型",
   "forward.detailTargetModel": "目标模型",
   "forward.detailProvider": "提供方",
+  "forward.detailConnection": "密钥",
+  "forward.detailAttempts": "尝试次数（{0}）",
   "forward.detailAccount": "账号",
   "forward.detailRoute": "路由",
   "forward.detailStatus": "状态",

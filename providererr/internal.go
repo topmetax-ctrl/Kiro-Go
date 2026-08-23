@@ -23,8 +23,15 @@ type InternalError struct {
 	RequestID string
 	Source    string // "forward", "kiro", "search", "network"
 
-	ProviderID     string
-	ProviderName   string
+	ProviderID   string
+	ProviderName string
+	// ConnectionID/ConnectionName name WHICH of a provider's API keys produced
+	// this failure. With a key pool behind one endpoint, "provider X returned 401"
+	// is not actionable on its own — the operator needs to know which credential
+	// to replace. Empty for the Kiro pool and for a provider still on its legacy
+	// single key.
+	ConnectionID   string
+	ConnectionName string
 	AccountID      string
 	Endpoint       string
 	ClientModel    string

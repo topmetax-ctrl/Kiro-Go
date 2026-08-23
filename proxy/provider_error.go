@@ -84,6 +84,8 @@ func (h *Handler) persistProviderError(in providererr.InternalError) {
 		Attempt:           in.Attempt,
 		ProviderID:        in.ProviderID,
 		ProviderName:      in.ProviderName,
+		ConnectionID:      in.ConnectionID,
+		ConnectionName:    in.ConnectionName,
 		AccountID:         in.AccountID,
 		Endpoint:          in.Endpoint,
 		ClientModel:       in.ClientModel,

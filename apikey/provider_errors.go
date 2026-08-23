@@ -13,6 +13,8 @@ type ProviderErrorDetail struct {
 	Attempt           int       `json:"attempt"`
 	ProviderID        string    `json:"providerId,omitempty"`
 	ProviderName      string    `json:"providerName,omitempty"`
+	ConnectionID      string    `json:"connectionId,omitempty"`
+	ConnectionName    string    `json:"connectionName,omitempty"`
 	AccountID         string    `json:"accountId,omitempty"`
 	Endpoint          string    `json:"endpoint,omitempty"`
 	ClientModel       string    `json:"clientModel,omitempty"`
@@ -38,11 +40,12 @@ func (s *Service) PutProviderErrorDetail(d ProviderErrorDetail) error {
 		d.CreatedAt = s.now().UTC()
 	}
 	_, err := s.db.Exec(`INSERT INTO provider_error_details(
-		request_id,attempt,provider_id,provider_name,account_id,endpoint,client_model,effective_model,
+		request_id,attempt,connection_id,connection_name,provider_id,provider_name,account_id,endpoint,client_model,effective_model,
 		upstream_status,upstream_code,upstream_message,upstream_request_id,retry_after,category,public_code,
 		detail,detail_truncated,created_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(request_id,attempt) DO UPDATE SET
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(request_id,attempt,connection_id) DO UPDATE SET
+			connection_name=excluded.connection_name,
 			provider_id=excluded.provider_id,
 			provider_name=excluded.provider_name,
 			account_id=excluded.account_id,
@@ -59,7 +62,7 @@ func (s *Service) PutProviderErrorDetail(d ProviderErrorDetail) error {
 			detail=excluded.detail,
 			detail_truncated=excluded.detail_truncated,
 			created_at=excluded.created_at`,
-		d.RequestID, d.Attempt, d.ProviderID, d.ProviderName, d.AccountID, d.Endpoint, d.ClientModel, d.EffectiveModel,
+		d.RequestID, d.Attempt, d.ConnectionID, d.ConnectionName, d.ProviderID, d.ProviderName, d.AccountID, d.Endpoint, d.ClientModel, d.EffectiveModel,
 		d.UpstreamStatus, d.UpstreamCode, d.UpstreamMessage, d.UpstreamRequestID, d.RetryAfter, d.Category, d.PublicCode,
 		d.Detail, boolInt(d.DetailTruncated), d.CreatedAt.Unix())
 	if err != nil {
@@ -78,10 +81,12 @@ func (s *Service) GetProviderErrorDetails(requestID string) ([]ProviderErrorDeta
 	if requestID == "" {
 		return nil, ErrNotFound
 	}
-	rows, err := s.db.Query(`SELECT request_id,attempt,provider_id,provider_name,account_id,endpoint,client_model,effective_model,
+	// Ordered by attempt, then by the order the keys were tried within it — created_at
+	// alone cannot separate two keys rejected in the same second.
+	rows, err := s.db.Query(`SELECT request_id,attempt,connection_id,connection_name,provider_id,provider_name,account_id,endpoint,client_model,effective_model,
 		upstream_status,upstream_code,upstream_message,upstream_request_id,retry_after,category,public_code,
 		detail,detail_truncated,created_at
-		FROM provider_error_details WHERE request_id=? ORDER BY attempt ASC`, requestID)
+		FROM provider_error_details WHERE request_id=? ORDER BY attempt ASC, created_at ASC, connection_id ASC`, requestID)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +95,7 @@ func (s *Service) GetProviderErrorDetails(requestID string) ([]ProviderErrorDeta
 	for rows.Next() {
 		var d ProviderErrorDetail
 		var trunc, created int64
-		if err := rows.Scan(&d.RequestID, &d.Attempt, &d.ProviderID, &d.ProviderName, &d.AccountID, &d.Endpoint, &d.ClientModel, &d.EffectiveModel,
+		if err := rows.Scan(&d.RequestID, &d.Attempt, &d.ConnectionID, &d.ConnectionName, &d.ProviderID, &d.ProviderName, &d.AccountID, &d.Endpoint, &d.ClientModel, &d.EffectiveModel,
 			&d.UpstreamStatus, &d.UpstreamCode, &d.UpstreamMessage, &d.UpstreamRequestID, &d.RetryAfter, &d.Category, &d.PublicCode,
 			&d.Detail, &trunc, &created); err != nil {
 			return nil, err

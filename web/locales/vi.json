@@ -1096,6 +1096,8 @@
   "forward.detailClientModel": "Mô hình client",
   "forward.detailTargetModel": "Mô hình đích",
   "forward.detailProvider": "Nhà cung cấp",
+  "forward.detailConnection": "Key",
+  "forward.detailAttempts": "Số lần thử ({0})",
   "forward.detailAccount": "Tài khoản",
   "forward.detailRoute": "Tuyến",
   "forward.detailStatus": "Trạng thái",

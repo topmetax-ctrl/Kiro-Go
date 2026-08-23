@@ -1018,6 +1018,8 @@
   "forward.detailClientModel": "Client model",
   "forward.detailTargetModel": "Target model",
   "forward.detailProvider": "Provider",
+  "forward.detailConnection": "Key",
+  "forward.detailAttempts": "Attempts ({0})",
   "forward.detailAccount": "Account",
   "forward.detailRoute": "Route",
   "forward.detailStatus": "Status",

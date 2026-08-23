@@ -6074,6 +6074,7 @@
     add(t('forward.detailClientModel'), escapeHtml(e.clientModel || '—'));
     if (e.targetModel) add(t('forward.detailTargetModel'), escapeHtml(e.targetModel));
     add(t('forward.detailProvider'), escapeHtml(e.providerName || fwdProviderNames[e.providerId] || e.providerId || '—'));
+    if (e.connectionName) add(t('forward.detailConnection'), escapeHtml(e.connectionName));
     if (e.accountLabel || e.accountId) add(t('forward.detailAccount'), escapeHtml(e.accountLabel || e.accountId));
     if (e.routeId) add(t('forward.detailRoute'), '<span class="font-mono">' + escapeHtml(e.routeId) + '</span>');
     add(t('forward.detailStatus'), String(e.status || '—'));
@@ -6088,7 +6089,24 @@
     let err = '';
     const attempts = extra && Array.isArray(extra.attempts) ? extra.attempts : [];
     const diag = attempts.length ? attempts[attempts.length - 1] : null;
+    // With a key pool one request can be rejected several times over — once per key,
+    // then once per backup provider. Showing only the last rejection would name the
+    // wrong credential, so every attempt is listed whenever there is more than one.
+    let ladder = '';
+    if (attempts.length > 1) {
+      ladder = '<div class="fwd-detail-error"><div class="fwd-detail-label">' +
+        escapeHtml(t('forward.detailAttempts', String(attempts.length))) + '</div><ol class="fwd-attempt-list">' +
+        attempts.map(a => {
+          const who = [a.providerName || a.providerId || '—', a.connectionName || ''].filter(Boolean).join(' / ');
+          const what = [a.upstreamStatus ? String(a.upstreamStatus) : '', a.upstreamCode || a.category || ''].filter(Boolean).join(' ');
+          const why = a.upstreamMessage || a.detail || '';
+          return '<li><span class="font-mono">' + escapeHtml(who) + '</span>' +
+            (what ? ' <span class="fwd-attempt-status">' + escapeHtml(what) + '</span>' : '') +
+            (why ? '<div class="fwd-attempt-why">' + escapeHtml(why) + '</div>' : '') + '</li>';
+        }).join('') + '</ol></div>';
+    }
     if (diag) {
+      if (diag.connectionName && !e.connectionName) add(t('forward.detailConnection'), escapeHtml(diag.connectionName));
       if (diag.upstreamStatus) add(t('forward.detailUpstreamStatus'), String(diag.upstreamStatus));
       if (diag.upstreamCode) add(t('forward.detailUpstreamCode'), escapeHtml(diag.upstreamCode));
       if (diag.upstreamRequestId) add(t('forward.detailUpstreamRequestId'), '<span class="font-mono">' + escapeHtml(diag.upstreamRequestId) + '</span>');
@@ -6109,7 +6127,7 @@
         escapeHtml(t('forward.detailNoError')) + '</p></div>';
     }
 
-    return '<div class="fwd-detail-panel">' + err +
+    return '<div class="fwd-detail-panel">' + err + ladder +
       '<div class="fwd-detail-grid">' + rows.join('') + '</div>' +
       '<div class="fwd-detail-actions"><button type="button" class="btn btn-outline btn-sm" ' +
       'data-fwd-copy="' + escapeHtml(uid) + '"><i class="fa-solid fa-copy" aria-hidden="true"></i>' +

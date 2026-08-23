@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"kiro-go/apikey"
 	"kiro-go/config"
 	"kiro-go/metrics"
 )
@@ -211,5 +213,66 @@ func TestConnectionDoesNotRotateAfterStreamCommit(t *testing.T) {
 	}
 	if second != 0 {
 		t.Fatalf("rotated to second key after stream started")
+	}
+}
+
+// End to end: every key on a pool is rejected, so the admin diagnostic must name
+// each dead credential. This is the pairing of the key pool with the provider
+// error boundary — the client is told nothing beyond a generic api_error, while the
+// operator gets one classified row per key, enough to know which to replace.
+func TestPoolFailureNamesEveryDeadKeyToAdminOnly(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		w.WriteHeader(401)
+		_, _ = w.Write([]byte(`{"error":{"code":"INVALID_KEY","message":"rejected ` + key + `"}}`))
+	}))
+	defer upstream.Close()
+
+	setupProviderWithKeys(t, upstream.URL, []string{"key-a", "key-b", "key-c"}, "")
+	svc, err := apikey.Open(filepath.Join(t.TempDir(), "k.db"), []byte("pepper-32-bytes-long-for-tests!!!!"), apikey.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+
+	h := &Handler{keys: svc}
+	rec := httptest.NewRecorder()
+	body := `{"model":"m","messages":[],"stream":false}`
+	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	r = r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, ""))
+	r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey{}, "req-pool-e2e"))
+	if !h.tryForwardUpstream(r, rec, []byte(body), "m", false, "/messages", true, "") {
+		t.Fatal("expected the route to forward")
+	}
+
+	// The client learns nothing about the credentials.
+	client := rec.Body.String()
+	for _, key := range []string{"key-a", "key-b", "key-c", "INVALID_KEY"} {
+		if strings.Contains(client, key) {
+			t.Fatalf("client response leaked %q: %s", key, client)
+		}
+	}
+
+	details, err := svc.GetProviderErrorDetails("req-pool-e2e")
+	if err != nil {
+		t.Fatalf("no diagnostic stored: %v", err)
+	}
+	if len(details) != 3 {
+		t.Fatalf("want one row per key tried, got %d: %+v", len(details), details)
+	}
+	seen := map[string]bool{}
+	for _, d := range details {
+		seen[d.ConnectionName] = true
+		if d.UpstreamStatus != 401 {
+			t.Errorf("%s recorded status %d", d.ConnectionName, d.UpstreamStatus)
+		}
+		if d.ConnectionID == "" {
+			t.Errorf("%s has no connection id", d.ConnectionName)
+		}
+	}
+	for _, name := range []string{"Key 1", "Key 2", "Key 3"} {
+		if !seen[name] {
+			t.Errorf("diagnostic missing %s; got %v", name, seen)
+		}
 	}
 }

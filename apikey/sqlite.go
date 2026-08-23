@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -136,6 +136,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expires ON portal_sessions(expires_at);
 CREATE TABLE IF NOT EXISTS provider_error_details (
   request_id TEXT NOT NULL,
   attempt INTEGER NOT NULL DEFAULT 0,
+  connection_id TEXT NOT NULL DEFAULT '',
+  connection_name TEXT NOT NULL DEFAULT '',
   provider_id TEXT NOT NULL DEFAULT '',
   provider_name TEXT NOT NULL DEFAULT '',
   account_id TEXT NOT NULL DEFAULT '',
@@ -152,7 +154,7 @@ CREATE TABLE IF NOT EXISTS provider_error_details (
   detail TEXT NOT NULL DEFAULT '',
   detail_truncated INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
-  PRIMARY KEY (request_id, attempt)
+  PRIMARY KEY (request_id, attempt, connection_id)
 );
 CREATE INDEX IF NOT EXISTS idx_provider_errors_created ON provider_error_details(created_at);
 `
@@ -275,6 +277,15 @@ func ensureSchemaVersion(db *sql.DB) error {
 		if _, err := db.Exec(`INSERT INTO schema_migrations(version) VALUES (4)`); err != nil {
 			return fmt.Errorf("record schema version 4: %w", err)
 		}
+		v = 4
+	}
+	if v < 5 {
+		if err := migrateV5(db); err != nil {
+			return fmt.Errorf("migrate v5: %w", err)
+		}
+		if _, err := db.Exec(`INSERT INTO schema_migrations(version) VALUES (5)`); err != nil {
+			return fmt.Errorf("record schema version 5: %w", err)
+		}
 	}
 	return nil
 }
@@ -300,6 +311,8 @@ func migrateV4(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS provider_error_details (
   request_id TEXT NOT NULL,
   attempt INTEGER NOT NULL DEFAULT 0,
+  connection_id TEXT NOT NULL DEFAULT '',
+  connection_name TEXT NOT NULL DEFAULT '',
   provider_id TEXT NOT NULL DEFAULT '',
   provider_name TEXT NOT NULL DEFAULT '',
   account_id TEXT NOT NULL DEFAULT '',
@@ -316,7 +329,7 @@ func migrateV4(db *sql.DB) error {
   detail TEXT NOT NULL DEFAULT '',
   detail_truncated INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
-  PRIMARY KEY (request_id, attempt)
+  PRIMARY KEY (request_id, attempt, connection_id)
 )`,
 		`CREATE INDEX IF NOT EXISTS idx_provider_errors_created ON provider_error_details(created_at)`,
 	}
@@ -326,6 +339,79 @@ func migrateV4(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// migrateV5 adds the connection dimension to provider_error_details.
+//
+// The column is only half of it: the primary key has to grow too. attempt is the
+// index of a ROUTE TARGET, and one target can now try several keys in turn, so
+// (request_id, attempt) is no longer unique — the upsert in
+// PutProviderErrorDetail would have each rejected key overwrite the previous
+// one, leaving exactly one row where the operator needs to see which of the keys
+// failed and how. SQLite cannot alter a primary key in place, so the table is
+// rebuilt and the existing rows are carried over with an empty connection_id,
+// which is what they legitimately are: failures recorded before pools existed.
+func migrateV5(db *sql.DB) error {
+	if has, err := columnExists(db, "provider_error_details", "connection_id"); err != nil {
+		return err
+	} else if has {
+		return nil
+	}
+	stmts := []string{
+		`CREATE TABLE provider_error_details_v5 (
+  request_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  connection_id TEXT NOT NULL DEFAULT '',
+  connection_name TEXT NOT NULL DEFAULT '',
+  provider_id TEXT NOT NULL DEFAULT '',
+  provider_name TEXT NOT NULL DEFAULT '',
+  account_id TEXT NOT NULL DEFAULT '',
+  endpoint TEXT NOT NULL DEFAULT '',
+  client_model TEXT NOT NULL DEFAULT '',
+  effective_model TEXT NOT NULL DEFAULT '',
+  upstream_status INTEGER NOT NULL DEFAULT 0,
+  upstream_code TEXT NOT NULL DEFAULT '',
+  upstream_message TEXT NOT NULL DEFAULT '',
+  upstream_request_id TEXT NOT NULL DEFAULT '',
+  retry_after TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL DEFAULT '',
+  public_code TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  detail_truncated INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (request_id, attempt, connection_id)
+)`,
+		`INSERT INTO provider_error_details_v5(
+  request_id,attempt,provider_id,provider_name,account_id,endpoint,client_model,effective_model,
+  upstream_status,upstream_code,upstream_message,upstream_request_id,retry_after,category,public_code,
+  detail,detail_truncated,created_at)
+ SELECT request_id,attempt,provider_id,provider_name,account_id,endpoint,client_model,effective_model,
+  upstream_status,upstream_code,upstream_message,upstream_request_id,retry_after,category,public_code,
+  detail,detail_truncated,created_at FROM provider_error_details`,
+		`DROP TABLE provider_error_details`,
+		`ALTER TABLE provider_error_details_v5 RENAME TO provider_error_details`,
+		`CREATE INDEX IF NOT EXISTS idx_provider_errors_created ON provider_error_details(created_at)`,
+	}
+	for _, st := range stmts {
+		if _, err := db.Exec(st); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// columnExists reports whether a table already carries a column, so a migration
+// can be skipped on a database created from the current base schema.
+func columnExists(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(`SELECT 1 FROM pragma_table_info(?) WHERE name=?`, table, column)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return true, rows.Err()
+	}
+	return false, rows.Err()
 }
 
 func migrateV3(db *sql.DB) error {

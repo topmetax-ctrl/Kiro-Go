@@ -3111,6 +3111,29 @@ img.brand-icon {
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* The per-attempt ladder for a key pool: each rejected credential in the order it
+   was tried. Numbered, because the order is the information. */
+.fwd-attempt-list {
+  margin: 0.3rem 0 0;
+  padding-left: 1.4rem;
+  font-size: 0.75rem;
+  display: grid;
+  gap: 0.3rem;
+}
+.fwd-attempt-list li {
+  list-style: decimal;
+}
+.fwd-attempt-status {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--destructive) 12%, transparent);
+  color: var(--destructive);
+}
+.fwd-attempt-why {
+  margin-top: 0.15rem;
+  color: var(--muted-foreground);
+  word-break: break-word;
+}
 .fwd-detail-actions {
   margin-top: 0.75rem;
 }
