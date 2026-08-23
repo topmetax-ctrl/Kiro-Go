@@ -2963,6 +2963,9 @@
         routes: Array.isArray(d.routes) ? d.routes : []
       };
       renderUpstreams();
+      // An add/edit/delete/toggle from inside the keys modal just refreshed the
+      // cache; redraw the modal from it or the operator sees stale rows.
+      if ($('upstreamConnsListModal').classList.contains('active')) renderConnsListModal();
     } catch (e) {
       upstreamCache = { providers: [], routes: [] };
       if (provList) provList.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('upstreams.loadFailed')) + '</div>';
@@ -3030,7 +3033,7 @@
         '</div>' +
       '</div>' +
       '<div class="text-xs muted-text font-mono" data-fwd-inline-for="' + id + '" style="margin-top:0.35rem;"></div>' +
-      connectionsPanel(item) +
+      connectionsSummary(item) +
       '<div class="provider-detail hidden" data-provider-detail="' + id + '"></div>' +
     '</div>';
   }
@@ -3068,72 +3071,163 @@
     }
   }
 
-  function connectionsPanel(item) {
+  // connectionsSummary is all a provider CARD shows of its key pool: one line with
+  // the count and the health spread, plus the button that opens the manager. The
+  // rows themselves live in the keys modal — rendering them inline would put every
+  // credential of every provider on one page, which stops being a list long before
+  // it stops being possible.
+  function connectionsSummary(item) {
     const id = item.id || '';
     const conns = providerConnections(item);
-    const st = connTestState(id);
-    const models = providerModels[id] || [];
+    let ok = 0, limited = 0, auth = 0, down = 0;
+    conns.forEach(c => {
+      switch (c.health || 'ok') {
+        case 'rate_limited': limited++; break;
+        case 'auth_failed': auth++; break;
+        case 'unhealthy': down++; break;
+        default: ok++;
+      }
+    });
+    const chips = [];
+    if (ok) chips.push('<span class="conn-health conn-health-ok">' + escapeHtml(t('upstreams.connHealthOk')) + ' ' + ok + '</span>');
+    if (limited) chips.push('<span class="conn-health conn-health-rate_limited">' + escapeHtml(t('upstreams.connHealthRateLimited')) + ' ' + limited + '</span>');
+    if (auth) chips.push('<span class="conn-health conn-health-auth_failed">' + escapeHtml(t('upstreams.connHealthAuthFailed')) + ' ' + auth + '</span>');
+    if (down) chips.push('<span class="conn-health conn-health-unhealthy">' + escapeHtml(t('upstreams.connHealthUnhealthy')) + ' ' + down + '</span>');
+    return '<div class="conn-summary">' +
+      '<i class="fa-solid fa-key" aria-hidden="true"></i> ' +
+      '<button class="btn btn-outline btn-xs" type="button" data-upstream-action="keys" data-id="' + escapeAttr(id) + '">' +
+        escapeHtml(t('upstreams.keysBtn', String(conns.length))) + '</button>' +
+      chips.join('') +
+    '</div>';
+  }
+
+  // ---- Keys modal: the pool behind one provider, paginated so a large import
+  // stays navigable and the provider list never grows with it. ----
+  let connsList = { pid: null, page: 0, pageSize: 50, q: '' };
+
+  function openConnsListModal(pid) {
+    connsList.pid = pid;
+    connsList.page = 0;
+    connsList.q = '';
+    const box = $('upstreamConnsSearch');
+    if (box) box.value = '';
+    renderConnsListModal();
+    openDialog('upstreamConnsListModal');
+  }
+
+  function connsListProvider() {
+    return upstreamCache.providers.find(x => x.id === connsList.pid) || null;
+  }
+
+  function connsListFiltered() {
+    const p = connsListProvider();
+    const all = p ? providerConnections(p) : [];
+    const kw = connsList.q.trim().toLowerCase();
+    if (!kw) return all;
+    return all.filter(c =>
+      (c.name || '').toLowerCase().includes(kw) ||
+      (c.apiKeyMasked || '').toLowerCase().includes(kw));
+  }
+
+  function renderConnsListModal() {
+    const p = connsListProvider();
+    const body = $('upstreamConnsListBody');
+    if (!body) return;
+    if (!p) { body.innerHTML = ''; return; }
+    $('upstreamConnsListTitle').textContent = t('upstreams.connsModalTitle', p.name || p.baseUrl || connsList.pid);
+
+    const st = connTestState(p.id);
+    const all = connsListFiltered();
+    const pages = Math.max(1, Math.ceil(all.length / connsList.pageSize));
+    if (connsList.page >= pages) connsList.page = pages - 1;
+    if (connsList.page < 0) connsList.page = 0;
+    const pageRows = all.slice(connsList.page * connsList.pageSize, (connsList.page + 1) * connsList.pageSize);
+
+    // Progress line while a one-by-one run is going.
+    let done = 0, totalQueued = 0;
+    Object.values(st.results).forEach(r => {
+      if (r.status === 'queued' || r.status === 'testing') totalQueued++;
+      else done++;
+    });
+    const stats = $('upstreamConnsListStats');
+    if (stats) {
+      stats.textContent = st.running
+        ? t('upstreams.connTestProgress', String(done), String(done + totalQueued))
+        : t('upstreams.connStats', String(all.length), String(done), String(all.filter(c => { const r = st.results[c.id]; return r && r.status === 'success'; }).length), String(all.filter(c => { const r = st.results[c.id]; return r && (r.status === 'failed' || r.status === 'timeout'); }).length));
+    }
+
+    const models = providerModels[p.id] || [];
     const testModel = st.model || models[0] || '';
     const modelOpts = models.map(m =>
       '<option value="' + escapeAttr(m) + '"' + (m === testModel ? ' selected' : '') + '>' + escapeHtml(m) + '</option>'
     ).join('');
-    const rrOn = (item.connectionStrategy || 'round_robin') !== 'primary';
-    let passed = 0, failed = 0, completed = 0;
-    conns.forEach(c => {
-      const r = st.results[c.id];
-      if (!r || r.status === 'queued' || r.status === 'testing') return;
-      completed++;
-      if (r.status === 'success') passed++;
-      else if (r.status === 'failed' || r.status === 'timeout') failed++;
-    });
-    const rows = conns.map(c => {
+    const rrOn = (p.connectionStrategy || 'round_robin') !== 'primary';
+
+    const rows = pageRows.map(c => {
       const cid = escapeAttr(c.id || '');
       const checked = !st.selected || st.selected[c.id] ? ' checked' : '';
       const res = st.results[c.id];
       const testLine = connTestLabel(res);
       return '<div class="conn-row">' +
-        '<label class="conn-check"><input type="checkbox" data-conn-select="' + cid + '" data-pid="' + escapeAttr(id) + '"' + checked + ' /></label>' +
+        '<label class="conn-check"><input type="checkbox" data-conn-select="' + cid + '" data-pid="' + escapeAttr(p.id) + '"' + checked + ' /></label>' +
         '<div class="conn-main">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
             '<span class="font-semibold">' + escapeHtml(c.name || t('upstreams.unnamed')) + '</span>' +
             '<span class="text-xs font-mono muted-text">' + escapeHtml(c.apiKeyMasked || '****') + '</span>' +
             '<span class="conn-health conn-health-' + escapeAttr(c.health || 'ok') + '">' + escapeHtml(connHealthLabel(c.health)) + '</span>' +
-            (testLine ? '<span class="text-xs muted-text">' + escapeHtml(testLine) + '</span>' : '') +
+            '<span class="text-xs muted-text" data-conn-test="' + cid + '">' + (testLine ? escapeHtml(testLine) : '') + '</span>' +
           '</div>' +
         '</div>' +
         '<div class="flex items-center gap-2">' +
           '<label class="switch" title="' + escapeAttr(t('upstreams.formEnabled')) + '">' +
-            '<input type="checkbox" data-conn-action="toggle" data-pid="' + escapeAttr(id) + '" data-cid="' + cid + '"' + (c.enabled ? ' checked' : '') + ' />' +
+            '<input type="checkbox" data-conn-action="toggle" data-pid="' + escapeAttr(p.id) + '" data-cid="' + cid + '"' + (c.enabled ? ' checked' : '') + ' />' +
             '<span class="slider"></span></label>' +
-          '<button class="btn btn-outline btn-xs" type="button" data-conn-action="edit" data-pid="' + escapeAttr(id) + '" data-cid="' + cid + '">' + escapeHtml(t('upstreams.actionEdit')) + '</button>' +
-          '<button class="btn btn-danger btn-xs" type="button" data-conn-action="delete" data-pid="' + escapeAttr(id) + '" data-cid="' + cid + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
+          '<button class="btn btn-outline btn-xs" type="button" data-conn-action="edit" data-pid="' + escapeAttr(p.id) + '" data-cid="' + cid + '">' + escapeHtml(t('upstreams.actionEdit')) + '</button>' +
+          '<button class="btn btn-danger btn-xs" type="button" data-conn-action="delete" data-pid="' + escapeAttr(p.id) + '" data-cid="' + cid + '">' + escapeHtml(t('upstreams.actionDelete')) + '</button>' +
         '</div>' +
       '</div>';
     }).join('');
-    return '<div class="conn-panel" data-conn-panel="' + escapeAttr(id) + '">' +
-      '<div class="conn-panel-head">' +
-        '<span class="font-semibold text-xs">' + escapeHtml(t('upstreams.connectionsTitle')) + '</span>' +
-        '<span class="text-xs muted-text">' +
-          escapeHtml(t('upstreams.connStats', String(conns.length), String(completed), String(passed), String(failed))) +
-        '</span>' +
-      '</div>' +
+
+    body.innerHTML =
       '<div class="conn-toolbar">' +
-        '<button class="btn btn-ghost btn-xs" type="button" data-conn-action="select-all" data-pid="' + escapeAttr(id) + '">' + escapeHtml(t('upstreams.connSelectAll')) + '</button>' +
+        '<button class="btn btn-ghost btn-xs" type="button" data-conn-action="select-all" data-pid="' + escapeAttr(p.id) + '">' + escapeHtml(t('upstreams.connSelectAll')) + '</button>' +
         '<label class="text-xs">' + escapeHtml(t('upstreams.connTestModel')) +
-          ' <select data-conn-action="test-model" data-pid="' + escapeAttr(id) + '">' +
+          ' <select data-conn-action="test-model" data-pid="' + escapeAttr(p.id) + '">' +
             (modelOpts || '<option value="">' + escapeHtml(t('upstreams.connTestModelNone')) + '</option>') +
           '</select></label>' +
         '<label class="flex items-center gap-1 text-xs">' +
-          '<span class="switch"><input type="checkbox" data-conn-action="rr" data-pid="' + escapeAttr(id) + '"' + (rrOn ? ' checked' : '') + ' /><span class="slider"></span></span>' +
+          '<span class="switch"><input type="checkbox" data-conn-action="rr" data-pid="' + escapeAttr(p.id) + '"' + (rrOn ? ' checked' : '') + ' /><span class="slider"></span></span>' +
           escapeHtml(t('upstreams.roundRobin')) +
         '</label>' +
+        '<button class="btn btn-outline btn-xs" type="button" data-upstream-action="add-key" data-id="' + escapeAttr(p.id) + '">' + escapeHtml(t('upstreams.addApiKey')) + '</button>' +
+        '<button class="btn btn-outline btn-xs" type="button" data-upstream-action="bulk" data-id="' + escapeAttr(p.id) + '">' + escapeHtml(t('upstreams.bulkImport')) + '</button>' +
         (st.running
-          ? '<button class="btn btn-outline btn-xs" type="button" data-conn-action="stop" data-pid="' + escapeAttr(id) + '">' + escapeHtml(t('upstreams.connStop')) + '</button>'
-          : '<button class="btn btn-outline btn-xs" type="button" data-conn-action="test-all" data-pid="' + escapeAttr(id) + '">' + escapeHtml(t('upstreams.connTestOneByOne')) + '</button>') +
+          ? '<button class="btn btn-outline btn-xs" type="button" data-conn-action="stop" data-pid="' + escapeAttr(p.id) + '">' + escapeHtml(t('upstreams.connStop')) + '</button>'
+          : '<button class="btn btn-outline btn-xs" type="button" data-conn-action="test-all" data-pid="' + escapeAttr(p.id) + '">' + escapeHtml(t('upstreams.connTestOneByOne')) + '</button>') +
       '</div>' +
-      (rows || '<div class="text-xs muted-text" style="padding:0.35rem 0;">' + escapeHtml(t('upstreams.connectionsEmpty')) + '</div>') +
-    '</div>';
+      (rows || '<div class="text-xs muted-text" style="padding:0.75rem 0;">' + escapeHtml(t(upstreamCache.providers.some(x => x.id === connsList.pid) && !providerConnections(p).length ? 'upstreams.connectionsEmpty' : 'upstreams.connsNoMatch')) + '</div>') +
+      '<div class="conn-pager">' +
+        '<button class="btn btn-outline btn-xs" type="button" data-conns-page="prev"' + (connsList.page <= 0 ? ' disabled' : '') + '><i class="fa-solid fa-chevron-left" aria-hidden="true"></i></button>' +
+        '<span class="text-xs muted-text">' + escapeHtml(t('upstreams.connsPageInfo',
+          String(all.length ? connsList.page * connsList.pageSize + 1 : 0),
+          String(Math.min(all.length, (connsList.page + 1) * connsList.pageSize)),
+          String(all.length))) + '</span>' +
+        '<button class="btn btn-outline btn-xs" type="button" data-conns-page="next"' + (connsList.page >= pages - 1 ? ' disabled' : '') + '><i class="fa-solid fa-chevron-right" aria-hidden="true"></i></button>' +
+      '</div>';
   }
+
+  // updateConnTestLine refreshes ONE row's test verdict in place. A thousand-key
+  // pool must not re-render the whole provider list per key probed — this is the
+  // difference between one DOM write per result and one innerHTML rebuild per key.
+  function updateConnTestLine(pid, cid) {
+    const el = document.querySelector('[data-conn-test="' + cssEscape(cid) + '"]');
+    if (el) {
+      const line = connTestLabel(connTestState(pid).results[cid]);
+      el.textContent = line || '';
+    }
+    if ($('upstreamConnsListModal').classList.contains('active')) renderConnsListModal();
+  }
+
 
   // Hidden providers are moved below a disclosure row instead of being dropped
   // from the DOM: the point of Hide is decluttering a long list, and a provider
@@ -3518,7 +3612,7 @@
     for (const c of conns) {
       if (!st.running) break;
       st.results[c.id] = { status: 'testing' };
-      renderProviders();
+      updateConnTestLine(pid, c.id);
       try {
         const res = await api('/upstreams/' + encodeURIComponent(pid) + '/connections/' + encodeURIComponent(c.id) + '/test', {
           method: 'POST',
@@ -3529,6 +3623,7 @@
         if (d.error === 'timeout') st.results[c.id] = { status: 'timeout', latencyMs: d.latencyMs };
         else if (d.ok) st.results[c.id] = { status: 'success', latencyMs: d.latencyMs };
         else st.results[c.id] = { status: 'failed', latencyMs: d.latencyMs, http: d.status, error: d.error };
+        updateConnTestLine(pid, c.id);
       } catch (e) {
         if (e && e.name === 'AbortError') {
           st.results[c.id] = { status: 'stopped' };
@@ -4508,6 +4603,7 @@
         else if (action === 'load') loadProviderModels(id);
         else if (action === 'details') toggleProviderDetail(id, btn, provList);
         else if (action === 'hide') setProviderHidden(id, !(entry && entry.hidden));
+        else if (action === 'keys') openConnsListModal(id);
         else if (action === 'add-key') openConnModal(id, null);
         else if (action === 'bulk') openBulkModal(id);
       });
@@ -4522,6 +4618,77 @@
         // stats already in memory instead of waiting for the next poll.
         renderProviderInlineStats();
       });
+      // The keys modal reuses the conn-action vocabulary but lives outside the
+      // provider list, so it carries its own delegation.
+      const connsBody = $('upstreamConnsListBody');
+      if (connsBody) {
+        connsBody.addEventListener('click', e => {
+          const ubtn = e.target.closest('[data-upstream-action]');
+          if (ubtn) {
+            const act = ubtn.dataset.upstreamAction;
+            const pid = ubtn.dataset.id;
+            if (act === 'add-key') openConnModal(pid, null);
+            else if (act === 'bulk') openBulkModal(pid);
+            return;
+          }
+          const pageBtn = e.target.closest('[data-conns-page]');
+          if (pageBtn) {
+            if (pageBtn.dataset.connsPage === 'prev') connsList.page--;
+            else connsList.page++;
+            renderConnsListModal();
+            return;
+          }
+          const btn = e.target.closest('[data-conn-action]');
+          if (!btn) return;
+          const action = btn.dataset.connAction;
+          const pid = btn.dataset.pid;
+          if (!pid) return;
+          const p = upstreamCache.providers.find(x => x.id === pid);
+          const cid = btn.dataset.cid;
+          const conn = p ? providerConnections(p).find(c => c.id === cid) : null;
+          if (action === 'edit') openConnModal(pid, conn);
+          else if (action === 'delete') deleteConnection(pid, cid, conn ? conn.name : '');
+          else if (action === 'test-all') testConnectionsOneByOne(pid);
+          else if (action === 'stop') stopConnectionTests(pid);
+          else if (action === 'select-all') {
+            connTestState(pid).selected = null;
+            renderConnsListModal();
+          }
+        });
+        connsBody.addEventListener('change', e => {
+          const connToggle = e.target.closest('input[data-conn-action="toggle"]');
+          if (connToggle) {
+            toggleConnection(connToggle.dataset.pid, connToggle.dataset.cid, connToggle.checked);
+            return;
+          }
+          const rr = e.target.closest('input[data-conn-action="rr"]');
+          if (rr) { setRoundRobin(rr.dataset.pid, rr.checked); return; }
+          const sel = e.target.closest('select[data-conn-action="test-model"]');
+          if (sel) { connTestState(sel.dataset.pid).model = sel.value; return; }
+          const pick = e.target.closest('input[data-conn-select]');
+          if (pick) {
+            const st = connTestState(pick.dataset.pid);
+            if (!st.selected) st.selected = {};
+            providerConnections(upstreamCache.providers.find(x => x.id === pick.dataset.pid)).forEach(c => {
+              if (st.selected[c.id] === undefined) st.selected[c.id] = true;
+            });
+            st.selected[pick.dataset.connSelect] = pick.checked;
+          }
+        });
+      }
+      const connsSearch = $('upstreamConnsSearch');
+      if (connsSearch) {
+        let debounce;
+        connsSearch.addEventListener('input', () => {
+          clearTimeout(debounce);
+          debounce = setTimeout(() => {
+            connsList.q = connsSearch.value;
+            connsList.page = 0;
+            renderConnsListModal();
+          }, 150);
+        });
+      }
+
       // Actions rendered inside an expanded detail panel.
       provList.addEventListener('click', e => {
         const btn = e.target.closest('[data-pd-action]');
@@ -4866,6 +5033,11 @@
     bindDialogBackdropClose('upstreamImportModal', closeUpstreamImportModal);
     bindDialogBackdropClose('upstreamConnModal', closeConnModal);
     bindDialogBackdropClose('upstreamBulkModal', closeBulkModal);
+    const connsListClose = $('upstreamConnsListClose');
+    if (connsListClose) connsListClose.addEventListener('click', () => closeDialog('upstreamConnsListModal'));
+    const connsListCloseBtn = $('upstreamConnsListCloseBtn');
+    if (connsListCloseBtn) connsListCloseBtn.addEventListener('click', () => closeDialog('upstreamConnsListModal'));
+    bindDialogBackdropClose('upstreamConnsListModal', () => closeDialog('upstreamConnsListModal'));
     const connSave = $('upstreamConnModalSaveBtn');
     if (connSave) connSave.addEventListener('click', submitConnModal);
     const connCancel = $('upstreamConnModalCancelBtn');

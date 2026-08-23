@@ -1260,6 +1260,29 @@
     </div>
   </div>
 
+  <!-- The key pool behind one provider. Sits BEFORE the editor modals in the DOM
+       so an Edit dialog opened from it stacks on top without z-index juggling. -->
+  <div id="upstreamConnsListModal" class="modal">
+    <div class="modal-content" style="max-width:860px;">
+      <div class="modal-header">
+        <span class="modal-title" id="upstreamConnsListTitle"></span>
+        <button class="modal-close" id="upstreamConnsListClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="text-xs muted-text" id="upstreamConnsListStats" style="margin-bottom:0.5rem;"></div>
+        <div class="form-group">
+          <input type="text" id="upstreamConnsSearch" spellcheck="false"
+            data-i18n-placeholder="upstreams.connsSearchPlaceholder" />
+        </div>
+        <div id="upstreamConnsListBody"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-primary" id="upstreamConnsListCloseBtn" type="button" data-i18n="upstreams.closeBtn"></button>
+      </div>
+    </div>
+  </div>
+
   <div id="upstreamModal" class="modal">
     <div class="modal-content">
       <div class="modal-header">
