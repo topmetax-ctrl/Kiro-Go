@@ -3129,7 +3129,72 @@ img.brand-icon {
   align-items: center;
   justify-content: center;
   gap: 0.75rem;
-  margin-top: 0.6rem;
+}
+/* The key-pool footer carries the pager on the left and Close on the right, so the
+   only way off page 1 of a large pool never scrolls out of reach. Close is pinned
+   right by its own margin rather than by space-between: a single-page pool leaves
+   the pager host empty, and space-between would slide Close over to the left. */
+.conns-footer {
+  align-items: center;
+}
+.conns-footer > .btn {
+  margin-left: auto;
+}
+.conns-footer > div:empty {
+  display: none;
+}
+/* Counters, search and the bulk actions pin to the top of the key-pool modal: a
+   50-row page is about three screens tall, and scrolling back up to reach Add
+   API Key or the search box is the whole friction this modal was meant to remove.
+   Negative insets let the bar span the modal-body padding so rows scroll under it
+   rather than beside it. */
+.conns-sticky {
+  position: sticky;
+  /* The negative top margin above pulls the static box up over the modal-body
+     padding; the sticky offset must match it or the pinned bar paints 20px below
+     its own layout box and covers the first row. */
+  top: -1.25rem;
+  z-index: 2;
+  background: var(--card);
+  margin: -1.25rem -1.5rem 0.35rem;
+  padding: 1.25rem 1.5rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.conns-sticky .conn-toolbar {
+  margin-bottom: 0;
+}
+/* A label pasted from a credential dump has no spaces to break at; without this
+   the row grows a horizontal scrollbar and pushes the action buttons off-screen. */
+.conn-name {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.conns-sticky #upstreamConnsListStats:empty {
+  display: none;
+}
+/* On a phone the row is too narrow for name + key + health + actions on one line:
+   let it wrap and keep the controls flush right instead of overflowing sideways. */
+@media (max-width: 560px) {
+  .conn-row {
+    flex-wrap: wrap;
+    /* The name/key/health group wraps to three lines here; centering would float
+       the checkbox against the middle line instead of the row it selects. */
+    align-items: flex-start;
+  }
+  .conn-check {
+    padding-top: 0.15rem;
+  }
+  .conn-row > .flex.items-center.gap-2:last-child {
+    margin-left: auto;
+  }
+  .conns-sticky {
+    margin: -1rem -1rem 0.35rem;
+    padding: 1rem 1rem 0.5rem;
+    top: -1rem;
+  }
 }
 /* The per-attempt ladder for a key pool: each rejected credential in the order it
    was tried. Numbered, because the order is the information. */

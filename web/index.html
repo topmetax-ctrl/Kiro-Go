@@ -1269,15 +1269,24 @@
         <button class="modal-close" id="upstreamConnsListClose" type="button" aria-label=""
           data-i18n-aria-label="common.close">&times;</button>
       </div>
-      <div class="modal-body">
-        <div class="text-xs muted-text" id="upstreamConnsListStats" style="margin-bottom:0.5rem;"></div>
-        <div class="form-group">
-          <input type="text" id="upstreamConnsSearch" spellcheck="false"
+      <div class="modal-body" id="upstreamConnsListPanel">
+        <!-- Search, counters and the bulk actions stay pinned: one page is ~3
+             screens of rows, and a toolbar you have to scroll back up to reach is
+             the difference between operating a pool and hunting for the button. -->
+        <div class="conns-sticky">
+          <div class="text-xs muted-text" id="upstreamConnsListStats"></div>
+          <input type="text" id="upstreamConnsSearch" spellcheck="false" aria-label=""
+            data-i18n-aria-label="upstreams.connsSearchPlaceholder"
             data-i18n-placeholder="upstreams.connsSearchPlaceholder" />
+          <div id="upstreamConnsListToolbar"></div>
         </div>
         <div id="upstreamConnsListBody"></div>
       </div>
-      <div class="modal-footer">
+      <!-- The pager lives in the footer, not in the scroll area: a page is ~3
+           screens of rows, and a pager that scrolls away is a pager you cannot
+           reach without first scrolling past everything you were trying to skip. -->
+      <div class="modal-footer conns-footer">
+        <div id="upstreamConnsListPager"></div>
         <button class="btn btn-primary" id="upstreamConnsListCloseBtn" type="button" data-i18n="upstreams.closeBtn"></button>
       </div>
     </div>

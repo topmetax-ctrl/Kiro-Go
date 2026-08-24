@@ -43,7 +43,7 @@ func publicConnection(p config.UpstreamProvider, c config.UpstreamConnection) ma
 	health, until := connectionHealthPublic(p.ID, c.ID, time.Now())
 	out := map[string]interface{}{
 		"id":           c.ID,
-		"name":         c.Name,
+		"name":         config.SafeConnectionLabel(c),
 		"apiKeyMasked": config.MaskConnectionSecret(c.ApiKey),
 		"hasApiKey":    strings.TrimSpace(c.ApiKey) != "",
 		"enabled":      c.Enabled,

@@ -258,7 +258,7 @@ func (h *Handler) forwardToTarget(r *http.Request, w http.ResponseWriter, body [
 		}
 		if moreConns {
 			logger.Warnf("[Forward] %s via %s/%s failed (%s); trying next connection",
-				model, up.Name, conn.Name, outcome.internalMsg)
+				model, up.Name, config.SafeConnectionLabel(conn), outcome.internalMsg)
 		}
 	}
 	// Exhausted every key on this provider. 401/403 on every key is a credential
@@ -302,7 +302,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 			ProviderID:     up.ID,
 			ProviderName:   up.Name,
 			ConnectionID:   conn.ID,
-			ConnectionName: conn.Name,
+			ConnectionName: config.SafeConnectionLabel(conn),
 			Endpoint:       forwardEndpointKind(isClaudeRoute),
 			ClientIP:       clientIPFromContext(r.Context()),
 			ApiKeyID:       apiKeyID,
@@ -369,7 +369,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 	}
 	client := GetForwardClientForProxy(proxyURL)
 
-	logger.Infof("[Forward] %s -> %s/%s (%s)", model, up.Name, conn.Name, url)
+	logger.Infof("[Forward] %s -> %s/%s (%s)", model, up.Name, config.SafeConnectionLabel(conn), url)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -384,7 +384,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 		netErr := providererr.FromNetwork(err)
 		netErr.RequestID = requestIDFromContext(r.Context())
 		netErr.ProviderID, netErr.ProviderName = up.ID, up.Name
-		netErr.ConnectionID, netErr.ConnectionName = conn.ID, conn.Name
+		netErr.ConnectionID, netErr.ConnectionName = conn.ID, config.SafeConnectionLabel(conn)
 		netErr.ClientModel, netErr.EffectiveModel = model, model
 		netErr.Source = "forward"
 		netErr.Endpoint = forwardEndpointKind(isClaudeRoute)
@@ -411,7 +411,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 		in := providererr.FromHTTP(resp.StatusCode, errBody, resp.Header)
 		in.RequestID = requestIDFromContext(r.Context())
 		in.ProviderID, in.ProviderName = up.ID, up.Name
-		in.ConnectionID, in.ConnectionName = conn.ID, conn.Name
+		in.ConnectionID, in.ConnectionName = conn.ID, config.SafeConnectionLabel(conn)
 		in.ClientModel, in.EffectiveModel = model, strings.TrimSpace(rt.Target.TargetModel)
 		if in.EffectiveModel == "" {
 			in.EffectiveModel = model
@@ -423,7 +423,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 		h.persistProviderError(in)
 		pub := in.Public()
 		upstreamErrMsg = in.AdminSummary()
-		logger.Warnf("[Forward] %s/%s returned %d category=%s request=%s", up.Name, conn.Name, resp.StatusCode, in.Category, in.RequestID)
+		logger.Warnf("[Forward] %s/%s returned %d category=%s request=%s", up.Name, config.SafeConnectionLabel(conn), resp.StatusCode, in.Category, in.RequestID)
 
 		// With another attempt available anywhere — a sibling key on this provider, or
 		// a backup provider on the route — return WITHOUT writing to the client, so the

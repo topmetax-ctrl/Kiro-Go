@@ -195,6 +195,16 @@ func scoreImportToken(tok string, isLast bool) int {
 	return score
 }
 
+// looksLikeCredentialField reports whether a non-key column is itself a secret.
+// A pasted line often carries two keys (rotated pair, "key | key" export); naming
+// the row after the one that lost the key-column contest would print a live
+// credential in the admin list and the forward log. Length is not a useful filter
+// here — the field sits in a credential dump, so the prefix alone is enough.
+func looksLikeCredentialField(s string) bool {
+	s = strings.TrimSpace(s)
+	return s != "" && hasKnownKeyPrefix(s) && isKeyCharset(strings.TrimPrefix(s, "Bearer "))
+}
+
 func nameFromFields(fields []string, keyIndex int, naming string, fallback string) string {
 	switch naming {
 	case NamingKeyN:
@@ -202,7 +212,7 @@ func nameFromFields(fields []string, keyIndex int, naming string, fallback strin
 	case NamingJoinNonKey:
 		parts := make([]string, 0, len(fields))
 		for i, f := range fields {
-			if i == keyIndex {
+			if i == keyIndex || looksLikeCredentialField(f) {
 				continue
 			}
 			parts = append(parts, f)
@@ -213,7 +223,7 @@ func nameFromFields(fields []string, keyIndex int, naming string, fallback strin
 		return strings.Join(parts, " | ")
 	default:
 		for i, f := range fields {
-			if i == keyIndex {
+			if i == keyIndex || looksLikeCredentialField(f) {
 				continue
 			}
 			return f
@@ -345,6 +355,12 @@ func ParseConnectionImport(text, delimiter, naming string, existingKeys, existin
 		fallback := NextKeyNName(usedNames)
 		row.Name = nameFromFields(fields, chosen, naming, fallback)
 		if naming == NamingKeyN {
+			row.Name = fallback
+		}
+		// A pasted line can carry a second credential in the non-key columns
+		// (rotated key, "key | key" export). Naming the row after it would print
+		// that secret in the admin list and the forward log, so fall back to Key N.
+		if sanitizeConnectionName(row.Name, key) == "" {
 			row.Name = fallback
 		}
 		usedNames = append(usedNames, row.Name)

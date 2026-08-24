@@ -61,7 +61,11 @@ func migrateOneProvider(p *UpstreamProvider) bool {
 		return false
 	}
 	if len(p.Connections) > 0 {
-		return syncLegacyApiKey(p)
+		changed := repairConnectionNames(p)
+		if syncLegacyApiKey(p) {
+			changed = true
+		}
+		return changed
 	}
 	key := strings.TrimSpace(p.ApiKey)
 	if key == "" {
@@ -236,6 +240,7 @@ func AddUpstreamConnection(providerID string, conn UpstreamConnection) (Upstream
 	if strings.TrimSpace(conn.ID) == "" {
 		conn.ID = newUUID()
 	}
+	conn.Name = sanitizeConnectionName(conn.Name, key)
 	if strings.TrimSpace(conn.Name) == "" {
 		conn.Name = NextKeyNName(ConnectionNames(p))
 	}
@@ -276,6 +281,7 @@ func AddUpstreamConnections(providerID string, conns []UpstreamConnection) ([]Up
 		if strings.TrimSpace(conn.ID) == "" {
 			conn.ID = newUUID()
 		}
+		conn.Name = sanitizeConnectionName(conn.Name, key)
 		if strings.TrimSpace(conn.Name) == "" {
 			names := ConnectionNames(p)
 			for _, a := range added {
@@ -328,7 +334,15 @@ func UpdateUpstreamConnection(providerID, connectionID string, patch UpstreamCon
 	}
 	cur := p.Connections[cidx]
 	if patch.Name != nil {
-		if name := strings.TrimSpace(*patch.Name); name != "" {
+		// The incoming key wins for the secret-shape check: renaming and rotating
+		// in the same PATCH must not let the new secret through as a label.
+		against := cur.ApiKey
+		if patch.ApiKey != nil {
+			if k := strings.TrimSpace(*patch.ApiKey); k != "" && !IsMaskedSecret(k) {
+				against = k
+			}
+		}
+		if name := strings.TrimSpace(sanitizeConnectionName(*patch.Name, against)); name != "" {
 			cur.Name = name
 		}
 	}
@@ -408,4 +422,59 @@ func findProviderLocked(providerID string) (UpstreamProvider, int, error) {
 		}
 	}
 	return UpstreamProvider{}, -1, ErrUpstreamProviderNotFound
+}
+
+// looksLikeSecretName reports whether a connection label is actually a
+// credential. Operators paste a whole line into the name box, and bulk imports
+// of key-only columns have produced names identical to the key — which then
+// renders in the admin UI and prints into [Forward] logs in cleartext.
+// The key argument is the connection's own secret (may be empty after rotation).
+func looksLikeSecretName(name, key string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	if key = strings.TrimSpace(key); key != "" {
+		if name == key || strings.Contains(name, key) {
+			return true
+		}
+	}
+	// A rotated key leaves the old secret behind as the label, so also reject
+	// anything that simply looks like a token on its own.
+	return hasKnownKeyPrefix(name) && len(name) >= 20 && !strings.ContainsAny(name, " \t|,;")
+}
+
+// SafeConnectionLabel is the only name that may be shown or logged. Stored
+// names are repaired on load, but read paths mask defensively so a config
+// written by an older build cannot leak a secret through the UI or the log.
+func SafeConnectionLabel(c UpstreamConnection) string {
+	if looksLikeSecretName(c.Name, c.ApiKey) {
+		return MaskConnectionSecret(strings.TrimSpace(c.Name))
+	}
+	return c.Name
+}
+
+// sanitizeConnectionName blanks a secret-shaped label so the caller's
+// "Key N" fallback names the connection instead.
+func sanitizeConnectionName(name, key string) string {
+	if looksLikeSecretName(name, key) {
+		return ""
+	}
+	return name
+}
+
+// repairConnectionNames rewrites labels that hold a raw credential. Runs on load
+// so a config written before the guard existed stops leaking the secret into the
+// admin list and the forward log on the next start. Names are replaced with the
+// next free "Key N" rather than a mask, so the row stays referable.
+func repairConnectionNames(p *UpstreamProvider) bool {
+	changed := false
+	for i := range p.Connections {
+		if !looksLikeSecretName(p.Connections[i].Name, p.Connections[i].ApiKey) {
+			continue
+		}
+		p.Connections[i].Name = NextKeyNName(ConnectionNames(*p))
+		changed = true
+	}
+	return changed
 }

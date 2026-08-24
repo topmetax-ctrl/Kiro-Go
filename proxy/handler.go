@@ -3356,6 +3356,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiResetProviderStats(w, r)
 	case path == "/forward-stats/reset" && r.Method == "POST":
 		h.apiResetForwardStats(w, r)
+	case path == "/forward-events" && r.Method == "GET":
+		h.apiGetForwardEvents(w, r)
 	case path == "/provider-errors" && r.Method == "GET":
 		h.apiGetProviderError(w, r)
 	case strings.HasPrefix(path, "/provider-errors/") && r.Method == "GET":

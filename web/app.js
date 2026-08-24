@@ -668,9 +668,43 @@
       requestAnimationFrame(() => previous.focus({ preventScroll: true }));
     }
   }
+  // Escape must dismiss whatever dialog is on top, and it has to run the dialog's
+  // OWN close function: confirmModal resolves a promise, the editors clear their
+  // editing state. bindDialogBackdropClose already knows that function per dialog,
+  // so reuse its registry instead of a blind closeDialog().
+  const dialogCloseFns = {};
+  function closeTopDialog() {
+    const open = qsa('.modal.active');
+    if (!open.length) return false;
+    // The focus stack records open order; fall back to DOM order for a dialog
+    // opened without it.
+    let id = '';
+    for (let i = modalFocusStack.length - 1; i >= 0; i--) {
+      const candidate = $(modalFocusStack[i].id);
+      if (candidate && candidate.classList.contains('active')) { id = modalFocusStack[i].id; break; }
+    }
+    if (!id) id = open[open.length - 1].id;
+    if (!id) return false;
+    const fn = dialogCloseFns[id];
+    if (fn) fn();
+    else closeDialog(id);
+    return true;
+  }
+  function bindDialogEscape() {
+    // Capture phase on purpose: the combobox closes itself from a bubbling handler,
+    // so by the time a bubbling listener here ran, `.is-open` would already be gone
+    // and one Escape would dismiss both the list and the dialog behind it. Running
+    // first lets us see the combobox still open and yield to it.
+    document.addEventListener('keydown', e => {
+      if (e.key !== 'Escape') return;
+      if (document.querySelector('.custom-select.is-open')) return;
+      if (closeTopDialog()) e.preventDefault();
+    }, true);
+  }
   function bindDialogBackdropClose(id, closeFn) {
     const modal = $(id);
     if (!modal) return;
+    dialogCloseFns[id] = closeFn;
     let startedOnBackdrop = false;
     modal.addEventListener('pointerdown', e => {
       startedOnBackdrop = e.target === modal;
@@ -2965,7 +2999,7 @@
       renderUpstreams();
       // An add/edit/delete/toggle from inside the keys modal just refreshed the
       // cache; redraw the modal from it or the operator sees stale rows.
-      if ($('upstreamConnsListModal').classList.contains('active')) renderConnsListModal();
+      if (isDialogOpen('upstreamConnsListModal')) renderConnsListModal();
     } catch (e) {
       upstreamCache = { providers: [], routes: [] };
       if (provList) provList.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('upstreams.loadFailed')) + '</div>';
@@ -3103,12 +3137,13 @@
 
   // ---- Keys modal: the pool behind one provider, paginated so a large import
   // stays navigable and the provider list never grows with it. ----
-  let connsList = { pid: null, page: 0, pageSize: 50, q: '' };
+  let connsList = { pid: null, page: 0, pageSize: 50, q: '', resetScroll: false };
 
   function openConnsListModal(pid) {
     connsList.pid = pid;
     connsList.page = 0;
     connsList.q = '';
+    connsList.resetScroll = true;
     const box = $('upstreamConnsSearch');
     if (box) box.value = '';
     renderConnsListModal();
@@ -3143,18 +3178,7 @@
     if (connsList.page < 0) connsList.page = 0;
     const pageRows = all.slice(connsList.page * connsList.pageSize, (connsList.page + 1) * connsList.pageSize);
 
-    // Progress line while a one-by-one run is going.
-    let done = 0, totalQueued = 0;
-    Object.values(st.results).forEach(r => {
-      if (r.status === 'queued' || r.status === 'testing') totalQueued++;
-      else done++;
-    });
-    const stats = $('upstreamConnsListStats');
-    if (stats) {
-      stats.textContent = st.running
-        ? t('upstreams.connTestProgress', String(done), String(done + totalQueued))
-        : t('upstreams.connStats', String(all.length), String(done), String(all.filter(c => { const r = st.results[c.id]; return r && r.status === 'success'; }).length), String(all.filter(c => { const r = st.results[c.id]; return r && (r.status === 'failed' || r.status === 'timeout'); }).length));
-    }
+    renderConnsListStats();
 
     const models = providerModels[p.id] || [];
     const testModel = st.model || models[0] || '';
@@ -3172,7 +3196,7 @@
         '<label class="conn-check"><input type="checkbox" data-conn-select="' + cid + '" data-pid="' + escapeAttr(p.id) + '"' + checked + ' /></label>' +
         '<div class="conn-main">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
-            '<span class="font-semibold">' + escapeHtml(c.name || t('upstreams.unnamed')) + '</span>' +
+            '<span class="font-semibold conn-name">' + escapeHtml(c.name || t('upstreams.unnamed')) + '</span>' +
             '<span class="text-xs font-mono muted-text">' + escapeHtml(c.apiKeyMasked || '****') + '</span>' +
             '<span class="conn-health conn-health-' + escapeAttr(c.health || 'ok') + '">' + escapeHtml(connHealthLabel(c.health)) + '</span>' +
             '<span class="text-xs muted-text" data-conn-test="' + cid + '">' + (testLine ? escapeHtml(testLine) : '') + '</span>' +
@@ -3188,7 +3212,8 @@
       '</div>';
     }).join('');
 
-    body.innerHTML =
+    const toolbarHost = $('upstreamConnsListToolbar');
+    const toolbarHtml =
       '<div class="conn-toolbar">' +
         '<button class="btn btn-ghost btn-xs" type="button" data-conn-action="select-all" data-pid="' + escapeAttr(p.id) + '">' + escapeHtml(t('upstreams.connSelectAll')) + '</button>' +
         '<label class="text-xs">' + escapeHtml(t('upstreams.connTestModel')) +
@@ -3204,16 +3229,30 @@
         (st.running
           ? '<button class="btn btn-outline btn-xs" type="button" data-conn-action="stop" data-pid="' + escapeAttr(p.id) + '">' + escapeHtml(t('upstreams.connStop')) + '</button>'
           : '<button class="btn btn-outline btn-xs" type="button" data-conn-action="test-all" data-pid="' + escapeAttr(p.id) + '">' + escapeHtml(t('upstreams.connTestOneByOne')) + '</button>') +
-      '</div>' +
-      (rows || '<div class="text-xs muted-text" style="padding:0.75rem 0;">' + escapeHtml(t(upstreamCache.providers.some(x => x.id === connsList.pid) && !providerConnections(p).length ? 'upstreams.connectionsEmpty' : 'upstreams.connsNoMatch')) + '</div>') +
+      '</div>';
+    if (toolbarHost) toolbarHost.innerHTML = toolbarHtml;
+    // A re-render must not throw the operator back to the top of the pool — a test
+    // verdict or a toggle repaints the list while they are reading row 40. Turning a
+    // page or typing a search IS a new list, so those ask for the top explicitly.
+    const panel = $('upstreamConnsListPanel');
+    const keepScroll = connsList.resetScroll ? 0 : (panel ? panel.scrollTop : 0);
+    connsList.resetScroll = false;
+    body.innerHTML =
+      (toolbarHost ? '' : toolbarHtml) +
+      (rows || '<div class="text-xs muted-text" style="padding:0.75rem 0;">' + escapeHtml(t(upstreamCache.providers.some(x => x.id === connsList.pid) && !providerConnections(p).length ? 'upstreams.connectionsEmpty' : 'upstreams.connsNoMatch')) + '</div>');
+    const pagerHost = $('upstreamConnsListPager');
+    const pagerHtml =
       '<div class="conn-pager">' +
-        '<button class="btn btn-outline btn-xs" type="button" data-conns-page="prev"' + (connsList.page <= 0 ? ' disabled' : '') + '><i class="fa-solid fa-chevron-left" aria-hidden="true"></i></button>' +
+        '<button class="btn btn-outline btn-xs" type="button" data-conns-page="prev" aria-label="' + escapeAttr(t('apiKeys.prev')) + '" title="' + escapeAttr(t('apiKeys.prev')) + '"' + (connsList.page <= 0 ? ' disabled' : '') + '><i class="fa-solid fa-chevron-left" aria-hidden="true"></i></button>' +
         '<span class="text-xs muted-text">' + escapeHtml(t('upstreams.connsPageInfo',
           String(all.length ? connsList.page * connsList.pageSize + 1 : 0),
           String(Math.min(all.length, (connsList.page + 1) * connsList.pageSize)),
           String(all.length))) + '</span>' +
-        '<button class="btn btn-outline btn-xs" type="button" data-conns-page="next"' + (connsList.page >= pages - 1 ? ' disabled' : '') + '><i class="fa-solid fa-chevron-right" aria-hidden="true"></i></button>' +
+        '<button class="btn btn-outline btn-xs" type="button" data-conns-page="next" aria-label="' + escapeAttr(t('apiKeys.next')) + '" title="' + escapeAttr(t('apiKeys.next')) + '"' + (connsList.page >= pages - 1 ? ' disabled' : '') + '><i class="fa-solid fa-chevron-right" aria-hidden="true"></i></button>' +
       '</div>';
+    if (pagerHost) pagerHost.innerHTML = pages > 1 || all.length > connsList.pageSize ? pagerHtml : '';
+    else body.insertAdjacentHTML('beforeend', pagerHtml);
+    if (panel) panel.scrollTop = keepScroll;
   }
 
   // updateConnTestLine refreshes ONE row's test verdict in place. A thousand-key
@@ -3225,7 +3264,32 @@
       const line = connTestLabel(connTestState(pid).results[cid]);
       el.textContent = line || '';
     }
-    if ($('upstreamConnsListModal').classList.contains('active')) renderConnsListModal();
+    // Only the counters move with each verdict. Re-rendering the whole modal here
+    // would rebuild a 750-node list once per key — 137 rebuilds for one Test run.
+    if (isDialogOpen('upstreamConnsListModal') && connsList.pid === pid) renderConnsListStats();
+  }
+
+  // renderConnsListStats writes the counter line (and the running progress) without
+  // touching the row list. Kept separate so both the full render and the per-result
+  // update can call it.
+  function renderConnsListStats() {
+    const p = connsListProvider();
+    const stats = $('upstreamConnsListStats');
+    if (!p || !stats) return;
+    const st = connTestState(p.id);
+    const all = connsListFiltered();
+    let done = 0, pending = 0;
+    Object.values(st.results).forEach(r => {
+      if (r.status === 'queued' || r.status === 'testing') pending++;
+      else done++;
+    });
+    if (st.running) {
+      stats.textContent = t('upstreams.connTestProgress', String(done), String(done + pending));
+      return;
+    }
+    const passed = all.filter(c => { const r = st.results[c.id]; return r && r.status === 'success'; }).length;
+    const failed = all.filter(c => { const r = st.results[c.id]; return r && (r.status === 'failed' || r.status === 'timeout'); }).length;
+    stats.textContent = t('upstreams.connStats', String(all.length), String(done), String(passed), String(failed));
   }
 
 
@@ -3568,7 +3632,10 @@
       await loadUpstreams();
     } catch (e) {
       toast((e && e.message) || t('common.saveFailed'), 'error');
+      // Roll the switch back to the server's truth. The modal owns the switch, so
+      // repaint it too when it is the surface the operator is looking at.
       renderProviders();
+      if (isDialogOpen('upstreamConnsListModal') && connsList.pid === pid) renderConnsListModal();
     }
   }
 
@@ -3608,7 +3675,9 @@
     st.abort = new AbortController();
     st.results = {};
     conns.forEach(c => { st.results[c.id] = { status: 'queued' }; });
-    renderProviders();
+    // One render at the start to show the queued rows and swap Test → Stop; each
+    // result then updates only its own row plus the counter line.
+    if (isDialogOpen('upstreamConnsListModal') && connsList.pid === pid) renderConnsListModal();
     for (const c of conns) {
       if (!st.running) break;
       st.results[c.id] = { status: 'testing' };
@@ -3637,7 +3706,8 @@
     });
     st.running = false;
     st.abort = null;
-    renderProviders();
+    // Final render restores the Stop → Test button and settles the counters.
+    if (isDialogOpen('upstreamConnsListModal') && connsList.pid === pid) renderConnsListModal();
   }
 
   function stopConnectionTests(pid) {
@@ -4619,8 +4689,10 @@
         renderProviderInlineStats();
       });
       // The keys modal reuses the conn-action vocabulary but lives outside the
-      // provider list, so it carries its own delegation.
-      const connsBody = $('upstreamConnsListBody');
+      // provider list, so it carries its own delegation. Bound on the whole modal:
+      // the toolbar sits in the sticky header and the pager in the footer, so a
+      // listener on the row list alone would miss both.
+      const connsBody = $('upstreamConnsListModal') || $('upstreamConnsListBody');
       if (connsBody) {
         connsBody.addEventListener('click', e => {
           const ubtn = e.target.closest('[data-upstream-action]');
@@ -4635,6 +4707,7 @@
           if (pageBtn) {
             if (pageBtn.dataset.connsPage === 'prev') connsList.page--;
             else connsList.page++;
+            connsList.resetScroll = true;
             renderConnsListModal();
             return;
           }
@@ -4684,6 +4757,7 @@
           debounce = setTimeout(() => {
             connsList.q = connsSearch.value;
             connsList.page = 0;
+            connsList.resetScroll = true;
             renderConnsListModal();
           }, 150);
         });
@@ -8376,6 +8450,7 @@
   }
 
   function bindModalEvents() {
+    bindDialogEscape();
     $('addModalClose').addEventListener('click', closeModal);
     $('detailModalClose').addEventListener('click', closeDetailModal);
     $('exportModalClose').addEventListener('click', closeExportModal);
