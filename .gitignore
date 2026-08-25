@@ -15,6 +15,7 @@
 .idea/
 .vscode/
 .claude/
+.cursor/
 .DS_Store
 Thumbs.db
 
@@ -27,4 +28,7 @@ PR-*.md
 
 # Playwright MCP test artifacts
 .playwright-mcp/
+# Screenshots land in the repo root when the MCP output dir is not writable.
+# Root-anchored so tracked art like web/icon.png is unaffected.
+/*.png
 kiro-go-darwin
