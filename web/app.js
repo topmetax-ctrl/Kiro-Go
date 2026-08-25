@@ -644,11 +644,24 @@
     const modal = $(id);
     return !!modal && modal.classList.contains('active');
   }
+  // Every .modal carries the same z-index (100), so two open dialogs are ordered
+  // by their position in the document -- and confirmModal is declared before the
+  // dialogs that raise it. A confirm opened from the key list therefore painted
+  // BEHIND that list: active in the DOM, invisible, and unreachable by the mouse,
+  // so the button looked dead. Stack dialogs by the order they were opened
+  // instead. Capped below the 220 layer that dropdown popovers use.
+  const DIALOG_BASE_Z = 100;
+  const DIALOG_MAX_Z = 200;
+  function applyDialogStackOrder(modal, depth) {
+    modal.style.zIndex = String(Math.min(DIALOG_BASE_Z + (depth - 1) * 10, DIALOG_MAX_Z));
+  }
+
   function openDialog(id) {
     const modal = $(id);
     if (!modal) return;
     prepareDialog(modal);
     modalFocusStack.push({ id, el: document.activeElement });
+    applyDialogStackOrder(modal, modalFocusStack.length);
     modal.removeEventListener('keydown', trapDialogFocus);
     modal.addEventListener('keydown', trapDialogFocus);
     modal.classList.add('active');
@@ -661,6 +674,7 @@
     if (!modal) return;
     modal.classList.remove('active');
     modal.setAttribute('aria-hidden', 'true');
+    modal.style.zIndex = '';
     const stackIndex = modalFocusStack.map(item => item.id).lastIndexOf(id);
     const previous = stackIndex >= 0 ? modalFocusStack.splice(stackIndex, 1)[0].el : null;
     unlockModalScrollIfIdle();
