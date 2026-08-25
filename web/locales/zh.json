@@ -907,6 +907,7 @@
   "upstreams.bulkImportBtn": "导入",
   "upstreams.bulkEmpty": "请先粘贴凭证",
   "upstreams.bulkFailed": "批量导入失败",
+  "upstreams.bulkNothingReady": "此次粘贴没有可导入的行 — 请先处理被标记的行",
   "upstreams.bulkSummary": "{0} 条可导入 · {1} 条重复 · {2} 条存疑 · {3} 条无效",
   "upstreams.bulkImported": "新增 {0} · 重复 {1} · 存疑 {2} · 无效 {3}",
   "upstreams.bulkColLine": "行",

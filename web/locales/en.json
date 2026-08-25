@@ -970,6 +970,7 @@
   "upstreams.bulkImportBtn": "Import",
   "upstreams.bulkEmpty": "Paste credentials first",
   "upstreams.bulkFailed": "Bulk import failed",
+  "upstreams.bulkNothingReady": "Nothing importable in this paste — fix the flagged rows first",
   "upstreams.bulkSummary": "{0} ready · {1} duplicate · {2} ambiguous · {3} invalid",
   "upstreams.bulkImported": "Added {0} · Duplicate {1} · Ambiguous {2} · Invalid {3}",
   "upstreams.bulkColLine": "Line",

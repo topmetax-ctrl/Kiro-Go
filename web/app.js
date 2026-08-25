@@ -2349,7 +2349,10 @@
   let connectionEditing = { providerId: '', connectionId: '' };
   let bulkImportPid = '';
   let bulkPreview = null;
+  let bulkPreviewStale = false;
   let bulkResolutions = {};
+  let bulkAnalyzeTimer = null;
+  let bulkAnalyzeSeq = 0;
   // Per-provider sequential test runner. Results are session-only.
   let connTest = {};
 
@@ -3719,15 +3722,17 @@
   function openBulkModal(pid) {
     bulkImportPid = pid;
     bulkPreview = null;
+    bulkPreviewStale = false;
     bulkResolutions = {};
+    if (bulkAnalyzeTimer) { clearTimeout(bulkAnalyzeTimer); bulkAnalyzeTimer = null; }
+    bulkAnalyzeSeq++;
     const box = $('upstreamBulkText');
     if (box) box.value = '';
     const sum = $('upstreamBulkSummary');
     if (sum) sum.textContent = '';
     const prev = $('upstreamBulkPreview');
-    if (prev) prev.innerHTML = '';
-    const imp = $('upstreamBulkImportBtn');
-    if (imp) imp.disabled = true;
+    if (prev) { prev.innerHTML = ''; prev.classList.remove('is-stale'); }
+    syncBulkImportBtn();
     openDialog('upstreamBulkModal');
   }
 
@@ -3735,7 +3740,56 @@
     closeDialog('upstreamBulkModal');
     bulkImportPid = '';
     bulkPreview = null;
+    bulkPreviewStale = false;
     bulkResolutions = {};
+    if (bulkAnalyzeTimer) { clearTimeout(bulkAnalyzeTimer); bulkAnalyzeTimer = null; }
+    bulkAnalyzeSeq++;
+  }
+
+  function currentBulkText() {
+    const box = $('upstreamBulkText');
+    return box ? (box.value || '').trim() : '';
+  }
+
+  // Import used to stay disabled until Analyze was pressed, and nothing on
+  // screen said so: paste keys, click Import, nothing happens. The preview is a
+  // convenience, not a prerequisite -- /connections/import re-parses the raw
+  // paste server-side -- so the button is live whenever there is text. Once a
+  // fresh preview exists it takes over and can veto, with a tooltip saying why;
+  // while the preview is stale (mid-edit) its counts describe the old text, so
+  // only the presence of text is trusted.
+  function syncBulkImportBtn() {
+    const imp = $('upstreamBulkImportBtn');
+    if (!imp) return;
+    if (currentBulkText() === '') {
+      imp.disabled = true;
+      imp.title = t('upstreams.bulkEmpty');
+      return;
+    }
+    if (bulkPreview && !bulkPreviewStale && !(bulkPreview.ready > 0)) {
+      imp.disabled = true;
+      imp.title = t('upstreams.bulkNothingReady');
+      return;
+    }
+    imp.disabled = false;
+    imp.title = '';
+  }
+
+  // Editing the paste or switching the naming mode invalidates the table on
+  // screen. Dim it rather than blanking it so the modal does not flicker on
+  // every keystroke, and re-analyze once typing settles.
+  function markBulkPreviewStale() {
+    bulkPreviewStale = true;
+    const el = $('upstreamBulkPreview');
+    if (el && el.innerHTML) el.classList.add('is-stale');
+  }
+
+  function scheduleBulkAnalyze() {
+    if (bulkAnalyzeTimer) clearTimeout(bulkAnalyzeTimer);
+    bulkAnalyzeTimer = setTimeout(() => {
+      bulkAnalyzeTimer = null;
+      analyzeBulkImport(true);
+    }, 350);
   }
 
   function bulkNaming() {
@@ -3746,12 +3800,13 @@
   function renderBulkPreview() {
     const el = $('upstreamBulkPreview');
     const sum = $('upstreamBulkSummary');
-    const imp = $('upstreamBulkImportBtn');
     if (!el) return;
+    bulkPreviewStale = false;
+    el.classList.remove('is-stale');
     if (!bulkPreview) {
       el.innerHTML = '';
       if (sum) sum.textContent = '';
-      if (imp) imp.disabled = true;
+      syncBulkImportBtn();
       return;
     }
     if (sum) {
@@ -3784,13 +3839,23 @@
         '</tr>';
       }).join('') +
       '</tbody></table>';
-    if (imp) imp.disabled = !(bulkPreview.ready > 0);
+    syncBulkImportBtn();
   }
 
-  async function analyzeBulkImport() {
+  // silent is set for the automatic re-analyze that follows typing: it must not
+  // fire a toast on every transient empty box or failed keystroke.
+  async function analyzeBulkImport(silent) {
     if (!bulkImportPid) return;
-    const text = ($('upstreamBulkText').value || '').trim();
-    if (!text) { toast(t('upstreams.bulkEmpty'), 'error'); return; }
+    const text = currentBulkText();
+    if (!text) {
+      bulkPreview = null;
+      renderBulkPreview();
+      if (!silent) toast(t('upstreams.bulkEmpty'), 'error');
+      return;
+    }
+    // Responses can land out of order once analyze runs per keystroke; only the
+    // newest request may paint, or a stale table overwrites a fresh one.
+    const seq = ++bulkAnalyzeSeq;
     try {
       const res = await api('/upstreams/' + encodeURIComponent(bulkImportPid) + '/connections/preview', {
         method: 'POST',
@@ -3803,16 +3868,18 @@
       });
       const d = await res.json().catch(() => ({}));
       if (!res.ok || d.success === false) throw new Error(d.error || t('upstreams.bulkFailed'));
+      if (seq !== bulkAnalyzeSeq) return;
       bulkPreview = d.preview || d;
       renderBulkPreview();
     } catch (e) {
-      toast((e && e.message) || t('upstreams.bulkFailed'), 'error');
+      if (seq !== bulkAnalyzeSeq) return;
+      if (!silent) toast((e && e.message) || t('upstreams.bulkFailed'), 'error');
     }
   }
 
   async function commitBulkImport() {
     if (!bulkImportPid) return;
-    const text = ($('upstreamBulkText').value || '').trim();
+    const text = currentBulkText();
     if (!text) { toast(t('upstreams.bulkEmpty'), 'error'); return; }
     try {
       const res = await api('/upstreams/' + encodeURIComponent(bulkImportPid) + '/connections/import', {
@@ -5119,7 +5186,25 @@
     const connClose = $('upstreamConnModalClose');
     if (connClose) connClose.addEventListener('click', closeConnModal);
     const bulkAnalyze = $('upstreamBulkAnalyzeBtn');
-    if (bulkAnalyze) bulkAnalyze.addEventListener('click', analyzeBulkImport);
+    // Wrapped: a raw listener passes the click Event as the silent flag.
+    if (bulkAnalyze) bulkAnalyze.addEventListener('click', () => analyzeBulkImport(false));
+    const bulkTextBox = $('upstreamBulkText');
+    if (bulkTextBox) {
+      bulkTextBox.addEventListener('input', () => {
+        // Column picks are keyed by line number, and editing the paste shifts
+        // those lines, so a stored pick would resolve the wrong column.
+        bulkResolutions = {};
+        markBulkPreviewStale();
+        syncBulkImportBtn();
+        scheduleBulkAnalyze();
+      });
+    }
+    document.querySelectorAll('input[name="upstreamBulkNaming"]').forEach(radio => {
+      radio.addEventListener('change', () => {
+        markBulkPreviewStale();
+        scheduleBulkAnalyze();
+      });
+    });
     const bulkImport = $('upstreamBulkImportBtn');
     if (bulkImport) bulkImport.addEventListener('click', commitBulkImport);
     const bulkCancel = $('upstreamBulkCancelBtn');
@@ -5132,7 +5217,7 @@
         const btn = e.target.closest('[data-bulk-col]');
         if (!btn) return;
         bulkResolutions[btn.dataset.bulkLine] = parseInt(btn.dataset.bulkCol, 10);
-        analyzeBulkImport();
+        analyzeBulkImport(false);
       });
     }
   }

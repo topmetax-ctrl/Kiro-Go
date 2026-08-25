@@ -2194,6 +2194,15 @@ img.brand-icon {
   border-top: 1px solid var(--border);
   flex-wrap: wrap;
 }
+/* The base rule assumes the footer sits inside .modal-body and inherits its
+   padding. Modals that need a scrollable body put the footer next to it instead,
+   as a direct child of .modal-content — there the buttons end up 1px from the
+   modal's bottom and right edges. Re-add the body's own insets so those footers
+   line up with the header and body. */
+.modal-content > .modal-footer {
+  margin-top: 0;
+  padding: 1rem 1.5rem 1.25rem;
+}
 .confirm-message {
   margin: 0;
   color: var(--muted-foreground);
@@ -2886,6 +2895,10 @@ img.brand-icon {
 .conn-health-auth_failed { background: rgba(239,68,68,0.15); color: #ef4444; }
 .conn-health-unhealthy { background: rgba(148,163,184,0.2); color: var(--muted-foreground); }
 .upstream-bulk-preview { max-height: 40vh; overflow: auto; }
+/* The table describes the paste as it was when analyzed. Dim it while an
+   edit is pending re-analysis instead of blanking it, so the modal does not
+   flash empty on every keystroke. */
+.upstream-bulk-preview.is-stale { opacity: 0.45; transition: opacity 0.12s ease; }
 .conn-preview-table { width: 100%; border-collapse: collapse; font-size: 0.75rem; }
 .conn-preview-table th, .conn-preview-table td { text-align: left; padding: 0.35rem 0.4rem; border-bottom: 1px solid var(--border); }
 .conn-preview-ready { color: #16a34a; }
@@ -5193,10 +5206,6 @@ body.modal-open .scroll-nav {
 }
 .ak-advanced-body .form-group {
   margin-bottom: 0;
-}
-.api-key-modal > .modal-footer {
-  margin-top: 0;
-  padding: 1rem 1.5rem 1.25rem;
 }
 .ak-show-key {
   margin-top: 1rem;

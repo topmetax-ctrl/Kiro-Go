@@ -1048,6 +1048,7 @@
   "upstreams.bulkImportBtn": "Nhập",
   "upstreams.bulkEmpty": "Hãy dán credential trước",
   "upstreams.bulkFailed": "Nhập hàng loạt thất bại",
+  "upstreams.bulkNothingReady": "Không có dòng nào nhập được — hãy xử lý các dòng được đánh dấu trước",
   "upstreams.bulkSummary": "{0} sẵn sàng · {1} trùng · {2} mơ hồ · {3} không hợp lệ",
   "upstreams.bulkImported": "Thêm {0} · Trùng {1} · Mơ hồ {2} · Lỗi {3}",
   "upstreams.bulkColLine": "Dòng",
