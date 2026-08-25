@@ -398,6 +398,55 @@ func DeleteUpstreamConnection(providerID, connectionID string) error {
 	return saveLocked()
 }
 
+// DeleteUpstreamConnections removes every connection whose ID appears in ids
+// and persists once. Clearing a selection from the admin key list would
+// otherwise be N requests, each taking the config lock and rewriting the file
+// while forwards are in flight. Unknown IDs are skipped -- the list the
+// operator selected from can be seconds stale -- but a call that matches
+// nothing returns ErrUpstreamConnectionNotFound so the UI cannot report a
+// successful no-op.
+func DeleteUpstreamConnections(providerID string, ids []string) (int, error) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	p, pidx, err := findProviderLocked(providerID)
+	if err != nil {
+		return 0, err
+	}
+	drop := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			drop[id] = true
+		}
+	}
+	if len(drop) == 0 {
+		return 0, ErrUpstreamConnectionNotFound
+	}
+	// A fresh slice rather than p.Connections[:0]: the backing array is shared
+	// with the provider snapshot a forward may be ranging over right now.
+	kept := make([]UpstreamConnection, 0, len(p.Connections))
+	removed := 0
+	for _, c := range p.Connections {
+		if drop[c.ID] {
+			removed++
+			continue
+		}
+		kept = append(kept, c)
+	}
+	if removed == 0 {
+		return 0, ErrUpstreamConnectionNotFound
+	}
+	p.Connections = kept
+	syncLegacyApiKey(&p)
+	if len(p.Connections) == 0 {
+		p.ApiKey = ""
+	}
+	cfg.Upstreams[pidx] = p
+	if err := saveLocked(); err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
 // SetProviderConnectionStrategy updates the load-balancing strategy and persists.
 func SetProviderConnectionStrategy(providerID, strategy string) error {
 	cfgLock.Lock()

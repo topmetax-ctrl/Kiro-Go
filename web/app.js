@@ -3215,10 +3215,12 @@
       '</div>';
     }).join('');
 
+    const selCount = selectedConnectionsInView().length;
+    const allSelected = all.length > 0 && selCount === all.length;
     const toolbarHost = $('upstreamConnsListToolbar');
     const toolbarHtml =
       '<div class="conn-toolbar">' +
-        '<button class="btn btn-ghost btn-xs" type="button" data-conn-action="select-all" data-pid="' + escapeAttr(p.id) + '">' + escapeHtml(t('upstreams.connSelectAll')) + '</button>' +
+        '<button class="btn btn-ghost btn-xs" type="button" data-conn-action="select-all" data-pid="' + escapeAttr(p.id) + '">' + escapeHtml(allSelected ? t('upstreams.connSelectNone') : t('upstreams.connSelectAll')) + '</button>' +
         '<label class="text-xs">' + escapeHtml(t('upstreams.connTestModel')) +
           ' <select data-conn-action="test-model" data-pid="' + escapeAttr(p.id) + '">' +
             (modelOpts || '<option value="">' + escapeHtml(t('upstreams.connTestModelNone')) + '</option>') +
@@ -3232,6 +3234,9 @@
         (st.running
           ? '<button class="btn btn-outline btn-xs" type="button" data-conn-action="stop" data-pid="' + escapeAttr(p.id) + '">' + escapeHtml(t('upstreams.connStop')) + '</button>'
           : '<button class="btn btn-outline btn-xs" type="button" data-conn-action="test-all" data-pid="' + escapeAttr(p.id) + '">' + escapeHtml(t('upstreams.connTestOneByOne')) + '</button>') +
+        '<button class="btn btn-danger btn-xs conn-delete-selected" type="button" data-conn-action="delete-selected" data-pid="' + escapeAttr(p.id) + '"' +
+          (selCount > 0 && !st.running ? '' : ' disabled') + '>' +
+          escapeHtml(t('upstreams.connDeleteSelected', String(selCount))) + '</button>' +
       '</div>';
     if (toolbarHost) toolbarHost.innerHTML = toolbarHtml;
     // A re-render must not throw the operator back to the top of the pool — a test
@@ -3275,6 +3280,28 @@
   // renderConnsListStats writes the counter line (and the running progress) without
   // touching the row list. Kept separate so both the full render and the per-result
   // update can call it.
+  // Ticking one box must not rebuild a thousand rows -- refresh only the two
+  // toolbar controls whose text depends on the selection. Scoped to the modal:
+  // the provider list renders a select-all of its own.
+  function renderConnsListToolbarCount() {
+    const p = connsListProvider();
+    if (!p) return;
+    const st = connTestState(p.id);
+    const all = connsListFiltered();
+    const selCount = selectedConnectionsInView().length;
+    const del = document.querySelector('#upstreamConnsListModal .conn-delete-selected');
+    if (del) {
+      del.textContent = t('upstreams.connDeleteSelected', String(selCount));
+      del.disabled = !(selCount > 0 && !st.running);
+    }
+    const selAll = document.querySelector('#upstreamConnsListModal [data-conn-action="select-all"]');
+    if (selAll) {
+      selAll.textContent = all.length > 0 && selCount === all.length
+        ? t('upstreams.connSelectNone')
+        : t('upstreams.connSelectAll');
+    }
+  }
+
   function renderConnsListStats() {
     const p = connsListProvider();
     const stats = $('upstreamConnsListStats');
@@ -3650,6 +3677,60 @@
       await loadUpstreams();
     } catch (e) {
       toast((e && e.message) || t('common.saveFailed'), 'error');
+    }
+  }
+
+  // The key-pool modal's bulk actions act on what the operator can see: a search
+  // narrows the list, so "everything selected" then means everything the search
+  // matched, not the whole pool hidden behind the filter.
+  function selectedConnectionsInView() {
+    const st = connTestState(connsList.pid);
+    return connsListFiltered().filter(c => !st.selected || st.selected[c.id]);
+  }
+
+  // Select All is a toggle. Rows start checked (st.selected === null means all),
+  // so without a way back to zero the only route to "delete these three" is
+  // unchecking the other ninety-seven.
+  function toggleConnSelectAll(pid, scope) {
+    const st = connTestState(pid);
+    const p = upstreamCache.providers.find(x => x.id === pid);
+    const list = scope === 'view' ? connsListFiltered() : providerConnections(p);
+    const allOn = list.length > 0 && list.every(c => !st.selected || st.selected[c.id]);
+    if (!st.selected) {
+      st.selected = {};
+      providerConnections(p).forEach(c => { st.selected[c.id] = true; });
+    }
+    list.forEach(c => { st.selected[c.id] = !allOn; });
+  }
+
+  async function deleteSelectedConnections(pid) {
+    const st = connTestState(pid);
+    if (st.running) { toast(t('upstreams.connBusyTesting'), 'warning'); return; }
+    const p = upstreamCache.providers.find(x => x.id === pid);
+    const conns = selectedConnectionsInView();
+    if (!conns.length) { toast(t('upstreams.connNoneSelected'), 'warning'); return; }
+    const ok = await confirmAction(
+      t('upstreams.connConfirmDeleteSelected', String(conns.length), p ? (p.name || p.baseUrl || pid) : pid),
+      { title: t('upstreams.connDeleteSelectedTitle'), confirmText: t('upstreams.actionDelete'), variant: 'danger' });
+    if (!ok) return;
+    const ids = conns.map(c => c.id);
+    try {
+      const res = await api('/upstreams/' + encodeURIComponent(pid) + '/connections/bulk-delete', {
+        method: 'POST',
+        body: JSON.stringify({ ids })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d.success === false) throw new Error(d.error || t('common.failed'));
+      // Selection and test verdicts are keyed by connection id; leaving the dead
+      // ones behind keeps a phantom count on the button after the reload.
+      ids.forEach(id => {
+        if (st.selected) delete st.selected[id];
+        delete st.results[id];
+      });
+      toast(t('upstreams.connDeletedSelected', String(d.removed != null ? d.removed : ids.length)), 'success');
+      await loadUpstreams();
+    } catch (e) {
+      toast((e && e.message) || t('common.failed'), 'error');
     }
   }
 
@@ -4790,8 +4871,9 @@
           else if (action === 'delete') deleteConnection(pid, cid, conn ? conn.name : '');
           else if (action === 'test-all') testConnectionsOneByOne(pid);
           else if (action === 'stop') stopConnectionTests(pid);
+          else if (action === 'delete-selected') deleteSelectedConnections(pid);
           else if (action === 'select-all') {
-            connTestState(pid).selected = null;
+            toggleConnSelectAll(pid, 'view');
             renderConnsListModal();
           }
         });
@@ -4813,6 +4895,8 @@
               if (st.selected[c.id] === undefined) st.selected[c.id] = true;
             });
             st.selected[pick.dataset.connSelect] = pick.checked;
+            // The delete button carries the count, so it has to follow the box.
+            renderConnsListToolbarCount();
           }
         });
       }
@@ -4889,9 +4973,7 @@
         else if (action === 'test-all') testConnectionsOneByOne(pid);
         else if (action === 'stop') stopConnectionTests(pid);
         else if (action === 'select-all') {
-          const st = connTestState(pid);
-          st.selected = {};
-          providerConnections(p).forEach(c => { st.selected[c.id] = true; });
+          toggleConnSelectAll(pid);
           renderProviders();
         }
       });

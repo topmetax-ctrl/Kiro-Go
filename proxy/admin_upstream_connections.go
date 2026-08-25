@@ -27,7 +27,7 @@ func parseUpstreamConnectionPath(path string) (providerID, connectionID, action 
 	case 2:
 		return providerID, "", "", true
 	case 3:
-		if parts[2] == "preview" || parts[2] == "import" {
+		if parts[2] == "preview" || parts[2] == "import" || parts[2] == "bulk-delete" {
 			return providerID, "", parts[2], true
 		}
 		return providerID, parts[2], "", true
@@ -113,6 +113,8 @@ func (h *Handler) handleUpstreamConnectionAPI(w http.ResponseWriter, r *http.Req
 		h.apiPreviewUpstreamConnections(w, r, providerID)
 	case action == "import" && r.Method == http.MethodPost:
 		h.apiImportUpstreamConnections(w, r, providerID)
+	case action == "bulk-delete" && r.Method == http.MethodPost:
+		h.apiBulkDeleteUpstreamConnections(w, r, providerID)
 	case action == "test" && r.Method == http.MethodPost:
 		h.apiTestUpstreamConnection(w, r, providerID, connectionID)
 	case connectionID == "" && r.Method == http.MethodPost:
@@ -204,6 +206,32 @@ func (h *Handler) apiDeleteUpstreamConnection(w http.ResponseWriter, r *http.Req
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+// apiBulkDeleteUpstreamConnections clears a selection from the key list in one
+// persist. POST rather than DELETE-with-body: the selection can run to hundreds
+// of IDs and intermediaries are free to drop a DELETE body.
+func (h *Handler) apiBulkDeleteUpstreamConnections(w http.ResponseWriter, r *http.Request, providerID string) {
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeConnError(w, 400, errors.New("invalid JSON"))
+		return
+	}
+	removed, err := config.DeleteUpstreamConnections(providerID, req.IDs)
+	if err != nil {
+		status := 400
+		if errors.Is(err, config.ErrUpstreamProviderNotFound) || errors.Is(err, config.ErrUpstreamConnectionNotFound) {
+			status = 404
+		}
+		writeConnError(w, status, err)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"removed": removed,
+	})
 }
 
 func (h *Handler) apiPreviewUpstreamConnections(w http.ResponseWriter, r *http.Request, providerID string) {
