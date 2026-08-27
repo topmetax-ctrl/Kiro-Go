@@ -693,7 +693,12 @@ select.custom-select-native {
   color: var(--foreground);
   margin-bottom: 0.375rem;
 }
-.form-group small {
+/* Hint text under a label, or directly under a card header now that the
+   forwarding views put their title in the header instead of a form-group
+   label. Same treatment either way, so a hint does not change appearance
+   depending on which wrapper it happens to sit in. */
+.form-group small,
+.card > small:not(.help-block) {
   display: block;
   color: var(--muted-foreground);
   font-size: 0.75rem;
@@ -794,6 +799,14 @@ label:has(> .switch) > span {
   width: 0;
   height: 0;
 }
+/* The native checkbox is 0x0 and transparent, which keeps it in the tab order
+   but leaves the visible switch with no focus indicator at all. Paint the ring on
+   the slider instead, so every switch in the panel -- including the one that
+   turns the character-key shortcuts off -- can be seen when it is focused. */
+.switch input:focus-visible + .slider {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
 .switch .slider {
   position: absolute;
   inset: 0;
@@ -828,84 +841,132 @@ label:has(> .switch) > span {
   margin-left: 0;
   min-width: 0;
 }
-.tabs {
+/* Sidebar navigation.
+   Rendered from the route registry in app.js as a nested list of links, not a
+   row of tab buttons: this is site navigation, so it is a <nav> with a list of
+   links rather than a menu widget or a tablist (MDN is explicit that role="menu"
+   is for action menus, not navigation). Links also come with focus order,
+   Enter/middle-click and copyable URLs for free, which the old buttons did not
+   have. */
+.nav-list,
+.nav-children {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.nav-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  width: 100%;
+}
+.nav-item,
+.nav-child {
   display: flex;
   align-items: center;
-  gap: 0.125rem;
-  background: transparent;
-  border: 0;
-  border-radius: 0;
-  padding: 0;
-  margin: 0;
-}
-.tab {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.4rem;
+  width: 100%;
   min-width: 0;
-  height: 2.25rem;
-  padding: 0 1.125rem;
-  font-size: 0.875rem;
-  font-weight: 500;
   color: var(--muted-foreground);
+  text-decoration: none;
   background: transparent;
   border: 0;
   border-radius: var(--radius-md);
   cursor: pointer;
   user-select: none;
   font-family: inherit;
-  letter-spacing: 0.005em;
   transition:
     color 0.15s ease,
     background 0.15s ease;
 }
-.tab:hover {
-  color: var(--foreground);
-  background: transparent;
-}
-.tab.active {
-  color: var(--foreground);
-  background: transparent;
-  border-color: transparent;
-}
-.tab:focus-visible {
-  outline: 2px solid var(--foreground);
-  outline-offset: -3px;
-}
-.tab-icon {
-  font-size: 0.8125rem;
-  flex: none;
-  opacity: 0.8;
-}
-
-/* Vertical sidebar tabs */
-.sidebar-nav .tabs {
-  flex-direction: column;
-  align-items: stretch;
-  gap: 0.125rem;
-}
-.sidebar-nav .tab {
-  justify-content: flex-start;
-  width: 100%;
-  height: auto;
+.nav-item {
+  gap: 0.625rem;
   min-height: 2.5rem;
   padding: 0 0.75rem;
-  gap: 0.625rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  letter-spacing: 0.005em;
 }
-.sidebar-nav .tab-icon {
+.nav-icon {
   width: 1.125rem;
+  flex: none;
   text-align: center;
   font-size: 0.875rem;
+  opacity: 0.8;
 }
-.sidebar-nav .tab:hover {
+.nav-item:hover,
+.nav-child:hover {
+  color: var(--foreground);
   background: var(--muted, rgba(127, 127, 127, 0.1));
 }
-.sidebar-nav .tab.active {
+/* The section a child belongs to reads as current without claiming to be the
+   open view — only one element in the set carries aria-current. */
+.nav-item.is-current-section {
+  color: var(--foreground);
+}
+.nav-item.is-active,
+.nav-child.is-active {
+  color: var(--foreground);
   background: var(--muted, rgba(127, 127, 127, 0.14));
   font-weight: 600;
 }
-
+.nav-item:focus-visible,
+.nav-child:focus-visible {
+  outline: 2px solid var(--foreground);
+  outline-offset: -2px;
+}
+/* Children hang off a rail so a group reads as one unit, and they stay visible
+   for every section rather than only the open one: the point of the nesting is
+   reaching another section's view in a single click from wherever you are. */
+.nav-children {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  margin: 0.125rem 0 0.25rem;
+  padding-left: 1.6rem;
+}
+.nav-children::before {
+  content: '';
+  position: absolute;
+  left: 1.1rem;
+  top: 0.125rem;
+  bottom: 0.125rem;
+  width: 1px;
+  background: var(--border);
+}
+.nav-child {
+  gap: 0.5rem;
+  min-height: 2rem;
+  padding: 0 0.6rem;
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+.nav-dot {
+  width: 0.3rem;
+  height: 0.3rem;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.45;
+}
+/* Muted by colour rather than opacity: 0.7rem text at opacity 0.6 measured
+   3.4:1 against the dark background, under the 4.5:1 AA floor, while the token
+   colour clears it in both themes. */
+.nav-count {
+  margin-left: auto;
+  color: var(--muted-foreground);
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+}
+/* Inline link inside body copy (empty states pointing at another view). */
+.text-link {
+  color: var(--foreground);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.text-link:hover {
+  opacity: 0.8;
+}
 #mainPage {
   min-height: 100vh;
 }
@@ -2699,6 +2760,23 @@ img.brand-icon {
 .route-target-row {
   position: relative;
 }
+/* The provider picker is a searchable custom-select, whose visible box is the
+   .custom-select sibling the enhancer inserts — the native <select> is left in the
+   DOM as the value holder. Both have to flex like the text inputs beside them, or
+   the row's two fields stop lining up. */
+.route-target-row select[data-target-field="upstreamProvider"] + .custom-select {
+  flex: 1;
+  min-width: 9rem;
+}
+/* Why the model field is free text and not a select: any name the upstream accepts
+   is valid, including ones its /models never lists. The note under it carries the
+   state of the suggestion list so an empty dropdown is never silent. */
+.route-target-model-note {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
 .route-target-handle {
   display: inline-flex;
   align-items: center;
@@ -2736,6 +2814,19 @@ img.brand-icon {
 }
 .route-target-row.drop-below::after {
   bottom: -3px;
+}
+/* The filter row above a long list: input plus its match counter. Kept narrow so
+   it reads as a filter rather than a form field, and wrapping so the counter drops
+   below the box instead of squeezing it on a phone. */
+.list-search-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+.list-search-row input[type="text"] {
+  width: min(22rem, 100%);
 }
 /* Hidden providers stay in the list, below a disclosure, so they can always be
    unhidden. They are dimmed rather than restyled: every control still works, and
@@ -2791,6 +2882,19 @@ img.brand-icon {
 .provider-hidden-toggle .fa-solid {
   font-size: 0.65rem;
 }
+/* While a filter is active the divider is informational: the keyword decides what
+   is on screen, so there is nothing left to toggle and the row must not offer a
+   click that would do nothing. */
+.provider-hidden-toggle.is-static {
+  cursor: default;
+}
+.provider-hidden-toggle.is-static:hover {
+  color: var(--muted-foreground);
+}
+.provider-hidden-toggle.is-static:hover::before,
+.provider-hidden-toggle.is-static:hover::after {
+  background: var(--border);
+}
 /* A hidden route target keeps its slot in the chain — hiding is presentation-only
    and never changes priority — so it is dimmed and dashed like a hidden provider
    rather than restyled or made to look disabled. */
@@ -2837,9 +2941,10 @@ img.brand-icon {
 .route-target-hidden-run:hover::after {
   border-top-color: color-mix(in srgb, var(--muted-foreground) 75%, transparent);
 }
-/* Five controls now share a target row's header — reorder ×2, probe, hide, remove —
-   in a modal about 600px wide. The default .btn-sm side padding made that cluster
-   wide enough to wrap onto its own line, so the icon-only buttons get a squarer box. */
+/* Six controls now share a target row's header — to-top, reorder ×2, probe, hide,
+   remove — in a modal about 600px wide. The default .btn-sm side padding made that
+   cluster wide enough to wrap onto its own line, so the icon-only buttons get a
+   squarer box. */
 .route-target-row .btn-sm {
   padding: 0 0.55rem;
   min-width: 2rem;
@@ -2856,6 +2961,150 @@ img.brand-icon {
 .route-target-hidden-run-action {
   text-decoration: underline;
   text-underline-offset: 2px;
+}
+/* The same marker standing in for rows a filter set aside. It is text, not a
+   control -- the search box is what decides visibility -- so it drops the pointer
+   and the hover response the disclosure version uses to look clickable. */
+.route-target-hidden-run.is-static {
+  cursor: default;
+}
+.route-target-hidden-run.is-static:hover {
+  color: var(--muted-foreground);
+}
+.route-target-hidden-run.is-static:hover::before,
+.route-target-hidden-run.is-static:hover::after {
+  border-top-color: color-mix(in srgb, var(--muted-foreground) 45%, transparent);
+}
+/* Dragging is disarmed while the list is filtered (the row above on screen is not
+   the row above in the chain), so the grip stops advertising the gesture. The
+   arrows next to it carry the same explanation in their tooltips. */
+.route-target-handle.is-locked {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+.route-target-handle.is-locked:hover {
+  color: var(--muted-foreground);
+}
+/* The header's two clusters. The notes on the left grow and wrap INTERNALLY; the
+   controls on the right neither wrap nor shrink. Without this the notes pushed the
+   whole button cluster onto a second line as soon as a row picked up one more badge —
+   "splitting by weight" on its own was enough — so a row's height depended on its
+   state, and the buttons moved under the cursor between clicks. */
+.route-target-row-head {
+  justify-content: space-between;
+  /* Not wrapping, on purpose: flex lays out lines BEFORE it shrinks anything, so with
+     wrapping on, one extra badge sent the entire button cluster to a second line instead
+     of narrowing the notes next to it. The row then grew or shrank according to which
+     badges its state happened to earn, and the buttons moved between two clicks aimed at
+     the same place. The notes shrink and wrap internally instead; the buttons are a fixed
+     six and stay where the eye left them. */
+  flex-wrap: nowrap;
+}
+.route-target-row-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.route-target-row-actions {
+  flex: 0 0 auto;
+}
+/* Position in the chain, and the handle for typing a different one. Deliberately quiet
+   — dashed, monospace, sized like the badges beside it — because it is a landmark
+   first and a control second. It has to be readable on every row, since the number it
+   shows is the number the editor accepts, without competing with the tier badge next
+   to it: those two are different numbers the moment any row shares a tier. */
+.route-target-pos {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  line-height: 1.35;
+  padding: 1px 5px;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+}
+.route-target-pos:hover {
+  border-style: solid;
+  border-color: var(--border-focus);
+  color: var(--foreground);
+}
+/* While a filter is in force the chip is a label, not a control: an absolute position
+   is only usable if the operator can see what sits at it, and elided runs make that a
+   guess. The same call the hidden-run marker makes, for the same reason. */
+.route-target-pos.is-static {
+  cursor: default;
+}
+.route-target-pos.is-static:hover {
+  border-style: dashed;
+  border-color: var(--border);
+  color: var(--muted-foreground);
+}
+/* The chip in edit mode. Every property here overrides the global input box, which is
+   2.25rem tall and 100% wide — either would reflow the header the chip sits in. */
+.route-target-pos-input {
+  flex: none;
+  width: 3.5rem;
+  height: 1.5rem;
+  padding: 0 0.25rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-align: center;
+}
+/* Where a moved row landed. "To top" crosses the whole chain, so in a modal that
+   scrolls the row arrives outside the viewport it left; scrollIntoView brings it back
+   and this says which one it is, because after a wholesale re-render every row looks
+   equally new. Monochrome like the rest of the theme — the same accent the drag
+   insertion line uses, since this is the same gesture by another route. */
+.route-target-row.is-just-moved {
+  animation: route-target-moved 0.9s ease-out 1;
+}
+@keyframes route-target-moved {
+  0% {
+    border-color: var(--border-focus);
+    background: color-mix(in srgb, var(--foreground) 12%, var(--card));
+  }
+  100% {
+    border-color: var(--border);
+    background: var(--card);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .route-target-row.is-just-moved {
+    animation: none;
+    border-color: var(--border-focus);
+  }
+}
+/* The row carries tabindex="-1" so focus has somewhere to land when a move disables
+   the button it was on (getModalFocusable skips it, so it stays out of the Tab cycle).
+   The ring is not optional: a keyboard reorder that left focus somewhere invisible
+   would strand the next Alt+Arrow. */
+.route-target-row:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+/* The target filter pins to the top of the list it filters. Unpinned it is out of
+   reach exactly when it matters — at row 12 of a 14-row chain the box has scrolled off
+   the top, so finding a row would start with scrolling back up to ask for it. Same
+   call as the key-pool modal's sticky toolbar. No negative margins are needed here:
+   this row and the target rows share one containing block, so it covers them as they
+   pass under. The z-index is needed, though — .route-target-row is positioned and
+   comes later in the DOM, so the rows would otherwise paint on top of it. */
+@media (max-width: 640px) {
+  /* Below this the two clusters genuinely cannot share a line, and squeezing the notes to
+     one word per line is worse than letting the buttons drop under them. */
+  .route-target-row-head {
+    flex-wrap: wrap;
+  }
+}
+#routeTargetSearchRow {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  margin-top: 0.25rem;
+  padding: 0.35rem 0 0.4rem;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
 }
 .conn-panel {
   margin-top: 0.65rem;
@@ -2979,74 +3228,6 @@ img.brand-icon {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
-}
-
-/* Forwarding tab sub-navigation: config vs live activity.
-   Styled as a segmented control — the flat theme has no underline-tab idiom, and
-   an underline alone left the bar floating between the stat cards and the card
-   below it with nothing to anchor it. */
-.subtabs {
-  display: inline-flex;
-  align-items: stretch;
-  height: 2.25rem;
-  margin-bottom: 1rem;
-  border-radius: var(--radius-md);
-  box-sizing: border-box;
-}
-.subtab {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.4rem;
-  height: 100%;
-  padding: 0 0.9rem;
-  border: 1px solid var(--border);
-  background: var(--card);
-  color: var(--muted-foreground);
-  font-family: var(--font-sans);
-  font-size: 0.8rem;
-  font-weight: 600;
-  line-height: 1;
-  border-radius: 0;
-  cursor: pointer;
-  transition:
-    background-color 0.16s ease,
-    border-color 0.16s ease,
-    color 0.16s ease;
-}
-.subtab:first-child {
-  border-top-left-radius: var(--radius-md);
-  border-bottom-left-radius: var(--radius-md);
-}
-.subtab:last-child {
-  border-top-right-radius: var(--radius-md);
-  border-bottom-right-radius: var(--radius-md);
-}
-.subtab + .subtab {
-  margin-left: -1px;
-}
-.subtab:hover {
-  z-index: 1;
-  background: var(--accent);
-  color: var(--accent-foreground);
-}
-.subtab.active {
-  z-index: 2;
-  background: var(--foreground);
-  color: var(--background);
-  border-color: var(--foreground);
-}
-.subtab.active:hover {
-  background: var(--foreground);
-  color: var(--background);
-}
-.subtab .fa-solid {
-  font-size: 0.75rem;
-  opacity: 0.9;
-}
-.fwd-pane.hidden {
-  display: none;
 }
 
 /* Expandable event rows */
@@ -5248,4 +5429,218 @@ body.modal-open .scroll-nav {
   font-family: var(--font-mono);
   font-size: 0.75rem;
   word-break: break-all;
+}
+
+/* ===== Keyboard shortcuts: key caps, chord echo, command palette, sheet ===== */
+
+/* One kbd treatment for every surface that prints a key, so the palette rows,
+   the sheet and the chord echo cannot drift apart. */
+kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.35rem;
+  padding: 0.1rem 0.35rem;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 0.3rem;
+  background: var(--muted);
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+/* Chord echo. Top-centre: the bottom-left corner is the sidebar's logout button
+   and the whole bottom edge belongs to the toasts, which go full-width on a narrow
+   screen. pointer-events off so a pill that appears for a second and a half can
+   never swallow a click on whatever is under it. */
+.chord-hint {
+  position: fixed;
+  top: 0.75rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 300;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+}
+
+/* Palette: pinned near the top rather than centred, because the list grows
+   downward as it filters and a centred box would shift under the reader. */
+.cmdk-modal {
+  align-items: flex-start;
+  padding: 12vh 5vw 5vh;
+}
+.cmdk-content {
+  width: min(34rem, 92vw);
+  margin: 0 auto;
+  overflow: hidden;
+}
+.cmdk-input-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.85rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.cmdk-input-icon {
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+}
+#cmdPaletteInput {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--foreground);
+  font-size: 0.9375rem;
+  padding: 0;
+}
+#cmdPaletteInput:focus,
+#cmdPaletteInput:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+.cmdk-hint-key {
+  flex: none;
+}
+.cmdk-list {
+  overflow-y: auto;
+  max-height: min(24rem, 52vh);
+  padding: 0.35rem;
+}
+.cmdk-group {
+  padding: 0.5rem 0.6rem 0.25rem;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.cmdk-item {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 0.8125rem;
+  color: var(--foreground);
+}
+/* The highlight is aria-activedescendant, not focus: DOM focus stays in the
+   input so typing keeps working, so the row needs its own visible state. */
+.cmdk-item.is-active {
+  background: var(--accent);
+}
+.cmdk-ico {
+  width: 1rem;
+  flex: none;
+  text-align: center;
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+}
+.cmdk-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cmdk-label mark {
+  background: transparent;
+  color: var(--info);
+  font-weight: 650;
+}
+.cmdk-keys {
+  flex: none;
+  display: flex;
+  gap: 0.2rem;
+}
+.cmdk-empty {
+  padding: 1.25rem 0.6rem;
+  text-align: center;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+}
+.cmdk-footer {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.55rem 1rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+}
+.cmdk-footer > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.cmdk-count {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Sheet */
+.shortcuts-modal-content {
+  width: min(30rem, 92vw);
+}
+.shortcuts-group-title {
+  margin: 1rem 0 0.4rem;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.shortcuts-body > .shortcuts-group-title:first-child {
+  margin-top: 0;
+}
+.shortcuts-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.35rem 0;
+  font-size: 0.8125rem;
+}
+.shortcuts-row-label {
+  flex: 1;
+  min-width: 0;
+}
+.shortcuts-row-keys {
+  flex: none;
+  display: flex;
+  gap: 0.2rem;
+}
+.shortcuts-setting {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+.shortcuts-setting small {
+  display: block;
+  margin-top: 0.4rem;
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+@media (max-width: 720px) {
+  .cmdk-modal {
+    padding: 6vh 3vw 3vh;
+  }
+  .cmdk-content {
+    width: min(34rem, 94vw);
+  }
 }

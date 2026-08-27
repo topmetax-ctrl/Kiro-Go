@@ -174,6 +174,14 @@
     // Inline stats and any expanded detail panels are innerHTML-built, so they
     // need an explicit re-render to pick up the new locale.
     renderProviderInlineStats();
+    // The nav hints, the sheet and the palette all render labels through t(),
+    // so they need the same nudge as the other innerHTML-built surfaces.
+    syncShortcutUi();
+    // An open route editor is innerHTML-built too, and its own filter box takes its
+    // placeholder from applyTranslations — so leaving the rows alone would switch the
+    // box's language while the badges, tooltips and match count beside it kept the
+    // old one. Guarded, so this is a no-op when the editor is closed.
+    if (isDialogOpen('modelRouteModal') && routeTargetDraft.length) renderRouteTargets();
     Object.keys(openProviderDetails).forEach(pid => {
       if (!providerDetailCache[pid]) return;
       qsa('[data-provider-detail="' + cssEscape(pid) + '"]').forEach(el => {
@@ -345,7 +353,10 @@
     const valueId = id + '-value';
     const value = trigger.querySelector('.custom-select-value');
     if (value) value.id = valueId;
-    const label = getCustomSelectLabelElement(select);
+    // An explicit aria-label on the select wins over the surrounding form-group's
+    // label. Repeated controls (one provider picker per route target row) all sit
+    // under one group label, so borrowing it would announce every row identically.
+    const label = select.getAttribute('aria-label') ? null : getCustomSelectLabelElement(select);
     if (label) {
       if (!label.id) label.id = id + '-label';
       trigger.removeAttribute('aria-label');
@@ -712,6 +723,19 @@
     document.addEventListener('keydown', e => {
       if (e.key !== 'Escape') return;
       if (document.querySelector('.custom-select.is-open')) return;
+      // Same courtesy for a filter box that clears itself on Escape (bindListSearch
+      // marks them). Inside a dialog the two meanings collide, and dismissing the
+      // dialog would throw away every unsaved edit underneath the filter — so the
+      // narrower one wins while there is something to clear, and an empty box falls
+      // through to closing the dialog like anything else in it. The decision has to
+      // be made here: this listener is on the capture phase for the combobox's sake,
+      // so the box's own bubbling handler could never stop it.
+      const filterBox = e.target && e.target.closest && e.target.closest('input[data-filter-clear]');
+      if (filterBox && filterBox.value) return;
+      // The route editor's position input has the same collision, with no value gate: an
+      // emptied field still means "I am editing a position", and Escape there abandons
+      // that edit -- not the route around it.
+      if (e.target && e.target.closest && e.target.closest('input[data-target-jump]')) return;
       if (closeTopDialog()) e.preventDefault();
     }, true);
   }
@@ -854,6 +878,7 @@
   function showMain() {
     $('loginPage').classList.add('hidden');
     $('mainPage').classList.remove('hidden');
+    startRouter();
   }
 
   // Data loaders
@@ -1058,6 +1083,18 @@
     }
   }
 
+  // This table is fed only by the Kiro account pool paths (recordSuccessLogSplit
+  // and recordFailureWithDetails); forwarded requests are recorded in a separate
+  // store and shown under Forwarding. With the pool switched off, an empty table
+  // is therefore the correct and permanent state, which reads exactly like a
+  // broken view unless it says so.
+  function logsEmptyHTML() {
+    const poolLive = (accountsData || []).some(a => a && a.enabled);
+    if (poolLive) return '<p class="text-muted">' + escapeHtml(t('logs.empty')) + '</p>';
+    return '<p class="text-muted">' + escapeHtml(t('logs.emptyPoolOff')) +
+      ' <a class="text-link" href="#/forwarding/activity">' + escapeHtml(t('logs.emptyPoolOffLink')) + '</a></p>';
+  }
+
   function renderLogs(logs) {
     logsCache = logs;
     const list = $('logsList');
@@ -1075,7 +1112,9 @@
     const filtered = logs.filter(l => logsFilter === 'all' || l.status === logsFilter);
 
     if (!filtered.length) {
-      list.innerHTML = '<p class="text-muted">' + escapeHtml(t('logs.empty')) + '</p>';
+      // A filter that matched nothing is a different statement from a table with
+      // nothing in it, so only the latter explains itself.
+      list.innerHTML = total ? '<p class="text-muted">' + escapeHtml(t('logs.empty')) + '</p>' : logsEmptyHTML();
       return;
     }
 
@@ -1128,7 +1167,7 @@
     if (logsAutoTimer) { clearInterval(logsAutoTimer); logsAutoTimer = null; }
     if (on) {
       logsAutoTimer = setInterval(() => {
-        if (!$('tabLogs').classList.contains('hidden')) loadLogs();
+        if (isActiveRoute('accounts/logs')) loadLogs();
       }, 5000);
     }
   }
@@ -2335,8 +2374,18 @@
   // Models fetched per provider (keyed by provider id) for the browse/copy/test UI.
   let providerModels = {};
   let providerModelsLoading = {};
+  // Why the failure is remembered separately from the (empty) model list: a provider
+  // whose /models answers 401 and one that genuinely offers nothing both leave an
+  // empty array, and the route editor has to say which — an empty dropdown with no
+  // explanation is the thing that made the field look broken.
+  let providerModelsError = {};
   let modelsModalPid = '';
   let modelsModalSearch = '';
+  // Filter keywords for the two long lists on the Forwarding tab. View state, not
+  // config, and deliberately NOT persisted: a filter that survives a reload hides
+  // rows the operator no longer remembers filtering out.
+  let provSearch = '';
+  let routeSearch = '';
   // Hidden providers are collapsed behind a "show hidden" disclosure rather than
   // dropped, so an operator can always get back to one. The expanded/collapsed
   // choice is a view preference, so it lives in localStorage; which providers are
@@ -2351,6 +2400,36 @@
   // that silently reads as contiguous when it is not would misdescribe the tier
   // above/below relationships the editor is built to show.
   let showHiddenRouteTargets = localStorage.getItem('kiro_show_hidden_route_targets') === '1';
+  // In-modal filter over ONE route's target rows. Deliberately not persisted, unlike
+  // the collapse preference above: it is a way of finding a row in the chain being
+  // edited, and a stored term would open the next chain with rows already elided.
+  let routeTargetSearch = '';
+  // The length at which a chain stops fitting on screen. Below it the filter box could
+  // only ever hide rows the operator can already see, and the position chip would be a
+  // number on every row of a list short enough to count by eye. Both affordances answer
+  // the same question -- "how do I reach the row I mean without scrolling past the rest"
+  // -- so they appear together, at the same length, and short routes look exactly as
+  // they did before. "Make this the primary" is deliberately NOT gated on this: it is a
+  // thing to say about a chain of any length, not a way of coping with a long one.
+  const ROUTE_TARGET_LONG_CHAIN = 6;
+  // Which row's position chip is currently an input, as a draft index, or -1. This
+  // is state rather than a chip swapped in the DOM on click, because the list is
+  // rebuilt wholesale for reasons that are not the operator's doing -- a background
+  // /models fetch is enough -- and an ad-hoc input would go with it mid-typing.
+  let routeTargetJumpAt = -1;
+  // What has been typed into that editor. It needs somewhere outside the DOM to live
+  // for the same reason the box exists at all: the list is rebuilt wholesale by things
+  // the operator did not do, and re-rendering the input from the row's CURRENT position
+  // would silently undo the number half-typed into it. Every open sets it, so it can
+  // never be read stale.
+  let routeTargetJumpValue = '';
+  // Where the last structural move put the row. The focus snapshot below is keyed by
+  // SLOT, so without this the render after a move hands focus to whichever row took
+  // the vacated slot -- which is why a second press of the same arrow used to move a
+  // different row. It also drives the scroll-and-flash: a promoted row leaves the
+  // viewport of a scrolled modal entirely, and a move nobody can see reads as a
+  // click that did nothing. Consumed by renderRouteTargets.
+  let routeTargetMovedTo = -1;
   // Per-target probe results, keyed by "providerId|model" rather than by row index.
   // A probe describes a provider+model PAIR, so reordering or hiding rows must not
   // carry a verdict onto a different target, and two rows aiming at the same pair
@@ -3343,29 +3422,82 @@
   function renderProviders() {
     const list = $('upstreamsList');
     if (!list) return;
-    if (!upstreamCache.providers.length) {
+    const total = upstreamCache.providers.length;
+    // The sidebar badge is how big the pool is without opening the view.
+    setNavCount('forwarding/providers', total || '');
+    const kw = provSearch.trim().toLowerCase();
+    const countEl = $('upstreamProvSearchCount');
+    if (!total) {
+      if (countEl) countEl.textContent = '';
       list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('upstreams.providersEmpty')) + '</div>';
       return;
     }
-    const shown = upstreamCache.providers.filter(p => !p.hidden);
-    const hiddenOnes = upstreamCache.providers.filter(p => p.hidden);
+    const matches = kw ? upstreamCache.providers.filter(p => providerMatchesSearch(p, kw)) : upstreamCache.providers;
+    // The counter only appears while filtering: on an unfiltered list "31 of 31"
+    // is noise, and the card count is already visible.
+    if (countEl) countEl.textContent = kw ? t('upstreams.provSearchCount', String(matches.length), String(total)) : '';
+    if (!matches.length) {
+      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' +
+        escapeHtml(t('upstreams.provNoMatch', provSearch.trim())) + '</div>';
+      return;
+    }
+    const shown = matches.filter(p => !p.hidden);
+    const hiddenOnes = matches.filter(p => p.hidden);
+    // Searching is an explicit act of looking for one provider, so a match that
+    // happens to be hidden is shown rather than left behind a count the operator
+    // would have to click — with 17 of 31 providers hidden here, the collapsed case
+    // is the common one. The stored preference is untouched, so clearing the box
+    // restores the collapsed view.
+    const expandHidden = showHiddenProviders || (!!kw && hiddenOnes.length > 0);
     let html = shown.map(providerCard).join('');
     // Hiding every provider would otherwise leave a blank panel that looks like a
     // load failure, so say what happened.
-    if (!shown.length) {
+    if (!shown.length && !expandHidden) {
       html += '<div class="muted-text text-xs" style="padding:0.5rem 0;">' +
         escapeHtml(t('upstreams.allHidden')) + '</div>';
     }
     if (hiddenOnes.length) {
-      const caret = showHiddenProviders ? 'fa-chevron-down' : 'fa-chevron-right';
-      html += '<button class="btn btn-ghost btn-sm provider-hidden-toggle" type="button"' +
-        ' data-upstream-toggle-hidden="1" aria-expanded="' + (showHiddenProviders ? 'true' : 'false') + '">' +
-        '<i class="fa-solid ' + caret + '" aria-hidden="true"></i>' +
-        escapeHtml(t('upstreams.hiddenCount', String(hiddenOnes.length))) +
-        '</button>';
-      if (showHiddenProviders) html += hiddenOnes.map(providerCard).join('');
+      // While filtering the divider is a label, not a control: the keyword is what
+      // decides visibility, so a toggle here would either be a dead click or fight
+      // the search. It goes back to being a button when the box is cleared.
+      const caret = expandHidden ? 'fa-chevron-down' : 'fa-chevron-right';
+      const label = kw
+        ? t('upstreams.provHiddenMatchCount', String(hiddenOnes.length))
+        : t('upstreams.hiddenCount', String(hiddenOnes.length));
+      html += kw
+        ? '<div class="btn btn-ghost btn-sm provider-hidden-toggle is-static">' +
+            '<i class="fa-solid fa-chevron-down" aria-hidden="true"></i>' +
+            escapeHtml(label) +
+          '</div>'
+        : '<button class="btn btn-ghost btn-sm provider-hidden-toggle" type="button"' +
+            ' data-upstream-toggle-hidden="1" aria-expanded="' + (expandHidden ? 'true' : 'false') + '">' +
+            '<i class="fa-solid ' + caret + '" aria-hidden="true"></i>' +
+            escapeHtml(label) +
+          '</button>';
+      if (expandHidden) html += hiddenOnes.map(providerCard).join('');
     }
     list.innerHTML = html;
+  }
+
+  // Matched against what identifies a provider on screen: its name and its base
+  // URL. The URL matters as much as the name here — several providers share a
+  // name shape ("Kiro API …") and are told apart by host.
+  function providerMatchesSearch(p, kw) {
+    if (!kw) return true;
+    return (p.name || '').toLowerCase().includes(kw) ||
+      (p.baseUrl || '').toLowerCase().includes(kw);
+  }
+
+  // A route is found by what it routes (the client model), by where it sends
+  // (target provider names), or by the model name it rewrites to. Hidden targets
+  // are searched too: "which route still points at X" has to answer yes even when
+  // that target is collapsed in the editor, or the search would help hide it.
+  function routeMatchesSearch(item, kw) {
+    if (!kw) return true;
+    if ((item.model || '').toLowerCase().includes(kw)) return true;
+    return routeTargets(item).some(tg =>
+      providerName(tg.upstreamId).toLowerCase().includes(kw) ||
+      (tg.targetModel || '').toLowerCase().includes(kw));
   }
 
   // Render the fetched-model list into the models modal, filtered by the search box.
@@ -3401,11 +3533,23 @@
   function renderModelRoutes() {
     const list = $('modelRoutesList');
     if (!list) return;
-    if (!upstreamCache.routes.length) {
+    const total = upstreamCache.routes.length;
+    setNavCount('forwarding/routes', total || '');
+    const kw = routeSearch.trim().toLowerCase();
+    const countEl = $('upstreamRouteSearchCount');
+    if (!total) {
+      if (countEl) countEl.textContent = '';
       list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('upstreams.routesEmpty')) + '</div>';
       return;
     }
-    list.innerHTML = upstreamCache.routes.map(item => {
+    const matches = kw ? upstreamCache.routes.filter(r => routeMatchesSearch(r, kw)) : upstreamCache.routes;
+    if (countEl) countEl.textContent = kw ? t('upstreams.routeSearchCount', String(matches.length), String(total)) : '';
+    if (!matches.length) {
+      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' +
+        escapeHtml(t('upstreams.routeNoMatch', routeSearch.trim())) + '</div>';
+      return;
+    }
+    list.innerHTML = matches.map(item => {
       const id = escapeAttr(item.id || '');
       const model = escapeHtml(item.model || '');
       const disabled = !item.enabled
@@ -4029,9 +4173,14 @@
       const d = await res.json().catch(() => ({}));
       if (!res.ok || d.error) throw new Error(d.error || t('upstreams.loadModelsFailed'));
       providerModels[pid] = Array.isArray(d.models) ? d.models : [];
+      delete providerModelsError[pid];
       if (!providerModels[pid].length) { toast(t('upstreams.noModels'), 'warning'); return; }
       openModelsModal(pid);
     } catch (e) {
+      // Record the reason, not just the empty result: this fills the same cache the
+      // route editor reads, and there an empty list with no reason is exactly what
+      // used to read as a broken field.
+      providerModelsError[pid] = (e && e.message) || t('upstreams.loadModelsFailed');
       providerModels[pid] = [];
       toast((e && e.message) || t('upstreams.loadModelsFailed'), 'error');
     } finally {
@@ -4145,19 +4294,137 @@
     return o ? o.label : '';
   }
 
-  function routeProviderIdFromLabel(label) {
-    const o = routeProviderOptions().find(x => x.label === label);
-    return o ? o.id : '';
+  // The row's provider picker. data-search="true" pins the filter box on rather
+  // than leaving it to the option-count threshold, so it is there from the first
+  // provider — the box is the whole point of this control.
+  //
+  // A target whose provider is gone (deleted while the route kept pointing at it)
+  // gets a synthetic option for its own id. Without one the select would fall back
+  // to its first option and SILENTLY re-aim the target at an unrelated provider on
+  // the next save; instead the row names the dead id and says so.
+  function providerSelectHTML(tg, i) {
+    const opts = routeProviderOptions();
+    const current = tg.upstreamId || '';
+    const known = opts.some(o => o.id === current);
+    let html = '<select data-target-field="upstreamProvider" data-index="' + i + '" data-search="true"' +
+      ' aria-label="' + escapeAttr(t('upstreams.routeTargetProviderLabel')) + '">';
+    if (!current) {
+      html += '<option value="" selected>' + escapeHtml(t('upstreams.routeTargetProviderPick')) + '</option>';
+    }
+    if (current && !known) {
+      html += '<option value="' + escapeAttr(current) + '" selected>' +
+        escapeHtml(t('upstreams.routeTargetProviderMissing', current)) + '</option>';
+    }
+    opts.forEach(o => {
+      html += '<option value="' + escapeAttr(o.id) + '"' + (o.id === current ? ' selected' : '') + '>' +
+        escapeHtml(o.label) + '</option>';
+    });
+    return html + '</select>';
   }
 
-  // Fill the shared provider datalist so every target row's provider field is a
-  // searchable dropdown (type to filter among many upstreams).
-  function populateProviderDatalist() {
-    const dl = $('routeProviderList');
-    if (!dl) return;
-    dl.innerHTML = routeProviderOptions()
-      .map(o => '<option value="' + escapeAttr(o.label) + '"></option>')
-      .join('');
+  // Focus survives a re-render of the target list. The list is rebuilt wholesale
+  // (innerHTML) for reasons that are not always the operator's doing — a provider's
+  // model list landing from a background fetch rebuilds it too — so without this a
+  // half-typed model name loses its caret, and picking a provider drops focus to
+  // <body> with Tab restarting at the top of the modal.
+  function captureTargetListFocus(box) {
+    const active = document.activeElement;
+    if (!active || !box.contains(active)) return null;
+    const row = active.closest('[data-target-index]');
+    if (!row) return null;
+    const snap = {
+      index: row.dataset.targetIndex,
+      // Anything inside the provider popover (trigger, filter box, an option) comes
+      // back as the trigger: the popover itself does not survive the rebuild.
+      inSelect: !!active.closest('.custom-select'),
+      field: active.dataset.targetField || null,
+      // The reorder controls are the keyboard path to what dragging does, so they
+      // have to survive the re-render they themselves cause. Snapshotting only the
+      // FIELDS meant focus fell to <body> after every arrow press -- and in a dialog
+      // with a focus trap that sends the next Tab back to the top of the modal, so
+      // moving a row two slots meant tabbing all the way down again between presses.
+      action: active.dataset.targetAction || null,
+      // The position editor deliberately is not a data-target-field (it must never
+      // write into the draft), so it needs its own handle here or a background
+      // re-render would close it mid-typing.
+      jump: !!active.dataset.targetJump,
+      // Focus can also sit on the row itself, which is where a keyboard reorder leaves
+      // it once the button it was on goes disabled -- and where Alt+Arrow is pressed
+      // from next. Without this the FIRST keyboard move would restore nothing and the
+      // second would have nowhere to act from.
+      self: active === row,
+      start: null,
+      end: null
+    };
+    // selectionStart throws on input types that have no text selection (number).
+    try { snap.start = active.selectionStart; snap.end = active.selectionEnd; } catch (e) { /* not a text field */ }
+    return snap;
+  }
+
+  function restoreTargetListFocus(box, snap) {
+    if (!snap) return;
+    const row = box.querySelector('[data-target-index="' + snap.index + '"]');
+    if (!row) return;
+    let el = snap.inSelect
+      ? row.querySelector('.custom-select-trigger')
+      : (snap.jump
+        ? row.querySelector('[data-target-jump]')
+        : (snap.field
+          ? row.querySelector('[data-target-field="' + snap.field + '"]')
+          : (snap.action ? row.querySelector('[data-target-action="' + snap.action + '"]') : null)));
+    // The control that was used can be gone or disabled at the row's new home: "move
+    // to top" disables its own button by succeeding, and a committed jump removes the
+    // input it was typed into. Fall back to the row, which carries tabindex="-1" for
+    // exactly this, so the keyboard path continues from where the operator is looking
+    // instead of from <body>.
+    if (el && el.disabled) el = null;
+    if (!el && (snap.action || snap.jump || snap.self)) el = row;
+    if (!el) return;
+    el.focus({ preventScroll: true });
+    if (snap.start !== null && typeof el.setSelectionRange === 'function') {
+      try { el.setSelectionRange(snap.start, snap.end); } catch (e) { /* not selectable */ }
+    }
+  }
+
+  // The note under a row's model field. The field itself stays free text — any name
+  // the upstream accepts is valid, including ones its /models never lists — so this
+  // reports the state of the SUGGESTIONS. It exists because an empty dropdown was
+  // indistinguishable from a broken one: half the providers here answer /models with
+  // 401, and the fetch failure was swallowed.
+  function targetModelNoteHTML(tg, i) {
+    const pid = tg.upstreamId;
+    if (!pid || pid === KIRO_POOL_ID) return '';
+    // A target pointing at a deleted provider has nothing to fetch from; the select
+    // above already says the provider is gone, so stay quiet rather than reporting a
+    // model list that can never load.
+    if (!upstreamCache.providers.some(p => p.id === pid)) return '';
+    const models = providerModels[pid];
+    // undefined means "not fetched yet": renderRouteTargets kicks the fetch off right
+    // after painting this note, so it is about to be loading — reporting it as such
+    // here avoids a render pass whose only job is to flip this one label.
+    if (providerModelsLoading[pid] || models === undefined) {
+      return '<span class="route-target-model-note text-xs muted-text">' +
+        '<i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i>' +
+        escapeHtml(t('upstreams.routeTargetModelsLoading')) + '</span>';
+    }
+    const err = providerModelsError[pid];
+    const retry = '<button class="btn btn-ghost btn-xs" type="button" data-target-action="reload-models"' +
+      ' data-index="' + i + '">' + escapeHtml(t('upstreams.routeTargetModelsRetry')) + '</button>';
+    if (err) {
+      return '<span class="route-target-model-note text-xs muted-text">' +
+        '<i class="fa-solid fa-triangle-exclamation" aria-hidden="true" style="color:#f59e0b;"></i>' +
+        '<span title="' + escapeAttr(t('upstreams.routeTargetModelsFailedHint', err)) + '">' +
+          escapeHtml(t('upstreams.routeTargetModelsFailed')) + '</span>' + retry + '</span>';
+    }
+    if (Array.isArray(models) && !models.length) {
+      return '<span class="route-target-model-note text-xs muted-text">' +
+        escapeHtml(t('upstreams.routeTargetModelsEmpty')) + retry + '</span>';
+    }
+    if (Array.isArray(models) && models.length) {
+      return '<span class="route-target-model-note text-xs muted-text">' +
+        escapeHtml(t('upstreams.routeTargetModelsCount', String(models.length))) + '</span>';
+    }
+    return '';
   }
 
   // targetModelOptionsHTML builds the <option>s for one row's model datalist from
@@ -4178,19 +4445,28 @@
 
   // Fetch a provider's model list without opening the browser modal. Populates the
   // providerModels cache and re-renders the route targets so the matching row's
-  // model dropdown fills in. Failures are swallowed (suggestions only).
+  // model dropdown fills in. A failure is recorded rather than swallowed: the
+  // suggestions are optional, but "we could not read this provider's /models" is
+  // exactly what the row has to be able to say (see targetModelNoteHTML).
   async function fetchProviderModelsSilently(pid) {
     const p = upstreamCache.providers.find(x => x.id === pid);
     if (!p) return;
     providerModelsLoading[pid] = true;
+    delete providerModelsError[pid];
     try {
       const res = await api('/upstream-models', {
         method: 'POST',
         body: JSON.stringify({ id: pid, baseUrl: p.baseUrl, proxyURL: p.proxyURL })
       });
       const d = await res.json().catch(() => ({}));
-      providerModels[pid] = (res.ok && !d.error && Array.isArray(d.models)) ? d.models : [];
+      if (!res.ok || d.error) {
+        providerModelsError[pid] = String(d.error || ('http ' + res.status));
+        providerModels[pid] = [];
+      } else {
+        providerModels[pid] = Array.isArray(d.models) ? d.models : [];
+      }
     } catch (e) {
+      providerModelsError[pid] = (e && e.message) || t('upstreams.loadModelsFailed');
       providerModels[pid] = [];
     } finally {
       providerModelsLoading[pid] = false;
@@ -4198,6 +4474,16 @@
       // the freshly fetched models. Guarded so this is a no-op when closed.
       if (isDialogOpen('modelRouteModal') && routeTargetDraft.length) renderRouteTargets();
     }
+  }
+
+  // Drop the cached list (and any recorded failure) and fetch again. ensureProviderModels
+  // only fetches when the cache entry is undefined, which is what keeps a failed
+  // provider from being retried on every render — so a retry has to clear it first.
+  function reloadProviderModels(pid) {
+    if (!pid || pid === KIRO_POOL_ID) return;
+    delete providerModels[pid];
+    delete providerModelsError[pid];
+    fetchProviderModelsSilently(pid);
   }
 
   function openRouteModal(entry) {
@@ -4214,7 +4500,16 @@
     // build, or by hand. Normalize on load so the badges describe the routing the
     // resolver will actually perform rather than the stale config.
     normalizeDraftTiers();
-    populateProviderDatalist();
+    // Per-visit, like the draft itself: a box still holding the last route's term
+    // would open this chain with rows already elided.
+    routeTargetSearch = '';
+    const targetSearchBox = $('routeTargetSearch');
+    if (targetSearchBox) targetSearchBox.value = '';
+    // Both are transient view state about the chain being edited, so neither may leak
+    // into the next one: an open position editor on row 9 of a chain that no longer has
+    // a row 9, or a flash pointing at a row this route never had.
+    routeTargetJumpAt = -1;
+    routeTargetMovedTo = -1;
     renderRouteTargets();
     populateClientModelDatalist();
     openDialog('modelRouteModal');
@@ -4255,19 +4550,6 @@
     });
   }
 
-  // Tier membership belongs to the SLOT, not to the target that happens to sit in
-  // it. Reordering is the documented "switch provider without losing the old
-  // setup" gesture, so moving a target into the primary slot must not drag its
-  // old sameTier flag along and collapse a shared tier. These two helpers let a
-  // reorder restore the flags by position after the rows have moved.
-  function draftTierFlags() {
-    return routeTargetDraft.map(tg => !!tg.sameTier);
-  }
-  function applyPositionalTiers(flags) {
-    routeTargetDraft.forEach((tg, i) => { tg.sameTier = !!flags[i]; });
-    normalizeDraftTiers();
-  }
-
   // The first row opens the first tier by definition. A stale sameTier there
   // would make draftTierNumbers start counting at 1 and mislabel every badge, so
   // every structural change funnels through this.
@@ -4290,6 +4572,24 @@
         tg.sameTier = false;
       }
     });
+  }
+
+  // The active filter term, or '' when there is none. Gated on the row count as
+  // well as the box: a term left in a hidden box (rows removed until the list fell
+  // under the threshold) must not keep filtering a list whose box is gone.
+  function routeTargetFilterKeyword() {
+    if (routeTargetDraft.length < ROUTE_TARGET_LONG_CHAIN) return '';
+    return routeTargetSearch.trim().toLowerCase();
+  }
+
+  // Matched on what names the destination on the row: the label the provider picker
+  // shows, the raw upstream id — the only handle a target left pointing at a deleted
+  // provider still has — and the model the row rewrites to.
+  function routeTargetMatchesSearch(tg, kw) {
+    if (!kw) return true;
+    return (routeProviderLabel(tg.upstreamId) || '').toLowerCase().includes(kw) ||
+      (tg.upstreamId || '').toLowerCase().includes(kw) ||
+      (tg.targetModel || '').toLowerCase().includes(kw);
   }
 
   // renderedTargetIndexes is the draft filtered down to the rows the operator can
@@ -4316,24 +4616,86 @@
     if (at < 0) return false;
     const neighbour = order[at + dir];
     if (neighbour === undefined) return false;
-    // moveDraftRow takes a gap index: moving up lands in the neighbour's slot,
-    // moving down lands just past it. It also restores the tier flags by position,
-    // which is what keeps "same tier as above" attached to the slot instead of
-    // riding along with the row.
+    // moveDraftRow takes a gap index: moving up lands in the neighbour's slot, moving
+    // down lands just past it. Tiers look after themselves there -- a press that
+    // exchanges two rows of one tier leaves that tier alone, and one that carries a row
+    // out of its tier hands the tier to whoever is left.
     return moveDraftRow(from, dir > 0 ? neighbour + 1 : neighbour);
   }
 
   // moveDraftRow relocates one row to an insertion slot, as produced by a drop.
   // insertAt is a gap index (0 == above the first row), so dropping either side
   // of the row's own position is a no-op. Returns whether anything moved.
+  //
+  // What travels with the row is its TIER IDENTITY, captured before anything shifts.
+  // Afterwards a row shares a tier with the row above it exactly when the two were in
+  // the same tier already, which is the one rule that keeps a move from rewriting rows
+  // nobody touched. sameTier is stored per row as "joins the row above", and that phrase
+  // changes meaning under the row it describes: restoring the flags by POSITION -- what
+  // this did before -- kept the boundaries still while the rows slid past them, so
+  // dragging the last target to the top would pair it with the old primary and separate
+  // that primary from the partner it had been splitting traffic with. Two silent changes
+  // to the routing, from a gesture that only claimed to move one row.
+  //
+  // The consequences of carrying identity instead:
+  //   - a tier survives a move that leaves it contiguous, wherever the row landed;
+  //   - reordering rows WITHIN one tier is free, since order inside a tier is only
+  //     reading order (the split is by weight);
+  //   - a row that leaves a tier it opened hands the tier to the member below it,
+  //     rather than leaving that member to be adopted by whoever moved in;
+  //   - a row that lands between two members of a tier splits it instead of joining it.
+  //     Nothing in a drop says "join this tier", and quietly enrolling a target into a
+  //     live weighted split is the more expensive guess to get wrong.
   function moveDraftRow(from, insertAt) {
     if (!routeTargetDraft[from]) return false;
     if (insertAt === from || insertAt === from + 1) return false;
-    const flags = draftTierFlags();
+    const groups = draftTierNumbers();
     const row = routeTargetDraft.splice(from, 1)[0];
-    routeTargetDraft.splice(insertAt > from ? insertAt - 1 : insertAt, 0, row);
-    applyPositionalTiers(flags);
+    const group = groups.splice(from, 1)[0];
+    const landed = insertAt > from ? insertAt - 1 : insertAt;
+    routeTargetDraft.splice(landed, 0, row);
+    groups.splice(landed, 0, group);
+    routeTargetDraft.forEach((tg, i) => { tg.sameTier = i > 0 && groups[i] === groups[i - 1]; });
+    // The pool's own tier rule, and the first row's, are enforced on the way out: this
+    // reassigns every flag, so a state normalizeDraftTiers forbids must not survive it.
+    normalizeDraftTiers();
+    // Every move funnels through here, so this is the one place that knows where the
+    // row ended up; the render that follows reads it for focus and for the flash.
+    routeTargetMovedTo = landed;
+    // Any move renumbers the rows between the two slots, so a position editor left open
+    // on one of them now points at a different target. Close it rather than let it
+    // rewrite a row nobody aimed at.
+    routeTargetJumpAt = -1;
     return true;
+  }
+
+  // "Make this the primary" is the reorder a long chain actually gets asked for, and
+  // unlike the arrows it names an absolute slot instead of a neighbour -- which is why
+  // it stays available while the list is filtered: position 0 is position 0 in every
+  // rendering, so nothing about it depends on the adjacency a filter hides.
+  //
+  // It means SOLE primary, which moveDraftRow's tier-identity rule delivers on its own:
+  // the arriving row was in nobody else's tier, so it opens its own, and the old primary
+  // is not adopted into it. A primary tier two providers were splitting stays a pair one
+  // tier further down instead of being broken up by a promotion aimed at neither.
+  function promoteTargetToTop(from) {
+    if (from <= 0 || !routeTargetDraft[from]) return false;
+    return moveDraftRow(from, 0);
+  }
+
+  // Move a row to the 1-based position typed into its chip. Returns 'moved', 'same' or
+  // 'range', so the caller can tell "already there" from "that is not a position" and
+  // say which. Positions count the WHOLE chain, hidden rows included: they are still
+  // targets the router walks, and the chips on screen carry the same numbering.
+  function moveTargetToPosition(from, pos1) {
+    if (!routeTargetDraft[from] || isNaN(pos1)) return 'range';
+    const to = Math.round(pos1) - 1;
+    if (to < 0 || to >= routeTargetDraft.length) return 'range';
+    if (to === from) return 'same';
+    // moveDraftRow takes a GAP index, and lifting the row out first shifts everything
+    // below it up by one, so landing further down the chain aims one gap past the
+    // position asked for.
+    return moveDraftRow(from, to > from ? to + 1 : to) ? 'moved' : 'same';
   }
 
   // draftTierNumbers returns each draft row's tier index, using the same rule as
@@ -4346,6 +4708,36 @@
     });
   }
 
+  // The box appears with the chain that needs it and goes away again when rows are
+  // removed. routeTargetFilterKeyword applies the same threshold, so a term left
+  // behind in a box that has just disappeared cannot keep filtering the list.
+  function syncRouteTargetSearchRow(shown, total) {
+    const row = $('routeTargetSearchRow');
+    if (row) row.hidden = total < ROUTE_TARGET_LONG_CHAIN;
+    const count = $('routeTargetSearchCount');
+    if (count) {
+      count.textContent = routeTargetFilterKeyword()
+        ? t('upstreams.routeTargetSearchCount', String(shown), String(total))
+        : '';
+    }
+  }
+
+  // Scroll the row that just moved into view and flash it. Both halves matter in a
+  // modal that scrolls: a promoted row leaves the viewport entirely, and a row that
+  // lands next to a collapsed run arrives somewhere the eye was not. The class is
+  // re-applied after forcing a reflow, or a second move while the first animation is
+  // still running would not blink at all.
+  function flashMovedTarget(box, index) {
+    const row = box.querySelector('[data-target-index="' + index + '"]');
+    if (!row) return;
+    row.classList.remove('is-just-moved');
+    void row.offsetWidth;
+    row.classList.add('is-just-moved');
+    // Instant, not smooth: holding Alt+Up walks the row up a slot at a time, and a
+    // smooth scroll per press would still be animating when the next one lands.
+    row.scrollIntoView({ block: 'nearest' });
+  }
+
   // Renders the draft target list. Tiers, not raw positions, carry the meaning:
   // consecutive rows can share a tier, and rows in the same tier split traffic by
   // weight instead of acting as each other's fallback. Reordering is still the
@@ -4353,6 +4745,12 @@
   function renderRouteTargets() {
     const box = $('routeTargetsList');
     if (!box) return;
+    const focusSnap = captureTargetListFocus(box);
+    // A move landed in this tick. The snapshot above is keyed by the SLOT the focused
+    // control sat in, which the row has just left, so point it at where the row went.
+    const movedTo = routeTargetMovedTo;
+    routeTargetMovedTo = -1;
+    if (movedTo >= 0 && focusSnap) focusSnap.index = String(movedTo);
     const tiers = draftTierNumbers();
     // A tier with more than one member is the only case where weight does
     // anything, so the weight input is enabled exactly there.
@@ -4369,6 +4767,20 @@
     const rendered = renderedTargetIndexes();
     const renderedAt = {};
     rendered.forEach((idx, pos) => { renderedAt[idx] = pos; });
+    // The filter never removes a row from the DRAFT, only from the rendering: the
+    // order of this list IS the routing, so nothing about being filtered may change
+    // what a save writes.
+    const longChain = routeTargetDraft.length >= ROUTE_TARGET_LONG_CHAIN;
+    const kw = routeTargetFilterKeyword();
+    const matched = routeTargetDraft.map(tg => routeTargetMatchesSearch(tg, kw));
+    const matchCount = matched.filter(Boolean).length;
+    // Reordering is off while a filter is in force. Position carries the meaning
+    // here — "same tier as above" is defined against the row directly above, and the
+    // pool's end-of-chain rule against everything below it — so once rows are elided
+    // the row above ON SCREEN is no longer the row above IN THE CHAIN. Rather than
+    // let a drag or an arrow land somewhere the operator did not aim, the structural
+    // controls say why they are inert while every content field stays editable.
+    const lockedHint = kw ? t('upstreams.routeTargetReorderFiltered') : '';
     // The marker names what stands behind it: how many targets, how many of those
     // are still enabled — the case where "out of sight" is easiest to misread as
     // "off" — and, in the tooltip, which providers. That tooltip is also what
@@ -4398,6 +4810,19 @@
         '<span class="route-target-hidden-run-action">' + escapeHtml(action) + '</span>' +
       '</button>';
     };
+    // A run of rows the filter did not match, elided in place. Static text rather
+    // than a disclosure: the keyword is what decides visibility here, so a toggle
+    // would either be a dead click or fight the box — the same call the provider
+    // list's hidden divider makes while its own search is active. It still names the
+    // providers behind it, so a filtered view never hides WHICH targets it set aside.
+    const filteredRunMarker = (start, end) => {
+      const run = routeTargetDraft.slice(start, end);
+      const names = run.map(tg => routeProviderLabel(tg.upstreamId) || tg.upstreamId).join(', ');
+      return '<div class="route-target-hidden-run is-static"' +
+        ' title="' + escapeAttr(t('upstreams.routeTargetFilteredNames', names)) + '">' +
+        '<span>' + escapeHtml(t('upstreams.routeTargetFilteredRun', String(run.length))) + '</span>' +
+      '</div>';
+    };
     const targetRow = (tg, i) => {
       const isPool = tg.upstreamId === KIRO_POOL_ID;
       const pos = renderedAt[i] === undefined ? -1 : renderedAt[i];
@@ -4422,8 +4847,9 @@
         (routeTargetDraft[i - 1] && routeTargetDraft[i - 1].upstreamId === KIRO_POOL_ID);
       const tierToggle = noTierToggle
         ? ''
-        : '<label class="text-xs muted-text flex items-center gap-1" title="' + escapeAttr(t('upstreams.routeTargetSameTierHint')) + '">' +
-            '<input type="checkbox" data-target-field="sameTier" data-index="' + i + '"' + (tg.sameTier ? ' checked' : '') + ' />' +
+        : '<label class="text-xs muted-text flex items-center gap-1" title="' + escapeAttr(lockedHint || t('upstreams.routeTargetSameTierHint')) + '">' +
+            '<input type="checkbox" data-target-field="sameTier" data-index="' + i + '"' + (tg.sameTier ? ' checked' : '') +
+              (kw ? ' disabled' : '') + ' />' +
             escapeHtml(t('upstreams.routeTargetSameTier')) +
           '</label>';
       const shareLabel = shares
@@ -4466,26 +4892,70 @@
       // The row is only made draggable on mousedown over the handle (see the
       // dragstart wiring), so dragging never starts from the text inputs and
       // ordinary text selection inside them keeps working.
-      const handle = '<span class="route-target-handle" data-target-handle="1" aria-hidden="true"' +
-        ' title="' + escapeAttr(t('common.dragToReorder')) + '">' +
+      const handle = '<span class="route-target-handle' + (kw ? ' is-locked' : '') +
+        '" data-target-handle="1" aria-hidden="true"' +
+        ' title="' + escapeAttr(lockedHint || t('common.dragToReorder')) + '">' +
         '<i class="fa-solid fa-grip-vertical"></i></span>';
+      // The chain position, and the handle for typing a different one. It is a second
+      // number next to the tier badge on purpose: the badge answers "when is this row
+      // tried", the chip answers "where in the list does it sit", and the moment two
+      // rows share a tier those stop being the same number. A bare "type a position"
+      // box was the alternative and it would have asked for a number the UI never
+      // shows -- countable only by eye, through collapsed runs, past rows a filter had
+      // set aside. Positions count the whole chain, hidden rows included, because
+      // those are still targets the router walks.
+      const posLabel = String(i + 1);
+      const posTitle = t('upstreams.routeTargetPositionHint', posLabel, String(routeTargetDraft.length));
+      // Locked while filtering, unlike "to top": an absolute position is only usable
+      // if the operator can see what is at it, and elided runs make that a guess.
+      const positionChip = !longChain ? '' : (routeTargetJumpAt === i && !kw)
+        ? '<input type="number" class="route-target-pos-input" data-target-jump="1" data-index="' + i + '"' +
+            ' min="1" max="' + routeTargetDraft.length + '" value="' + escapeAttr(routeTargetJumpValue) + '"' +
+            ' aria-label="' + escapeAttr(t('upstreams.routeTargetJumpLabel')) + '"' +
+            ' title="' + escapeAttr(t('upstreams.routeTargetJumpHint')) + '" />'
+        : (kw
+          ? '<span class="route-target-pos is-static" title="' + escapeAttr(lockedHint) + '">#' +
+              escapeHtml(posLabel) + '</span>'
+          : '<button class="route-target-pos" type="button" data-target-action="jump" data-index="' + i + '"' +
+              ' title="' + escapeAttr(posTitle) + '" aria-label="' + escapeAttr(posTitle) + '">#' +
+              escapeHtml(posLabel) + '</button>');
       // Each row's model field suggests ITS OWN provider's models via a per-row
       // datalist. A single shared datalist (the old behaviour) could only ever
       // reflect one provider, so fallback rows suggested the primary's models.
       const modelListId = 'routeTargetModelList-' + i;
-      const providerField =
-        '<input type="text" data-target-field="upstreamProvider" data-index="' + i + '" list="routeProviderList"' +
-          ' autocomplete="off" value="' + escapeAttr(routeProviderLabel(tg.upstreamId)) + '" style="flex:1;min-width:9rem;"' +
-          ' placeholder="' + escapeAttr(t('upstreams.providerSearchPlaceholder')) + '" />';
+      // The provider picker is a real select, enhanced into a searchable popover by
+      // the shared custom-select. It used to be a text input over a datalist, which
+      // was searchable in name only: the native popup filters by whatever is already
+      // in the box, so a row that already had a provider suggested exactly that one
+      // and nothing else — the list of 30+ upstreams was unreachable without first
+      // clearing the field. A select also removes the label→id round trip, so a
+      // half-typed name can no longer resolve to nothing and snap back.
+      const providerField = providerSelectHTML(tg, i);
+      // tabindex="-1" keeps the row out of the Tab cycle (getModalFocusable skips it)
+      // while making it a place focus can be PUT: after a move the control that was
+      // used may be disabled at the row's new home, and landing on the row keeps
+      // Alt+Arrow working from where the operator is looking.
       return '<div class="card route-target-row' + (tg.hidden ? ' is-hidden-target' : '') + '" draggable="false"' +
-        ' data-target-index="' + i + '" style="margin-top:0.5rem;padding:0.5rem;">' +
-        '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
-          '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' + handle + badge + hiddenBadge + tierToggle + shareLabel + poolNote + deadNote + testSlot + '</div>' +
-          '<div class="flex items-center gap-1">' +
+        ' tabindex="-1" data-target-index="' + i + '" style="margin-top:0.5rem;padding:0.5rem;">' +
+        '<div class="flex items-center gap-2 route-target-row-head">' +
+          '<div class="flex items-center gap-2 route-target-row-meta" style="flex-wrap:wrap;">' + handle + positionChip + badge + hiddenBadge + tierToggle + shareLabel + poolNote + deadNote + testSlot + '</div>' +
+          '<div class="flex items-center gap-1 route-target-row-actions">' +
+            // Disabled on the row that is already first in the DRAFT, not the first on
+            // screen: "primary" is a property of the chain, so a row sitting at the top
+            // of a collapsed view with live hidden rows above it can still be promoted.
+            '<button class="btn btn-outline btn-sm" type="button" data-target-action="top" data-index="' + i + '"' +
+              (i === 0 ? ' disabled' : '') +
+              ' title="' + escapeAttr(t('upstreams.routeTargetToTopHint', altKeyLabel())) + '"' +
+              ' aria-label="' + escapeAttr(t('upstreams.routeTargetToTop')) + '">' +
+              '<i class="fa-solid fa-angles-up" aria-hidden="true"></i></button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-target-action="up" data-index="' + i + '"' +
-              (pos > 0 ? '' : ' disabled') + ' title="' + escapeAttr(t('upstreams.routeTargetUp')) + '">&uarr;</button>' +
+              (pos > 0 && !kw ? '' : ' disabled') +
+              ' title="' + escapeAttr(lockedHint || t('upstreams.routeTargetUpHint', altKeyLabel())) + '"' +
+              ' aria-label="' + escapeAttr(t('upstreams.routeTargetUp')) + '">&uarr;</button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-target-action="down" data-index="' + i + '"' +
-              (pos >= 0 && pos < rendered.length - 1 ? '' : ' disabled') + ' title="' + escapeAttr(t('upstreams.routeTargetDown')) + '">&darr;</button>' +
+              (pos >= 0 && pos < rendered.length - 1 && !kw ? '' : ' disabled') +
+              ' title="' + escapeAttr(lockedHint || t('upstreams.routeTargetDownHint', altKeyLabel())) + '"' +
+              ' aria-label="' + escapeAttr(t('upstreams.routeTargetDown')) + '">&darr;</button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-target-action="test" data-index="' + i + '"' +
               (isPool || !probeModel ? ' disabled' : '') +
               ' title="' + escapeAttr(testTitle) + '" aria-label="' + escapeAttr(t('upstreams.test')) + '">' +
@@ -4518,6 +4988,7 @@
             '<input type="checkbox" data-target-field="enabled" data-index="' + i + '"' + (tg.enabled === false ? '' : ' checked') + ' />' +
             '<span class="slider"></span>' +
           '</label>' +
+          targetModelNoteHTML(tg, i) +
         '</div>' +
       '</div>';
     };
@@ -4528,29 +4999,59 @@
     // Expanding keeps the marker as that run's header, which is what makes the
     // collapse reversible from the same control.
     let html = '';
-    for (let i = 0; i < routeTargetDraft.length;) {
-      if (!showHiddenRouteTargets && routeTargetDraft[i].hidden) {
-        const start = i;
-        while (i < routeTargetDraft.length && routeTargetDraft[i].hidden) i++;
-        html += hiddenRunMarker(start, i);
-        continue;
+    if (kw) {
+      // While filtering, a hidden row that matches is rendered anyway: searching is
+      // an explicit act of looking for one target, so leaving the match behind a
+      // collapsed run would make the filter hide the row it was asked to find. The
+      // stored collapse preference is untouched, so clearing the box brings the
+      // collapsed view back — the same bargain the provider list strikes.
+      for (let i = 0; i < routeTargetDraft.length;) {
+        if (!matched[i]) {
+          const start = i;
+          while (i < routeTargetDraft.length && !matched[i]) i++;
+          html += filteredRunMarker(start, i);
+          continue;
+        }
+        html += targetRow(routeTargetDraft[i], i);
+        i++;
       }
-      if (showHiddenRouteTargets && routeTargetDraft[i].hidden &&
-          (i === 0 || !routeTargetDraft[i - 1].hidden)) {
-        let end = i;
-        while (end < routeTargetDraft.length && routeTargetDraft[end].hidden) end++;
-        html += hiddenRunMarker(i, end);
+      // One marker spanning the whole chain would say "12 filtered out" and nothing
+      // else, which reads as a rendering failure rather than an empty result.
+      if (!matchCount) {
+        html = '<div class="muted-text text-xs" style="padding:0.5rem 0;">' +
+          escapeHtml(t('upstreams.routeTargetNoMatch', routeTargetSearch.trim())) + '</div>';
       }
-      html += targetRow(routeTargetDraft[i], i);
-      i++;
-    }
-    // Hiding every target would otherwise leave the editor looking empty, which
-    // reads as "this route lost its targets" rather than "they are collapsed".
-    if (!rendered.length) {
-      html += '<div class="muted-text text-xs" style="padding:0.5rem 0;">' +
-        escapeHtml(t('upstreams.routeTargetAllHidden')) + '</div>';
+    } else {
+      for (let i = 0; i < routeTargetDraft.length;) {
+        if (!showHiddenRouteTargets && routeTargetDraft[i].hidden) {
+          const start = i;
+          while (i < routeTargetDraft.length && routeTargetDraft[i].hidden) i++;
+          html += hiddenRunMarker(start, i);
+          continue;
+        }
+        if (showHiddenRouteTargets && routeTargetDraft[i].hidden &&
+            (i === 0 || !routeTargetDraft[i - 1].hidden)) {
+          let end = i;
+          while (end < routeTargetDraft.length && routeTargetDraft[end].hidden) end++;
+          html += hiddenRunMarker(i, end);
+        }
+        html += targetRow(routeTargetDraft[i], i);
+        i++;
+      }
+      // Hiding every target would otherwise leave the editor looking empty, which
+      // reads as "this route lost its targets" rather than "they are collapsed".
+      if (!rendered.length) {
+        html += '<div class="muted-text text-xs" style="padding:0.5rem 0;">' +
+          escapeHtml(t('upstreams.routeTargetAllHidden')) + '</div>';
+      }
     }
     box.innerHTML = html;
+    syncRouteTargetSearchRow(matchCount, routeTargetDraft.length);
+    // Each row ships a plain <select> for its provider; enhance them into searchable
+    // popovers now rather than waiting for the MutationObserver's next frame, which
+    // would flash the native select on every re-render.
+    refreshCustomSelects(box);
+    restoreTargetListFocus(box, focusSnap);
     // The row markup ships its verdict slot empty, so restore what has been probed
     // this session: reorder / hide / provider change all rebuild this list, and a
     // result that vanished on the next click would read as "the test was lost".
@@ -4558,6 +5059,10 @@
     // Fill each row's model dropdown from its own provider, fetching quietly the
     // first time a provider's model list is needed.
     routeTargetDraft.forEach(tg => ensureProviderModels(tg.upstreamId));
+    // Focus is deliberately not moved here: restoreTargetListFocus only redirects
+    // focus that was already inside the list, so a mouse click is never answered with
+    // a caret the operator did not ask for. The flash is what a mouse user gets.
+    if (movedTo >= 0) flashMovedTarget(box, movedTo);
   }
 
   function closeRouteModal() {
@@ -4992,6 +5497,52 @@
         }
       });
     }
+    // The list filters: two on the Forwarding tab, one inside the route editor. Every
+    // box lives OUTSIDE the list it filters, so re-rendering never takes the caret
+    // out of it.
+    const bindListSearch = (inputId, apply) => {
+      const box = $(inputId);
+      if (!box) return;
+      let debounce;
+      box.addEventListener('input', () => {
+        clearTimeout(debounce);
+        debounce = setTimeout(() => apply(box.value), 150);
+      });
+      // A filter is view state with no undo anywhere else in the UI, so Escape
+      // clears it from the keyboard instead of forcing a select-all-delete. The
+      // marker is what bindDialogEscape yields to: a box inside a dialog has to
+      // clear itself without the dialog closing on the same key.
+      box.dataset.filterClear = '1';
+      box.addEventListener('keydown', e => {
+        if (e.key !== 'Escape' || !box.value) return;
+        e.preventDefault();
+        e.stopPropagation();
+        clearTimeout(debounce);
+        box.value = '';
+        apply('');
+      });
+    };
+    bindListSearch('upstreamProvSearch', v => {
+      provSearch = v;
+      renderProviders();
+      // Cards come back with an empty stat line and the next poll can be seconds
+      // away, so repaint the stats already in memory.
+      renderProviderInlineStats();
+    });
+    bindListSearch('upstreamRouteSearch', v => {
+      routeSearch = v;
+      renderModelRoutes();
+    });
+    // Third box, inside the route editor rather than on the tab: same shape, and
+    // outside its list for the same reason.
+    bindListSearch('routeTargetSearch', v => {
+      routeTargetSearch = v;
+      // The position editor is locked while filtering, so an open one is dropped rather
+      // than parked: it would otherwise reappear on a row the operator has stopped
+      // looking at the moment the box is cleared.
+      routeTargetJumpAt = -1;
+      if (isDialogOpen('modelRouteModal')) renderRouteTargets();
+    });
     // Per-model actions (copy / test / make route) live inside the models modal.
     const modelsList = $('upstreamModelsList');
     if (modelsList) {
@@ -5079,14 +5630,35 @@
         if (action === 'remove') {
           if (routeTargetDraft.length <= 1) return;
           routeTargetDraft.splice(i, 1);
+          // Removing a row shifts every position below it, so an open position editor
+          // would be sitting on a different target than the one it was opened for.
+          routeTargetJumpAt = -1;
         } else if (action === 'up') {
           if (!moveRenderedRow(i, -1)) return;
         } else if (action === 'down') {
           if (!moveRenderedRow(i, 1)) return;
+        } else if (action === 'top') {
+          if (!promoteTargetToTop(i)) return;
+        } else if (action === 'jump') {
+          // Clicking another row's chip moves the editor there: only one is ever open,
+          // so there is never a caret in two positions at once. Rendered first, then
+          // focused, because the input does not exist until the row is rebuilt.
+          routeTargetJumpAt = i;
+          routeTargetJumpValue = String(i + 1);
+          renderRouteTargets();
+          const jumpBox = rtTargets.querySelector('[data-target-jump]');
+          if (jumpBox) { jumpBox.focus(); jumpBox.select(); }
+          return;
         } else if (action === 'test') {
           // No re-render: testRouteTarget paints its own slot, and rebuilding the list
           // here would drop the caret out of whatever field is being edited.
           testRouteTarget(i);
+          return;
+        } else if (action === 'reload-models') {
+          // Suggestions only, so this never touches the draft — it refetches and lets
+          // the fetch's own completion re-render the note.
+          reloadProviderModels(routeTargetDraft[i].upstreamId);
+          renderRouteTargets();
           return;
         } else if (action === 'hide') {
           // Draft-only, like every other field in this modal: Cancel discards it,
@@ -5114,34 +5686,28 @@
       // half-typed model name is not lost when the row re-renders for another
       // reason; selects and checkboxes only emit 'change'.
       const applyField = e => {
+        // The position editor is not a draft field -- it must never write into the chain
+        // -- but its text still has to survive a re-render it did not ask for, so it is
+        // kept in step here alongside the fields that do.
+        const jumpBox = e.target.closest && e.target.closest('[data-target-jump]');
+        if (jumpBox) { routeTargetJumpValue = jumpBox.value; return; }
         const el = e.target.closest('[data-target-field]');
         if (!el) return;
         const i = parseInt(el.dataset.index, 10);
         if (isNaN(i) || !routeTargetDraft[i]) return;
         const field = el.dataset.targetField;
         if (field === 'upstreamProvider') {
-          // The provider field is a searchable text combobox. Resolution runs on
-          // 'change' ONLY (option picked, Enter, or blur) — never on 'input':
-          // re-rendering mid-keystroke would destroy the field, close the
-          // datalist and break both typing-to-filter and clicking a suggestion.
-          // Letting 'input' fall through untouched lets the native datalist do
-          // the live filtering.
+          // The picker is a <select>, so its value IS the provider id: no label
+          // lookup, and no way to commit a name that resolves to nothing. The
+          // custom-select fires 'input' then 'change' for one pick; act on 'change'
+          // alone or the row would be rebuilt twice per selection.
           if (e.type !== 'change') return;
-          const id = routeProviderIdFromLabel(el.value);
-          if (!id) {
-            // Partial / unknown label committed: snap back to the current provider
-            // so the field never lingers in an invalid state.
-            renderRouteTargets();
-            return;
-          }
-          if (id === routeTargetDraft[i].upstreamId) {
-            // Same provider re-selected: snap the text to the canonical label.
-            renderRouteTargets();
-            return;
-          }
+          const id = el.value;
+          if (!id || id === routeTargetDraft[i].upstreamId) return;
           routeTargetDraft[i].upstreamId = id;
-          // Provider changed: the row's model dropdown, weight state, pool shape
+          // Provider changed: the row's model suggestions, weight state, pool shape
           // and reachability of rows below can all change, so re-render the list.
+          // renderRouteTargets carries focus back to this row's trigger.
           normalizeDraftTiers();
           renderRouteTargets();
           return;
@@ -5174,6 +5740,78 @@
       rtTargets.addEventListener('change', applyField);
       rtTargets.addEventListener('input', applyField);
 
+      // Keyboard reordering, and the position editor's own two keys. This is what
+      // replaces the pointer on a long chain: hold Alt+Up and the row walks, with no
+      // 1.25rem grip to aim at and no drag inside a container that does not
+      // auto-scroll. It lives here rather than in the global dispatcher, which
+      // deliberately ignores Alt -- leaving the browser and the OS their own
+      // combinations -- and returns on any open dialog because a dialog has its own
+      // keys.
+      rtTargets.addEventListener('keydown', e => {
+        if (e.isComposing) return;
+        const jumpBox = e.target.closest && e.target.closest('[data-target-jump]');
+        if (jumpBox) {
+          const at = parseInt(jumpBox.dataset.index, 10);
+          if (e.key === 'Escape') {
+            // Abandon the edit and keep the dialog: bindDialogEscape yields to this
+            // input for the same reason it yields to a filter box -- dismissing the
+            // editor would otherwise throw away every unsaved target edit under it.
+            // stopPropagation is not what saves it (that handler is on the capture
+            // phase); it only keeps the sidebar's document-level Escape out of this.
+            e.preventDefault();
+            e.stopPropagation();
+            routeTargetJumpAt = -1;
+            renderRouteTargets();
+            return;
+          }
+          if (e.key !== 'Enter' || isNaN(at)) return;
+          e.preventDefault();
+          const outcome = moveTargetToPosition(at, parseInt(jumpBox.value, 10));
+          if (outcome === 'range') {
+            // Left open with the refused value still in it: emptying the field or
+            // closing the editor would hide both what was typed and why it bounced.
+            toast(t('upstreams.routeTargetJumpRange', String(routeTargetDraft.length)), 'warning');
+            return;
+          }
+          routeTargetJumpAt = -1;
+          normalizeDraftTiers();
+          renderRouteTargets();
+          return;
+        }
+        if (!e.altKey || e.metaKey || e.ctrlKey || e.shiftKey) return;
+        // Narrower than isTypingTarget on purpose: a text field owns Alt+Arrow on
+        // macOS (paragraph navigation) and a number input owns the arrows outright, but
+        // the enable switch owns neither, so focus sitting on it should not make the
+        // keys dead.
+        const tag = e.target.tagName;
+        if (e.target.isContentEditable || tag === 'TEXTAREA' || tag === 'SELECT' ||
+            (tag === 'INPUT' && e.target.type !== 'checkbox' && e.target.type !== 'radio')) return;
+        const row = e.target.closest('.route-target-row');
+        if (!row) return;
+        const at = parseInt(row.dataset.targetIndex, 10);
+        if (isNaN(at) || !routeTargetDraft[at]) return;
+        let moved = false;
+        if (e.key === 'Home') {
+          e.preventDefault();
+          moved = promoteTargetToTop(at);
+        } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+          e.preventDefault();
+          // The same lock the arrow buttons carry, for the same reason. A key that goes
+          // quiet reads as broken, so it says why -- once, in a toast, rather than in a
+          // tooltip nobody hovers a keyboard over.
+          if (routeTargetFilterKeyword()) {
+            toast(t('upstreams.routeTargetReorderFiltered'), 'warning');
+            return;
+          }
+          moved = moveRenderedRow(at, e.key === 'ArrowUp' ? -1 : 1);
+        } else {
+          return;
+        }
+        if (!moved) return;
+        normalizeDraftTiers();
+        renderRouteTargets();
+      });
+
       // Drag to reorder. The row carries draggable=false in the markup and is
       // only armed while the pointer is held on the grip: HTML5 drag on a
       // container would otherwise swallow text selection and caret placement in
@@ -5182,7 +5820,9 @@
       rtTargets.addEventListener('mousedown', e => {
         const row = e.target.closest('.route-target-row');
         if (!row) return;
-        row.draggable = !!e.target.closest('[data-target-handle]');
+        // Never armed while the list is filtered: with rows elided, a drop between
+        // two visible rows names a gap that is not the one under the cursor.
+        row.draggable = !routeTargetFilterKeyword() && !!e.target.closest('[data-target-handle]');
       });
       // Disarm on release so a later drag attempt from an input cannot inherit
       // the armed state left by an earlier grip press.
@@ -5764,31 +6404,15 @@
       // The custom-select wrapper mirrors the native value into its own label.
       if (typeof syncCustomSelect === 'function') syncCustomSelect(sel);
     }
-    fwdEventsOffset = 0;
-    loadForwardEvents();
-    // The events table now lives in the activity pane; without this the scroll
-    // below would target a hidden element and appear to do nothing.
-    switchForwardPane('activity');
+    // Navigating runs the activity view's enter hook, which resets the offset and
+    // refetches with the filter just set — so this must not fetch as well, or the
+    // click costs two requests. The table lives in that view, so without the
+    // navigation the scroll below would target a hidden element and appear to do
+    // nothing.
+    navigate('forwarding/activity');
     const table = $('fwdEventsBody');
     if (table && table.closest('.card')) {
       table.closest('.card').scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }
-  }
-
-  // switchForwardPane toggles the Forwarding tab between config and activity.
-  function switchForwardPane(pane) {
-    const target = pane === 'activity' ? 'activity' : 'config';
-    const cfg = $('fwdPaneConfig');
-    const act = $('fwdPaneActivity');
-    if (cfg) cfg.classList.toggle('hidden', target !== 'config');
-    if (act) act.classList.toggle('hidden', target !== 'activity');
-    const bar = $('fwdSubtabs');
-    if (bar) {
-      bar.querySelectorAll('[data-fwd-pane]').forEach(b => {
-        const on = b.dataset.fwdPane === target;
-        b.classList.toggle('active', on);
-        b.setAttribute('aria-selected', on ? 'true' : 'false');
-      });
     }
   }
 
@@ -6620,10 +7244,12 @@
     fwdStatsRefreshTimer = setTimeout(() => {
       fwdStatsRefreshTimer = null;
       loadForwardStats();
-      // The Stats tab reads a separate range-scoped payload, so it needs its own
-      // refresh; skipped when hidden to avoid a request nobody is looking at.
-      const statsTab = $('tabStats');
-      if (statsTab && !statsTab.classList.contains('hidden')) loadStatsWindow();
+      // The statistics view reads a separate range-scoped payload, so it needs
+      // its own refresh; skipped when it is not the open view to avoid a request
+      // nobody is looking at. Reachable now that the stream stays open on that
+      // view: it used to be dead code, because the stream only lived while the
+      // forwarding tab was showing and that hid the stats tab by definition.
+      if (isActiveRoute('forwarding/analytics')) loadStatsWindow();
     }, 2000);
   }
 
@@ -6652,28 +7278,16 @@
     if (dot) dot.textContent = '';
   }
 
-  function openForwarding() {
+  // The stream itself is reconciled by the router from the route's stream
+  // declaration; this only has to fetch what the view shows.
+  function enterForwardActivity() {
     fwdEventsOffset = 0;
     loadForwardStats();
     loadForwardEvents();
-    openForwardStream();
-  }
-
-  function closeForwarding() {
-    closeForwardStream();
   }
 
   let fwdModelSearchTimer = null;
   function bindForwardEvents() {
-    // Sub-tab switching between the config pane and the live activity pane.
-    const subtabs = $('fwdSubtabs');
-    if (subtabs) {
-      subtabs.addEventListener('click', e => {
-        const btn = e.target.closest('[data-fwd-pane]');
-        if (btn) switchForwardPane(btn.dataset.fwdPane);
-      });
-    }
-
     // Row expansion: delegated, so it survives the table being re-rendered on
     // every page load and on each live SSE event.
     const eventsBody = $('fwdEventsBody');
@@ -8431,21 +9045,256 @@
     scrollNavSchedule();
   }
 
-  // Tabs
-  function switchTab(tab) {
-    qsa('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
-    qsa('.tab-content').forEach(c => c.classList.add('hidden'));
-    $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
-    if (tab === 'console') openConsole();
-    else closeConsole();
-    if (tab === 'forwarding') openForwarding();
-    else closeForwarding();
-    if (tab === 'stats') openStats();
-    if (tab === 'logs') loadLogs();
-    if (tab === 'apikeys') loadApiKeys();
+  // ===== Navigation: route registry and hash router =====
+  //
+  // ROUTES is the single source of truth for four things that used to be edited
+  // in four places: the sidebar rows, which panel is visible, what the URL says,
+  // and which long-lived connections a view needs. Adding a view is one entry
+  // plus one panel element, so a panel cannot exist while being unreachable from
+  // the nav, and a row cannot point at a panel nobody wired up.
+  //
+  // Hierarchy here is data, not DOM nesting: a child names any panel by id. That
+  // is what lets the request log sit under Accounts and the provider statistics
+  // under Forwarding without either block of markup moving, and it keeps one
+  // visibility mechanism instead of a tab layer plus a pane layer.
+  //
+  // Panel ids are historical (tabStats, tabLogs) and stay as stable ids; the
+  // registry, not the id, says where a view belongs.
+  //
+  // `key` is the second key of the "g" chord for that view. It sits here rather
+  // than in the shortcut layer so one table still answers every question about a
+  // view: where it appears, what it shows, what it streams, and how to reach it
+  // from the keyboard.
+  const ROUTES = [
+    {
+      id: 'accounts', labelKey: 'tabs.accounts', icon: 'fa-users', children: [
+        { id: 'accounts/pool', labelKey: 'nav.accountsPool', panel: 'tabAccounts', key: 'a' },
+        { id: 'accounts/logs', labelKey: 'tabs.logs', panel: 'tabLogs', key: 'l', enter: () => loadLogs() },
+      ],
+    },
+    { id: 'settings', labelKey: 'tabs.settings', icon: 'fa-sliders', panel: 'tabSettings', key: 's' },
+    { id: 'api', labelKey: 'tabs.api', icon: 'fa-plug', panel: 'tabApi', key: 'i' },
+    { id: 'apikeys', labelKey: 'tabs.apikeys', icon: 'fa-key', panel: 'tabApikeys', key: 'k', enter: () => loadApiKeys() },
+    {
+      id: 'forwarding', labelKey: 'tabs.forwarding', icon: 'fa-diagram-project', children: [
+        // The pool list carries per-provider counters, so it needs the stats
+        // payload but not the event stream.
+        { id: 'forwarding/providers', labelKey: 'upstreams.providersTitle', panel: 'fwdPaneProviders', key: 'p', enter: () => loadForwardStats() },
+        // Routes render from upstreamCache, which loadSettings already filled.
+        { id: 'forwarding/routes', labelKey: 'upstreams.routesTitle', panel: 'fwdPaneRoutes', key: 'r' },
+        { id: 'forwarding/activity', labelKey: 'forward.paneActivity', panel: 'fwdPaneActivity', key: 'e', stream: 'forward', enter: () => enterForwardActivity() },
+        { id: 'forwarding/analytics', labelKey: 'tabs.stats', panel: 'tabStats', key: 't', stream: 'forward', enter: () => openStats() },
+      ],
+    },
+    { id: 'console', labelKey: 'tabs.console', icon: 'fa-terminal', panel: 'tabConsole', key: 'c', stream: 'console', ownScroller: 'consoleOutput' },
+  ];
+
+  const routeIndex = new Map();
+  const routePanelIds = [];
+  // Leaf routes in sidebar order. This is what [ and ] step through and the order
+  // the palette and the shortcut sheet list views in, so all three agree with what
+  // the sidebar shows without any of them keeping a second list.
+  const routeOrder = [];
+  // Second key of the "g" chord -> route. Derived from the same table, so a chord
+  // can never name a view that does not exist, and two routes claiming one letter
+  // is a boot warning instead of one shortcut silently shadowing the other.
+  const routeByKey = Object.create(null);
+  ROUTES.forEach(section => {
+    routeIndex.set(section.id, section);
+    if (section.panel) routePanelIds.push(section.panel);
+    if (!section.children) registerLeafRoute(section);
+    (section.children || []).forEach(child => {
+      child.parent = section;
+      routeIndex.set(child.id, child);
+      if (child.panel) routePanelIds.push(child.panel);
+      registerLeafRoute(child);
+    });
+  });
+  function registerLeafRoute(route) {
+    routeOrder.push(route);
+    if (!route.key) return;
+    if (routeByKey[route.key]) {
+      console.warn('[nav] shortcut key already taken:', route.key, routeByKey[route.key].id, 'vs', route.id);
+      return;
+    }
+    routeByKey[route.key] = route;
+  }
+
+  // A section resolves to its first view, so '#/forwarding' and a click on the
+  // section row both land somewhere real.
+  function routeLeaf(route) {
+    if (!route) return null;
+    return route.children ? route.children[0] : route;
+  }
+  const DEFAULT_ROUTE_ID = routeLeaf(ROUTES[0]).id;
+
+  let activeRoute = null;
+  let routerStarted = false;
+  // Per-route scroll offsets, view state only: deliberately not persisted, and
+  // dropped on reload like any other scroll position.
+  const routeScroll = Object.create(null);
+
+  function isActiveRoute(id) {
+    return !!activeRoute && activeRoute.id === id;
+  }
+
+  function renderNav() {
+    const list = $('navList');
+    if (!list) return;
+    let html = '';
+    ROUTES.forEach(section => {
+      const target = routeLeaf(section);
+      html += '<li>';
+      html += '<a class="nav-item" href="#/' + escapeAttr(target.id) + '" data-nav="' + escapeAttr(section.id) + '">' +
+        '<i class="fa-solid ' + escapeAttr(section.icon) + ' nav-icon" aria-hidden="true"></i>' +
+        '<span data-i18n="' + escapeAttr(section.labelKey) + '"></span></a>';
+      if (section.children) {
+        html += '<ul class="nav-children">';
+        section.children.forEach(child => {
+          html += '<li><a class="nav-child" href="#/' + escapeAttr(child.id) + '" data-nav="' + escapeAttr(child.id) + '">' +
+            '<span class="nav-dot" aria-hidden="true"></span>' +
+            '<span data-i18n="' + escapeAttr(child.labelKey) + '"></span>' +
+            '<span class="nav-count" data-nav-count="' + escapeAttr(child.id) + '"></span></a></li>';
+        });
+        html += '</ul>';
+      }
+      html += '</li>';
+    });
+    list.innerHTML = html;
+    // A route whose panel element is missing would hide everything and show
+    // nothing, which is a blank page with no error. Say it once at boot instead,
+    // so a typo in the registry is caught by whoever added it.
+    routePanelIds.forEach(id => {
+      if (!$(id)) console.warn('[nav] route panel missing from the document:', id);
+    });
+    syncNavShortcutHints();
+  }
+
+  // setNavCount is pushed from the render that knows the number, so the nav does
+  // not have to reach into feature state to pull it.
+  function setNavCount(routeId, value) {
+    const el = document.querySelector('#navList [data-nav-count="' + cssEscape(routeId) + '"]');
+    if (!el) return;
+    el.textContent = value === null || value === undefined || value === '' ? '' : String(value);
+  }
+
+  // aria-current marks the one open view. The section row gets a class only:
+  // exactly one element in a set may be current, and the section is not the view.
+  function markNavActive(route) {
+    const sectionId = (route.parent || route).id;
+    qsa('#navList a[data-nav]').forEach(a => {
+      const entry = routeIndex.get(a.dataset.nav);
+      const isLeafLink = !!entry && !entry.children;
+      const current = isLeafLink && a.dataset.nav === route.id;
+      if (current) a.setAttribute('aria-current', 'page');
+      else a.removeAttribute('aria-current');
+      a.classList.toggle('is-active', current);
+      if (a.classList.contains('nav-item')) a.classList.toggle('is-current-section', a.dataset.nav === sectionId);
+    });
+  }
+
+  // Long-lived connections are declared by the route and reconciled here rather
+  // than opened and closed by hand in each view: moving between two routes that
+  // both want the forward stream keeps the one connection instead of tearing it
+  // down and dialling again, and leaving the section always closes it. Both
+  // openers are idempotent, which is what makes the diff safe to run on every
+  // navigation.
+  function syncRouteStreams(route) {
+    const want = route && route.stream;
+    if (want !== 'forward') closeForwardStream();
+    if (want !== 'console') closeConsole();
+    if (want === 'forward') openForwardStream();
+    if (want === 'console') openConsole();
+  }
+
+  function rememberRouteScroll(route) {
+    if (!route || route.ownScroller) return;
+    routeScroll[route.id] = window.scrollY;
+  }
+
+  // Restoring the offset on a plain click, not only on back/forward the way a
+  // browser does, is the deliberate part: these views are switched between while
+  // editing, and being dropped at the top of a four-screen pool list every time
+  // is the cost this whole layout exists to remove. The offset is clamped to the
+  // new document and applied twice, because a panel that renders in its enter
+  // hook can still be growing when the first pass runs.
+  function restoreRouteScroll(route) {
+    if (route.ownScroller) { window.scrollTo({ top: 0, behavior: 'auto' }); return; }
+    const want = routeScroll[route.id] || 0;
+    const apply = () => {
+      const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+      window.scrollTo({ top: Math.min(want, max), behavior: 'auto' });
+    };
+    apply();
+    requestAnimationFrame(apply);
+  }
+
+  function applyRoute(route) {
+    if (!route) return;
+    // Re-selecting the open view must not scroll it: on mobile the row that was
+    // just tapped is the one already showing.
+    if (activeRoute && activeRoute.id === route.id) { setSidebar(false); return; }
+    rememberRouteScroll(activeRoute);
+    // What "g g" comes back to. Recorded here rather than from the URL so it
+    // survives a replaceState, and only when the view really changed.
+    if (activeRoute) previousRouteId = activeRoute.id;
+    activeRoute = route;
+    routePanelIds.forEach(id => {
+      const el = $(id);
+      if (el) el.classList.toggle('hidden', id !== route.panel);
+    });
+    markNavActive(route);
+    syncRouteStreams(route);
+    // Console scrolls in its own overflow pane; every other view scrolls the page.
+    scrollNavSetTarget(route.ownScroller ? $(route.ownScroller) : null);
+    if (typeof route.enter === 'function') route.enter();
+    restoreRouteScroll(route);
     setSidebar(false);
-    // Console scrolls in its own overflow pane; every other tab scrolls the page.
-    scrollNavSetTarget(tab === 'console' ? $('consoleOutput') : null);
+  }
+
+  // The URL is a hash, not a path: /admin is one Go handler serving one file, so
+  // '/admin/forwarding/routes' would 404 on reload, and a hash also survives
+  // whatever prefix an operator reverse-proxies this panel under. Fragments are
+  // namespaced with a leading slash so they can never match an element id and
+  // trigger the browser's own scroll-to-fragment.
+  function hashRouteId() {
+    return (location.hash || '').replace(/^#\/?/, '');
+  }
+
+  // Single entry point from the URL to a view, so the address bar and the shown
+  // panel cannot disagree: an unknown id falls back to the default, and a section
+  // id is rewritten to the view it resolves to rather than left in the URL naming
+  // something that is not a view.
+  function applyHash() {
+    const raw = hashRouteId();
+    const route = routeLeaf(routeIndex.get(raw));
+    if (!route) { navigate(DEFAULT_ROUTE_ID, { replace: true }); return; }
+    if (route.id !== raw) { navigate(route.id, { replace: true }); return; }
+    applyRoute(route);
+  }
+
+  function navigate(id, opts) {
+    const target = routeLeaf(routeIndex.get(id));
+    if (!target) return;
+    const hash = '#/' + target.id;
+    if (location.hash === hash) { applyRoute(target); return; }
+    // replace is for the boot fallback: an unknown or empty hash should not
+    // leave a history entry nobody can go back to.
+    if (opts && opts.replace) {
+      history.replaceState(null, '', hash);
+      applyRoute(target);
+      return;
+    }
+    location.hash = hash; // hashchange drives applyRoute, so there is one path in
+  }
+
+  // Started once the main page is visible, which is also what makes a deep link
+  // survive the login screen.
+  function startRouter() {
+    if (routerStarted) return;
+    routerStarted = true;
+    window.addEventListener('hashchange', applyHash);
+    applyHash();
   }
 
   function setSidebar(open) {
@@ -8456,6 +9305,473 @@
     if (toggle) toggle.setAttribute('aria-expanded', String(open));
     const backdrop = $('sidebarBackdrop');
     if (backdrop) backdrop.hidden = !open;
+  }
+
+
+  // ===== Keyboard shortcuts =====
+  //
+  // Two tiers, and the split is deliberate.
+  //
+  // Cmd/Ctrl+K opens the command palette. It carries a non-printable key, so
+  // WCAG 2.1.4 does not apply to it and it keeps working when the character
+  // shortcuts below are switched off. That makes the palette the keyboard path
+  // that always survives -- including for speech-input users, whose dictation is
+  // exactly what single-character shortcuts misfire on -- which is why every view
+  // is reachable from it and not only from a chord.
+  //
+  // g + letter, [ , ] and ? are character-key shortcuts. SC 2.1.4 covers these
+  // even though the chord is two keys: its Understanding document is explicit
+  // that "pressing G and then A in quick succession" still counts as relying on
+  // character keys. The criterion is satisfied here by "Turn off" -- the switch in
+  // the shortcut sheet -- rather than by remapping, because a remap UI would put a
+  // second, editable source of truth in front of every chord while the sheet and
+  // the palette render straight from the route registry.
+  //
+  // Navigation deliberately avoids modifier combinations: Alt+letter is the
+  // accesskey trigger in Chrome, Ctrl/Cmd+digit switches browser tabs, and which
+  // combinations are free differs per platform. A chord that needs no modifier
+  // cannot collide with any of them, which is the trade this design makes and
+  // then pays for with the off switch.
+  const CHORD_KEY = 'g';
+  const CHORD_TIMEOUT_MS = 1500;
+  const PALETTE_MODAL_ID = 'cmdPaletteModal';
+  const SHORTCUTS_MODAL_ID = 'shortcutsModal';
+  let chordArmed = false;
+  let chordTimer = 0;
+  let charShortcuts = localStorage.getItem('kiro_char_shortcuts') !== '0';
+  let previousRouteId = '';
+
+  // Palette entries that are not views. `run` fires after the palette has closed,
+  // so a command may open a dialog of its own; adding one is a single entry.
+  const COMMANDS = [
+    { id: 'cmd:shortcuts', labelKey: 'shortcuts.title', icon: 'fa-keyboard', keys: ['?'], run: () => openShortcutsSheet() },
+    { id: 'cmd:addProvider', labelKey: 'upstreams.addProvider', icon: 'fa-plus', run: () => navigateThen('forwarding/providers', () => openUpstreamModal(null)) },
+    { id: 'cmd:addRoute', labelKey: 'upstreams.addRoute', icon: 'fa-plus', run: () => navigateThen('forwarding/routes', () => openRouteModal(null)) },
+    { id: 'cmd:addKey', labelKey: 'apiKeys.add', icon: 'fa-plus', run: () => navigateThen('apikeys', () => openApiKeyModal(null, 'create')) },
+    { id: 'cmd:addAccount', labelKey: 'accounts.add', icon: 'fa-plus', run: () => navigateThen('accounts/pool', () => showModal('add')) },
+    { id: 'cmd:theme', labelKey: 'theme.toggle', icon: 'fa-circle-half-stroke', run: () => toggleTheme() },
+    { id: 'cmd:privacy', labelKey: 'privacy.label', icon: 'fa-user-secret', run: () => togglePrivacyMode() },
+  ];
+
+  // Navigating and then opening a dialog has to wait for the view: assigning
+  // location.hash dispatches hashchange asynchronously, and applyRoute scrolls
+  // the page in a frame of its own, which would fight the dialog's scroll lock.
+  function navigateThen(routeId, fn) {
+    if (isActiveRoute(routeId)) { fn(); return; }
+    navigate(routeId);
+    requestAnimationFrame(() => requestAnimationFrame(fn));
+  }
+
+  // Flip the existing control rather than the state behind it, so the checkbox,
+  // localStorage and every masked field stay on the one code path that already
+  // owns them.
+  function togglePrivacyMode() {
+    const box = $('privacyModeToggle');
+    if (!box) return;
+    box.checked = !box.checked;
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function isApplePlatform() {
+    const s = (navigator.platform || navigator.userAgent || '');
+    return /Mac|iPhone|iPad|iPod/i.test(s);
+  }
+  function modKeyLabel() {
+    return isApplePlatform() ? '⌘' : 'Ctrl';
+  }
+  // Alt is Option on a Mac, and it is engraved ⌥ there rather than spelled out, so a
+  // tooltip promising "Alt" names a key the operator cannot find on the keyboard.
+  function altKeyLabel() {
+    return isApplePlatform() ? '⌥' : 'Alt';
+  }
+
+  // Vietnamese is the working language here, so palette matching has to be
+  // diacritic-blind: "thong ke" must find "Thống kê" and "dinh tuyen" must find
+  // "Định tuyến". NFD splits the accents off so they can be stripped, but đ is a
+  // letter in its own right and survives decomposition, so it is folded by hand.
+  // The index map exists because folding changes length -- one source character
+  // can fold to one, two or zero -- and without it a highlight would drift by the
+  // number of accents that were removed before it.
+  function foldIndexed(s) {
+    let folded = '';
+    const map = [];
+    const src = s == null ? '' : String(s);
+    for (let i = 0; i < src.length; i++) {
+      let c = src[i].normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      if (c === 'đ') c = 'd';
+      else if (c === 'Đ') c = 'D';
+      c = c.toLowerCase();
+      for (let j = 0; j < c.length; j++) map.push(i);
+      folded += c;
+    }
+    return { folded: folded, map: map };
+  }
+  function foldPlain(s) {
+    return foldIndexed(s).folded;
+  }
+
+  // A contiguous hit beats a scattered one, and an earlier hit beats a later one,
+  // so typing "rou" puts "Model Routes" above a provider that merely contains the
+  // letters. The subsequence fallback is what makes initials work ("fr" -> the
+  // Forwarding / Routes row).
+  function matchToken(token, haystack) {
+    const hay = foldIndexed(haystack);
+    const idx = hay.folded.indexOf(token);
+    if (idx >= 0) {
+      return { score: 1000 - Math.min(idx, 900), start: hay.map[idx], end: hay.map[idx + token.length - 1] + 1 };
+    }
+    let qi = 0;
+    for (let i = 0; i < hay.folded.length && qi < token.length; i++) {
+      if (hay.folded[i] === token[qi]) qi++;
+    }
+    return qi === token.length ? { score: 1 } : null;
+  }
+  // Every whitespace-separated token has to match, which is what lets a query be
+  // typed in any order ("routes forward" finds the same row as "forward routes").
+  function matchAllTokens(tokens, haystack) {
+    let score = 0;
+    let range = null;
+    for (let i = 0; i < tokens.length; i++) {
+      const m = matchToken(tokens[i], haystack);
+      if (!m) return null;
+      score += m.score;
+      if (!range && m.start !== undefined) range = [m.start, m.end];
+    }
+    return { score: score, range: range };
+  }
+
+  function routeLabelPath(route) {
+    return route.parent ? t(route.parent.labelKey) + ' › ' + t(route.labelKey) : t(route.labelKey);
+  }
+
+  // One list, built from the registry plus COMMANDS, so the palette cannot offer
+  // a view that does not exist or miss one that does.
+  function paletteActions() {
+    const actions = [];
+    routeOrder.forEach(route => {
+      actions.push({
+        id: 'route:' + route.id,
+        group: 'shortcuts.groupViews',
+        label: routeLabelPath(route),
+        icon: (route.parent || route).icon,
+        keys: route.key ? [CHORD_KEY, route.key] : [],
+        // The route id joins the haystack so the English name still finds the
+        // view while the panel is running in Vietnamese or Chinese.
+        extra: route.id,
+        // Views outrank commands on a near-tie. Without this, "dinh tuyen" put
+        // "Thêm định tuyến" above the Model Routes view purely because the
+        // command's label is shorter, so Enter would open a dialog when the user
+        // was navigating. Small enough that a real command match still wins.
+        bias: 60,
+        run: () => navigate(route.id),
+      });
+    });
+    COMMANDS.forEach(cmd => {
+      actions.push({
+        id: cmd.id,
+        group: 'shortcuts.groupCommands',
+        label: t(cmd.labelKey),
+        icon: cmd.icon,
+        keys: cmd.keys || [],
+        extra: cmd.id,
+        bias: 0,
+        run: cmd.run,
+      });
+    });
+    return actions;
+  }
+
+  let paletteItems = [];
+  let paletteActive = 0;
+
+  function keyCapsHTML(keys) {
+    if (!keys || !keys.length) return '';
+    return '<span class="cmdk-keys">' + keys.map(k => '<kbd>' + escapeHtml(k) + '</kbd>').join('') + '</span>';
+  }
+  function highlightLabel(label, range) {
+    // A hit inside the searchable extras has no place in the visible label, so it
+    // is dropped rather than clamped to a range that would mark the wrong letters.
+    if (!range || range[1] > label.length) return escapeHtml(label);
+    return escapeHtml(label.slice(0, range[0])) + '<mark>' + escapeHtml(label.slice(range[0], range[1])) +
+      '</mark>' + escapeHtml(label.slice(range[1]));
+  }
+
+  function renderPaletteList() {
+    const list = $('cmdPaletteList');
+    const input = $('cmdPaletteInput');
+    if (!list || !input) return;
+    const tokens = foldPlain(input.value.trim()).split(/\s+/).filter(Boolean);
+    const scored = [];
+    paletteActions().forEach((action, order) => {
+      if (!tokens.length) { scored.push({ action: action, range: null, score: 0, order: order }); return; }
+      const m = matchAllTokens(tokens, action.label + ' ' + action.extra + ' ' + action.keys.join(''));
+      if (m) scored.push({ action: action, range: m.range, score: m.score + (action.bias || 0), order: order });
+    });
+    // Registry order is meaningful (it is the sidebar), so it decides ties and is
+    // kept outright when there is no query: an unfiltered palette is a launcher,
+    // and grouping it the way the sidebar groups is what makes it readable.
+    scored.sort((a, b) => b.score - a.score || a.order - b.order);
+    paletteItems = scored;
+    if (paletteActive >= scored.length) paletteActive = 0;
+    let html = '';
+    let lastGroup = '';
+    scored.forEach((entry, i) => {
+      const a = entry.action;
+      if (!tokens.length && a.group !== lastGroup) {
+        lastGroup = a.group;
+        html += '<div class="cmdk-group">' + escapeHtml(t(a.group)) + '</div>';
+      }
+      html += '<div class="cmdk-item" role="option" id="cmdkOpt' + i + '" data-cmdk-index="' + i +
+        '" aria-selected="false">' +
+        '<i class="fa-solid ' + escapeAttr(a.icon || 'fa-arrow-right') + ' cmdk-ico" aria-hidden="true"></i>' +
+        '<span class="cmdk-label">' + highlightLabel(a.label, entry.range) + '</span>' +
+        keyCapsHTML(a.keys) + '</div>';
+    });
+    if (!scored.length) html = '<div class="cmdk-empty">' + escapeHtml(t('shortcuts.paletteEmpty')) + '</div>';
+    list.innerHTML = html;
+    const count = $('cmdPaletteCount');
+    if (count) count.textContent = scored.length ? String(scored.length) : '';
+    syncPaletteActive();
+  }
+
+  // The highlighted row is aria-activedescendant, not focus: DOM focus stays in
+  // the input or the user could not keep typing, so the row needs both its own
+  // visible state and an explicit scroll into view, which is what the browser
+  // would have done for real focus.
+  function syncPaletteActive() {
+    const input = $('cmdPaletteInput');
+    const rows = qsa('#cmdPaletteList .cmdk-item');
+    if (!input) return;
+    rows.forEach((row, i) => {
+      const on = i === paletteActive;
+      row.classList.toggle('is-active', on);
+      row.setAttribute('aria-selected', String(on));
+      if (on) {
+        input.setAttribute('aria-activedescendant', row.id);
+        row.scrollIntoView({ block: 'nearest' });
+      }
+    });
+    if (!rows.length) input.removeAttribute('aria-activedescendant');
+  }
+  function movePaletteActive(delta) {
+    if (!paletteItems.length) return;
+    paletteActive = (paletteActive + delta + paletteItems.length) % paletteItems.length;
+    syncPaletteActive();
+  }
+
+  function paletteIsOpen() {
+    return isDialogOpen(PALETTE_MODAL_ID);
+  }
+  function openCommandPalette() {
+    const input = $('cmdPaletteInput');
+    if (!input) return;
+    input.value = '';
+    paletteActive = 0;
+    renderPaletteList();
+    openDialog(PALETTE_MODAL_ID);
+    input.focus({ preventScroll: true });
+  }
+  function closeCommandPalette() {
+    if (!paletteIsOpen()) return;
+    closeDialog(PALETTE_MODAL_ID);
+  }
+  function toggleCommandPalette() {
+    if (paletteIsOpen()) closeCommandPalette();
+    else openCommandPalette();
+  }
+  function runPaletteEntry(index) {
+    const entry = paletteItems[index];
+    if (!entry) return;
+    closeCommandPalette();
+    // closeDialog hands focus back to whatever had it before the palette, one
+    // frame later. A command that opens another dialog has to run after that, or
+    // the restore would pull focus straight back out of the new dialog.
+    requestAnimationFrame(() => entry.action.run());
+  }
+
+  function shortcutRowHTML(label, keys) {
+    return '<div class="shortcuts-row"><span class="shortcuts-row-label">' + escapeHtml(label) + '</span>' +
+      '<span class="shortcuts-row-keys">' + keys.map(k => '<kbd>' + escapeHtml(k) + '</kbd>').join('') +
+      '</span></div>';
+  }
+  // Rendered from the registry, so the sheet cannot advertise a chord the
+  // dispatcher does not honour -- which is the failure mode of every hand-written
+  // shortcut list.
+  function renderShortcutsSheet() {
+    const body = $('shortcutsBody');
+    if (!body) return;
+    let html = '<div class="shortcuts-group-title">' + escapeHtml(t('shortcuts.groupGlobal')) + '</div>';
+    html += shortcutRowHTML(t('shortcuts.palette'), [modKeyLabel(), 'K']);
+    html += shortcutRowHTML(t('shortcuts.nextView'), [']']);
+    html += shortcutRowHTML(t('shortcuts.prevView'), ['[']);
+    html += shortcutRowHTML(t('shortcuts.lastView'), [CHORD_KEY, CHORD_KEY]);
+    html += shortcutRowHTML(t('shortcuts.openSheet'), ['?']);
+    html += '<div class="shortcuts-group-title">' + escapeHtml(t('shortcuts.groupViews')) + '</div>';
+    routeOrder.forEach(route => {
+      if (!route.key) return;
+      html += shortcutRowHTML(routeLabelPath(route), [CHORD_KEY, route.key]);
+    });
+    body.innerHTML = html;
+    const box = $('charShortcutsToggle');
+    if (box) box.checked = charShortcuts;
+  }
+  function openShortcutsSheet() {
+    renderShortcutsSheet();
+    openDialog(SHORTCUTS_MODAL_ID);
+  }
+  function closeShortcutsSheet() {
+    closeDialog(SHORTCUTS_MODAL_ID);
+  }
+
+  // SC 2.1.4 is satisfied through this switch, so it has to be reachable without
+  // using a shortcut: the sidebar button opens the sheet it lives in.
+  function setCharShortcuts(on) {
+    charShortcuts = !!on;
+    localStorage.setItem('kiro_char_shortcuts', charShortcuts ? '1' : '0');
+    clearChord();
+    syncShortcutUi();
+  }
+  function syncShortcutUi() {
+    const box = $('charShortcutsToggle');
+    if (box) box.checked = charShortcuts;
+    syncNavShortcutHints();
+    if (isDialogOpen(SHORTCUTS_MODAL_ID)) renderShortcutsSheet();
+    if (paletteIsOpen()) renderPaletteList();
+  }
+  // The nav rows carry their chord as a hover hint, which is how the shortcuts get
+  // discovered by someone who never presses "?". Dropped entirely rather than
+  // greyed out when the shortcuts are off: a hint for a key that does nothing is
+  // worse than no hint at all.
+  function syncNavShortcutHints() {
+    qsa('#navList a[data-nav]').forEach(a => {
+      const leaf = routeLeaf(routeIndex.get(a.dataset.nav));
+      if (!leaf || !leaf.key || !charShortcuts) { a.removeAttribute('title'); return; }
+      a.title = t('shortcuts.navHint', CHORD_KEY + ' ' + leaf.key);
+    });
+  }
+
+  function isTypingTarget(el) {
+    if (!el || !el.tagName) return false;
+    if (el.isContentEditable) return true;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+  }
+  function armChord() {
+    chordArmed = true;
+    if (chordTimer) clearTimeout(chordTimer);
+    chordTimer = setTimeout(clearChord, CHORD_TIMEOUT_MS);
+    const hint = $('chordHint');
+    if (hint) hint.hidden = false;
+  }
+  function clearChord() {
+    chordArmed = false;
+    if (chordTimer) { clearTimeout(chordTimer); chordTimer = 0; }
+    const hint = $('chordHint');
+    if (hint) hint.hidden = true;
+  }
+  // [ and ] walk the sidebar in the order it is drawn and wrap at both ends, so
+  // flipping between two neighbouring views -- providers and routes, activity and
+  // analytics -- is one key with nothing to aim at.
+  function stepRoute(delta) {
+    if (!routeOrder.length) return;
+    const at = activeRoute ? routeOrder.indexOf(activeRoute) : -1;
+    const next = routeOrder[(at + delta + routeOrder.length) % routeOrder.length];
+    if (next) navigate(next.id);
+  }
+  // g g returns to the view before this one, and because that view then becomes
+  // the previous one, pressing it again comes back: the A-B flip for a pair that
+  // is not adjacent in the sidebar.
+  function gotoPreviousRoute() {
+    if (previousRouteId && routeIndex.get(previousRouteId)) navigate(previousRouteId);
+  }
+
+  function handleGlobalKeydown(e) {
+    if (!routerStarted) return; // still on the login screen
+    // A composing IME turns every keystroke into a candidate: Vietnamese telex
+    // input would otherwise fire chords in the middle of a word.
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.defaultPrevented) return;
+    if (isTypingTarget(e.target)) return;
+    // The combobox popover reads its own letters for type-ahead.
+    if (document.querySelector('.custom-select.is-open')) return;
+
+    const open = qsa('.modal.active');
+    const onlyPalette = !open.length || (open.length === 1 && open[0].id === PALETTE_MODAL_ID);
+    const mod = e.metaKey || e.ctrlKey;
+    if (mod && !e.altKey && !e.shiftKey && (e.key || '').toLowerCase() === 'k' && onlyPalette) {
+      e.preventDefault();
+      toggleCommandPalette();
+      return;
+    }
+    // Everything below is a character-key shortcut: hence the switch, and hence
+    // never firing over a dialog, which has its own keys and its own focus trap.
+    if (open.length || !charShortcuts) return;
+    // Leave the browser and the OS their own combinations -- Cmd+G, Ctrl+[,
+    // Alt+Arrow -- by acting only on an unmodified key.
+    if (mod || e.altKey) return;
+
+    const key = (e.key || '').toLowerCase();
+    if (chordArmed) {
+      clearChord();
+      if (key === CHORD_KEY) { e.preventDefault(); gotoPreviousRoute(); return; }
+      const route = routeByKey[key];
+      if (route) { e.preventDefault(); navigate(route.id); }
+      return; // an unknown second key just disarms, it does not act
+    }
+    if (key === CHORD_KEY) { e.preventDefault(); armChord(); return; }
+    if (key === '[') { e.preventDefault(); stepRoute(-1); return; }
+    if (key === ']') { e.preventDefault(); stepRoute(1); return; }
+    if (e.key === '?') { e.preventDefault(); openShortcutsSheet(); return; }
+  }
+
+  function bindShortcutEvents() {
+    document.addEventListener('keydown', handleGlobalKeydown);
+
+    const openBtn = $('shortcutsBtn');
+    if (openBtn) openBtn.addEventListener('click', openShortcutsSheet);
+    const closeBtn = $('shortcutsModalClose');
+    if (closeBtn) closeBtn.addEventListener('click', closeShortcutsSheet);
+    bindDialogBackdropClose(SHORTCUTS_MODAL_ID, closeShortcutsSheet);
+    const charBox = $('charShortcutsToggle');
+    if (charBox) charBox.addEventListener('change', e => setCharShortcuts(e.target.checked));
+
+    const input = $('cmdPaletteInput');
+    const list = $('cmdPaletteList');
+    if (input) {
+      input.addEventListener('input', () => { paletteActive = 0; renderPaletteList(); });
+      // The global dispatcher ignores anything typed into a field, so the palette
+      // handles its own keys -- including the chord that closes it again.
+      input.addEventListener('keydown', e => {
+        if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key || '').toLowerCase() === 'k') {
+          e.preventDefault();
+          closeCommandPalette();
+          return;
+        }
+        if (e.isComposing) return;
+        if (e.key === 'ArrowDown') { e.preventDefault(); movePaletteActive(1); return; }
+        if (e.key === 'ArrowUp') { e.preventDefault(); movePaletteActive(-1); return; }
+        if (e.key === 'Enter') { e.preventDefault(); runPaletteEntry(paletteActive); }
+      });
+    }
+    if (list) {
+      // Hover moves the highlight so the mouse and the keyboard cannot end up
+      // pointing at two different rows.
+      list.addEventListener('mousemove', e => {
+        const row = e.target.closest('.cmdk-item');
+        if (!row) return;
+        const i = parseInt(row.dataset.cmdkIndex, 10);
+        if (isNaN(i) || i === paletteActive) return;
+        paletteActive = i;
+        syncPaletteActive();
+      });
+      list.addEventListener('click', e => {
+        const row = e.target.closest('.cmdk-item');
+        if (!row) return;
+        runPaletteEntry(parseInt(row.dataset.cmdkIndex, 10));
+      });
+    }
+    bindDialogBackdropClose(PALETTE_MODAL_ID, closeCommandPalette);
+    syncShortcutUi();
   }
 
   // Event wiring
@@ -8499,8 +9815,6 @@
     $('loginThemeToggle').addEventListener('click', toggleTheme);
     $('mainThemeToggle').addEventListener('click', toggleTheme);
     $('logoutBtn').addEventListener('click', logout);
-
-    qsa('#tabBar .tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
 
     const sidebarToggle = $('sidebarToggle');
     if (sidebarToggle) sidebarToggle.addEventListener('click', () => {
@@ -8923,13 +10237,18 @@
     bindConsoleEvents();
     bindForwardEvents();
     bindStatsEvents();
+    bindShortcutEvents();
   }
 
   // Init
   async function init() {
+    // Route panels are hidden at boot and shown by the router, so a scroll offset
+    // the browser restored from the previous visit would land in the wrong view.
+    if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
     initTheme();
     await loadLocale(currentLang);
     if (currentLang !== 'zh') await loadLocale('zh');
+    renderNav();
     applyTranslations();
     initCustomSelectObserver();
     initPrivacyMode();

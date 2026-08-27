@@ -105,24 +105,12 @@
         </div>
       </div>
       <nav class="header-nav sidebar-nav" aria-label="" data-i18n-aria-label="aria.sections">
-        <div class="tabs" id="tabBar">
-          <button type="button" class="tab active" data-tab="accounts"><i class="fa-solid fa-users tab-icon"></i><span
-              data-i18n="tabs.accounts"></span></button>
-          <button type="button" class="tab" data-tab="settings"><i class="fa-solid fa-sliders tab-icon"></i><span
-              data-i18n="tabs.settings"></span></button>
-          <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
-              data-i18n="tabs.api"></span></button>
-          <button type="button" class="tab" data-tab="apikeys"><i class="fa-solid fa-key tab-icon"></i><span
-              data-i18n="tabs.apikeys"></span></button>
-          <button type="button" class="tab" data-tab="forwarding"><i class="fa-solid fa-diagram-project tab-icon"></i><span
-              data-i18n="tabs.forwarding"></span></button>
-          <button type="button" class="tab" data-tab="stats"><i class="fa-solid fa-chart-column tab-icon"></i><span
-              data-i18n="tabs.stats"></span></button>
-          <button type="button" class="tab" data-tab="console"><i class="fa-solid fa-terminal tab-icon"></i><span
-              data-i18n="tabs.console"></span></button>
-          <button type="button" class="tab" data-tab="logs"><i class="fa-solid fa-list tab-icon"></i><span
-              data-i18n="tabs.logs"></span></button>
-        </div>
+        <!-- Rendered from the route registry in app.js. The sidebar rows, the
+             visible panel and the URL hash all come from that one table, so a
+             view cannot exist in the markup while being unreachable from the
+             nav, nor a row point at a panel nobody wired up. Labels resolve
+             through data-i18n like the rest of the shell. -->
+        <ul class="nav-list" id="navList"></ul>
       </nav>
       <div class="sidebar-actions topbar-actions">
         <select class="lang-select" id="mainLangSelect" aria-label="" data-i18n-aria-label="lang.label">
@@ -135,6 +123,13 @@
           <i class="fa-solid fa-circle-half-stroke theme-ico-system"></i>
           <i class="fa-solid fa-sun theme-ico-light"></i>
           <i class="fa-solid fa-moon theme-ico-dark"></i>
+        </button>
+        <!-- The only mouse path to the shortcut sheet, which is also where the
+             character-key shortcuts are switched off. WCAG 2.1.4 wants that
+             mechanism available, so it cannot itself be behind a shortcut. -->
+        <button id="shortcutsBtn" class="icon-btn" type="button" aria-label=""
+          data-i18n-title="shortcuts.open" data-i18n-aria-label="shortcuts.open">
+          <i class="fa-solid fa-keyboard"></i>
         </button>
         <button class="btn btn-outline btn-sm" id="logoutBtn">
           <i class="fa-solid fa-right-from-bracket"></i>
@@ -764,25 +759,20 @@
       </div>
 
       <!-- Forwarding dashboard tab -->
-      <div id="tabForwarding" class="tab-content hidden">
-        <!-- Config and live activity are different jobs: one is write-mostly and
-             rarely touched, the other is read-mostly and watched. Splitting them
-             keeps a long provider/route list from burying the events table. -->
-        <div class="subtabs" id="fwdSubtabs" role="tablist" data-i18n-aria-label="forward.sections">
-          <button type="button" class="subtab active" data-fwd-pane="config" role="tab" aria-selected="true"
-            aria-controls="fwdPaneConfig"><i class="fa-solid fa-sliders" aria-hidden="true"></i><span
-              data-i18n="forward.paneConfig"></span></button>
-          <button type="button" class="subtab" data-fwd-pane="activity" role="tab" aria-selected="false"
-            aria-controls="fwdPaneActivity"><i class="fa-solid fa-wave-square" aria-hidden="true"></i><span
-              data-i18n="forward.paneActivity"></span></button>
-        </div>
-
-        <div id="fwdPaneConfig" class="fwd-pane" role="tabpanel">
-        <!-- Upstream forwarding config -->
+      <!-- Forwarding is four sibling panels, one per route, not one tall page.
+           The pool list alone runs several screens, and the route editor, the
+           live event table and the provider statistics are read at different
+           moments; a shared page meant reaching any of them by scrolling past
+           the others. Grouping lives in the nav registry (app.js), so these
+           panels are flat siblings like every other route panel. -->
+      <div id="fwdPaneProviders" class="tab-content hidden">
         <div class="card">
           <div class="card-header">
-            <span class="card-title" data-i18n="settings.upstreamTitle"></span>
+            <span class="card-title" data-i18n="upstreams.providersTitle"></span>
             <div class="card-actions">
+              <button class="btn btn-outline btn-sm" id="addUpstreamBtn" type="button"><i
+                  class="fa-solid fa-plus" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="upstreams.addProvider"></span></button>
               <button class="btn btn-outline btn-sm" id="upstreamExportBtn" type="button"><i
                   class="fa-solid fa-file-export" aria-hidden="true"></i><span class="btn-text"
                   data-i18n="upstreams.exportBtn"></span></button>
@@ -792,34 +782,49 @@
             </div>
           </div>
           <small class="help-block" data-i18n="upstreams.intro"></small>
-
-          <div class="form-group" style="margin-top: 1rem;">
-            <div class="flex items-center gap-2" style="justify-content: space-between;">
-              <label class="font-semibold" data-i18n="upstreams.providersTitle"></label>
-              <button class="btn btn-outline btn-sm" id="addUpstreamBtn" type="button">
-                <i class="fa-solid fa-plus"></i>
-                <span data-i18n="upstreams.addProvider"></span>
-              </button>
-            </div>
-            <small data-i18n="upstreams.providersHint"></small>
+          <small data-i18n="upstreams.providersHint"></small>
+          <!-- A working pool is 30+ providers, which is several screens of cards.
+               Filtering by name or base URL is the only way to reach one without
+               scrolling past everything else. -->
+          <div class="list-search-row">
+            <input type="text" id="upstreamProvSearch" spellcheck="false" autocomplete="off" aria-label=""
+              data-i18n-aria-label="upstreams.provSearchPlaceholder"
+              data-i18n-placeholder="upstreams.provSearchPlaceholder" />
+            <span class="text-xs muted-text" id="upstreamProvSearchCount" aria-live="polite"></span>
           </div>
           <div id="upstreamsList"></div>
+        </div>
+      </div>
 
-          <div class="form-group" style="margin-top: 1rem;">
-            <div class="flex items-center gap-2" style="justify-content: space-between;">
-              <label class="font-semibold" data-i18n="upstreams.routesTitle"></label>
-              <button class="btn btn-outline btn-sm" id="addRouteBtn" type="button">
-                <i class="fa-solid fa-plus"></i>
-                <span data-i18n="upstreams.addRoute"></span>
-              </button>
+      <div id="fwdPaneRoutes" class="tab-content hidden">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title" data-i18n="upstreams.routesTitle"></span>
+            <div class="card-actions">
+              <button class="btn btn-outline btn-sm" id="addRouteBtn" type="button"><i
+                  class="fa-solid fa-plus" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="upstreams.addRoute"></span></button>
             </div>
-            <small data-i18n="upstreams.routesHint"></small>
+          </div>
+          <small data-i18n="upstreams.routesHint"></small>
+          <!-- The export/import pair stays on the Providers view because one
+               bundle carries providers and routes together; say so here, or the
+               buttons look like they went missing when the page was split. -->
+          <small data-i18n="upstreams.bundleHint"></small>
+          <!-- Routes outnumber providers once every client model has a chain, and
+               the thing an operator looks for is usually "which route sends to X" —
+               so the filter matches the target providers too, not just the model. -->
+          <div class="list-search-row">
+            <input type="text" id="upstreamRouteSearch" spellcheck="false" autocomplete="off" aria-label=""
+              data-i18n-aria-label="upstreams.routeSearchPlaceholder"
+              data-i18n-placeholder="upstreams.routeSearchPlaceholder" />
+            <span class="text-xs muted-text" id="upstreamRouteSearchCount" aria-live="polite"></span>
           </div>
           <div id="modelRoutesList"></div>
         </div>
-        </div>
+      </div>
 
-        <div id="fwdPaneActivity" class="fwd-pane hidden" role="tabpanel">
+      <div id="fwdPaneActivity" class="tab-content hidden">
         <div class="card">
           <div class="card-header">
             <span class="card-title" data-i18n="forward.title"></span>
@@ -917,10 +922,10 @@
             <button class="btn btn-outline btn-sm" id="fwdNextBtn" type="button" data-i18n="forward.next"></button>
           </div>
         </div>
-        </div>
       </div>
 
-      <!-- Stats tab: cross-provider comparison and drill-down -->
+      <!-- Provider statistics: reached as Forwarding > Stats in the nav; the
+           panel id predates the route registry and stays as a stable id. -->
       <div id="tabStats" class="tab-content hidden">
         <div class="card">
           <div class="card-header">
@@ -1453,11 +1458,22 @@
         </div>
         <div class="form-group">
           <label data-i18n="upstreams.routeTargets"></label>
+          <!-- A chain reaches a dozen-plus targets, all inside a modal that scrolls,
+               so reaching the row that points at one provider means scrolling past
+               every other row. The box lives OUTSIDE the list because the list is
+               rebuilt wholesale for reasons that are not the operator's doing (a
+               background /models fetch is enough), which would take the caret out
+               of a filter placed inside it. -->
+          <div class="list-search-row" id="routeTargetSearchRow" hidden>
+            <input type="text" id="routeTargetSearch" spellcheck="false" autocomplete="off" aria-label=""
+              data-i18n-aria-label="upstreams.routeTargetSearchPlaceholder"
+              data-i18n-placeholder="upstreams.routeTargetSearchPlaceholder" />
+            <span class="text-xs muted-text" id="routeTargetSearchCount" aria-live="polite"></span>
+          </div>
           <div id="routeTargetsList"></div>
           <button class="btn btn-outline btn-sm" id="routeAddTargetBtn" type="button" style="margin-top:0.5rem;">
             + <span data-i18n="upstreams.routeAddTarget"></span>
           </button>
-          <datalist id="routeProviderList"></datalist>
           <small data-i18n="upstreams.routeTargetsHint"></small>
         </div>
         <div class="form-group">
@@ -1556,6 +1572,60 @@
       </div>
       <div class="modal-body" id="apiViewBody">
         <div class="api-view-loading"><i class="fa-solid fa-spinner fa-spin"></i> <span data-i18n="api.loading"></span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pressing g arms a two-key chord; without an echo the app looks frozen for
+       the second key. Lives outside the modals so it can never be clipped. -->
+  <div id="chordHint" class="chord-hint" hidden aria-hidden="true">
+    <kbd>g</kbd><span data-i18n="shortcuts.chordPending"></span>
+  </div>
+
+  <!-- Command palette. Opened with a modifier chord, so it stays available when
+       character-key shortcuts are switched off: that makes it the keyboard path
+       that speech-input users keep. The combobox keeps DOM focus on the input and
+       marks the highlighted row with aria-activedescendant, because moving real
+       focus to a row would stop the user typing. -->
+  <div id="cmdPaletteModal" class="modal cmdk-modal" aria-label="" data-i18n-aria-label="shortcuts.paletteLabel">
+    <div class="modal-content cmdk-content">
+      <div class="cmdk-input-row">
+        <i class="fa-solid fa-magnifying-glass cmdk-input-icon" aria-hidden="true"></i>
+        <input id="cmdPaletteInput" type="text" role="combobox" aria-expanded="true" aria-controls="cmdPaletteList"
+          aria-autocomplete="list" autocomplete="off" spellcheck="false" aria-label=""
+          data-i18n-aria-label="shortcuts.paletteLabel" data-i18n-placeholder="shortcuts.palettePlaceholder" />
+        <kbd class="cmdk-hint-key">Esc</kbd>
+      </div>
+      <div id="cmdPaletteList" class="cmdk-list" role="listbox" aria-label=""
+        data-i18n-aria-label="shortcuts.paletteResults"></div>
+      <div class="cmdk-footer">
+        <span><kbd>&uarr;</kbd><kbd>&darr;</kbd><span data-i18n="shortcuts.footerMove"></span></span>
+        <span><kbd data-i18n="shortcuts.keyEnter"></kbd><span data-i18n="shortcuts.footerOpen"></span></span>
+        <span id="cmdPaletteCount" class="cmdk-count" aria-live="polite"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Shortcut sheet: the discovery surface (? or the sidebar button) and the
+       home of the on/off switch. Rendered from the route registry so it can never
+       list a chord the dispatcher does not honour. -->
+  <div id="shortcutsModal" class="modal">
+    <div class="modal-content shortcuts-modal-content">
+      <div class="modal-header">
+        <span class="modal-title" data-i18n="shortcuts.title"></span>
+        <button class="modal-close" id="shortcutsModalClose" type="button" aria-label=""
+          data-i18n-aria-label="common.close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="shortcutsBody" class="shortcuts-body"></div>
+        <div class="shortcuts-setting">
+          <label class="flex items-center gap-2 cursor-pointer select-none">
+            <span class="switch"><input type="checkbox" id="charShortcutsToggle" checked /><span
+                class="slider"></span></span>
+            <span data-i18n="shortcuts.charToggle"></span>
+          </label>
+          <small data-i18n="shortcuts.charToggleHint"></small>
+        </div>
       </div>
     </div>
   </div>
