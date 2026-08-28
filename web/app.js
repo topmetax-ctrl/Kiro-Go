@@ -2404,6 +2404,25 @@
   // the collapse preference above: it is a way of finding a row in the chain being
   // edited, and a stored term would open the next chain with rows already elided.
   let routeTargetSearch = '';
+  // The second filter axis: '' (either), 'enabled', or 'disabled'. Separate from the
+  // text term rather than folded into it as a keyword, because the two answer
+  // different questions and are used together -- "the disabled rows pointing at
+  // OpenRouter" is one thought, and a magic word inside the text box could not be
+  // combined with a name. Same lifetime as the term: per-visit, never persisted.
+  let routeTargetStateFilter = '';
+  // Draft indices to keep rendered even though they no longer match the filter.
+  //
+  // This exists for one interaction: turning a row's switch OFF while the filter says
+  // "enabled only". The row instantly stops matching, and the two obvious behaviours
+  // are both wrong — vanishing under the cursor the moment it is clicked (the operator
+  // cannot undo a toggle they can no longer see), or lingering until some unrelated
+  // re-render silently removes it (a background /models fetch is enough, so the row
+  // disappears at a moment nobody chose). Keeping it until the FILTER is next touched
+  // makes the disappearance something the operator asks for.
+  //
+  // Indices are safe to hold: reordering is locked while filtering, and the two things
+  // that do shift them — removing a row, changing the filter — both clear this.
+  let routeTargetFilterKeep = {};
   // The length at which a chain stops fitting on screen. Below it the filter box could
   // only ever hide rows the operator can already see, and the position chip would be a
   // number on every row of a list short enough to count by eye. Both affordances answer
@@ -2430,12 +2449,23 @@
   // viewport of a scrolled modal entirely, and a move nobody can see reads as a
   // click that did nothing. Consumed by renderRouteTargets.
   let routeTargetMovedTo = -1;
-  // Per-target probe results, keyed by "providerId|model" rather than by row index.
-  // A probe describes a provider+model PAIR, so reordering or hiding rows must not
-  // carry a verdict onto a different target, and two rows aiming at the same pair
-  // legitimately share one result. Cleared when the modal opens: a verdict from a
-  // previous editing session would be presented as if it were current.
-  let routeTargetTests = {};
+  // Probe results, keyed by "providerId|model". A probe describes a provider+model
+  // PAIR, so reordering or hiding route rows must not carry a verdict onto a
+  // different target, and two rows aiming at the same pair legitimately share one
+  // result.
+  //
+  // One store for every place that probes -- the models browser, the route editor --
+  // because the thing being described is the pair, not the modal it was clicked in.
+  // Testing glm-5.3 while browsing b.ai's models and then building a route to it is
+  // one question asked once, and re-probing on the way from one screen to the other
+  // is a request the operator did not ask to send. Each entry carries `at`, so age is
+  // SHOWN rather than papered over by wiping the map (which is what the route editor
+  // used to do on open, taking every still-valid verdict with it).
+  let providerProbes = {};
+  // Which probe details panels are expanded, keyed the same way. View state: a
+  // verdict is a line, and the reason behind it is a JSON body that must not push
+  // every other row off the screen until it is asked for.
+  let probeDetailOpen = {};
   // Model names served by this kiro-go instance (from /v1/models), used to
   // suggest Target Model values in the route modal. Still free-text + optional.
   let kiroGoModels = [];
@@ -3193,12 +3223,32 @@
       case 'queued': return t('upstreams.connTestQueued');
       case 'testing': return t('upstreams.connTestTesting');
       case 'success': return t('upstreams.connTestSuccess') + ms;
-      case 'failed': return t('upstreams.connTestFailed') + (res.http ? '  ' + res.http : '') + ms;
+      // The class, next to the status. Across a pool of keys it is the column that
+      // separates "these two keys are rejected" from "the endpoint was briefly
+      // unavailable while they were tested" — the same status can be either, and only
+      // one of them is a reason to replace a credential.
+      case 'failed': return t('upstreams.connTestFailed') + (res.http ? '  ' + res.http : '') +
+        (res.category ? '  ' + probeCategoryLabel(res.category) : '') + ms;
       case 'timeout': return t('upstreams.connTestTimeout') + ms;
       case 'skipped': return t('upstreams.connTestSkipped');
       case 'stopped': return t('upstreams.connTestStopped');
       default: return '';
     }
+  }
+
+  // The reason, on the row's tooltip. No disclosure panel here, unlike the models
+  // browser: this list is paged over a pool that runs to three figures, and a panel
+  // per row would bury the run it is reporting on. The full text is one hover away
+  // and the whole verdict is copyable from the key's own row.
+  function connTestTitle(res) {
+    if (!res || res.status !== 'failed') return '';
+    const bits = [];
+    if (res.path) bits.push(t('upstreams.routeTargetTestVia', res.path));
+    if (res.kind) bits.push(res.kind);
+    if (res.retryAfter) bits.push(t('forward.detailRetryAfter') + ': ' + res.retryAfter);
+    const body = res.error || res.message || '';
+    if (body) bits.push(String(body).slice(0, 400));
+    return bits.join(' — ');
   }
 
   // connectionsSummary is all a provider CARD shows of its key pool: one line with
@@ -3295,7 +3345,8 @@
             '<span class="font-semibold conn-name">' + escapeHtml(c.name || t('upstreams.unnamed')) + '</span>' +
             '<span class="text-xs font-mono muted-text">' + escapeHtml(c.apiKeyMasked || '****') + '</span>' +
             '<span class="conn-health conn-health-' + escapeAttr(c.health || 'ok') + '">' + escapeHtml(connHealthLabel(c.health)) + '</span>' +
-            '<span class="text-xs muted-text" data-conn-test="' + cid + '">' + (testLine ? escapeHtml(testLine) : '') + '</span>' +
+            '<span class="text-xs muted-text" data-conn-test="' + cid + '"' +
+              ' title="' + escapeAttr(connTestTitle(res)) + '">' + (testLine ? escapeHtml(testLine) : '') + '</span>' +
           '</div>' +
         '</div>' +
         '<div class="flex items-center gap-2">' +
@@ -3362,8 +3413,9 @@
   function updateConnTestLine(pid, cid) {
     const el = document.querySelector('[data-conn-test="' + cssEscape(cid) + '"]');
     if (el) {
-      const line = connTestLabel(connTestState(pid).results[cid]);
-      el.textContent = line || '';
+      const res = connTestState(pid).results[cid];
+      el.textContent = connTestLabel(res) || '';
+      el.title = connTestTitle(res);
     }
     // Only the counters move with each verdict. Re-rendering the whole modal here
     // would rebuild a 750-node list once per key — 137 rebuilds for one Test run.
@@ -3518,16 +3570,28 @@
     list.innerHTML = filtered.map(m => {
       const mid = escapeHtml(m);
       const midAttr = escapeAttr(m);
+      // The verdict slot, the "why" disclosure and the panel all carry the SAME
+      // provider|model key, and all three ship empty: paintProbe fills them from the
+      // shared store, so a result survives this list being re-rendered (a keystroke in
+      // the filter box is enough) and is shared with the route editor's own Test.
+      const key = escapeAttr(probeKey(pid, m));
       return '<div class="upstream-model-row">' +
         '<span class="font-mono text-xs upstream-model-id">' + mid + '</span>' +
-        '<span class="upstream-model-test text-xs muted-text" data-model-test-for="' + pidAttr + '|' + midAttr + '"></span>' +
+        '<span class="upstream-model-test text-xs muted-text" data-probe-for="' + key + '"></span>' +
         '<span class="flex items-center gap-1">' +
+          // Hidden until there is a failure to explain: paintProbe owns the flag.
+          '<button class="btn btn-ghost btn-xs upstream-model-why" type="button" data-probe-why="' + key + '"' +
+            ' aria-expanded="false" hidden>' + escapeHtml(t('upstreams.probeWhy')) + '</button>' +
           '<button class="btn btn-outline btn-xs" type="button" data-model-action="copy" data-model="' + midAttr + '">' + escapeHtml(t('upstreams.copy')) + '</button>' +
           '<button class="btn btn-outline btn-xs" type="button" data-model-action="test" data-pid="' + pidAttr + '" data-model="' + midAttr + '">' + escapeHtml(t('upstreams.test')) + '</button>' +
           '<button class="btn btn-outline btn-xs" type="button" data-model-action="route" data-pid="' + pidAttr + '" data-model="' + midAttr + '">' + escapeHtml(t('upstreams.makeRoute')) + '</button>' +
         '</span>' +
+        // Full-width, below its own row: the reason is a JSON body, and squeezing it
+        // into the row would either clip it or push the buttons off the line.
+        '<div class="upstream-model-detail" data-probe-detail-for="' + key + '" hidden></div>' +
       '</div>';
     }).join('');
+    repaintProbes();
   }
 
   function renderModelRoutes() {
@@ -3933,7 +3997,13 @@
         const d = await res.json().catch(() => ({}));
         if (d.error === 'timeout') st.results[c.id] = { status: 'timeout', latencyMs: d.latencyMs };
         else if (d.ok) st.results[c.id] = { status: 'success', latencyMs: d.latencyMs };
-        else st.results[c.id] = { status: 'failed', latencyMs: d.latencyMs, http: d.status, error: d.error };
+        // The classification travels with the verdict: which key failed is only half
+        // the answer, and "was this the key or the endpoint" is the other half.
+        else st.results[c.id] = {
+          status: 'failed', latencyMs: d.latencyMs, http: d.status, error: d.error,
+          category: d.category, kind: d.kind, message: d.message,
+          path: d.path, retryAfter: d.retryAfter, retryable: d.retryable
+        };
         updateConnTestLine(pid, c.id);
       } catch (e) {
         if (e && e.name === 'AbortError') {
@@ -4209,32 +4279,236 @@
     modelsModalSearch = '';
   }
 
-  // Send a minimal probe to one model and show status + latency inline.
-  async function testModel(pid, model) {
+  // ---- Upstream probes -------------------------------------------------------
+  // One probe path behind every Test button in the panel: the models browser and
+  // the route editor. Both ask the same question of the same endpoint — "does this
+  // provider answer for this model" — so they share the request, the result store,
+  // and the way a failure is explained.
+  //
+  // What the server sends back is the SAME classification the forward path applies
+  // to live traffic (providererr.Diagnose*), not a second opinion invented for the
+  // admin panel. That is the point of showing it: "rejected" here means a real
+  // request would have been rejected and NOT failed over, and "unavailable" means it
+  // would have been retried on the next target. A status code alone says neither.
+  function probeKey(pid, model) { return pid + '|' + model; }
+
+  // Categories are the error boundary's internal vocabulary. The panel already ships
+  // a label per PUBLIC error code for the portal, and the two are one-to-one, so
+  // those strings are reused rather than translated a second time under new keys —
+  // one wording per concept, in every language, however the operator arrives at it.
+  const PROBE_CATEGORY_LABEL_KEYS = {
+    rate_limited: 'portal.error.provider_rate_limited',
+    timeout: 'portal.error.provider_timeout',
+    unavailable: 'portal.error.provider_unavailable',
+    rejected: 'portal.error.provider_rejected',
+    error: 'portal.error.provider_error',
+    canceled: 'portal.error.client_cancelled',
+    internal: 'portal.error.internal_error'
+  };
+  function probeCategoryLabel(cat) {
+    const key = PROBE_CATEGORY_LABEL_KEYS[cat];
+    return key ? t(key) : String(cat || '');
+  }
+
+  // How old a verdict is. Verdicts now outlive the modal they were taken in, which is
+  // the point -- but a green tick from twenty minutes ago is a different claim from one
+  // from twenty seconds ago, and an operator who cannot tell them apart is better off
+  // with no tick at all. Reuses the portal's own two age strings rather than inventing
+  // a third wording for the same idea.
+  function probeAgeLabel(at) {
+    if (!at) return '';
+    const secs = Math.max(0, Math.round((Date.now() - at) / 1000));
+    if (secs < 60) return t('portal.secondsAgo', String(secs));
+    return t('portal.minutesAgo', String(Math.round(secs / 60)));
+  }
+
+  // The one-line verdict. A failure leads with the status because that is what the
+  // operator recognises, then names the classification, because two 400s can mean
+  // different things to the router and only one of them ever fails over.
+  function probeVerdictText(rec) {
+    if (!rec) return '';
+    if (rec.state === 'testing') return t('upstreams.testing');
+    if (rec.state === 'ok') return '✓ ' + t('upstreams.testOk', String(rec.latencyMs || 0));
+    const parts = [];
+    if (rec.status) parts.push('HTTP ' + rec.status);
+    if (rec.category) parts.push(probeCategoryLabel(rec.category));
+    // Nothing answered and nothing classified: the transport's own word for it, which
+    // for our own deadline is the literal "timeout".
+    else if (rec.error) parts.push(String(rec.error).slice(0, 60));
+    return '✗ ' + (parts.join(' · ') || t('upstreams.testFail'));
+  }
+
+  // Only failures get a detail panel. A green row has nothing to explain, and a
+  // disclosure on every one of forty-four models is noise standing in for a service.
+  function probeHasDetail(rec) { return !!rec && rec.state === 'fail'; }
+
+  // The tooltip stays the at-a-glance version: which API shape answered, then the
+  // upstream's own first words. The panel below is the full account.
+  function probeVerdictTitle(rec) {
+    if (!rec || rec.state === 'testing') return '';
+    const bits = [];
+    const age = probeAgeLabel(rec.at);
+    if (age) bits.push(age);
+    if (rec.path) bits.push(t('upstreams.routeTargetTestVia', rec.path));
+    const msg = rec.message || rec.error || '';
+    if (rec.state === 'fail' && msg) bits.push(String(msg).slice(0, 200));
+    return bits.join(' — ');
+  }
+
+  // The panel. Everything here is admin-only by construction: the endpoint is behind
+  // the admin password, and the body has already been through the boundary's
+  // redactor, so a gateway that echoes the request back cannot put our Authorization
+  // header on this page.
+  function probeDetailHtml(key, rec) {
+    const rows = [];
+    const add = (label, value) => {
+      if (value === '' || value == null) return;
+      rows.push('<div class="fwd-detail-item"><span class="fwd-detail-label">' + escapeHtml(label) +
+        '</span><span class="fwd-detail-value">' + value + '</span></div>');
+    };
+    add(t('upstreams.probeClass'), escapeHtml(probeCategoryLabel(rec.category)));
+    // Whether the router would move on. This is the field that turns a verdict into a
+    // decision: a retryable failure on a primary is survivable if a fallback exists,
+    // and a non-retryable one will be returned to the client no matter how many
+    // targets sit below it.
+    add(t('upstreams.probeRetryable'), escapeHtml(t(rec.retryable ? 'forward.detailYes' : 'forward.detailNo')));
+    if (rec.status) add(t('forward.detailStatus'), escapeHtml(String(rec.status)));
+    // Transport kind, when nothing answered: "does not resolve" and "resolved and
+    // refused the connection" are the same red row and completely different fixes.
+    if (rec.kind) add(t('upstreams.probeKind'), escapeHtml(rec.kind));
+    if (rec.path) add(t('upstreams.probePath'), '<span class="font-mono">' + escapeHtml(rec.path) + '</span>');
+    add(t('forward.detailLatency'), escapeHtml(fwdFmtLatency(rec.latencyMs)));
+    if (rec.code) add(t('forward.detailUpstreamCode'), '<span class="font-mono">' + escapeHtml(rec.code) + '</span>');
+    if (rec.upstreamRequestId) {
+      add(t('forward.detailUpstreamRequestId'), '<span class="font-mono">' + escapeHtml(rec.upstreamRequestId) + '</span>');
+    }
+    if (rec.retryAfter) add(t('forward.detailRetryAfter'), escapeHtml(rec.retryAfter));
+    if (rec.at) {
+      add(t('upstreams.probeAt'), escapeHtml(new Date(rec.at).toLocaleTimeString() +
+        (probeAgeLabel(rec.at) ? ' · ' + probeAgeLabel(rec.at) : '')));
+    }
+    if (rec.message && rec.message !== rec.body) add(t('upstreams.probeMessage'), escapeHtml(rec.message));
+
+    // The upstream's own words, verbatim (redacted, capped). This is the field that
+    // answers the question a status code cannot: whether the model name, the base URL
+    // or the credential is the wrong one.
+    const body = rec.body || rec.message || '';
+    const err = '<div class="fwd-detail-error"><div class="fwd-detail-label">' +
+      escapeHtml(t('forward.detailError')) +
+      (rec.truncated ? ' <span class="muted-text">(' + escapeHtml(t('forward.detailTruncated')) + ')</span>' : '') +
+      '</div>' + (body
+        ? '<pre class="fwd-detail-errtext">' + escapeHtml(body) + '</pre>'
+        : '<p class="muted-text text-xs">' + escapeHtml(t('upstreams.probeNoBody')) + '</p>') +
+      '</div>';
+
+    return '<div class="fwd-detail-panel">' + err +
+      '<div class="fwd-detail-grid">' + rows.join('') + '</div>' +
+      '<div class="fwd-detail-actions"><button type="button" class="btn btn-outline btn-sm"' +
+      ' data-probe-copy="' + escapeAttr(key) + '"><i class="fa-solid fa-copy" aria-hidden="true"></i>' +
+      '<span class="btn-text">' + escapeHtml(t('forward.detailCopy')) + '</span></button></div></div>';
+  }
+
+  // Paint one verdict into every slot aiming at that pair WITHOUT re-rendering the
+  // list: a probe can land while the operator is typing in a sibling field, and a
+  // full re-render would take the caret with it. Both lists therefore ship their
+  // slots empty and let this fill them, which is also what restores results after an
+  // unrelated re-render.
+  function paintProbe(key) {
+    const rec = providerProbes[key];
+    const sel = '="' + cssEscape(key) + '"]';
+    const has = probeHasDetail(rec);
+    const open = has && !!probeDetailOpen[key];
+    qsa('[data-probe-for' + sel).forEach(el => {
+      el.textContent = probeVerdictText(rec);
+      el.style.color = !rec ? '' : rec.state === 'ok' ? 'var(--success, #22c55e)'
+        : rec.state === 'fail' ? 'var(--danger, #ef4444)' : '';
+      el.title = probeVerdictTitle(rec);
+    });
+    qsa('[data-probe-why' + sel).forEach(btn => {
+      btn.hidden = !has;
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      btn.textContent = t(open ? 'upstreams.probeWhyHide' : 'upstreams.probeWhy');
+    });
+    qsa('[data-probe-detail-for' + sel).forEach(host => {
+      // Built on expand, not on every paint: a forty-four model list would otherwise
+      // carry forty-four hidden panels nobody asked to read.
+      host.innerHTML = open ? probeDetailHtml(key, rec) : '';
+      host.hidden = !open;
+    });
+  }
+
+  function toggleProbeDetail(key) {
+    if (probeDetailOpen[key]) delete probeDetailOpen[key];
+    else probeDetailOpen[key] = true;
+    paintProbe(key);
+  }
+
+  // Re-apply every known verdict. Called at the end of a list render, since the rows
+  // ship their slots empty.
+  function repaintProbes() { Object.keys(providerProbes).forEach(paintProbe); }
+
+  // Send the one-token probe and record the verdict. pid/model identify the pair;
+  // creds are resolved server-side from the provider id, so the masked key the admin
+  // UI holds is not a problem.
+  //
+  // seq guards against a slower earlier probe overwriting a later one on the same
+  // pair — two clicks on Test, or a click in the models browser while the route
+  // editor is probing the same target.
+  let probeSeq = 0;
+  async function runProbe(pid, model) {
+    const key = probeKey(pid, model);
     const p = upstreamCache.providers.find(x => x.id === pid);
-    if (!p) return;
-    const slot = document.querySelector('[data-model-test-for="' + (window.CSS && CSS.escape ? CSS.escape(pid) : pid) + '|' + (window.CSS && CSS.escape ? CSS.escape(model) : model) + '"]');
-    if (slot) slot.textContent = t('upstreams.testing');
+    const seq = ++probeSeq;
+    providerProbes[key] = { state: 'testing', seq: seq, at: Date.now() };
+    // A stale panel under a fresh probe would describe the previous answer as if it
+    // were this one.
+    delete probeDetailOpen[key];
+    paintProbe(key);
+    let rec;
     try {
       const res = await api('/upstream-test', {
         method: 'POST',
-        body: JSON.stringify({ id: pid, baseUrl: p.baseUrl, proxyURL: p.proxyURL, model })
+        body: JSON.stringify({ id: pid, baseUrl: p ? p.baseUrl : '', proxyURL: p ? p.proxyURL : '', model })
       });
       const d = await res.json().catch(() => ({}));
-      if (!slot) {
-        toast(d.ok ? t('upstreams.testOk', String(d.latencyMs || 0)) : t('upstreams.testFail'), d.ok ? 'success' : 'error');
-        return;
-      }
-      if (d.ok) {
-        slot.textContent = '✓ ' + t('upstreams.testOk', String(d.latencyMs || 0));
-        slot.style.color = 'var(--success, #22c55e)';
-      } else {
-        slot.textContent = '✗ ' + (d.status ? ('HTTP ' + d.status) : t('upstreams.testFail'));
-        slot.style.color = 'var(--danger, #ef4444)';
-      }
+      rec = {
+        state: d.ok ? 'ok' : 'fail',
+        at: Date.now(),
+        seq: seq,
+        status: d.status || 0,
+        latencyMs: d.latencyMs || 0,
+        // Which API answered. A target that only speaks one of the two shapes still
+        // forwards fine for the clients that use it, so the path is information and
+        // not a footnote.
+        path: d.path || '',
+        category: d.category || '',
+        kind: d.kind || '',
+        code: d.code || '',
+        message: d.message || '',
+        body: d.error || '',
+        upstreamRequestId: d.upstreamRequestId || '',
+        retryAfter: d.retryAfter || '',
+        retryable: !!d.retryable,
+        truncated: !!d.truncated,
+        // A non-2xx with no HTTP status never reached the upstream at all. The panel
+        // reads differently for those, so the distinction is kept rather than inferred.
+        error: d.ok ? '' : (d.error || d.message || '')
+      };
     } catch (e) {
-      if (slot) { slot.textContent = '✗ ' + t('upstreams.testFail'); slot.style.color = 'var(--danger, #ef4444)'; }
+      // The gateway itself did not answer (offline, session expired). Classify it as
+      // ours rather than blaming the upstream for a request that never left.
+      rec = {
+        state: 'fail', at: Date.now(), seq: seq, status: 0, latencyMs: 0,
+        category: 'internal', retryable: false,
+        body: (e && e.message) || t('common.failed'),
+        error: (e && e.message) || t('common.failed')
+      };
     }
+    // A newer probe on this pair has already answered; this one is history.
+    if (providerProbes[key] && providerProbes[key].seq > seq) return providerProbes[key];
+    providerProbes[key] = rec;
+    paintProbe(key);
+    return rec;
   }
 
   // Open the route modal prefilled from a fetched model (one-click route creation).
@@ -4493,7 +4767,13 @@
     $('routeForm_enabled').checked = entry ? !!entry.enabled : true;
     // draftFromTargets copies as it derives sameTier, so Cancel discards target
     // edits; the cache is only touched on save.
-    routeTargetTests = {};
+    //
+    // Probe verdicts are deliberately NOT cleared here (they used to be). They
+    // describe a provider+model pair, not this editing session, so a target tested
+    // from the models browser a moment ago is still tested — and each verdict carries
+    // its own timestamp, so age is shown rather than assumed. Only the expanded
+    // detail panels are collapsed, since those are about reading one failure.
+    probeDetailOpen = {};
     routeTargetDraft = entry ? draftFromTargets(routeTargets(entry)) : [newRouteTarget()];
     if (!routeTargetDraft.length) routeTargetDraft = [newRouteTarget()];
     // A stored route can carry a pool target sharing a tier — written by an older
@@ -4501,10 +4781,15 @@
     // resolver will actually perform rather than the stale config.
     normalizeDraftTiers();
     // Per-visit, like the draft itself: a box still holding the last route's term
-    // would open this chain with rows already elided.
+    // would open this chain with rows already elided. Same for the state axis -- a
+    // leftover "disabled" would open the next chain looking like it had two rows.
     routeTargetSearch = '';
+    routeTargetStateFilter = '';
+    clearRouteTargetFilterKeep();
     const targetSearchBox = $('routeTargetSearch');
     if (targetSearchBox) targetSearchBox.value = '';
+    const targetStateBox = $('routeTargetStateFilter');
+    if (targetStateBox) targetStateBox.value = '';
     // Both are transient view state about the chain being edited, so neither may leak
     // into the next one: an open position editor on row 9 of a chain that no longer has
     // a row 9, or a flash pointing at a row this route never had.
@@ -4582,6 +4867,22 @@
     return routeTargetSearch.trim().toLowerCase();
   }
 
+  // The state axis, under the same row-count gate and for the same reason: the
+  // control is hidden below the threshold, so a value left in it must stop applying
+  // with it. Returns '' when either state is acceptable.
+  function routeTargetStateTerm() {
+    if (routeTargetDraft.length < ROUTE_TARGET_LONG_CHAIN) return '';
+    return routeTargetStateFilter === 'enabled' || routeTargetStateFilter === 'disabled'
+      ? routeTargetStateFilter : '';
+  }
+
+  // Whether ANY filter is narrowing the list. This is what the structural controls
+  // read: elision is what makes "the row above" ambiguous, and it does not matter
+  // which axis caused it.
+  function routeTargetFilterActive() {
+    return !!routeTargetFilterKeyword() || !!routeTargetStateTerm();
+  }
+
   // Matched on what names the destination on the row: the label the provider picker
   // shows, the raw upstream id — the only handle a target left pointing at a deleted
   // provider still has — and the model the row rewrites to.
@@ -4591,6 +4892,33 @@
       (tg.upstreamId || '').toLowerCase().includes(kw) ||
       (tg.targetModel || '').toLowerCase().includes(kw);
   }
+
+  // How the active filter reads back to the operator, for the empty-result message.
+  // Both axes in one phrase when both are set: they are ANDed, so naming only one
+  // would describe a filter that is not the one in force.
+  function routeTargetFilterDescription(kw, state) {
+    const stateLabel = state === 'enabled' ? t('upstreams.routeTargetStateEnabled')
+      : state === 'disabled' ? t('upstreams.routeTargetStateDisabled') : '';
+    const term = routeTargetSearch.trim();
+    if (kw && stateLabel) return t('upstreams.routeTargetFilterBoth', term, stateLabel);
+    if (stateLabel) return stateLabel;
+    return term;
+  }
+
+  // The two axes are ANDed: each one narrows what the other left. `enabled` is
+  // absent-means-true throughout the draft (newRouteTarget sets it, but a route
+  // written by an older build or by hand may omit it), so the test is written the
+  // same way the row's own switch and the save path write it -- `!== false`.
+  function routeTargetMatchesFilters(tg, kw, state) {
+    if (!routeTargetMatchesSearch(tg, kw)) return false;
+    if (state === 'enabled') return tg.enabled !== false;
+    if (state === 'disabled') return tg.enabled === false;
+    return true;
+  }
+
+  // Clear the keep-set. Called whenever holding an index would be wrong: the filter
+  // moved (the operator is asking a new question), or the draft shifted under it.
+  function clearRouteTargetFilterKeep() { routeTargetFilterKeep = {}; }
 
   // renderedTargetIndexes is the draft filtered down to the rows the operator can
   // actually see: hidden rows drop out of it while their run is collapsed.
@@ -4714,9 +5042,20 @@
   function syncRouteTargetSearchRow(shown, total) {
     const row = $('routeTargetSearchRow');
     if (row) row.hidden = total < ROUTE_TARGET_LONG_CHAIN;
+    // The select is a control the operator can leave set, so keep the DOM in step with
+    // the state: the list is rebuilt wholesale by things nobody clicked, and the enhanced
+    // custom-select reads its value from the native element it wraps.
+    const state = $('routeTargetStateFilter');
+    if (state && state.value !== routeTargetStateFilter) {
+      state.value = routeTargetStateFilter;
+      refreshCustomSelects(row || document);
+    }
     const count = $('routeTargetSearchCount');
     if (count) {
-      count.textContent = routeTargetFilterKeyword()
+      // Shown-of-total whenever EITHER axis is narrowing. Without this a state-only
+      // filter would elide rows with no count beside it, which is the one case where
+      // the operator cannot tell a filtered list from a short one.
+      count.textContent = routeTargetFilterActive()
         ? t('upstreams.routeTargetSearchCount', String(shown), String(total))
         : '';
     }
@@ -4772,7 +5111,17 @@
     // what a save writes.
     const longChain = routeTargetDraft.length >= ROUTE_TARGET_LONG_CHAIN;
     const kw = routeTargetFilterKeyword();
-    const matched = routeTargetDraft.map(tg => routeTargetMatchesSearch(tg, kw));
+    const stateTerm = routeTargetStateTerm();
+    // `filtering` stands in for "rows are elided" everywhere below. Either axis does
+    // that, and the consequences -- inert reordering, a static position chip, a run
+    // marker in place of the rows -- follow from the elision, not from which control
+    // caused it.
+    const filtering = !!kw || !!stateTerm;
+    // A row the operator just edited out of the filter stays put (see
+    // routeTargetFilterKeep). It counts as shown, because it IS shown -- a count that
+    // said 2 next to three rendered rows would be the more confusing of the two.
+    const matched = routeTargetDraft.map((tg, i) =>
+      routeTargetMatchesFilters(tg, kw, stateTerm) || (filtering && !!routeTargetFilterKeep[i]));
     const matchCount = matched.filter(Boolean).length;
     // Reordering is off while a filter is in force. Position carries the meaning
     // here — "same tier as above" is defined against the row directly above, and the
@@ -4780,7 +5129,7 @@
     // the row above ON SCREEN is no longer the row above IN THE CHAIN. Rather than
     // let a drag or an arrow land somewhere the operator did not aim, the structural
     // controls say why they are inert while every content field stays editable.
-    const lockedHint = kw ? t('upstreams.routeTargetReorderFiltered') : '';
+    const lockedHint = filtering ? t('upstreams.routeTargetReorderFiltered') : '';
     // The marker names what stands behind it: how many targets, how many of those
     // are still enabled — the case where "out of sight" is easiest to misread as
     // "off" — and, in the tooltip, which providers. That tooltip is also what
@@ -4849,7 +5198,7 @@
         ? ''
         : '<label class="text-xs muted-text flex items-center gap-1" title="' + escapeAttr(lockedHint || t('upstreams.routeTargetSameTierHint')) + '">' +
             '<input type="checkbox" data-target-field="sameTier" data-index="' + i + '"' + (tg.sameTier ? ' checked' : '') +
-              (kw ? ' disabled' : '') + ' />' +
+              (filtering ? ' disabled' : '') + ' />' +
             escapeHtml(t('upstreams.routeTargetSameTier')) +
           '</label>';
       const shareLabel = shares
@@ -4879,7 +5228,7 @@
       // the row's own provider+model pair and a verdict cannot outlive an edit that
       // changed either half.
       const probeModel = routeTargetProbeModel(tg);
-      const testKey = tg.upstreamId + '|' + probeModel;
+      const testKey = probeKey(tg.upstreamId, probeModel);
       // The pool is answered locally instead of being relayed to, so there is no
       // endpoint to probe; with no model name on either side there is nothing to ask
       // for. Both are disabled-with-a-reason rather than hidden, so the button does
@@ -4887,12 +5236,18 @@
       const testTitle = isPool
         ? t('upstreams.routeTargetTestPoolHint')
         : (probeModel ? t('upstreams.routeTargetTestHint', probeModel) : t('upstreams.routeTargetTestNoModel'));
-      const testSlot = '<span class="route-target-test text-xs font-mono" data-target-test-for="' +
-        escapeAttr(testKey) + '"></span>';
+      // The verdict, and the disclosure for its reason. Both are keyed by the PAIR, so
+      // a result probed from the models browser already shows here — and the reason a
+      // target was refused reaches the operator on the screen where the fix is (change
+      // the model name, or the provider), instead of only as a truncated tooltip.
+      const testSlot = '<span class="route-target-test text-xs font-mono" data-probe-for="' +
+        escapeAttr(testKey) + '"></span>' +
+        '<button class="btn btn-ghost btn-xs route-target-why" type="button" data-probe-why="' +
+        escapeAttr(testKey) + '" aria-expanded="false" hidden>' + escapeHtml(t('upstreams.probeWhy')) + '</button>';
       // The row is only made draggable on mousedown over the handle (see the
       // dragstart wiring), so dragging never starts from the text inputs and
       // ordinary text selection inside them keeps working.
-      const handle = '<span class="route-target-handle' + (kw ? ' is-locked' : '') +
+      const handle = '<span class="route-target-handle' + (filtering ? ' is-locked' : '') +
         '" data-target-handle="1" aria-hidden="true"' +
         ' title="' + escapeAttr(lockedHint || t('common.dragToReorder')) + '">' +
         '<i class="fa-solid fa-grip-vertical"></i></span>';
@@ -4908,12 +5263,12 @@
       const posTitle = t('upstreams.routeTargetPositionHint', posLabel, String(routeTargetDraft.length));
       // Locked while filtering, unlike "to top": an absolute position is only usable
       // if the operator can see what is at it, and elided runs make that a guess.
-      const positionChip = !longChain ? '' : (routeTargetJumpAt === i && !kw)
+      const positionChip = !longChain ? '' : (routeTargetJumpAt === i && !filtering)
         ? '<input type="number" class="route-target-pos-input" data-target-jump="1" data-index="' + i + '"' +
             ' min="1" max="' + routeTargetDraft.length + '" value="' + escapeAttr(routeTargetJumpValue) + '"' +
             ' aria-label="' + escapeAttr(t('upstreams.routeTargetJumpLabel')) + '"' +
             ' title="' + escapeAttr(t('upstreams.routeTargetJumpHint')) + '" />'
-        : (kw
+        : (filtering
           ? '<span class="route-target-pos is-static" title="' + escapeAttr(lockedHint) + '">#' +
               escapeHtml(posLabel) + '</span>'
           : '<button class="route-target-pos" type="button" data-target-action="jump" data-index="' + i + '"' +
@@ -4949,11 +5304,11 @@
               ' aria-label="' + escapeAttr(t('upstreams.routeTargetToTop')) + '">' +
               '<i class="fa-solid fa-angles-up" aria-hidden="true"></i></button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-target-action="up" data-index="' + i + '"' +
-              (pos > 0 && !kw ? '' : ' disabled') +
+              (pos > 0 && !filtering ? '' : ' disabled') +
               ' title="' + escapeAttr(lockedHint || t('upstreams.routeTargetUpHint', altKeyLabel())) + '"' +
               ' aria-label="' + escapeAttr(t('upstreams.routeTargetUp')) + '">&uarr;</button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-target-action="down" data-index="' + i + '"' +
-              (pos >= 0 && pos < rendered.length - 1 && !kw ? '' : ' disabled') +
+              (pos >= 0 && pos < rendered.length - 1 && !filtering ? '' : ' disabled') +
               ' title="' + escapeAttr(lockedHint || t('upstreams.routeTargetDownHint', altKeyLabel())) + '"' +
               ' aria-label="' + escapeAttr(t('upstreams.routeTargetDown')) + '">&darr;</button>' +
             '<button class="btn btn-outline btn-sm" type="button" data-target-action="test" data-index="' + i + '"' +
@@ -4990,6 +5345,10 @@
           '</label>' +
           targetModelNoteHTML(tg, i) +
         '</div>' +
+        // Below the row's own fields, full width: the panel holds a JSON error body,
+        // and the row is already two lines of controls. Empty and hidden until the
+        // disclosure is used — paintProbe builds it on demand.
+        '<div class="route-target-detail" data-probe-detail-for="' + escapeAttr(testKey) + '" hidden></div>' +
       '</div>';
     };
     // Hidden rows are elided as a run, with the marker standing exactly where they
@@ -4999,7 +5358,7 @@
     // Expanding keeps the marker as that run's header, which is what makes the
     // collapse reversible from the same control.
     let html = '';
-    if (kw) {
+    if (filtering) {
       // While filtering, a hidden row that matches is rendered anyway: searching is
       // an explicit act of looking for one target, so leaving the match behind a
       // collapsed run would make the filter hide the row it was asked to find. The
@@ -5016,10 +5375,14 @@
         i++;
       }
       // One marker spanning the whole chain would say "12 filtered out" and nothing
-      // else, which reads as a rendering failure rather than an empty result.
+      // else, which reads as a rendering failure rather than an empty result. The
+      // message names WHAT was asked for, because with two axes an empty result has
+      // two possible causes and the operator has to see which combination is in force
+      // -- a bare "no match" next to a text box that still has a term in it invites
+      // clearing the wrong control.
       if (!matchCount) {
         html = '<div class="muted-text text-xs" style="padding:0.5rem 0;">' +
-          escapeHtml(t('upstreams.routeTargetNoMatch', routeTargetSearch.trim())) + '</div>';
+          escapeHtml(t('upstreams.routeTargetNoMatch', routeTargetFilterDescription(kw, stateTerm))) + '</div>';
       }
     } else {
       for (let i = 0; i < routeTargetDraft.length;) {
@@ -5052,10 +5415,10 @@
     // would flash the native select on every re-render.
     refreshCustomSelects(box);
     restoreTargetListFocus(box, focusSnap);
-    // The row markup ships its verdict slot empty, so restore what has been probed
-    // this session: reorder / hide / provider change all rebuild this list, and a
-    // result that vanished on the next click would read as "the test was lost".
-    Object.keys(routeTargetTests).forEach(paintRouteTargetTest);
+    // The row markup ships its verdict slot empty, so restore what has been probed:
+    // reorder / hide / provider change all rebuild this list, and a result that
+    // vanished on the next click would read as "the test was lost".
+    repaintProbes();
     // Fill each row's model dropdown from its own provider, fetching quietly the
     // first time a provider's model list is needed.
     routeTargetDraft.forEach(tg => ensureProviderModels(tg.upstreamId));
@@ -5069,7 +5432,9 @@
     closeDialog('modelRouteModal');
     routeEditingId = '';
     routeTargetDraft = [];
-    routeTargetTests = {};
+    // The verdicts outlive the modal on purpose (see openRouteModal); only the
+    // expanded panels are a property of this visit.
+    probeDetailOpen = {};
   }
 
   // The model a target will ACTUALLY send: its rewrite when set, otherwise the
@@ -5083,55 +5448,31 @@
     return el ? el.value.trim() : '';
   }
 
-  // Paint one verdict into every row aiming at that pair WITHOUT re-rendering the
-  // list: a probe can land while the operator is typing in a sibling field, and a
-  // full re-render would take the caret with it.
-  function paintRouteTargetTest(key) {
-    const st = routeTargetTests[key];
-    const sel = '[data-target-test-for="' + (window.CSS && CSS.escape ? CSS.escape(key) : key) + '"]';
-    qsa(sel).forEach(el => {
-      el.textContent = !st ? '' : (st.state === 'testing' ? t('upstreams.testing') : st.text);
-      el.style.color = st && st.state === 'ok' ? 'var(--success, #22c55e)'
-        : st && st.state === 'fail' ? 'var(--danger, #ef4444)' : '';
-      el.title = (st && st.detail) || '';
-    });
-  }
-
-  // Send the same one-token probe the models browser uses (POST /upstream-test),
-  // but aimed at the pair THIS row will forward. Creds are resolved server-side
-  // from the provider id, so the masked key the admin UI holds is not a problem.
-  async function testRouteTarget(i) {
+  // Aim the shared probe at the pair THIS row will forward: its rewrite when set,
+  // otherwise the client model, because that is the request the forwarder makes.
+  function testRouteTarget(i) {
     const tg = routeTargetDraft[i];
     if (!tg || tg.upstreamId === KIRO_POOL_ID) return;
     const model = routeTargetProbeModel(tg);
     if (!model) { toast(t('upstreams.routeTargetTestNoModel'), 'error'); return; }
-    const key = tg.upstreamId + '|' + model;
-    const p = upstreamCache.providers.find(x => x.id === tg.upstreamId);
-    routeTargetTests[key] = { state: 'testing' };
-    paintRouteTargetTest(key);
-    try {
-      const res = await api('/upstream-test', {
-        method: 'POST',
-        body: JSON.stringify({ id: tg.upstreamId, baseUrl: p ? p.baseUrl : '', proxyURL: p ? p.proxyURL : '', model })
-      });
-      const d = await res.json().catch(() => ({}));
-      // Which path answered matters: the server probes OpenAI's /chat/completions and
-      // falls back to Anthropic's /messages, and a target that only speaks one shape
-      // still forwards fine for the clients that use it.
-      const via = d.path ? t('upstreams.routeTargetTestVia', d.path) : '';
-      routeTargetTests[key] = d.ok
-        ? { state: 'ok', text: '✓ ' + t('upstreams.testOk', String(d.latencyMs || 0)), detail: via }
-        : {
-            state: 'fail',
-            text: '✗ ' + (d.status ? ('HTTP ' + d.status) : t('upstreams.testFail')),
-            // The upstream's own error body, on the tooltip: "HTTP 404" alone does not
-            // say whether the model name or the base URL is the wrong one.
-            detail: (via ? via + ' — ' : '') + String(d.error || '').slice(0, 400)
-          };
-    } catch (e) {
-      routeTargetTests[key] = { state: 'fail', text: '✗ ' + t('upstreams.testFail'), detail: (e && e.message) || '' };
-    }
-    paintRouteTargetTest(key);
+    runProbe(tg.upstreamId, model);
+  }
+
+  // Copy one verdict as JSON. A failed probe is what gets pasted into a ticket to the
+  // upstream's support desk or into an issue here, and retyping a request id off the
+  // screen is how the wrong one ends up in the ticket.
+  function copyProbeRecord(key) {
+    const rec = providerProbes[key];
+    if (!rec) return;
+    const sep = key.lastIndexOf('|');
+    const payload = Object.assign({
+      provider: providerName(key.slice(0, sep)),
+      model: key.slice(sep + 1)
+    }, rec);
+    // Internal bookkeeping, not part of the report.
+    delete payload.seq;
+    if (payload.at) payload.at = new Date(payload.at).toISOString();
+    copyText(JSON.stringify(payload, null, 2)).then(() => toast(t('common.copied'), 'success'));
   }
 
   async function submitRouteModal() {
@@ -5541,8 +5882,25 @@
       // than parked: it would otherwise reappear on a row the operator has stopped
       // looking at the moment the box is cleared.
       routeTargetJumpAt = -1;
+      // Touching a filter is what settles any row being held from a previous edit.
+      clearRouteTargetFilterKeep();
       if (isDialogOpen('modelRouteModal')) renderRouteTargets();
     });
+    // The state axis beside it. No debounce and no Escape-to-clear: a select commits
+    // one discrete choice per interaction, and Escape inside an open custom-select
+    // popover already means "close the popover" (bindDialogEscape yields to it), so
+    // taking that key here would collide with the control's own.
+    const targetStateFilter = $('routeTargetStateFilter');
+    if (targetStateFilter) {
+      targetStateFilter.addEventListener('change', () => {
+        routeTargetStateFilter = targetStateFilter.value;
+        // Same reasoning as the text box: an open position editor is dropped rather
+        // than parked, because it is inert while rows are elided.
+        routeTargetJumpAt = -1;
+        clearRouteTargetFilterKeep();
+        if (isDialogOpen('modelRouteModal')) renderRouteTargets();
+      });
+    }
     // Per-model actions (copy / test / make route) live inside the models modal.
     const modelsList = $('upstreamModelsList');
     if (modelsList) {
@@ -5553,8 +5911,17 @@
         const model = mbtn.dataset.model || '';
         const pid = mbtn.dataset.pid || '';
         if (action === 'copy') copyText(model).then(() => toast(t('upstreams.copied'), 'success'));
-        else if (action === 'test') testModel(pid, model);
+        else if (action === 'test') runProbe(pid, model);
         else if (action === 'route') makeRouteFromModel(pid, model);
+      });
+      // The verdict's own two controls: expand the reason, and copy it. Delegated
+      // from the stable list container, because paintProbe replaces the panel's
+      // contents in place.
+      modelsList.addEventListener('click', e => {
+        const why = e.target.closest('[data-probe-why]');
+        if (why) { toggleProbeDetail(why.dataset.probeWhy); return; }
+        const copy = e.target.closest('[data-probe-copy]');
+        if (copy) copyProbeRecord(copy.dataset.probeCopy);
       });
     }
     const modelsSearch = $('upstreamModelsSearch');
@@ -5631,8 +5998,10 @@
           if (routeTargetDraft.length <= 1) return;
           routeTargetDraft.splice(i, 1);
           // Removing a row shifts every position below it, so an open position editor
-          // would be sitting on a different target than the one it was opened for.
+          // would be sitting on a different target than the one it was opened for --
+          // and a held index would name a different row for the same reason.
           routeTargetJumpAt = -1;
+          clearRouteTargetFilterKeep();
         } else if (action === 'up') {
           if (!moveRenderedRow(i, -1)) return;
         } else if (action === 'down') {
@@ -5671,6 +6040,16 @@
         }
         normalizeDraftTiers();
         renderRouteTargets();
+      });
+      // The verdict's own controls, in a listener of their own: the handler above
+      // returns on anything that is not a [data-target-action], and these two must not
+      // re-render the list — paintProbe swaps the panel in place, so the caret stays
+      // wherever it was in the row's fields.
+      rtTargets.addEventListener('click', e => {
+        const why = e.target.closest('[data-probe-why]');
+        if (why) { toggleProbeDetail(why.dataset.probeWhy); return; }
+        const copy = e.target.closest('[data-probe-copy]');
+        if (copy) copyProbeRecord(copy.dataset.probeCopy);
       });
       // The hidden-run disclosure. Delegated from the stable container because the
       // markers are re-rendered on every list change, and it flips ALL runs at once:
@@ -5712,7 +6091,12 @@
           renderRouteTargets();
           return;
         }
-        if (field === 'enabled') routeTargetDraft[i].enabled = el.checked;
+        if (field === 'enabled') {
+          routeTargetDraft[i].enabled = el.checked;
+          // Under a state filter this row may have just stopped matching. Pin it so the
+          // switch the operator is looking at is still there to be clicked back.
+          if (routeTargetStateTerm()) routeTargetFilterKeep[i] = true;
+        }
         else if (field === 'weight') routeTargetDraft[i].weight = Math.max(1, parseInt(el.value, 10) || 1);
         else if (field === 'sameTier') {
           // Both checkbox fields must read .checked, not .value: the generic
@@ -5732,8 +6116,14 @@
           // undoing the edit brings the result back.)
           if (field === 'targetModel') {
             const row = el.closest('.route-target-row');
-            const slot = row && row.querySelector('[data-target-test-for]');
+            const slot = row && row.querySelector('[data-probe-for]');
             if (slot) { slot.textContent = ''; slot.title = ''; slot.style.color = ''; }
+            // The reason panel and its disclosure go with the verdict: left standing,
+            // they would explain a rejection of a model name no longer in the field.
+            const why = row && row.querySelector('[data-probe-why]');
+            if (why) { why.hidden = true; why.setAttribute('aria-expanded', 'false'); }
+            const panel = row && row.querySelector('[data-probe-detail-for]');
+            if (panel) { panel.innerHTML = ''; panel.hidden = true; }
           }
         }
       };
@@ -5799,7 +6189,7 @@
           // The same lock the arrow buttons carry, for the same reason. A key that goes
           // quiet reads as broken, so it says why -- once, in a toast, rather than in a
           // tooltip nobody hovers a keyboard over.
-          if (routeTargetFilterKeyword()) {
+          if (routeTargetFilterActive()) {
             toast(t('upstreams.routeTargetReorderFiltered'), 'warning');
             return;
           }
@@ -5822,7 +6212,7 @@
         if (!row) return;
         // Never armed while the list is filtered: with rows elided, a drop between
         // two visible rows names a gap that is not the one under the cursor.
-        row.draggable = !routeTargetFilterKeyword() && !!e.target.closest('[data-target-handle]');
+        row.draggable = !routeTargetFilterActive() && !!e.target.closest('[data-target-handle]');
       });
       // Disarm on release so a later drag attempt from an input cannot inherit
       // the armed state left by an earlier grip press.
@@ -5883,6 +6273,11 @@
       // See addRouteBtn: newRouteTarget falls back to the pool sentinel, so a row
       // can be added without any provider configured.
       routeTargetDraft.push(newRouteTarget());
+      // A new row is enabled and points at the first provider, so under any filter in
+      // force it probably does not match -- and "+ Add target" that adds an invisible
+      // row is indistinguishable from a button that does nothing. Pin it, like an
+      // edited row: appending shifts no existing index, so the held ones stay valid.
+      if (routeTargetFilterActive()) routeTargetFilterKeep[routeTargetDraft.length - 1] = true;
       renderRouteTargets();
     });
     const upExport = $('upstreamExportBtn');

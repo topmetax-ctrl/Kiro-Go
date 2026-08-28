@@ -2755,6 +2755,45 @@ img.brand-icon {
   padding: 0.375rem 0;
   border-bottom: 1px solid var(--border, rgba(148, 163, 184, 0.15));
 }
+/* The probe reason panel sits on its own line under the row it belongs to. The row
+   is a wrapping flex line, so a full basis is what moves it below the buttons
+   instead of squeezing a JSON body in beside them. */
+.upstream-model-detail,
+.route-target-detail {
+  flex-basis: 100%;
+  min-width: 0;
+}
+/* Hidden until there is a failure to explain (paintProbe owns the attribute). The
+   explicit rule is required because both hosts are flex items, and `display: flex`
+   from a utility class would otherwise beat the [hidden] default. */
+.upstream-model-detail[hidden],
+.route-target-detail[hidden] {
+  display: none;
+}
+/* The "why" disclosure reads as a link rather than a third button competing with
+   Copy / Test / Route for the eye — it only appears on the rows that failed. */
+.upstream-model-why,
+.route-target-why {
+  padding-inline: 0.25rem;
+  color: var(--destructive);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  white-space: nowrap;
+}
+.upstream-model-why[hidden],
+.route-target-why[hidden] {
+  display: none;
+}
+/* Inside a modal the panel has no table row to sit in (unlike the Forwarding tab's
+   copy), so it carries its own frame. */
+.upstream-model-detail .fwd-detail-panel,
+.route-target-detail .fwd-detail-panel {
+  margin-top: 0.4rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--border, rgba(148, 163, 184, 0.2));
+  border-radius: 8px;
+  background: var(--secondary);
+}
 /* Route target rows: drag to reorder. The row is positioned so the drop marker
    can be drawn as an inset pseudo-element instead of shifting the layout. */
 .route-target-row {
@@ -2827,6 +2866,24 @@ img.brand-icon {
 }
 .list-search-row input[type="text"] {
   width: min(22rem, 100%);
+}
+/* The state axis sits beside the text box on one line and drops below it when the
+   modal is narrow. It must not stretch: a three-option select as wide as the text
+   field reads as the more important of the two, and it is the secondary control. */
+.list-search-row select {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 9rem;
+}
+/* The select is enhanced into a searchable popover, and the visible box is the
+   .custom-select sibling the enhancer inserts — the native <select> shrinks to 1px
+   and only holds the value. That sibling carries `width: 100%` from its own base
+   rule, so an explicit width is required here or it claims the whole line and the
+   filter row becomes three stacked rows. */
+.list-search-row select + .custom-select {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 10rem;
 }
 /* Hidden providers stay in the list, below a disclosure, so they can always be
    unhidden. They are dimmed rather than restyled: every control still works, and

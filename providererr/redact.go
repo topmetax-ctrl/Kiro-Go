@@ -58,6 +58,11 @@ var (
 	skRe     = regexp.MustCompile(`(?i)\bsk-[a-z0-9_\-]{8,}`)
 	ptRe     = regexp.MustCompile(`(?i)\bpt-[a-z0-9_\-]{8,}`)
 	apiKeyKV = regexp.MustCompile(`(?i)("?(?:authorization|proxy-authorization|api[_-]?key|apiKey|access_token|refresh_token|x-api-key|cookie)"?\s*[:=]\s*"?)([^"\s,}]+)`)
+	// URL userinfo: an outbound proxy is configured as http://user:pass@host, and
+	// a transport error carrying that URL puts the proxy password in the
+	// diagnostic. The host is kept — it is what the operator needs — and only the
+	// credential half is dropped.
+	urlUserinfoRe = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.\-]*://)[^/\s:@]+:[^/\s@]*@`)
 )
 
 const redacted = "[REDACTED]"
@@ -72,6 +77,7 @@ func Redact(s string) string {
 	out = skRe.ReplaceAllString(out, redacted)
 	out = ptRe.ReplaceAllString(out, redacted)
 	out = apiKeyKV.ReplaceAllString(out, "${1}"+redacted)
+	out = urlUserinfoRe.ReplaceAllString(out, "${1}"+redacted+"@")
 	return out
 }
 

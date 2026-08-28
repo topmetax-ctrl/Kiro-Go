@@ -58,6 +58,45 @@ API-key quota remains 429 + `token_quota_exceeded` / `credit_quota_exceeded` / `
 - Storage: `provider_error_details`, 16 KiB cap, same retention as `request_events`.
 - Secrets redacted: `Authorization`, Bearer, `sk-`/`pt-`, `api_key` / `access_token` / `cookie` assignments.
 
+## Admin probes (Test buttons)
+
+The panel's three Test buttons — a provider's model browser, a key in the pool
+manager, a route target — all `POST /admin/api/upstream-test` and all run the
+SAME classification the forward path runs, via `providererr.Diagnose*`.
+
+`Diagnose*` is the unmetered twin of `From*`: identical parse / classify /
+redact, but it does not touch the classification counters. A probe is an
+operator's question, not upstream traffic, so twelve clicks on Test must not
+read back as twelve upstream failures on the dashboards. `FromHTTP` /
+`FromNetwork` remain the metered entry points and are now thin wrappers over the
+same core, so the two paths cannot drift apart.
+
+What the endpoint reports on a failure:
+
+| Field | Meaning |
+|---|---|
+| `category` | internal class (`rejected`, `rate_limited`, `unavailable`, `timeout`, `error`) |
+| `retryable` | whether the forward path would try the next target |
+| `status` | upstream HTTP status; absent when nothing answered |
+| `kind` | transport failure (`dns`, `tls`, `refused`, `eof`, `timeout`); absent when the upstream answered |
+| `code` / `message` | the upstream's own error code and message |
+| `error` | the redacted, capped upstream body; absent when it sent none |
+| `upstreamRequestId` / `retryAfter` | from the upstream's response headers |
+
+Successful probes report none of these — the panel decides what to render from
+which fields exist, so a category on a healthy probe would open an empty "why"
+panel on a green row.
+
+The body reaches the panel only through `Redact` + the 16 KiB cap. This matters
+because some gateways echo the refused request back inside their 400, which
+would otherwise hand the panel the `Authorization` header we just sent (test:
+`TestUpstreamTestRedactsEchoedCredentials`). Proxy URL userinfo
+(`http://user:pass@host`) is redacted too, keeping the host: a dial failure
+through a configured proxy carries that credential in its error text.
+
+Client-facing behaviour is unchanged by this: `/admin/api/upstream-test` is
+admin-only, and no `PublicError` renderer reads these fields.
+
 ## Known limitations
 
 - Compressed non-JSON error bodies on a **200** stream that never form SSE frames larger than 64 KiB could still pass through; those are treated as truncated/replaced when the buffer exceeds the parse cap.

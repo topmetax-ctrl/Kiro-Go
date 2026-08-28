@@ -14,27 +14,28 @@ import (
 
 // FromHTTP builds an InternalError from an upstream HTTP response. Body is
 // parsed once; secrets are redacted before Detail is populated.
+//
+// This is the METERED entry point: it records the classification counters. The
+// same work without metrics is DiagnoseHTTP, which admin probes use.
 func FromHTTP(status int, body []byte, hdr http.Header) InternalError {
-	parsed := ParseBody(body)
-	redacted, _ := BoundAndRedact(body)
-	cat := categoryFromStatus(status, parsed.Code, parsed.Message)
+	d, redactedSomething := diagnoseHTTP(status, body, hdr)
 	in := InternalError{
 		UpstreamStatus:    status,
-		UpstreamCode:      parsed.Code,
-		UpstreamMessage:   Redact(parsed.Message),
-		UpstreamRequestID: firstHeader(hdr, "X-Request-Id", "X-Request-ID", "Request-Id", "Cf-Ray"),
-		RetryAfter:        firstHeader(hdr, "Retry-After"),
-		Detail:            redacted.Text,
-		DetailTruncated:   redacted.Truncated,
-		Category:          cat,
-		Retryable:         RetryableStatus(status) || cat == CategoryTimeout || cat == CategoryUnavailable || cat == CategoryRateLimited,
+		UpstreamCode:      d.Code,
+		UpstreamMessage:   d.Message,
+		UpstreamRequestID: d.RequestID,
+		RetryAfter:        d.RetryAfter,
+		Detail:            d.Detail,
+		DetailTruncated:   d.Truncated,
+		Category:          d.Category,
+		Retryable:         d.Retryable,
 		Timestamp:         time.Now(),
 	}
-	if parsed.RequestID != "" && in.UpstreamRequestID == "" {
-		in.UpstreamRequestID = parsed.RequestID
+	IncClassified(d.Category)
+	if redactedSomething {
+		IncRedacted()
 	}
-	IncClassified(cat)
-	if redacted.Truncated {
+	if d.Truncated {
 		IncTruncated()
 	}
 	return in
@@ -42,49 +43,73 @@ func FromHTTP(status int, body []byte, hdr http.Header) InternalError {
 
 // FromNetwork classifies a transport/Go error that never produced an HTTP
 // response. Typed checks come first; string matching is a last resort.
+//
+// Metered, like FromHTTP; DiagnoseError is the unmetered twin.
 func FromNetwork(err error) InternalError {
-	in := InternalError{Timestamp: time.Now(), Retryable: true}
 	if err == nil {
-		in.Category = CategoryInternal
-		in.Retryable = false
+		in := InternalError{Timestamp: time.Now(), Category: CategoryInternal}
 		IncClassified(in.Category)
 		return in
 	}
-
-	switch {
-	case errors.Is(err, context.Canceled):
-		in.Category = CategoryCanceled
-		in.NetworkKind = "canceled"
-		in.Retryable = false
-	case errors.Is(err, context.DeadlineExceeded):
-		in.Category = CategoryTimeout
-		in.NetworkKind = "deadline"
-	case isTimeout(err):
-		in.Category = CategoryTimeout
-		in.NetworkKind = "timeout"
-	case isDNS(err):
-		in.Category = CategoryUnavailable
-		in.NetworkKind = "dns"
-	case isTLS(err):
-		in.Category = CategoryUnavailable
-		in.NetworkKind = "tls"
-	case isRefused(err):
-		in.Category = CategoryUnavailable
-		in.NetworkKind = "refused"
-	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
-		in.Category = CategoryError
-		in.NetworkKind = "eof"
-	default:
-		in.Category = CategoryUnavailable
-		in.NetworkKind = "network"
+	d, redactedSomething := diagnoseError(err)
+	in := InternalError{
+		Category:        d.Category,
+		NetworkKind:     d.Kind,
+		UpstreamMessage: d.Message,
+		Detail:          d.Detail,
+		DetailTruncated: d.Truncated,
+		Retryable:       d.Retryable,
+		Timestamp:       time.Now(),
 	}
-
-	bound, _ := BoundAndRedactString(err.Error())
-	in.Detail = bound.Text
-	in.DetailTruncated = bound.Truncated
-	in.UpstreamMessage = in.Detail
-	IncClassified(in.Category)
+	IncClassified(d.Category)
+	if redactedSomething {
+		IncRedacted()
+	}
 	return in
+}
+
+// CategoryForError classifies a transport/Go error and names the failure kind,
+// without touching the classification counters.
+//
+// The counters exist to measure what real traffic hit, so anything that
+// classifies OUTSIDE the forward path — an operator pressing Test, a diagnostic
+// probe — has to be able to reuse this table without inflating them. FromNetwork
+// is the metered entry point; this is the pure one.
+func CategoryForError(err error) (Category, string) {
+	switch {
+	case err == nil:
+		return CategoryInternal, ""
+	case errors.Is(err, context.Canceled):
+		return CategoryCanceled, "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return CategoryTimeout, "deadline"
+	case isTimeout(err):
+		return CategoryTimeout, "timeout"
+	case isDNS(err):
+		return CategoryUnavailable, "dns"
+	case isTLS(err):
+		return CategoryUnavailable, "tls"
+	case isRefused(err):
+		return CategoryUnavailable, "refused"
+	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
+		return CategoryError, "eof"
+	default:
+		return CategoryUnavailable, "network"
+	}
+}
+
+// CategoryForStatus classifies an upstream HTTP status without recording
+// metrics. Same relationship to FromHTTP that CategoryForError has to
+// FromNetwork.
+func CategoryForStatus(status int) Category {
+	return categoryFromStatus(status, "", "")
+}
+
+// RetryableCategory is whether a transport-level classification is worth another
+// attempt. Everything except a client cancel is: the request never reached a
+// decision, so a different account or endpoint may still answer it.
+func RetryableCategory(cat Category) bool {
+	return cat != CategoryCanceled && cat != CategoryInternal
 }
 
 func categoryFromStatus(status int, code, message string) Category {

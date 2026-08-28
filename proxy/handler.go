@@ -5787,15 +5787,34 @@ func (h *Handler) runUpstreamTest(w http.ResponseWriter, r *http.Request, id, co
 	defer cancel()
 	client := GetClientForProxy(proxyURL)
 
-	status, latency, body, path, err := probeUpstream(ctx, client, baseURL, apiKey, payload)
+	status, latency, body, hdr, path, err := probeUpstream(ctx, client, baseURL, apiKey, payload)
 	if err != nil {
-		w.WriteHeader(200)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		// Transport failure: nothing answered, so there is no status or body to
+		// report — only what went wrong reaching the host. The classification comes
+		// from the same table the forward path uses, so "Test says unavailable"
+		// means the router would have called it unavailable too.
+		diag := providererr.DiagnoseError(err)
+		res := map[string]interface{}{
 			"ok":        false,
-			"error":     upstreamTestErrMsg(ctx, err),
+			"error":     upstreamTestErrMsg(ctx, err, diag),
 			"path":      path,
 			"latencyMs": latency,
-		})
+			"category":  string(diag.Category),
+			"retryable": diag.Retryable,
+		}
+		// kind names the transport failure (dns, tls, refused, eof…). It is the one
+		// field that separates "this host does not resolve" from "it resolved and
+		// refused" — two problems with completely different fixes.
+		if diag.Kind != "" {
+			res["kind"] = diag.Kind
+		}
+		if diag.Message != "" {
+			res["message"] = diag.Message
+		}
+		if diag.Truncated {
+			res["truncated"] = true
+		}
+		json.NewEncoder(w).Encode(res)
 		return
 	}
 
@@ -5809,7 +5828,37 @@ func (h *Handler) runUpstreamTest(w http.ResponseWriter, r *http.Request, id, co
 		"path": path,
 	}
 	if status < 200 || status >= 300 {
-		result["error"] = string(body)
+		// "HTTP 400" alone does not say whether the model name, the base URL or the
+		// credential is the wrong one — the upstream's own words do, and this
+		// endpoint is behind the admin password. They still go through the boundary's
+		// redactor and size cap: a gateway that echoes the request back would
+		// otherwise hand the Authorization header straight to the panel.
+		diag := providererr.DiagnoseHTTP(status, body, hdr)
+		result["category"] = string(diag.Category)
+		result["retryable"] = diag.Retryable
+		// An empty body is left absent rather than sent as "": the panel decides what
+		// to show from which fields EXIST, and a present-but-empty error reads as "the
+		// upstream explained itself" when it said nothing at all.
+		if diag.Detail != "" {
+			result["error"] = diag.Detail
+		}
+		if diag.Message != "" {
+			result["message"] = diag.Message
+		}
+		if diag.Code != "" {
+			result["code"] = diag.Code
+		}
+		// The upstream's own request id is what its support desk asks for, and
+		// Retry-After is the difference between "broken" and "come back in 30s".
+		if diag.RequestID != "" {
+			result["upstreamRequestId"] = diag.RequestID
+		}
+		if diag.RetryAfter != "" {
+			result["retryAfter"] = diag.RetryAfter
+		}
+		if diag.Truncated {
+			result["truncated"] = true
+		}
 	}
 	json.NewEncoder(w).Encode(result)
 }
@@ -5817,15 +5866,23 @@ func (h *Handler) runUpstreamTest(w http.ResponseWriter, r *http.Request, id, co
 // upstreamTestErrMsg labels a probe that never got an answer. Our own deadline is
 // the common case and needs its own word: the transport error for it reads
 // "context deadline exceeded", which describes the mechanism and not the fact the
-// operator needs, that this upstream did not respond in time.
-func upstreamTestErrMsg(ctx context.Context, err error) string {
+// operator needs, that this upstream did not respond in time. The two literals are
+// also a contract the key-pool runner reads ("timeout" is its own row state).
+//
+// Anything else is the transport's own words, taken from the diagnostic rather
+// than from err.Error() directly: a dial failure through a configured proxy
+// carries that proxy's URL, credentials included, and this response goes to a
+// browser page and into whatever the operator pastes into a bug report.
+func upstreamTestErrMsg(ctx context.Context, err error, diag providererr.Diagnostic) string {
 	switch {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return "timeout"
 	case errors.Is(ctx.Err(), context.Canceled):
 		return "canceled"
+	case diag.Detail != "":
+		return diag.Detail
 	default:
-		return err.Error()
+		return diag.MessageOrKind()
 	}
 }
 
@@ -5845,7 +5902,7 @@ func upstreamTestErrMsg(ctx context.Context, err error) string {
 // own, and must be reported as-is rather than masked by a second probe. A
 // transport error stops immediately: nothing answered, so the path is not the
 // question.
-func probeUpstream(ctx context.Context, client *http.Client, baseURL, apiKey string, payload []byte) (int, int64, []byte, string, error) {
+func probeUpstream(ctx context.Context, client *http.Client, baseURL, apiKey string, payload []byte) (int, int64, []byte, http.Header, string, error) {
 	shapes := []struct {
 		path  string
 		extra map[string]string
@@ -5857,31 +5914,37 @@ func probeUpstream(ctx context.Context, client *http.Client, baseURL, apiKey str
 		status  int
 		latency int64
 		body    []byte
+		hdr     http.Header
 		path    string
 		err     error
 	)
 	for _, shape := range shapes {
 		path = shape.path
-		status, latency, body, err = probeUpstreamOnce(ctx, client, baseURL, apiKey, shape.path, payload, shape.extra)
+		status, latency, body, hdr, err = probeUpstreamOnce(ctx, client, baseURL, apiKey, shape.path, payload, shape.extra)
 		if err != nil {
-			return status, latency, body, path, err
+			return status, latency, body, hdr, path, err
 		}
 		if status >= 200 && status < 300 {
-			return status, latency, body, path, nil
+			return status, latency, body, hdr, path, nil
 		}
 		if status != http.StatusNotFound && status != http.StatusMethodNotAllowed {
-			return status, latency, body, path, nil
+			return status, latency, body, hdr, path, nil
 		}
 	}
-	return status, latency, body, path, err
+	return status, latency, body, hdr, path, err
 }
 
 // probeUpstreamOnce sends one probe. A non-2xx status is NOT an error here: only
 // the caller knows whether that status means "try the other shape".
-func probeUpstreamOnce(ctx context.Context, client *http.Client, baseURL, apiKey, path string, payload []byte, extra map[string]string) (int, int64, []byte, error) {
+//
+// The response headers come back with the body: Retry-After and the upstream's
+// own request id live there, and both are things an operator reading a failed
+// Test needs (one says "wait", the other is what the upstream's support desk
+// asks for).
+func probeUpstreamOnce(ctx context.Context, client *http.Client, baseURL, apiKey, path string, payload []byte, extra map[string]string) (int, int64, []byte, http.Header, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(baseURL, "/")+path, bytes.NewReader(payload))
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, nil, nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
@@ -5895,12 +5958,12 @@ func probeUpstreamOnce(ctx context.Context, client *http.Client, baseURL, apiKey
 	start := time.Now()
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return 0, time.Since(start).Milliseconds(), nil, err
+		return 0, time.Since(start).Milliseconds(), nil, nil, err
 	}
 	defer resp.Body.Close()
 	latency := time.Since(start).Milliseconds()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-	return resp.StatusCode, latency, body, nil
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, providererr.MaxParseBytes))
+	return resp.StatusCode, latency, body, resp.Header, nil
 }
 
 // apiGetPublicIP probes an external service to discover the machine's public

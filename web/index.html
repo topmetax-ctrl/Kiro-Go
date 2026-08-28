@@ -1468,6 +1468,17 @@
             <input type="text" id="routeTargetSearch" spellcheck="false" autocomplete="off" aria-label=""
               data-i18n-aria-label="upstreams.routeTargetSearchPlaceholder"
               data-i18n-placeholder="upstreams.routeTargetSearchPlaceholder" />
+            <!-- The other axis. Text narrows by WHERE a row points; this narrows by
+                 whether the row is carrying traffic at all — "which of these 22 did I
+                 turn off" is not a question a name can answer, and the toggles are the
+                 rightmost control on every row, so scanning for them means reading a
+                 column that scrolls. A select rather than a checkbox because the two
+                 answers are exclusive and "either" is the resting state. -->
+            <select id="routeTargetStateFilter" data-i18n-aria-label="upstreams.routeTargetStateFilter">
+              <option value="" data-i18n="upstreams.routeTargetStateAny"></option>
+              <option value="enabled" data-i18n="upstreams.routeTargetStateEnabled"></option>
+              <option value="disabled" data-i18n="upstreams.routeTargetStateDisabled"></option>
+            </select>
             <span class="text-xs muted-text" id="routeTargetSearchCount" aria-live="polite"></span>
           </div>
           <div id="routeTargetsList"></div>
