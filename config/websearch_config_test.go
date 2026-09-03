@@ -189,3 +189,62 @@ func TestTavilyProviderEnabledWithEnvKey(t *testing.T) {
 		t.Fatalf("env key should resolve, got %q", TavilyAPIKeyResolved())
 	}
 }
+
+// TestWebSearchConfigRawRoundTrip proves GetWebSearchConfigRaw returns the
+// stored config WITHOUT resolving defaults (so the admin API can patch raw
+// state without persisting default-drift), and UpdateWebSearchConfig persists
+// atomically and takes effect on the next read.
+func TestWebSearchConfigRawRoundTrip(t *testing.T) {
+	t.Setenv("TAVILY_API_KEY", "")
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+
+	c := Config{
+		Port:      8080,
+		Host:      "0.0.0.0",
+		WebSearch: WebSearchConfig{Enabled: true, SearXNG: SearXNGConfig{BaseURL: "http://my-searxng:8888"}},
+	}
+	data, _ := json.MarshalIndent(c, "", "  ")
+	if err := os.WriteFile(cfgFile, data, 0600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	// Raw getter must NOT resolve defaults: an empty Limits stays zero and the
+	// SearXNG Enabled pointer stays nil, exactly as stored.
+	raw := GetWebSearchConfigRaw()
+	if raw.SearXNG.BaseURL != "http://my-searxng:8888" {
+		t.Fatalf("raw BaseURL = %q", raw.SearXNG.BaseURL)
+	}
+	if raw.Limits.MaxRounds != 0 {
+		t.Fatalf("raw MaxRounds must be 0 (unset), got %d", raw.Limits.MaxRounds)
+	}
+	if raw.SearXNG.Enabled != nil {
+		t.Fatalf("raw SearXNG.Enabled must be nil (unset), got %v", *raw.SearXNG.Enabled)
+	}
+
+	// Resolved getter still applies defaults on top of the raw state.
+	resolved := GetWebSearchConfig()
+	if resolved.Limits.MaxRounds != DefaultWebSearchMaxRounds {
+		t.Fatalf("resolved MaxRounds = %d", resolved.Limits.MaxRounds)
+	}
+
+	// Update flips the toggle; the next reads see it immediately.
+	raw.Enabled = false
+	if err := UpdateWebSearchConfig(raw); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if WebSearchToggledOn() {
+		t.Fatalf("WebSearchToggledOn must be false after update")
+	}
+	if resolved2 := GetWebSearchConfig(); resolved2.Enabled {
+		t.Fatalf("resolved config still enabled after update")
+	}
+	// The patch must not have clobbered unrelated stored fields.
+	rawAfter := GetWebSearchConfigRaw()
+	if rawAfter.SearXNG.BaseURL != "http://my-searxng:8888" {
+		t.Fatalf("BaseURL was clobbered by update: %q", rawAfter.SearXNG.BaseURL)
+	}
+}

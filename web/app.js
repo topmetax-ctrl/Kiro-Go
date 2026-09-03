@@ -2107,7 +2107,7 @@
     $('allowOverUsage').checked = d.allowOverUsage || false;
     $('maxPayloadBytes').value = String(d.maxPayloadBytes || 2000000);
     if ($('publicModelCatalog')) $('publicModelCatalog').value = d.publicModelCatalog || '';
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadMemoryConfig(), loadApiKeys(), loadUpstreams(), loadSecurityConfig(), loadKiroGoModels()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadMemoryConfig(), loadWebSearchConfig(), loadApiKeys(), loadUpstreams(), loadSecurityConfig(), loadKiroGoModels()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -7813,6 +7813,36 @@
     if (d.success) { toast(t('memory.saved'), 'success'); loadMemoryConfig(); }
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
+  async function loadWebSearchConfig() {
+    const res = await api('/websearch');
+    const d = await res.json();
+    $('webSearchEnabled').checked = !!d.enabled;
+    $('webSearchSearxngEnabled').checked = d.searxngEnabled !== false;
+    $('webSearchSearxngBaseUrl').value = d.searxngBaseUrl || '';
+    $('webSearchTavilyEnabled').checked = !!d.tavilyEnabled;
+    $('webSearchTavilyApiKey').value = '';
+    $('webSearchTavilyApiKey').placeholder = d.tavilyApiKeyMasked || '';
+    $('webSearchAllowPaid').checked = !!d.allowPaidUsage;
+    $('webSearchAppendSources').checked = d.appendSources !== false;
+  }
+  async function saveWebSearchConfig() {
+    const body = {
+      enabled: $('webSearchEnabled').checked,
+      searxngEnabled: $('webSearchSearxngEnabled').checked,
+      searxngBaseUrl: $('webSearchSearxngBaseUrl').value.trim(),
+      tavilyEnabled: $('webSearchTavilyEnabled').checked,
+      allowPaidUsage: $('webSearchAllowPaid').checked,
+      appendSources: $('webSearchAppendSources').checked,
+    };
+    // Only send the API key when the operator typed a new one; an empty field
+    // means "keep the stored key" (backend preserves it).
+    const key = $('webSearchTavilyApiKey').value.trim();
+    if (key) body.tavilyApiKey = key;
+    const res = await api('/websearch', { method: 'POST', body: JSON.stringify(body) });
+    const d = await res.json();
+    if (d.success) { toast(t('webSearch.saved'), 'success'); loadWebSearchConfig(); }
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
+  }
   function renderPromptRules() {
     const c = $('promptFilterRules');
     if (!c) return;
@@ -10337,6 +10367,7 @@
   function bindMemoryEvents() {
     $('saveMemoryBtn').addEventListener('click', saveMemoryConfig);
     $('memoryWriteMode').addEventListener('change', updateMemoryWriteModeWarning);
+    $('saveWebSearchBtn').addEventListener('click', saveWebSearchConfig);
   }
 
   function bindModalEvents() {

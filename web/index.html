@@ -587,6 +587,58 @@
           <button class="btn btn-primary" id="saveMemoryBtn" data-i18n="memory.save"></button>
         </div>
 
+        <!-- Web Search -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="webSearch.title"></span></div>
+          <small class="help-block" data-i18n="webSearch.intro"></small>
+          <div class="form-group mt-2">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="webSearchEnabled" /><span class="slider"></span></span>
+              <span data-i18n="webSearch.enabled"></span>
+            </label>
+            <small class="field-hint-offset" data-i18n="webSearch.enabledHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="webSearch.searxngBaseUrl"></label>
+            <input type="text" id="webSearchSearxngBaseUrl" class="font-mono" placeholder="http://searxng:8080" />
+            <small data-i18n="webSearch.searxngBaseUrlHint"></small>
+          </div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="webSearchSearxngEnabled" /><span class="slider"></span></span>
+              <span data-i18n="webSearch.searxngEnabled"></span>
+            </label>
+            <small class="field-hint-offset" data-i18n="webSearch.searxngEnabledHint"></small>
+          </div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="webSearchTavilyEnabled" /><span class="slider"></span></span>
+              <span data-i18n="webSearch.tavilyEnabled"></span>
+            </label>
+            <small class="field-hint-offset" data-i18n="webSearch.tavilyEnabledHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="webSearch.tavilyApiKey"></label>
+            <input type="password" id="webSearchTavilyApiKey" autocomplete="off" />
+            <small data-i18n="webSearch.tavilyApiKeyHint"></small>
+          </div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="webSearchAllowPaid" /><span class="slider"></span></span>
+              <span data-i18n="webSearch.allowPaidUsage"></span>
+            </label>
+            <small class="field-hint-offset" data-i18n="webSearch.allowPaidUsageHint"></small>
+          </div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="webSearchAppendSources" /><span class="slider"></span></span>
+              <span data-i18n="webSearch.appendSources"></span>
+            </label>
+            <small class="field-hint-offset" data-i18n="webSearch.appendSourcesHint"></small>
+          </div>
+          <button class="btn btn-primary" id="saveWebSearchBtn" data-i18n="webSearch.save"></button>
+        </div>
+
         <!-- Statistics reset -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.statistics"></span></div>

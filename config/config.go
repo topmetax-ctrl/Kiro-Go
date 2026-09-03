@@ -2353,6 +2353,30 @@ func WebSearchEnabled() bool {
 	return SearXNGProviderEnabled() || TavilyProviderEnabled()
 }
 
+// GetWebSearchConfigRaw returns the stored web search settings WITHOUT resolving
+// zero-valued fields to defaults. Used by the admin API to avoid persisting
+// resolved defaults as if the operator set them (default-drift).
+func GetWebSearchConfigRaw() WebSearchConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return WebSearchConfig{}
+	}
+	return cfg.WebSearch
+}
+
+// UpdateWebSearchConfig persists the web search settings atomically. The caller
+// must supply a complete WebSearchConfig (typically read via GetWebSearchConfigRaw,
+// patched, then saved back). The new config takes effect on the next request
+// because each helper (WebSearchToggledOn, GetWebSearchConfig, etc.) reads cfg
+// under lock on every call.
+func UpdateWebSearchConfig(ws WebSearchConfig) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.WebSearch = ws
+	return Save()
+}
+
 // GetMemoryConfig returns the memory sidecar settings with zero-valued fields
 // resolved to their defaults. The APIKey is returned as-is (mask at the admin
 // boundary, not here). The returned value is a copy; callers cannot mutate

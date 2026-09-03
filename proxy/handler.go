@@ -1051,18 +1051,28 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 
-	// Pure native web_search: relay via Kiro MCP (generateAssistantResponse does not run it).
-	if hasWebSearchTool(&req) {
-		h.handleWebSearchRequest(r.Context(), w, &req, estimatedInputTokens, apiKeyID)
-		return
-	}
+	// Both native web_search paths (MCP pure + agentic loop) are gated by the
+	// operator toggle exactly like the SearXNG runner below. When the toggle is
+	// off we fall through to the normal chat path: convertClaudeTools skips the
+	// native tool spec, Kiro never emits a web_search tool_use, and the request
+	// proceeds with any remaining client tools. This is what makes
+	// webSearch.enabled=false mean "no server-side search at all" across BOTH
+	// stacks (a toggle that only gated the runner would leave the MCP path
+	// running silently).
+	if config.WebSearchToggledOn() {
+		// Pure native web_search: relay via Kiro MCP (generateAssistantResponse does not run it).
+		if hasWebSearchTool(&req) {
+			h.handleWebSearchRequest(r.Context(), w, &req, estimatedInputTokens, apiKeyID)
+			return
+		}
 
-	// Mixed tools including native web_search: agentic loop digests web_search internally
-	// and returns client tool_use blocks as-is.
-	if hasWebSearchAmongTools(&req) {
-		logger.Infof("[WebSearch] Mixed tools with native web_search, entering agentic loop")
-		h.runWebSearchLoop(r.Context(), w, &req, thinking, estimatedInputTokens, apiKeyID)
-		return
+		// Mixed tools including native web_search: agentic loop digests web_search internally
+		// and returns client tool_use blocks as-is.
+		if hasWebSearchAmongTools(&req) {
+			logger.Infof("[WebSearch] Mixed tools with native web_search, entering agentic loop")
+			h.runWebSearchLoop(r.Context(), w, &req, thinking, estimatedInputTokens, apiKeyID)
+			return
+		}
 	}
 
 	// 转换请求
@@ -3322,6 +3332,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetMemoryConfig(w, r)
 	case path == "/memory/config" && r.Method == "POST":
 		h.apiUpdateMemoryConfig(w, r)
+	case path == "/websearch" && r.Method == "GET":
+		h.apiGetWebSearchConfig(w, r)
+	case path == "/websearch" && r.Method == "POST":
+		h.apiUpdateWebSearchConfig(w, r)
 	case path == "/memory/search" && r.Method == "GET":
 		h.apiMemorySearch(w, r)
 	case path == "/memory" && r.Method == "POST":
