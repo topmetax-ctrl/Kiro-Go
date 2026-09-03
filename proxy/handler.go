@@ -5774,9 +5774,16 @@ func (h *Handler) runUpstreamTest(w http.ResponseWriter, r *http.Request, id, co
 	// One body satisfies both APIs — model + max_tokens + a single user message is
 	// valid for OpenAI's /chat/completions and Anthropic's /messages alike — so the
 	// shapes differ only in path and version header.
+	//
+	// max_tokens is 16 and not the 1 a reachability probe needs, because some
+	// providers enforce a floor above 1 and reject the body before they ever look
+	// at the credential or the model: b.ai answers max_tokens 1 with HTTP 400
+	// "max_tokens must be greater than 2", which the panel then reports as a
+	// rejected target when nothing about the target is wrong. 16 clears the floors
+	// we have seen while still costing one short sentence of output.
 	payload, _ := json.Marshal(map[string]interface{}{
 		"model":      model,
-		"max_tokens": 1,
+		"max_tokens": 16,
 		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
 	})
 

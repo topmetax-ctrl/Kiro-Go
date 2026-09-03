@@ -224,3 +224,31 @@ func TestUpstreamTestOmitsEmptyErrorBody(t *testing.T) {
 		t.Fatalf("category = %v, want error", got["category"])
 	}
 }
+
+// The probe body has to survive the provider's OWN request validation, or Test
+// reports a rejected target when nothing about the target is wrong: b.ai answers
+// max_tokens 1 with HTTP 400 "max_tokens must be greater than 2", before it ever
+// looks at the credential or the model. Pinned here because the floor is
+// invisible from our side — a reachability probe wants the smallest max_tokens
+// there is, and the smallest one is the one that fails.
+func TestUpstreamTestProbeClearsProviderMaxTokensFloor(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got struct {
+			MaxTokens int `json:"max_tokens"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		if got.MaxTokens <= 2 {
+			w.WriteHeader(400)
+			_, _ = w.Write([]byte(`{"error":{"message":"max_tokens must be greater than 2","type":"invalid_request_error","code":"invalid_request"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"pong"}}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	got := postProbe(t, &Handler{}, srv.URL, "glm-5.3-flash")
+	if got["ok"] != true {
+		t.Fatalf("ok = %v (%v), want true: the probe body must clear a max_tokens floor above 1", got["ok"], got["error"])
+	}
+}
