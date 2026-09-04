@@ -1021,8 +1021,57 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		}
 	}
 
+	// Capability-aware forwarding for web_search: resolve the model route
+	// and the provider's web_search execution strategy BEFORE the forwarding
+	// fork. This is the sole place the handler decides "passthrough vs
+	// gateway loop" for a forwarded provider; raw strings never leak into
+	// the handler.
+	//
+	// Three shapes (forwarded only; Kiro pool is handled below):
+	//   - native      -> forward raw; provider executes server-side web_search.
+	//   - local       -> same provider/route, buffered rounds via the forward
+	//                   local loop (SearchOrchestrator). Never silently falls
+	//                   back to the Kiro pool; an explicit __kiro_pool__ target
+	//                   in a later tier is the operator's opt-in fallback.
+	//   - unsupported -> explicit error (400). No silent Kiro pool.
+	//   - unspecified -> preserve pre-Phase-2 behavior (raw passthrough).
+	//
+	// Forwarded requests that do NOT carry web_search bypass this entirely and
+	// use the existing raw passthrough, so no new behavior is introduced for
+	// ordinary model traffic.
+	if route, targets := config.ResolveRoute(req.Model); route != nil && len(targets) > 0 {
+		if pol, hasWS, _ := extractWebSearchPolicy(req.Tools); hasWS {
+			strategy := resolveForwardWebSearchStrategy(targets)
+			switch strategy {
+			case forwardWebSearchUnsupported:
+				h.sendClaudeError(w, 400, "invalid_request_error", "web_search is not supported by this provider route (native web_search disabled and no local execution configured)")
+				return
+			case forwardWebSearchLocal:
+				if !pol.Enabled {
+					if !config.WebSearchToggledOn() {
+						h.sendClaudeError(w, 400, "invalid_request_error", "web_search is not enabled")
+					} else {
+						h.sendClaudeError(w, 500, "api_error", "web_search is enabled but no search provider is configured (set a SearXNG base URL or a Tavily API key)")
+					}
+					return
+				}
+				// Same-provider buffered loop; owns the response.
+				if h.forwardLocalWebSearch(r, w, body, req, pol, route, targets, userText) {
+					return
+				}
+				// Local loop declined (e.g. route became empty due to cooldown);
+				// fall through to the normal handling rather than 500.
+			case forwardWebSearchNative, forwardWebSearchUnspecified:
+				// Native or unspecified -> raw forward as before (including streaming).
+				// No synthesis here; metrics trust usage.server_tool_use when present.
+			default:
+			}
+		}
+	}
 	// Forward to an external upstream when the (raw, un-normalized) client model
 	// matches an enabled route. Passthrough bypasses the Kiro pool entirely.
+	// Local-web_search routes are handled above; this is now the ordinary
+	// non-web_search forwarding path (or native/unspecified web_search).
 	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/messages", true, userText) {
 		// Capture (write) for the forward path is handled inside tryForwardUpstream
 		// (non-stream only), since only it can tee the upstream response body.
@@ -2059,15 +2108,15 @@ func recordToolUsageFromRunner(ctx context.Context, run *KiroRunResult, requestI
 		execs = run.SearchCalls // unknown granularity; do not fabricate cache
 	}
 	u := metrics.ToolUsage{
-		TimeMs:      time.Now().UnixMilli(),
-		RequestID:   requestID,
-		ToolKind:    metrics.ToolKindWebSearch,
-		Origin:      metrics.ToolOriginKiroOrchestrator,
-		ProviderID:  metrics.KiroPoolID,
-		Uses:        int64(run.SearchCalls),
-		Executions:  int64(execs),
-		CacheHits:   int64(run.CacheHits),
-		Credits:     int64(run.TavilyCredits),
+		TimeMs:     time.Now().UnixMilli(),
+		RequestID:  requestID,
+		ToolKind:   metrics.ToolKindWebSearch,
+		Origin:     metrics.ToolOriginKiroOrchestrator,
+		ProviderID: metrics.KiroPoolID,
+		Uses:       int64(run.SearchCalls),
+		Executions: int64(execs),
+		CacheHits:  int64(run.CacheHits),
+		Credits:    int64(run.TavilyCredits),
 	}
 	metrics.RecordToolUsage(u)
 }
@@ -2081,12 +2130,12 @@ func recordToolUsageForward(requestID string, upstreamExec *upstreamToolUsage, p
 		return
 	}
 	u := metrics.ToolUsage{
-		TimeMs:      time.Now().UnixMilli(),
-		RequestID:   requestID,
-		ToolKind:    metrics.ToolKindWebSearch,
-		Origin:      metrics.ToolOriginUpstreamNative,
-		ProviderID:  providerID,
-		Uses:        upstreamExec.WebSearchRequests,
+		TimeMs:     time.Now().UnixMilli(),
+		RequestID:  requestID,
+		ToolKind:   metrics.ToolKindWebSearch,
+		Origin:     metrics.ToolOriginUpstreamNative,
+		ProviderID: providerID,
+		Uses:       upstreamExec.WebSearchRequests,
 	}
 	metrics.RecordToolUsage(u)
 }

@@ -246,6 +246,18 @@ type UpstreamProvider struct {
 	// label, so a hidden-but-live provider stays live.
 	Hidden bool `json:"hidden,omitempty"`
 
+	// WebSearchStrategy declares how this provider handles Anthropic native
+	// web_search server tools.
+	//
+	// Raw values (persisted JSON) are "native" | "local" | "unsupported" | "".
+	// Empty/unset means "unspecified" and MUST preserve the pre-Phase-2
+	// behavior (raw request passthrough, no synthetic injection). Never default
+	// it to "local" — that would silently change deployed providers.
+	//
+	// Runtime code must never branch on the raw string. Call p.WebSearchStrategy()
+	// which normalizes once at the config boundary to a typed ProviderWebSearchStrategy.
+	WebSearchStrategy string `json:"webSearchStrategy,omitempty"`
+
 	// Operator-supplied prices in USD per 1M tokens, used only to estimate the
 	// cost shown in the stats dashboard. Zero means "unpriced": no cost is
 	// attributed, and the UI shows "—" rather than a misleading $0.00. Nothing
@@ -2295,6 +2307,66 @@ func WebSearchMCPFallback() bool {
 		return false
 	}
 	return *cfg.WebSearch.MCPFallback
+}
+
+// ProviderWebSearchStrategy is the normalized, typed web_search execution
+// strategy for a forwarding upstream. Stored config keeps a string for
+// backward compatibility; runtime branching uses this enum so typos and
+// empty-vs-unknown cannot leak into the handler.
+//
+//   - Unspecified: raw value "" — preserve raw passthrough (pre-Phase-2).
+//     Never silently becomes Local.
+//   - Native: provider executes Anthropic server-side web_search itself.
+//     Forward raw, trust usage.server_tool_use.
+//   - Local: provider does not execute native web_search but supports
+//     client tool calling. Rewrite native web_search into a synthetic
+//     client tool, intercept tool_use, execute via SearchOrchestrator,
+//     and feed the result back to the SAME resolved provider/route.
+//   - Unsupported: provider supports neither. Return an explicit error
+//     instead of silently switching to the Kiro pool; an explicit
+//     ModelRoute target __kiro_pool__ in a later tier is the operator's
+//     opt-in fallback, not an implicit one.
+type ProviderWebSearchStrategy uint8
+
+const (
+	ProviderWebSearchStrategyUnspecified ProviderWebSearchStrategy = iota
+	ProviderWebSearchStrategyNative
+	ProviderWebSearchStrategyLocal
+	ProviderWebSearchStrategyUnsupported
+)
+
+func (s ProviderWebSearchStrategy) String() string {
+	switch s {
+	case ProviderWebSearchStrategyNative:
+		return "native"
+	case ProviderWebSearchStrategyLocal:
+		return "local"
+	case ProviderWebSearchStrategyUnsupported:
+		return "unsupported"
+	default:
+		return ""
+	}
+}
+
+// ParseProviderWebSearchStrategy normalizes a raw persisted string. Unknown
+// strings map to Unspecified so they preserve raw passthrough rather than
+// being misinterpreted as a specific strategy.
+func ParseProviderWebSearchStrategy(raw string) ProviderWebSearchStrategy {
+	switch strings.TrimSpace(strings.ToLower(raw)) {
+	case "native":
+		return ProviderWebSearchStrategyNative
+	case "local":
+		return ProviderWebSearchStrategyLocal
+	case "unsupported", "disabled":
+		return ProviderWebSearchStrategyUnsupported
+	default:
+		return ProviderWebSearchStrategyUnspecified
+	}
+}
+
+// WebSearchStrategy returns the normalized strategy for this provider.
+func (p UpstreamProvider) WebSearchStrategyResolved() ProviderWebSearchStrategy {
+	return ParseProviderWebSearchStrategy(p.WebSearchStrategy)
 }
 
 // TavilyAPIKeyResolved returns the effective Tavily API key, with the
