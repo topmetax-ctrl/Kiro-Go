@@ -7838,6 +7838,7 @@
     $('webSearchTavilyApiKey').placeholder = d.tavilyApiKeyMasked || '';
     $('webSearchAllowPaid').checked = !!d.allowPaidUsage;
     $('webSearchAppendSources').checked = d.appendSources !== false;
+    $('webSearchMCPFallback').checked = !!d.mcpFallback;
   }
   async function saveWebSearchConfig() {
     const body = {
@@ -7847,6 +7848,7 @@
       tavilyEnabled: $('webSearchTavilyEnabled').checked,
       allowPaidUsage: $('webSearchAllowPaid').checked,
       appendSources: $('webSearchAppendSources').checked,
+      mcpFallback: $('webSearchMCPFallback').checked,
     };
     // Only send the API key when the operator typed a new one; an empty field
     // means "keep the stored key" (backend preserves it).

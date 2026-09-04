@@ -1310,6 +1310,8 @@
   "webSearch.allowPaidUsageHint": "Khi tắt, Tavily chỉ dùng khi ngân sách miễn phí còn.",
   "webSearch.appendSources": "Thêm nguồn vào câu trả lời",
   "webSearch.appendSourcesHint": "Thêm danh sách nguồn \"Sources: [1] ...\" vào câu trả lời cuối của mô hình.",
+  "webSearch.mcpFallback": "Chuyển web_search gốc qua Kiro MCP (dự phòng)",
+  "webSearch.mcpFallbackHint": "Tắt (mặc định): web_search gốc được thực thi bởi SearXNG/Tavily của chính proxy. Bật: chuyển tiếp qua endpoint MCP của Kiro — chỉ dùng khi SearXNG cấu hình sai hoặc không khả dụng.",
   "webSearch.save": "Lưu cài đặt tìm kiếm",
   "webSearch.saved": "Đã lưu cài đặt tìm kiếm",
   "stats.webSearchUses": "Web Search Uses",

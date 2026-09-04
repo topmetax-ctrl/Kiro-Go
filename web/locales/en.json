@@ -1310,6 +1310,8 @@
   "webSearch.allowPaidUsageHint": "When off, Tavily is only used while its free-tier budget remains.",
   "webSearch.appendSources": "Append sources to answer",
   "webSearch.appendSourcesHint": "Appends a deduplicated \"Sources: [1] ...\" list to the model's final answer.",
+  "webSearch.mcpFallback": "Route native web_search through Kiro MCP (fallback)",
+  "webSearch.mcpFallbackHint": "Off (default): native web_search is executed by this proxy's own SearXNG/Tavily orchestrator. On: it is relayed through Kiro's MCP endpoint instead — useful only if SearXNG is misconfigured or unreachable.",
   "webSearch.save": "Save Web Search Settings",
   "webSearch.saved": "Web search settings saved",
   "stats.webSearchUses": "Web Search Uses",

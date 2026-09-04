@@ -19,6 +19,7 @@ type webSearchConfigView struct {
 	AllowPaidUsage    bool   `json:"allowPaidUsage"`
 	AppendSources     bool   `json:"appendSources"`
 	EmitNativeBlocks  bool   `json:"emitNativeToolBlocks"`
+	MCPFallback       bool   `json:"mcpFallback"`
 	MaxRounds         int    `json:"maxRounds"`
 	MaxSearches       int    `json:"maxSearchesPerRequest"`
 	MaxResults        int    `json:"maxResultsPerSearch"`
@@ -39,6 +40,8 @@ func toWebSearchConfigView(ws config.WebSearchConfig) webSearchConfigView {
 	// AppendSources / EmitNativeToolBlocks: nil → default true; stored false → false.
 	appendSrc := config.WebSearchAppendSources()
 	emitBlocks := config.WebSearchEmitNativeToolBlocks()
+	// MCPFallback: nil → default false; stored true → true.
+	mcpFallback := config.WebSearchMCPFallback()
 
 	return webSearchConfigView{
 		Enabled:            ws.Enabled,
@@ -49,6 +52,7 @@ func toWebSearchConfigView(ws config.WebSearchConfig) webSearchConfigView {
 		AllowPaidUsage:     ws.Routing.AllowPaidUsage,
 		AppendSources:      appendSrc,
 		EmitNativeBlocks:   emitBlocks,
+		MCPFallback:        mcpFallback,
 		MaxRounds:          ws.Limits.MaxRounds,
 		MaxSearches:        ws.Limits.MaxSearchesPerRequest,
 		MaxResults:         ws.Limits.MaxResultsPerSearch,
@@ -78,6 +82,7 @@ func (h *Handler) apiUpdateWebSearchConfig(w http.ResponseWriter, r *http.Reques
 		AllowPaidUsage   *bool   `json:"allowPaidUsage,omitempty"`
 		AppendSources    *bool   `json:"appendSources,omitempty"`
 		EmitNativeBlocks *bool   `json:"emitNativeToolBlocks,omitempty"`
+		MCPFallback      *bool   `json:"mcpFallback,omitempty"`
 		MaxRounds        *int    `json:"maxRounds,omitempty"`
 		MaxSearches      *int    `json:"maxSearchesPerRequest,omitempty"`
 		MaxResults       *int    `json:"maxResultsPerSearch,omitempty"`
@@ -130,6 +135,9 @@ func (h *Handler) apiUpdateWebSearchConfig(w http.ResponseWriter, r *http.Reques
 	}
 	if req.EmitNativeBlocks != nil {
 		cur.EmitNativeToolBlocks = req.EmitNativeBlocks
+	}
+	if req.MCPFallback != nil {
+		cur.MCPFallback = req.MCPFallback
 	}
 
 	// Limits

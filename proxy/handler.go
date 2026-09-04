@@ -1051,25 +1051,21 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
 
-	// Both native web_search paths (MCP pure + agentic loop) are gated by the
-	// operator toggle exactly like the SearXNG runner below. When the toggle is
-	// off we fall through to the normal chat path: convertClaudeTools skips the
-	// native tool spec, Kiro never emits a web_search tool_use, and the request
-	// proceeds with any remaining client tools. This is what makes
-	// webSearch.enabled=false mean "no server-side search at all" across BOTH
-	// stacks (a toggle that only gated the runner would leave the MCP path
-	// running silently).
-	if config.WebSearchToggledOn() {
-		// Pure native web_search: relay via Kiro MCP (generateAssistantResponse does not run it).
+	// Native web_search MCP fast-path: relay via Kiro's MCP endpoint instead of
+	// this proxy's own search orchestrator (SearXNG/Tavily). This is gated by
+	// BOTH the operator toggle AND the MCP fallback flag (default OFF). With the
+	// flag off (the default), a native web_search request falls through to
+	// extractWebSearchPolicy → useRunner → ConversationRunner → Orchestrator,
+	// which is the canonical self-hosted path. The flag exists as an escape
+	// hatch: MCP needs only a valid Kiro account, so it is the one path that
+	// still works when SearXNG is misconfigured or unreachable.
+	if config.WebSearchToggledOn() && config.WebSearchMCPFallback() {
 		if hasWebSearchTool(&req) {
 			h.handleWebSearchRequest(r.Context(), w, &req, estimatedInputTokens, apiKeyID)
 			return
 		}
-
-		// Mixed tools including native web_search: agentic loop digests web_search internally
-		// and returns client tool_use blocks as-is.
 		if hasWebSearchAmongTools(&req) {
-			logger.Infof("[WebSearch] Mixed tools with native web_search, entering agentic loop")
+			logger.Infof("[WebSearch] Mixed tools with native web_search, entering agentic loop (mcpFallback)")
 			h.runWebSearchLoop(r.Context(), w, &req, thinking, estimatedInputTokens, apiKeyID)
 			return
 		}

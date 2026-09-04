@@ -1310,6 +1310,8 @@
   "webSearch.allowPaidUsageHint": "关闭时，Tavily 仅在免费额度剩余时使用。",
   "webSearch.appendSources": "在回答中附加来源",
   "webSearch.appendSourcesHint": "在模型的最终回答后附加去重的 \"Sources: [1] ...\" 列表。",
+  "webSearch.mcpFallback": "通过 Kiro MCP 转发原生 web_search（回退）",
+  "webSearch.mcpFallbackHint": "关闭（默认）：原生 web_search 由本代理自身的 SearXNG/Tavily 编排器执行。开启：改为通过 Kiro 的 MCP 端点转发——仅在 SearXNG 配置错误或不可用时使用。",
   "webSearch.save": "保存网页搜索设置",
   "webSearch.saved": "网页搜索设置已保存",
   "stats.webSearchUses": "Web Search Uses",

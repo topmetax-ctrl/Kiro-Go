@@ -574,6 +574,20 @@ type WebSearchConfig struct {
 	// true when unset. A kill-switch: set false if a client rejects the synthetic
 	// shape.
 	EmitNativeToolBlocks *bool `json:"emitNativeToolBlocks,omitempty"`
+
+	// MCPFallback routes Anthropic-native web_search through Kiro's MCP endpoint
+	// (https://q.{region}.amazonaws.com/mcp) instead of this proxy's own search
+	// orchestrator. It defaults to FALSE, which is the whole point of the
+	// self-hosted stack: the native tool shape Claude Code sends
+	// ({"name":"web_search","type":"web_search_20250305"}) used to be captured by
+	// an MCP fast path that returned before the orchestrator was ever consulted,
+	// so SearXNG/Tavily never ran for real client traffic.
+	//
+	// Kept as an escape hatch rather than deleted: MCP needs only a valid Kiro
+	// account, so it is the one path that still works when SearXNG is
+	// misconfigured or unreachable. Turning it on is a deliberate operator
+	// choice to trade self-hosted search for Kiro-side search.
+	MCPFallback *bool `json:"mcpFallback,omitempty"`
 }
 
 // WebSearchRouting selects providers and enforces the free-first / no-paid-usage
@@ -2265,6 +2279,22 @@ func WebSearchEmitNativeToolBlocks() bool {
 		return true
 	}
 	return *cfg.WebSearch.EmitNativeToolBlocks
+}
+
+// WebSearchMCPFallback reports whether native web_search should be routed
+// through Kiro's MCP endpoint instead of this proxy's search orchestrator.
+//
+// Defaults to FALSE (pointer nil), unlike the other web-search booleans which
+// default to true. The default is the fix: while MCP was unconditional it
+// shadowed the orchestrator for every request Claude Code sends, so the
+// self-hosted SearXNG/Tavily stack never executed a single search.
+func WebSearchMCPFallback() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.WebSearch.MCPFallback == nil {
+		return false
+	}
+	return *cfg.WebSearch.MCPFallback
 }
 
 // TavilyAPIKeyResolved returns the effective Tavily API key, with the
