@@ -1023,17 +1023,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Forward to an external upstream when the (raw, un-normalized) client model
 	// matches an enabled route. Passthrough bypasses the Kiro pool entirely.
-	//
-	// Exception: requests carrying native web_search tools must NOT be forwarded.
-	// The upstream provider cannot execute Kiro's server-side search tool; it
-	// returns an unresolved tool_use block, which causes Claude Code to report
-	// "Did 0 searches" — even though the search was attempted, the client never
-	// sees the server_tool_use + web_search_tool_result response. Bypass
-	// forwarding so the Kiro pool's ConversationRunner can execute the search
-	// locally and return the fully-resolved answer with proper native blocks.
-	if config.WebSearchToggledOn() && (hasWebSearchTool(&req) || hasWebSearchAmongTools(&req)) {
-		logger.Debugf("[WebSearch] skipping forwarding for web_search request; routing to Kiro pool runner")
-	} else if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/messages", true, userText) {
+	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/messages", true, userText) {
 		// Capture (write) for the forward path is handled inside tryForwardUpstream
 		// (non-stream only), since only it can tee the upstream response body.
 		return
