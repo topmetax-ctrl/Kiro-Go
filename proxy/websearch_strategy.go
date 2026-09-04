@@ -30,26 +30,51 @@ func (s forwardWebSearchStrategy) String() string {
 	}
 }
 
-// resolveForwardWebSearchStrategy maps the first eligible non-pool target's
-// provider strategy to an executable strategy. Unspecified preserves the
-// pre-Phase-2 behavior (raw passthrough) and never silently becomes local.
+// resolveForwardWebSearchStrategy maps the route's provider strategies to one
+// executable strategy for the handler's forwarding fork.
+//
+// The PRIMARY (first non-pool target) governs: its strategy is what decides
+// raw-passthrough vs local loop vs explicit error. The one exception is an
+// unsupported primary with a capable (native/local) backup — that route can
+// still serve, so we adopt the backup's strategy instead of erroring out
+// (tryForwardUpstream then skips the unsupported primary per-target).
+//
+// Unspecified preserves the pre-Phase-2 behavior (raw passthrough) and never
+// silently becomes local.
 func resolveForwardWebSearchStrategy(targets []config.ResolvedTarget) forwardWebSearchStrategy {
+	var first forwardWebSearchStrategy = forwardWebSearchUnspecified
+	var backup forwardWebSearchStrategy = forwardWebSearchUnspecified
 	for _, rt := range targets {
 		if rt.Provider.ID == config.KiroPoolTargetID {
 			continue
 		}
+		st := forwardWebSearchUnspecified
 		switch rt.Provider.WebSearchStrategyResolved() {
 		case config.ProviderWebSearchStrategyNative:
-			return forwardWebSearchNative
+			st = forwardWebSearchNative
 		case config.ProviderWebSearchStrategyLocal:
-			return forwardWebSearchLocal
+			st = forwardWebSearchLocal
 		case config.ProviderWebSearchStrategyUnsupported:
-			return forwardWebSearchUnsupported
-		default:
-			return forwardWebSearchUnspecified
+			st = forwardWebSearchUnsupported
+		}
+		if first == forwardWebSearchUnspecified {
+			first = st
+			if st == forwardWebSearchNative || st == forwardWebSearchLocal {
+				return st // primary is capable; it governs the route
+			}
+			continue
+		}
+		// Primary was unsupported: remember the first capable backup so the route
+		// is not rejected outright when a later target can serve.
+		if first == forwardWebSearchUnsupported && backup == forwardWebSearchUnspecified &&
+			(st == forwardWebSearchNative || st == forwardWebSearchLocal) {
+			backup = st
 		}
 	}
-	return forwardWebSearchUnspecified
+	if first == forwardWebSearchUnsupported && backup != forwardWebSearchUnspecified {
+		return backup
+	}
+	return first
 }
 
 // forwardLocalWebSearchError classifies why a local loop cannot proceed.

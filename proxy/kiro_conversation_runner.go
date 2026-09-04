@@ -36,9 +36,9 @@ type KiroRunResult struct {
 	BackendExecutions int
 	// CacheHits counts searches satisfied from per-request dedup or orchestrator cache
 	// (including request-level reuse). Useful to attribute "why executions < uses".
-	CacheHits         int
-	SearchRounds      int
-	Sources           []SearchSource
+	CacheHits    int
+	SearchRounds int
+	Sources      []SearchSource
 	// TavilyCredits is the total Tavily credit spend for this request, tracked
 	// separately from TotalCredits (which is Kiro credits only) so the two billing
 	// domains never conflate. 0 when only the free provider (SearXNG) was used.
@@ -385,10 +385,6 @@ func countDistinctQueries(calls []KiroToolUse, cache map[string]KiroToolResult) 
 		n++
 	}
 	return n
-}
-
-func backendExecutionsForCalls(calls []KiroToolUse, cache map[string]KiroToolResult) int {
-	return countDistinctQueries(calls, cache)
 }
 
 func partitionToolUses(toolUses []KiroToolUse, executor ServerToolExecutor) (internal, external []KiroToolUse) {

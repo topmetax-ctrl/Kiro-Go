@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
+	"kiro-go/apikey"
 	"net/http"
 	"strings"
 	"time"
@@ -63,6 +65,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 	}
 
 	ctx := r.Context()
+	requestID := requestIDFromContext(ctx)
 	apiKeyID := apiKeyIDFromContext(ctx)
 	clientModel := origReq.Model
 	executor := newWebSearchExecutor(search.NewOrchestratorFromConfig(
@@ -73,6 +76,11 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 	working := origReq
 	// Deep copy messages so appends do not alias.
 	working.Messages = append([]ClaudeMessage(nil), origReq.Messages...)
+	// Rewrite native web_search in the working tool list ONCE (struct level), so
+	// every continuation round serializes the synthetic client tool — not just
+	// round 0's body bytes. round 0 still rewrites origBody because memory inject
+	// may have enriched it separately.
+	working.Tools = syntheticWebSearchTools(working.Tools)
 
 	agg := KiroRunResult{}
 	cache := map[string]KiroToolResult{}
@@ -99,8 +107,9 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 					return true
 				}
 			}
-			// Native web_search must become a synthetic client tool for the upstream
-			// that is in local mode. Rewrite the tools array once before round 0.
+			// Round-0 body still carries the memory-enriched original; apply the
+			// synthetic rewrite to the BYTES as well so the first upstream call and
+			// all later serializations agree.
 			body, err = rewriteNativeWebSearchToSynthetic(body)
 			if err != nil {
 				h.sendClaudeError(w, 400, "invalid_request_error", err.Error())
@@ -121,7 +130,6 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 					return true
 				}
 			}
-			// working already has synthetic tool in req; no need to rewrite again
 		}
 
 		res, forwardUsage, forwardErr := h.forwardRoundBuffered(ctx, pinned.Provider, *pinned, body, clientModel, route, captureUserText, round == 0)
@@ -136,6 +144,14 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 		// every round). Record after each successful upstream round so dashboards
 		// reflect the provider actually used, not the Kiro pool.
 		h.recordForwardLocalSuccess(forwardUsage, pinned.Provider, route, clientModel, ctx, apiKeyID)
+		// Per-key usage accounting: match the forwarding path's contract so quota
+		// enforcement and per-key dashboards see forwarded-local requests.
+		inTok, outTok := int(forwardUsage.Input), int(forwardUsage.Output)
+		if inTok == 0 && outTok == 0 {
+			outTok = 1 // request-count charge, same as forwardedUsageTokens fallback
+		}
+		noteAPIKeyUsage(ctx, int64(inTok), int64(outTok), 0, apikey.UsageSourceUpstream, false)
+		h.recordSuccessForApiKey(ctx, apiKeyID, inTok, outTok, 0)
 
 		agg.TotalInputTokens += res.inputTokens
 		agg.TotalOutputTokens += res.outputTokens
@@ -149,7 +165,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 				VisibleContent: res.text,
 				ToolUses:       external,
 			}
-			return h.renderForwardLocalFinal(w, origReq, agg, res.text, policy)
+			return h.renderForwardLocalFinal(w, origReq, agg, res.text, policy, requestID)
 		}
 		if len(external) > 0 {
 			h.sendClaudeError(w, 400, "invalid_request_error", fmt.Sprintf("mixed tool uses in one turn: web_search with %v is not supported in forwarded local mode", toolUseNames(external)))
@@ -180,7 +196,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 			agg.TotalInputTokens += finalRes.inputTokens
 			agg.TotalOutputTokens += finalRes.outputTokens
 			agg.FinalRound = KiroRoundResult{VisibleContent: finalRes.text, ToolUses: finalRes.toolUses}
-			return h.renderForwardLocalFinal(w, origReq, agg, finalRes.text, policy)
+			return h.renderForwardLocalFinal(w, origReq, agg, finalRes.text, policy, requestID)
 		}
 
 		distinctBefore := countDistinctQueries(internal, cache)
@@ -216,7 +232,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 	agg.TotalInputTokens += finalRes.inputTokens
 	agg.TotalOutputTokens += finalRes.outputTokens
 	agg.FinalRound = KiroRoundResult{VisibleContent: finalRes.text, ToolUses: finalRes.toolUses}
-	return h.renderForwardLocalFinal(w, origReq, agg, finalRes.text, policy)
+	return h.renderForwardLocalFinal(w, origReq, agg, finalRes.text, policy, requestID)
 }
 
 // forwardRoundBuffered does one buffered (non-stream) POST to the pinned provider
@@ -408,9 +424,11 @@ func advanceForwardWorking(working ClaudeRequest, res *forwardLocalRoundResult, 
 	// User turn with tool_result blocks.
 	userBlocks := make([]interface{}, 0, len(toolResults))
 	for _, tr := range toolResults {
-		text := ""
-		if len(tr.Content) > 0 {
-			text = tr.Content[0].Text
+		// Concatenate ALL content blocks — search results may span multiple
+		// Text segments with URLs, titles, and snippets interleaved.
+		var text string
+		for _, c := range tr.Content {
+			text += c.Text
 		}
 		userBlocks = append(userBlocks, map[string]interface{}{
 			"type": "tool_result", "tool_use_id": tr.ToolUseID, "content": text,
@@ -434,11 +452,59 @@ func stripForwardWebSearchTools(req ClaudeRequest) ClaudeRequest {
 	return req
 }
 
+// syntheticWebSearchTools rewrites native web_search ClaudeTools in a tool list
+// into synthetic client-tool form. If no native tools are present, returns the
+// original slice unchanged.
+func syntheticWebSearchTools(tools []ClaudeTool) []ClaudeTool {
+	if len(tools) == 0 {
+		return tools
+	}
+	hasNative := false
+	for _, t := range tools {
+		if isNativeWebSearchTool(t) {
+			hasNative = true
+			break
+		}
+	}
+	if !hasNative {
+		return tools
+	}
+	synthetic := ClaudeTool{
+		Name:        webSearchToolName,
+		Description: "Search the web for up-to-date information.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "The web search query",
+				},
+			},
+			"required": []interface{}{"query"},
+		},
+	}
+	out := make([]ClaudeTool, 0, len(tools))
+	for _, t := range tools {
+		if isNativeWebSearchTool(t) {
+			out = append(out, synthetic)
+		} else {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 // renderForwardLocalFinal writes the final non-stream JSON response, synthesizing
 // native server_tool_use blocks when searches ran so the client renders
 // "Did N searches" with citations.
-func (h *Handler) renderForwardLocalFinal(w http.ResponseWriter, origReq ClaudeRequest, agg KiroRunResult, finalText string, policy WebSearchPolicy) bool {
+func (h *Handler) renderForwardLocalFinal(w http.ResponseWriter, origReq ClaudeRequest, agg KiroRunResult, finalText string, policy WebSearchPolicy, requestID string) bool {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	// Append deterministic Sources list BEFORE building content so the amended
+	// final text (with citations) is what the client sees.
+	if config.WebSearchAppendSources() && len(agg.Sources) > 0 {
+		finalText = finalText + formatSourcesList(agg.Sources)
+	}
 
 	content := buildForwardLocalContentBlocks(agg, finalText)
 
@@ -451,15 +517,8 @@ func (h *Handler) renderForwardLocalFinal(w http.ResponseWriter, origReq ClaudeR
 		usage["server_tool_use"] = map[string]interface{}{"web_search_requests": len(agg.Searches)}
 	}
 
-	// Append deterministic Sources list when enabled and we have sources.
-	if config.WebSearchAppendSources() && len(agg.Sources) > 0 {
-		finalText = finalText + formatSourcesList(agg.Sources)
-		// Rebuild content with amended text already in content blocks above is handled
-		// by buildForwardLocalContentBlocks including sources in last text block.
-	}
-
 	resp := map[string]interface{}{
-		"id":          "msg_" + randomID(),
+		"id":          "msg_" + randomMessageID(),
 		"type":        "message",
 		"role":        "assistant",
 		"content":     content,
@@ -475,7 +534,7 @@ func (h *Handler) renderForwardLocalFinal(w http.ResponseWriter, origReq ClaudeR
 	if len(agg.Searches) > 0 {
 		u := metrics.ToolUsage{
 			TimeMs:     time.Now().UnixMilli(),
-			RequestID:  requestIDFromContext(context.Background()),
+			RequestID:  requestID,
 			ToolKind:   metrics.ToolKindWebSearch,
 			Origin:     metrics.ToolOriginKiroOrchestrator,
 			Uses:       int64(len(agg.Searches)),
@@ -493,13 +552,14 @@ func buildForwardLocalContentBlocks(agg KiroRunResult, finalText string) []map[s
 		out = append(out, map[string]interface{}{
 			"type": "server_tool_use", "id": inv.ToolUseID, "name": "web_search", "input": map[string]interface{}{"query": inv.Query},
 		})
-		// web_search_tool_result with sources
+		// No tool_use_id field — matches the official Anthropic API shape
+		// and is consistent with the pure-path streamWebSearchSSE.
 		sourcesArr := make([]map[string]interface{}, 0, len(inv.Sources))
 		for _, s := range inv.Sources {
 			sourcesArr = append(sourcesArr, map[string]interface{}{"title": s.Title, "url": s.URL})
 		}
 		out = append(out, map[string]interface{}{
-			"type": "web_search_tool_result", "tool_use_id": inv.ToolUseID,
+			"type":    "web_search_tool_result",
 			"content": sourcesArr,
 		})
 	}
@@ -507,12 +567,8 @@ func buildForwardLocalContentBlocks(agg KiroRunResult, finalText string) []map[s
 	return out
 }
 
-func randomID() string {
-	b := make([]byte, 12)
-	for i := range b {
-		b[i] = byte('a' + (time.Now().UnixNano()+int64(i))%26)
-	}
-	return string(b)
+func randomMessageID() string {
+	return "msg_" + strings.ReplaceAll(uuid.New().String(), "-", "")
 }
 
 // providerForwardError is the classified forward error for a buffered round.

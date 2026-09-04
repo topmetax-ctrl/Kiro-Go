@@ -59,6 +59,15 @@ func (h *Handler) tryForwardUpstream(r *http.Request, w http.ResponseWriter, bod
 
 	// Walk the targets in resolved order. A target is only retried past when it
 	// failed BEFORE anything was written to the client — see forwardToTarget.
+	//
+	// Strategy-per-target: when the request carries a native web_search tool, each
+	// target's WebStrategy dictates whether it can serve this body: "unsupported"
+	// targets are skipped (they would 400 non-retryably), "local" targets receive a
+	// synthetic-rewritten body so the single-shot relay doesn't stall on an
+	// unresolved tool_use. This lets mixed-strategy routes (e.g. native + local)
+	// failover safely, and unsupported-primary routes with a capable backup not be
+	// rejected at the handler level.
+	hasNativeWS := bytes.Contains(body, []byte(`"type":"web_search_`)) || bytes.Contains(body, []byte(`"type": "web_search_`))
 	var last forwardOutcome
 	for i, rt := range targets {
 		// The Kiro Pool sentinel is a special target that signals "fall through to
@@ -69,8 +78,26 @@ func (h *Handler) tryForwardUpstream(r *http.Request, w http.ResponseWriter, bod
 		if rt.Provider.ID == metrics.KiroPoolID {
 			return false
 		}
+		// Per-target web_search strategy: skip or rewrite per this target's capability.
+		targetBody := body
+		if hasNativeWS {
+			switch rt.Provider.WebSearchStrategyResolved() {
+			case config.ProviderWebSearchStrategyUnsupported:
+				// This target cannot handle native web_search; skip rather than
+				// send a body that would 400 non-retryably (killing failover).
+				logger.Infof("[Forward] %s: skipping target %s (unsupported web_search strategy)", model, rt.Provider.Name)
+				continue
+			case config.ProviderWebSearchStrategyLocal:
+				// Rewrite native → synthetic client tool for this target so the
+				// single-shot forward doesn't stall on an unresolved tool_use.
+				rb, rwErr := rewriteNativeWebSearchToSynthetic(body)
+				if rwErr == nil {
+					targetBody = rb
+				}
+			}
+		}
 		moreTargets := i+1 < len(targets)
-		outcome := h.forwardToTarget(r, w, body, model, stream, subPath, isClaudeRoute, captureUserText, route, rt, i, moreTargets)
+		outcome := h.forwardToTarget(r, w, targetBody, model, stream, subPath, isClaudeRoute, captureUserText, route, rt, i, moreTargets)
 		last = outcome
 		if outcome.committed {
 			// The client has its answer (success, or an error we chose to surface).
