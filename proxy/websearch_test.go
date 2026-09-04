@@ -405,15 +405,38 @@ func TestConvertClaudeTools_SkipsNativeWebSearchAndInjectsSchema(t *testing.T) {
 	}
 }
 
-func TestConvertClaudeTools_PureNativeWebSearchSkipped(t *testing.T) {
-	// Pure path never calls convertClaudeTools. If it did, native-only must not
-	// inject a Kiro web_search (no client tools remain after filtering).
+func TestConvertClaudeTools_NativeWebSearch_KiroPool_LocalLoop_InjectsSchema(t *testing.T) {
+	// Kiro-pool-only behavior. When mcpFallback is false (default), a pure
+	// native web_search declaration ({"name":"web_search","type":"web_search_20250305"})
+	// — the shape Claude Code sends — falls through to the Kiro pool's
+	// local_tool_loop. convertClaudeTools MUST inject a Kiro-compatible
+	// web_search client-tool schema so the model can emit tool_use for the
+	// runner to execute via SearXNG/Tavily; without it Kiro receives ZERO tools
+	// and the runner has nothing to execute.
+	//
+	// This synthetic injection is NOT a global WebSearch conversion rule:
+	// forwarded requests never call convertClaudeTools (they relay raw via
+	// tryForwardUpstream). The forwarding-provider strategy (native passthrough
+	// vs local execution vs unsupported) must be resolved capability-aware after
+	// route resolution and before the forwarding/tool execution fork (Phase 2).
 	tools := []ClaudeTool{
 		{Type: "web_search_20250305", Name: "web_search"},
 	}
 	kiroTools, _ := convertClaudeTools(tools)
-	if len(kiroTools) != 0 {
-		t.Fatalf("pure native web_search must not produce Kiro tools, got %+v", kiroTools)
+	if len(kiroTools) != 1 {
+		t.Fatalf("pure native web_search must inject exactly one Kiro web_search tool, got %+v", kiroTools)
+	}
+	tspec := kiroTools[0].ToolSpecification
+	if tspec.Name != "web_search" {
+		t.Fatalf("injected tool = %q, want web_search", tspec.Name)
+	}
+	schema, ok := tspec.InputSchema.JSON.(map[string]interface{})
+	if !ok {
+		t.Fatal("web_search schema must be object map")
+	}
+	props, _ := schema["properties"].(map[string]interface{})
+	if props == nil || props["query"] == nil {
+		t.Fatalf("web_search schema missing query: %+v", schema)
 	}
 }
 

@@ -915,6 +915,21 @@ func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) 
 	return text, toolUses
 }
 
+// convertClaudeTools translates Claude tool specifications into Kiro-compatible
+// tool wrappers.
+//
+// Scope and invariants:
+//   - Kiro pool path only. It is called through ClaudeToKiro after forwarding
+//     has declined/fallen through. Forwarded requests relay the raw request via
+//     tryForwardUpstream and must not use this converter.
+//   - Synthetic web_search injection here represents the Kiro-pool
+//     local_tool_loop strategy. It rewrites Anthropic native server-tool syntax
+//     into a gateway-owned client-tool schema so the Kiro conversation/tool
+//     loop can execute search locally.
+//   - This is NOT the forwarding-provider WebSearch strategy resolver.
+//     Forwarded providers must decide native passthrough vs local execution vs
+//     unsupported after route resolution and before the forwarding/tool
+//     execution fork.
 func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]string) {
 	if len(tools) == 0 {
 		return nil, nil
@@ -954,12 +969,13 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 		result = append(result, w)
 	}
 
-	// Mixed-tools path: if the client declared native web_search alongside other
-	// tools, inject a Kiro-compatible web_search function schema so the model can
-	// still request searches (handled internally by the agentic loop). Pure
-	// web_search-only requests never reach convertClaudeTools (fast path); do not
-	// inject when no client tools remain after filtering.
-	if hasNativeWebSearchInTools(tools) && len(result) > 0 && !hasKiroWebSearchTool(result) {
+	// Native web_search injection: if the client declared native web_search
+	// (alone or alongside other tools), inject a Kiro-compatible web_search
+	// function schema so the Kiro model can still request searches. The pure
+	// web_search-only case needs this too: convertClaudeTools skips the native
+	// spec above, so without the injection Kiro would receive ZERO tools, never
+	// emit a web_search tool_use, and the runner would have nothing to execute.
+	if hasNativeWebSearchInTools(tools) && !hasKiroWebSearchTool(result) {
 		w := KiroToolWrapper{}
 		w.ToolSpecification.Name = webSearchToolName
 		w.ToolSpecification.Description = "Search the web for up-to-date information."
