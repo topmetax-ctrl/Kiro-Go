@@ -31,7 +31,11 @@ type persistedCounter struct {
 	InputTokens    int64   `json:"inputTokens,omitempty"`
 	OutputTokens   int64   `json:"outputTokens,omitempty"`
 	CostUSD        float64 `json:"costUsd,omitempty"`
-	LastUsed       int64   `json:"lastUsed"`
+	// ModelRounds is additive: a file written before this field existed loads as
+	// 0, and fromPersistedCounter then backfills it from Requests so history keeps
+	// the pre-existing "one round per request" meaning instead of reading as zero.
+	ModelRounds int64 `json:"modelRounds,omitempty"`
+	LastUsed    int64 `json:"lastUsed"`
 }
 
 type persistedProvider struct {
@@ -62,6 +66,7 @@ type persistedBucket struct {
 	InputTokens  int64   `json:"i,omitempty"`
 	OutputTokens int64   `json:"o,omitempty"`
 	CostUSD      float64 `json:"c,omitempty"`
+	ModelRounds  int64   `json:"mr,omitempty"`
 	SumLatencyMs int64   `json:"l,omitempty"`
 }
 
@@ -115,12 +120,13 @@ func toPersistedCounter(c counter) persistedCounter {
 		InputTokens:    c.inputTokens,
 		OutputTokens:   c.outputTokens,
 		CostUSD:        c.costUSD,
+		ModelRounds:    c.modelRounds,
 		LastUsed:       c.lastUsed,
 	}
 }
 
 func fromPersistedCounter(p persistedCounter) counter {
-	return counter{
+	c := counter{
 		requests:       p.Requests,
 		success:        p.Success,
 		failed:         p.Failed,
@@ -132,8 +138,15 @@ func fromPersistedCounter(p persistedCounter) counter {
 		inputTokens:    p.InputTokens,
 		outputTokens:   p.OutputTokens,
 		costUSD:        p.CostUSD,
+		modelRounds:    p.ModelRounds,
 		lastUsed:       p.LastUsed,
 	}
+	if c.modelRounds == 0 && c.requests > 0 {
+		// Pre-ModelRounds file: every recorded request was one model round, which
+		// is exactly what eventModelRounds assumes for an unset Event.
+		c.modelRounds = c.requests
+	}
+	return c
 }
 
 // statusKey/parseStatusKey convert the int status map to string keys, because
@@ -268,6 +281,7 @@ func Save(path string) error {
 				InputTokens:  b.InputTokens,
 				OutputTokens: b.OutputTokens,
 				CostUSD:      b.CostUSD,
+				ModelRounds:  b.ModelRounds,
 				SumLatencyMs: b.SumLatencyMs,
 			})
 		}
@@ -346,6 +360,11 @@ func Load(path string) error {
 			if b.Hour < cutoffHour {
 				continue
 			}
+			mr := b.ModelRounds
+			if mr == 0 {
+				// Pre-ModelRounds history: one round per request (see fromPersistedCounter).
+				mr = b.Requests
+			}
 			agg.hours[b.Hour] = &Bucket{
 				Minute:       b.Hour,
 				Requests:     b.Requests,
@@ -354,6 +373,7 @@ func Load(path string) error {
 				InputTokens:  b.InputTokens,
 				OutputTokens: b.OutputTokens,
 				CostUSD:      b.CostUSD,
+				ModelRounds:  mr,
 				SumLatencyMs: b.SumLatencyMs,
 			}
 		}

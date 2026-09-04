@@ -72,6 +72,26 @@ type Event struct {
 	// list. 0 means the route's preferred provider served it; >0 means a failover
 	// happened, which is the signal that a higher-priority target is unhealthy.
 	Attempt int `json:"attempt,omitempty"`
+	// ModelRounds is how many upstream model rounds this ONE request/attempt
+	// consumed. It exists so a multi-round tool loop (a local web_search strategy
+	// runs the model, executes the search, then runs the model again) can report
+	// its real provider consumption WITHOUT filing one Event per round — which
+	// would break the invariant that one Event is one request/attempt outcome and
+	// would show a single client request as N requests on the dashboard.
+	//
+	// 0 means unset and is read as 1, so every existing caller keeps its meaning
+	// and "model rounds" equals "requests" for ordinary traffic. Set it only to
+	// the real count (>1) from a loop that genuinely ran several rounds.
+	ModelRounds int `json:"modelRounds,omitempty"`
+}
+
+// eventModelRounds is the number of model rounds an Event represents. Unset (0)
+// is one round, so ordinary single-round traffic needs no change at its call site.
+func eventModelRounds(ev Event) int64 {
+	if ev.ModelRounds > 1 {
+		return int64(ev.ModelRounds)
+	}
+	return 1
 }
 
 // counter aggregates outcomes for the overall stream or one provider/route/model.
@@ -93,6 +113,11 @@ type counter struct {
 	outputTokens   int64
 	costUSD        float64
 	lastUsed       int64
+	// modelRounds is the number of upstream model rounds these requests consumed.
+	// It equals requests for ordinary traffic and exceeds it when a multi-round
+	// tool loop served a request. Kept as its own total rather than folded into
+	// requests so provider consumption is observable without inflating volume.
+	modelRounds int64
 }
 
 func (c *counter) add(ev Event) {
@@ -120,6 +145,7 @@ func (c *counter) add(ev Event) {
 	c.inputTokens += ev.InputTokens
 	c.outputTokens += ev.OutputTokens
 	c.costUSD += ev.CostUSD
+	c.modelRounds += eventModelRounds(ev)
 	if ev.TimeMs > c.lastUsed {
 		c.lastUsed = ev.TimeMs
 	}
@@ -140,6 +166,7 @@ func (c *counter) sub(o counter) {
 	c.inputTokens -= o.inputTokens
 	c.outputTokens -= o.outputTokens
 	c.costUSD -= o.costUSD
+	c.modelRounds -= o.modelRounds
 	// lastUsed is a max, not a sum: it cannot be un-mixed, so it is left as is
 	// rather than guessed at.
 	c.clampNonNegative()
@@ -181,6 +208,9 @@ func (c *counter) clampNonNegative() {
 	}
 	if c.costUSD < 0 {
 		c.costUSD = 0
+	}
+	if c.modelRounds < 0 {
+		c.modelRounds = 0
 	}
 }
 
@@ -261,9 +291,12 @@ type Bucket struct {
 	OutputTokens int64 `json:"outputTokens"`
 	// CostUSD lets spend be summed over an arbitrary window (the Stats tab's
 	// range filter) rather than only all-time from the provider counter.
-	CostUSD      float64 `json:"costUsd"`
-	SumLatencyMs int64   `json:"-"`
-	AvgLatencyMs int64   `json:"avgLatencyMs"`
+	CostUSD float64 `json:"costUsd"`
+	// ModelRounds is upstream model rounds in this bucket; equals Requests for
+	// ordinary traffic and exceeds it when a multi-round tool loop ran.
+	ModelRounds  int64 `json:"modelRounds,omitempty"`
+	SumLatencyMs int64 `json:"-"`
+	AvgLatencyMs int64 `json:"avgLatencyMs"`
 }
 
 func (b *Bucket) add(ev Event) {
@@ -281,6 +314,7 @@ func (b *Bucket) add(ev Event) {
 	b.InputTokens += ev.InputTokens
 	b.OutputTokens += ev.OutputTokens
 	b.CostUSD += ev.CostUSD
+	b.ModelRounds += eventModelRounds(ev)
 	b.SumLatencyMs += ev.LatencyMs
 }
 
@@ -520,7 +554,11 @@ type OverallStat struct {
 	InputTokens  int64   `json:"inputTokens"`
 	OutputTokens int64   `json:"outputTokens"`
 	CostUSD      float64 `json:"costUsd"`
-	LastUsed     int64   `json:"lastUsed"`
+	// ModelRounds is total upstream model rounds. It equals Requests for ordinary
+	// traffic; a multi-round tool loop makes it larger while Requests stays at the
+	// number of client requests.
+	ModelRounds int64 `json:"modelRounds"`
+	LastUsed    int64 `json:"lastUsed"`
 }
 
 // Overall returns the aggregate across every recorded request.
@@ -538,6 +576,7 @@ func Overall() OverallStat {
 		InputTokens:  c.inputTokens,
 		OutputTokens: c.outputTokens,
 		CostUSD:      c.costUSD,
+		ModelRounds:  c.modelRounds,
 		LastUsed:     c.lastUsed,
 	}
 }
@@ -558,6 +597,9 @@ type ProviderStat struct {
 	InputTokens  int64   `json:"inputTokens"`
 	OutputTokens int64   `json:"outputTokens"`
 	CostUSD      float64 `json:"costUsd"`
+	// ModelRounds is upstream model rounds served for this provider. Larger than
+	// Requests when a multi-round tool loop (local web_search) ran against it.
+	ModelRounds  int64   `json:"modelRounds,omitempty"`
 	RPM          float64 `json:"rpm"`          // requests/min over the last 5 min
 	TPM          float64 `json:"tpm"`          // tokens/min over the last 5 min
 	TokensPerSec float64 `json:"tokensPerSec"` // output tokens per second of latency
@@ -640,6 +682,7 @@ func (s *store) providerStatLocked(id string, p *providerAgg, nowMinute int64) P
 		InputTokens:  p.inputTokens,
 		OutputTokens: p.outputTokens,
 		CostUSD:      p.costUSD,
+		ModelRounds:  p.modelRounds,
 		RPM:          rpm,
 		TPM:          tpm,
 		TokensPerSec: p.tokensPerSec(),
@@ -752,6 +795,7 @@ func ProviderStatsWindow(hours int) []ProviderStat {
 			agg.InputTokens += b.InputTokens
 			agg.OutputTokens += b.OutputTokens
 			agg.CostUSD += b.CostUSD
+			agg.ModelRounds += b.ModelRounds
 			agg.SumLatencyMs += b.SumLatencyMs
 		}
 
@@ -765,6 +809,7 @@ func ProviderStatsWindow(hours int) []ProviderStat {
 			InputTokens:  agg.InputTokens,
 			OutputTokens: agg.OutputTokens,
 			CostUSD:      agg.CostUSD,
+			ModelRounds:  agg.ModelRounds,
 			// Live signals, deliberately not windowed.
 			InFlight:     p.inFlight,
 			PeakInFlight: p.peakFlight,

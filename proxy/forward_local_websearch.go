@@ -34,6 +34,36 @@ type forwardLocalRoundResult struct {
 	stopReason   string
 }
 
+// forwardLocalConsumption accumulates what the pinned provider actually consumed
+// across the loop's model rounds, so the whole logical request files exactly ONE
+// metrics.Event.
+//
+// This is the accounting invariant the loop must not break: metrics.Event means
+// one request/attempt outcome, and metrics.Record increments the request counters
+// of every aggregate it touches (overall, provider, route, per-minute bucket). A
+// three-round loop that filed one Event per round would therefore report three
+// provider/API requests for one client request — the dashboard would disagree
+// with the handler's own counters. Provider consumption is instead reported on
+// the single Event via Event.ModelRounds, which is summed separately from
+// requests, so "1 request, 3 model rounds, 450 tokens" is expressible without
+// inflating volume.
+type forwardLocalConsumption struct {
+	rounds       int
+	inputTokens  int64
+	outputTokens int64
+	costUSD      float64
+	latencyMs    int64
+}
+
+// addRound folds one completed upstream round into the totals.
+func (c *forwardLocalConsumption) addRound(usage usageCounts, provider config.UpstreamProvider, latencyMs int64) {
+	c.rounds++
+	c.inputTokens += usage.Input
+	c.outputTokens += usage.Output
+	c.costUSD += provider.CostUSD(usage.Input, usage.Output)
+	c.latencyMs += latencyMs
+}
+
 // forwardLocalWebSearch handles the "local" web_search strategy for a forwarded
 // Claude route. It keeps model inference pinned to the SAME resolved provider
 // route for every round (same ProviderID + same route/model-target), while
@@ -101,10 +131,24 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 	agg := KiroRunResult{}
 	cache := map[string]KiroToolResult{}
 	sourcesByQuery := map[string][]SearchSource{}
+	// Provider consumption across every round of this ONE logical request. Filed
+	// as a single metrics.Event at whichever terminal point ends the loop.
+	var consumed forwardLocalConsumption
+
+	// fail closes out the request on any non-success exit: one failure Event
+	// carrying the consumption incurred so far, plus the tool usage already
+	// performed. Every early return below goes through it so no path can leave the
+	// request with zero Events (invisible on the dashboard) or two.
+	fail := func(status int, errMsg string) bool {
+		h.finishForwardLocalFailure(ctx, consumed, agg, pinned.Provider, *pinned, route, clientModel, apiKeyID, requestID, status, errMsg)
+		return true
+	}
 
 	for round := 0; round < policy.MaxRounds; round++ {
 		if err := ctx.Err(); err != nil {
-			return true // client gone
+			// Client disconnected: recorded as canceled (not a failure), with the
+			// consumption already incurred still attributed to the provider.
+			return fail(499, "client canceled")
 		}
 
 		// Build payload for this round. For round 0 it is origReq's body bytes
@@ -120,7 +164,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 				body, err = rewriteModelField(body, tm)
 				if err != nil {
 					h.sendClaudeError(w, 400, "invalid_request_error", err.Error())
-					return true
+					return fail(400, "invalid_request_error: "+err.Error())
 				}
 			}
 			// Round-0 body still carries the memory-enriched original; apply the
@@ -129,13 +173,13 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 			body, err = rewriteNativeWebSearchToSynthetic(body)
 			if err != nil {
 				h.sendClaudeError(w, 400, "invalid_request_error", err.Error())
-				return true
+				return fail(400, "invalid_request_error: "+err.Error())
 			}
 		} else {
 			body, err = json.Marshal(working)
 			if err != nil {
 				h.sendClaudeError(w, 500, "api_error", "failed to serialize continuation")
-				return true
+				return fail(500, "failed to serialize continuation")
 			}
 			// Model rewrite for continuation as well (same pinned mapping every round
 			// — proves same-route invariant).
@@ -143,7 +187,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 				body, err = rewriteModelField(body, tm)
 				if err != nil {
 					h.sendClaudeError(w, 400, "invalid_request_error", err.Error())
-					return true
+					return fail(400, "invalid_request_error: "+err.Error())
 				}
 			}
 		}
@@ -154,17 +198,14 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 			// Upstream failure before any byte committed; surface the classified error.
 			// Do not silently fall through to Kiro pool — that would change provider.
 			h.sendPublicForwardError(w, true, forwardErr.Public())
-			return true
+			return fail(forwardErr.status, forwardErr.message)
 		}
 
-		// Attribute request metrics to the pinned provider/route (same ProviderID
-		// every round). Record after each successful upstream round so dashboards
-		// reflect the provider actually used, not the Kiro pool.
-		h.recordForwardLocalRound(ctx, forwardUsage, pinned.Provider, *pinned, route, clientModel, apiKeyID, time.Since(roundStart).Milliseconds())
-		// Provider consumption accrues per round; the LOGICAL request is counted
-		// once, at the end. recordSuccessForApiKey must NOT be called here: it goes
-		// through recordSuccess, which increments totalRequests/successRequests, so
-		// an N-round loop would report N client requests for one client request.
+		// Accumulate provider consumption. Nothing is filed with metrics or the
+		// handler counters here: one client request must produce exactly one
+		// metrics.Event and exactly one recordSuccess, both at the terminal point.
+		// See forwardLocalConsumption for why per-round Events are wrong.
+		consumed.addRound(forwardUsage, pinned.Provider, time.Since(roundStart).Milliseconds())
 		agg.TotalInputTokens += res.inputTokens
 		agg.TotalOutputTokens += res.outputTokens
 
@@ -177,11 +218,13 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 				VisibleContent: res.text,
 				ToolUses:       external,
 			}
-			return h.renderForwardLocalFinal(ctx, w, origReq, agg, res.text, policy, requestID, apiKeyID)
+			h.recordForwardLocalRequest(ctx, consumed, pinned.Provider, *pinned, route, clientModel, apiKeyID)
+			return h.renderForwardLocalFinal(ctx, w, origReq, agg, res.text, policy, requestID, apiKeyID, pinned.Provider.ID)
 		}
 		if len(external) > 0 {
-			h.sendClaudeError(w, 400, "invalid_request_error", fmt.Sprintf("mixed tool uses in one turn: web_search with %v is not supported in forwarded local mode", toolUseNames(external)))
-			return true
+			msg := fmt.Sprintf("mixed tool uses in one turn: web_search with %v is not supported in forwarded local mode", toolUseNames(external))
+			h.sendClaudeError(w, 400, "invalid_request_error", msg)
+			return fail(400, msg)
 		}
 		if agg.SearchCalls+len(internal) > policy.MaxSearches {
 			// Budget exhausted: feed a notice and do one final round with tool stripped.
@@ -203,28 +246,32 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 			finalRes, finalUsage, ferr := h.forwardRoundBuffered(ctx, pinned.Provider, *pinned, strippedBody, clientModel, route, captureUserText, false)
 			if ferr != nil {
 				h.sendPublicForwardError(w, true, ferr.Public())
-				return true
+				return fail(ferr.status, ferr.message)
 			}
-			h.recordForwardLocalRound(ctx, finalUsage, pinned.Provider, *pinned, route, clientModel, apiKeyID, time.Since(finalStart).Milliseconds())
+			consumed.addRound(finalUsage, pinned.Provider, time.Since(finalStart).Milliseconds())
 			agg.TotalInputTokens += finalRes.inputTokens
 			agg.TotalOutputTokens += finalRes.outputTokens
 			agg.FinalRound = KiroRoundResult{VisibleContent: finalRes.text, ToolUses: finalRes.toolUses}
-			return h.renderForwardLocalFinal(ctx, w, origReq, agg, finalRes.text, policy, requestID, apiKeyID)
+			h.recordForwardLocalRequest(ctx, consumed, pinned.Provider, *pinned, route, clientModel, apiKeyID)
+			return h.renderForwardLocalFinal(ctx, w, origReq, agg, finalRes.text, policy, requestID, apiKeyID, pinned.Provider.ID)
 		}
 
 		distinctBefore := countDistinctQueries(internal, cache)
-		toolResults, sources, credits, invocations, execErr := (&kiroConversationRunner{caller: nil, executor: executor}).executeAll(ctx, internal, policy, cache, sourcesByQuery)
+		toolResults, sources, stats, invocations, execErr := (&kiroConversationRunner{caller: nil, executor: executor}).executeAll(ctx, internal, policy, cache, sourcesByQuery)
 		if execErr != nil {
+			// Search-side failure: the model rounds already consumed still count, and
+			// the request is a failure. Never fails over to another provider.
 			h.sendClaudeError(w, 500, "api_error", execErr.Error())
-			return true
+			return fail(500, "web_search: "+execErr.Error())
 		}
 		agg.SearchCalls += len(internal)
 		agg.BackendExecutions += distinctBefore
 		agg.CacheHits += len(internal) - distinctBefore
 		agg.SearchRounds++
 		agg.Sources = append(agg.Sources, sources...)
-		agg.TavilyCredits += credits
+		agg.TavilyCredits += stats.TavilyCredits
 		agg.Searches = append(agg.Searches, invocations...)
+		agg.mergeBackendStats(stats)
 
 		working = advanceForwardWorking(working, res, toolResults)
 	}
@@ -240,13 +287,14 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 	finalRes, finalUsage, ferr := h.forwardRoundBuffered(ctx, p2.Provider, p2, strippedBody, clientModel, route, captureUserText, false)
 	if ferr != nil {
 		h.sendPublicForwardError(w, true, ferr.Public())
-		return true
+		return fail(ferr.status, ferr.message)
 	}
-	h.recordForwardLocalRound(ctx, finalUsage, p2.Provider, p2, route, clientModel, apiKeyID, time.Since(finalStart).Milliseconds())
+	consumed.addRound(finalUsage, p2.Provider, time.Since(finalStart).Milliseconds())
 	agg.TotalInputTokens += finalRes.inputTokens
 	agg.TotalOutputTokens += finalRes.outputTokens
 	agg.FinalRound = KiroRoundResult{VisibleContent: finalRes.text, ToolUses: finalRes.toolUses}
-	return h.renderForwardLocalFinal(ctx, w, origReq, agg, finalRes.text, policy, requestID, apiKeyID)
+	h.recordForwardLocalRequest(ctx, consumed, p2.Provider, p2, route, clientModel, apiKeyID)
+	return h.renderForwardLocalFinal(ctx, w, origReq, agg, finalRes.text, policy, requestID, apiKeyID, p2.Provider.ID)
 }
 
 // forwardRoundBuffered does one buffered (non-stream) POST to the pinned provider
@@ -544,7 +592,7 @@ func syntheticWebSearchTools(tools []ClaudeTool) []ClaudeTool {
 // renderForwardLocalFinal writes the final non-stream JSON response, synthesizing
 // native server_tool_use blocks when searches ran so the client renders
 // "Did N searches" with citations.
-func (h *Handler) renderForwardLocalFinal(ctx context.Context, w http.ResponseWriter, origReq ClaudeRequest, agg KiroRunResult, finalText string, policy WebSearchPolicy, requestID, apiKeyID string) bool {
+func (h *Handler) renderForwardLocalFinal(ctx context.Context, w http.ResponseWriter, origReq ClaudeRequest, agg KiroRunResult, finalText string, policy WebSearchPolicy, requestID, apiKeyID, providerID string) bool {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
 	// Logical-request accounting happens exactly ONCE here, at the single point
@@ -594,20 +642,119 @@ func (h *Handler) renderForwardLocalFinal(ctx context.Context, w http.ResponseWr
 		logger.Warnf("[ForwardLocal] final encode failed: %v", err)
 		return true
 	}
-	// Emit tool observability (kiro_orchestrator, pinned provider).
-	if len(agg.Searches) > 0 {
-		u := metrics.ToolUsage{
-			TimeMs:     time.Now().UnixMilli(),
-			RequestID:  requestID,
-			ToolKind:   metrics.ToolKindWebSearch,
-			Origin:     metrics.ToolOriginKiroOrchestrator,
-			Uses:       int64(len(agg.Searches)),
-			Executions: int64(agg.BackendExecutions),
-			CacheHits:  int64(agg.CacheHits),
+	// Tool observability, once per logical request, with real backend attribution
+	// (see recordWebSearchToolUsage). The failure path calls the same helper, and
+	// the two terminal points are mutually exclusive.
+	recordWebSearchToolUsage(agg, requestID, providerID)
+	return true
+}
+
+// finishForwardLocalFailure closes out a local loop that died mid-flight: it files
+// the ONE failure Event for the request and advances the handler's failure
+// counters, then records whatever tool work had already been done.
+//
+// Consumption incurred before the failure is preserved on the Event (a loop that
+// burned two rounds of tokens and then hit a 429 really did spend them), while
+// the outcome stays a failure so no fake success is reported. Tool usage is
+// emitted here too, from the same single-shot helper the success path uses, so an
+// executed search is neither lost nor counted twice — the two terminal points are
+// mutually exclusive.
+func (h *Handler) finishForwardLocalFailure(ctx context.Context, consumed forwardLocalConsumption, agg KiroRunResult, provider config.UpstreamProvider, rt config.ResolvedTarget, route *config.ModelRoute, clientModel, apiKeyID, requestID string, status int, errMsg string) {
+	routeID := ""
+	if route != nil {
+		routeID = route.ID
+	}
+	canceled := status == 499
+	metrics.Record(metrics.Event{
+		ClientModel:  clientModel,
+		TargetModel:  strings.TrimSpace(rt.Target.TargetModel),
+		RouteID:      routeID,
+		ProviderID:   provider.ID,
+		ProviderName: provider.Name,
+		Endpoint:     "claude",
+		ClientIP:     clientIPFromContext(ctx),
+		ApiKeyID:     apiKeyID,
+		RequestID:    requestIDFromContext(ctx),
+		Status:       status,
+		LatencyMs:    consumed.latencyMs,
+		InputTokens:  consumed.inputTokens,
+		OutputTokens: consumed.outputTokens,
+		CostUSD:      consumed.costUSD,
+		ModelRounds:  consumed.rounds,
+		Canceled:     canceled,
+		Ok:           false,
+		ErrorMsg:     errMsg,
+	})
+	if !canceled {
+		// A client disconnect is not a failed request (same rule as the forward
+		// path): it advances neither the success nor the failure counter.
+		h.recordFailure()
+	}
+	recordWebSearchToolUsage(agg, requestID, provider.ID)
+}
+
+// recordWebSearchToolUsage emits tool observability for one logical request's
+// local web_search work, exactly once, whatever the request's outcome.
+//
+// Backend attribution is decomposed so metrics.ToolUsage (one Backend per
+// observation) can express a request that hit two backends without inflating any
+// total: each backend that actually executed gets its own observation carrying
+// only its own executions and credits, and the request-level figures (Uses,
+// CacheHits) ride on the first one so toolCounter.requests still advances exactly
+// once. When nothing executed (every call a cache hit) a single backendless
+// observation carries the uses.
+func recordWebSearchToolUsage(agg KiroRunResult, requestID, providerID string) {
+	if agg.SearchCalls <= 0 {
+		return
+	}
+	base := metrics.ToolUsage{
+		TimeMs:     time.Now().UnixMilli(),
+		RequestID:  requestID,
+		ToolKind:   metrics.ToolKindWebSearch,
+		Origin:     metrics.ToolOriginKiroOrchestrator,
+		ProviderID: providerID,
+	}
+	if len(agg.ExecutionsByBackend) == 0 {
+		u := base
+		u.Uses = int64(agg.SearchCalls)
+		u.Executions = int64(agg.BackendExecutions)
+		u.CacheHits = int64(agg.CacheHits)
+		u.Credits = int64(agg.TavilyCredits)
+		metrics.RecordToolUsage(u)
+		return
+	}
+	first := true
+	credits := int64(agg.TavilyCredits)
+	for _, name := range backendNamesInOrder(agg) {
+		u := base
+		u.Backend = name
+		u.Executions = int64(agg.ExecutionsByBackend[name])
+		if first {
+			// Request-level figures ride on exactly one observation.
+			u.Uses = int64(agg.SearchCalls)
+			u.CacheHits = int64(agg.CacheHits)
+			u.Credits = credits
+			first = false
 		}
 		metrics.RecordToolUsage(u)
 	}
-	return true
+}
+
+// backendNamesInOrder lists the backends that executed, preferring the first-seen
+// order the runner recorded so output is deterministic.
+func backendNamesInOrder(agg KiroRunResult) []string {
+	out := make([]string, 0, len(agg.ExecutionsByBackend))
+	for _, name := range agg.Providers {
+		if _, ok := agg.ExecutionsByBackend[name]; ok {
+			out = append(out, name)
+		}
+	}
+	for name := range agg.ExecutionsByBackend {
+		if _, seen := indexOfString(out, name); !seen {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // buildForwardLocalContentBlocks renders the CLIENT-facing content array: the
@@ -661,20 +808,33 @@ func classifyForwardError(status int, body []byte, header http.Header, provider 
 	return newProviderForwardError(pub.HTTPStatus, pub.Message)
 }
 
-// recordForwardLocalRound files one metrics.Event per PROVIDER ROUND, which is
-// what the Event invariant means on this path: one Event = one upstream attempt
-// outcome. A three-round local loop legitimately files three provider events —
-// that is provider consumption, and the dashboard's per-provider latency/token
-// figures depend on it.
+// recordForwardLocalRequest files exactly ONE metrics.Event for the whole local
+// loop, attributed to the pinned provider/route.
 //
-// The LOGICAL client request is counted separately, exactly once, in
-// renderForwardLocalFinal (recordSuccessForApiKey). The two must not be merged:
-// provider rounds and client requests are different denominators.
-func (h *Handler) recordForwardLocalRound(ctx context.Context, usage usageCounts, provider config.UpstreamProvider, rt config.ResolvedTarget, route *config.ModelRoute, clientModel, apiKeyID string, latencyMs int64) {
+// One Event = one request/attempt outcome. metrics.Record increments the request
+// counter of every aggregate it touches, so filing an Event per model round would
+// make a single client request read as N provider/API requests and put the
+// dashboard at odds with the handler's own counters.
+//
+// Provider consumption is not lost by collapsing to one Event: tokens, cost and
+// latency are the sums across rounds, and Event.ModelRounds carries the round
+// count as its own dimension (summed separately from requests). A three-round
+// loop therefore reports requests=1, modelRounds=3, tokens=sum — which is what
+// the operator needs to see.
+//
+// The logical client counters (totalRequests/successRequests/totalTokens) are
+// advanced once more, in renderForwardLocalFinal via recordSuccessForApiKey.
+// That is a different store (handler atomics + per-key ledger) and never calls
+// metrics.Record, so the two cannot double-count each other.
+func (h *Handler) recordForwardLocalRequest(ctx context.Context, consumed forwardLocalConsumption, provider config.UpstreamProvider, rt config.ResolvedTarget, route *config.ModelRoute, clientModel, apiKeyID string) {
+	routeID := ""
+	if route != nil {
+		routeID = route.ID
+	}
 	metrics.Record(metrics.Event{
 		ClientModel:  clientModel,
 		TargetModel:  strings.TrimSpace(rt.Target.TargetModel),
-		RouteID:      route.ID,
+		RouteID:      routeID,
 		ProviderID:   provider.ID,
 		ProviderName: provider.Name,
 		Endpoint:     "claude",
@@ -682,10 +842,11 @@ func (h *Handler) recordForwardLocalRound(ctx context.Context, usage usageCounts
 		ApiKeyID:     apiKeyID,
 		RequestID:    requestIDFromContext(ctx),
 		Status:       200,
-		LatencyMs:    latencyMs,
-		InputTokens:  usage.Input,
-		OutputTokens: usage.Output,
-		CostUSD:      provider.CostUSD(usage.Input, usage.Output),
+		LatencyMs:    consumed.latencyMs,
+		InputTokens:  consumed.inputTokens,
+		OutputTokens: consumed.outputTokens,
+		CostUSD:      consumed.costUSD,
+		ModelRounds:  consumed.rounds,
 		Ok:           true,
 	})
 }

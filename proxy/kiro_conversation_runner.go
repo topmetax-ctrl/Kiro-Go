@@ -47,6 +47,11 @@ type KiroRunResult struct {
 	// this request (e.g. ["searxng"], or ["searxng","tavily"] if a fallback fired),
 	// for observability. Order is first-seen.
 	Providers []string
+	// ExecutionsByBackend counts real backend executions per search provider
+	// ("searxng", "tavily"). It sums to BackendExecutions and is what lets tool
+	// metrics answer "did SearXNG actually run?" rather than only "was the tool
+	// used?". Nil when nothing executed.
+	ExecutionsByBackend map[string]int
 	// Searches records one entry per web_search tool_use the model issued across
 	// all rounds, in issue order, so the handler can synthesize Anthropic-native
 	// server_tool_use / web_search_tool_result blocks (and the web_search_requests
@@ -62,6 +67,36 @@ type WebSearchInvocation struct {
 	ToolUseID string
 	Query     string
 	Sources   []SearchSource
+}
+
+// mergeBackendStats folds one round's execution stats into the request total, so
+// ExecutionsByBackend/Providers describe the whole request rather than the last
+// round. Only fresh executions are ever passed in (see searchRoundStats).
+func (res *KiroRunResult) mergeBackendStats(st searchRoundStats) {
+	for _, name := range st.Providers {
+		if _, seen := indexOfString(res.Providers, name); !seen {
+			res.Providers = append(res.Providers, name)
+		}
+	}
+	if len(st.ByBackend) == 0 {
+		return
+	}
+	if res.ExecutionsByBackend == nil {
+		res.ExecutionsByBackend = make(map[string]int, len(st.ByBackend))
+	}
+	for name, n := range st.ByBackend {
+		res.ExecutionsByBackend[name] += n
+	}
+}
+
+// indexOfString reports whether needle is in haystack (and where).
+func indexOfString(haystack []string, needle string) (int, bool) {
+	for i, v := range haystack {
+		if v == needle {
+			return i, true
+		}
+	}
+	return -1, false
 }
 
 // kiroConversationRunner is the production ConversationRunner.
@@ -152,7 +187,7 @@ func (r *kiroConversationRunner) Run(ctx context.Context, account *config.Accoun
 		// i.e. ones that will actually hit the backend. After executeAll runs, those
 		// keys are in cache, so the remainder of `internal` were dedup/cache hits.
 		distinctBefore := countDistinctQueries(internal, cache)
-		toolResults, sources, credits, invocations, execErr := r.executeAll(ctx, internal, policy, cache, sourcesByQuery)
+		toolResults, sources, stats, invocations, execErr := r.executeAll(ctx, internal, policy, cache, sourcesByQuery)
 		if execErr != nil {
 			// A hard search error (auth/config/context). Do NOT fail the Kiro
 			// account; the handler maps this to a search-specific status.
@@ -163,8 +198,9 @@ func (r *kiroConversationRunner) Run(ctx context.Context, account *config.Accoun
 		agg.CacheHits += len(internal) - distinctBefore
 		agg.SearchRounds++
 		agg.Sources = append(agg.Sources, sources...)
-		agg.TavilyCredits += credits
+		agg.TavilyCredits += stats.TavilyCredits
 		agg.Searches = append(agg.Searches, invocations...)
+		agg.mergeBackendStats(stats)
 
 		working = advancePayload(working, result, toolResults)
 	}
@@ -232,7 +268,34 @@ type searchWork struct {
 	execMeta   ToolExecutionMetadata
 }
 
-func (r *kiroConversationRunner) executeAll(ctx context.Context, calls []KiroToolUse, policy WebSearchPolicy, cache map[string]KiroToolResult, sourcesByQuery map[string][]SearchSource) ([]KiroToolResult, []SearchSource, int, []WebSearchInvocation, error) {
+// searchRoundStats is the execution-side accounting for one round's searches:
+// what the paid provider cost, and which backends actually ran. Both are needed
+// to report honestly (a cache hit spends nothing and runs no backend), and both
+// come from the same fold over fresh executions, so they travel together.
+type searchRoundStats struct {
+	TavilyCredits int
+	// ByBackend counts fresh executions per search provider name ("searxng",
+	// "tavily"). Only fresh executions appear: a dedup/cache hit ran no backend.
+	ByBackend map[string]int
+	// Providers is the distinct backend names in first-seen order.
+	Providers []string
+}
+
+func (st *searchRoundStats) addExecution(provider string, credits int) {
+	st.TavilyCredits += credits
+	if provider == "" {
+		return
+	}
+	if st.ByBackend == nil {
+		st.ByBackend = map[string]int{}
+	}
+	if _, seen := st.ByBackend[provider]; !seen {
+		st.Providers = append(st.Providers, provider)
+	}
+	st.ByBackend[provider]++
+}
+
+func (r *kiroConversationRunner) executeAll(ctx context.Context, calls []KiroToolUse, policy WebSearchPolicy, cache map[string]KiroToolResult, sourcesByQuery map[string][]SearchSource) ([]KiroToolResult, []SearchSource, searchRoundStats, []WebSearchInvocation, error) {
 	results := make([]KiroToolResult, len(calls))
 	metas := make([]ToolExecutionMetadata, len(calls))
 
@@ -256,10 +319,10 @@ func (r *kiroConversationRunner) executeAll(ctx context.Context, calls []KiroToo
 		toRun = append(toRun, searchWork{index: i, call: call})
 	}
 
-	tavilyCredits := 0
+	var stats searchRoundStats
 	if len(toRun) > 0 {
 		if err := r.runSearches(ctx, toRun, policy); err != nil {
-			return nil, nil, 0, nil, err
+			return nil, nil, stats, nil, err
 		}
 		// Fold the freshly executed results into the per-request cache and the
 		// index slots they were run from. Only fresh executions accrue provider
@@ -269,7 +332,7 @@ func (r *kiroConversationRunner) executeAll(ctx context.Context, calls []KiroToo
 		for _, w := range toRun {
 			results[w.index] = w.execResult
 			metas[w.index] = w.execMeta
-			tavilyCredits += w.execMeta.TavilyCredits
+			stats.addExecution(w.execMeta.Provider, w.execMeta.TavilyCredits)
 			if key := cacheKey(w.call); key != "" {
 				cache[key] = w.execResult
 				sourcesByQuery[key] = w.execMeta.Sources
@@ -294,7 +357,7 @@ func (r *kiroConversationRunner) executeAll(ctx context.Context, calls []KiroToo
 			cached, ok := cache[key]
 			if !ok || key == "" {
 				// Should not happen: every call is either cached or was scheduled.
-				return nil, nil, 0, nil, &search.ConfigError{Reason: "internal: search result missing for tool_use"}
+				return nil, nil, stats, nil, &search.ConfigError{Reason: "internal: search result missing for tool_use"}
 			}
 			cp := cached
 			cp.ToolUseID = call.ToolUseID
@@ -308,7 +371,7 @@ func (r *kiroConversationRunner) executeAll(ctx context.Context, calls []KiroToo
 			Sources:   callSources,
 		})
 	}
-	return results, sources, tavilyCredits, invocations, nil
+	return results, sources, stats, invocations, nil
 }
 
 // runSearches executes the given work items concurrently, bounded by

@@ -2088,6 +2088,11 @@ func (h *Handler) recordFailureWithDetails(ctx context.Context, endpoint, model,
 // issued; Executions = actual backend executions; CacheHits = dedup/cache
 // saves. This is a separate signal from metrics.Event (which stays one
 // request outcome) — see metrics/tool.go.
+//
+// It shares recordWebSearchToolUsage with the forwarded local loop so both paths
+// attribute executions to the backend that really ran (searxng/tavily), which is
+// what makes "did SearXNG serve this?" answerable from the dashboard instead of
+// only "was web_search used?".
 func recordToolUsageFromRunner(ctx context.Context, run *KiroRunResult, requestID string) {
 	if run == nil || run.SearchCalls <= 0 {
 		return
@@ -2095,22 +2100,11 @@ func recordToolUsageFromRunner(ctx context.Context, run *KiroRunResult, requestI
 	if requestID == "" {
 		requestID = requestIDFromContext(ctx)
 	}
-	execs := run.BackendExecutions
-	if execs <= 0 {
-		execs = run.SearchCalls // unknown granularity; do not fabricate cache
+	agg := *run
+	if agg.BackendExecutions <= 0 {
+		agg.BackendExecutions = agg.SearchCalls // unknown granularity; do not fabricate cache
 	}
-	u := metrics.ToolUsage{
-		TimeMs:     time.Now().UnixMilli(),
-		RequestID:  requestID,
-		ToolKind:   metrics.ToolKindWebSearch,
-		Origin:     metrics.ToolOriginKiroOrchestrator,
-		ProviderID: metrics.KiroPoolID,
-		Uses:       int64(run.SearchCalls),
-		Executions: int64(execs),
-		CacheHits:  int64(run.CacheHits),
-		Credits:    int64(run.TavilyCredits),
-	}
-	metrics.RecordToolUsage(u)
+	recordWebSearchToolUsage(agg, requestID, metrics.KiroPoolID)
 }
 
 // recordToolUsageForward emits tool observability for the forwarding path.
