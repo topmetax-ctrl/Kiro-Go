@@ -1411,6 +1411,16 @@
           <small data-i18n="upstreams.pricingHint"></small>
         </div>
         <div class="form-group">
+          <label data-i18n="upstreams.webSearchStrategy"></label>
+          <select id="upstreamForm_webSearchStrategy">
+            <option value="" data-i18n="upstreams.webSearchStrategyDefault"></option>
+            <option value="native" data-i18n="upstreams.webSearchStrategyNative"></option>
+            <option value="local" data-i18n="upstreams.webSearchStrategyLocal"></option>
+            <option value="unsupported" data-i18n="upstreams.webSearchStrategyDisabled"></option>
+          </select>
+          <small id="upstreamForm_webSearchStrategyHint" data-i18n="upstreams.webSearchStrategyHintDefault"></small>
+        </div>
+        <div class="form-group">
           <label class="flex items-center gap-2">
             <span class="switch"><input type="checkbox" id="upstreamForm_enabled" checked /><span class="slider"></span></span>
             <span data-i18n="upstreams.formEnabled"></span>

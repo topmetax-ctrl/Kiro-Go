@@ -3745,7 +3745,33 @@
     $('upstreamForm_priceIn').value = entry && entry.priceInPerM ? String(entry.priceInPerM) : '';
     $('upstreamForm_priceOut').value = entry && entry.priceOutPerM ? String(entry.priceOutPerM) : '';
     $('upstreamForm_enabled').checked = entry ? !!entry.enabled : true;
+    // Unset stays unset: the empty option preserves the provider's existing
+    // passthrough behavior, and an unrecognized stored value is shown as unset
+    // rather than silently rewritten to something the operator did not choose.
+    const strategySelect = $('upstreamForm_webSearchStrategy');
+    if (strategySelect) {
+      const stored = entry && typeof entry.webSearchStrategy === 'string'
+        ? entry.webSearchStrategy.trim().toLowerCase() : '';
+      strategySelect.value = ['native', 'local', 'unsupported'].includes(stored) ? stored : '';
+      updateWebSearchStrategyHint();
+    }
     openDialog('upstreamModal');
+  }
+
+  // updateWebSearchStrategyHint swaps the help text to describe the selected
+  // strategy, because the difference between them (who executes the search, and
+  // which provider answers) is not obvious from the option label alone.
+  function updateWebSearchStrategyHint() {
+    const sel = $('upstreamForm_webSearchStrategy');
+    const hint = $('upstreamForm_webSearchStrategyHint');
+    if (!sel || !hint) return;
+    const key = {
+      native: 'upstreams.webSearchStrategyHintNative',
+      local: 'upstreams.webSearchStrategyHintLocal',
+      unsupported: 'upstreams.webSearchStrategyHintDisabled'
+    }[sel.value] || 'upstreams.webSearchStrategyHintDefault';
+    hint.setAttribute('data-i18n', key);
+    hint.textContent = t(key);
   }
 
   function closeUpstreamModal() {
@@ -3762,6 +3788,8 @@
     const priceInPerM = parseFloat($('upstreamForm_priceIn').value) || 0;
     const priceOutPerM = parseFloat($('upstreamForm_priceOut').value) || 0;
     const enabled = $('upstreamForm_enabled').checked;
+    const strategySelect = $('upstreamForm_webSearchStrategy');
+    const webSearchStrategy = strategySelect ? strategySelect.value : '';
     if (!baseUrl) { toast(t('upstreams.baseUrlRequired'), 'error'); return; }
     if (priceInPerM < 0 || priceOutPerM < 0) { toast(t('upstreams.priceInvalid'), 'error'); return; }
     const prev = JSON.parse(JSON.stringify(upstreamCache));
@@ -3771,9 +3799,12 @@
         if (p) {
           p.name = name; p.baseUrl = baseUrl; p.proxyURL = proxyURL; p.enabled = enabled;
           p.priceInPerM = priceInPerM; p.priceOutPerM = priceOutPerM;
+          p.webSearchStrategy = webSearchStrategy;
         }
       } else {
-        upstreamCache.providers.push({ id: '', name, baseUrl, apiKey, proxyURL, enabled, priceInPerM, priceOutPerM });
+        upstreamCache.providers.push({
+          id: '', name, baseUrl, apiKey, proxyURL, enabled, priceInPerM, priceOutPerM, webSearchStrategy
+        });
       }
       await persistUpstreams();
       toast(t('common.saved'), 'success');
@@ -5981,6 +6012,8 @@
     if (upCancel) upCancel.addEventListener('click', closeUpstreamModal);
     const upClose = $('upstreamModalClose');
     if (upClose) upClose.addEventListener('click', closeUpstreamModal);
+    const upStrategy = $('upstreamForm_webSearchStrategy');
+    if (upStrategy) upStrategy.addEventListener('change', updateWebSearchStrategyHint);
     const rtSave = $('modelRouteModalSaveBtn');
     if (rtSave) rtSave.addEventListener('click', submitRouteModal);
     const rtCancel = $('modelRouteModalCancelBtn');

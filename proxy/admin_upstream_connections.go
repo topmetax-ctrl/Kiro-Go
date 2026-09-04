@@ -80,6 +80,11 @@ func publicProvider(p config.UpstreamProvider) map[string]interface{} {
 		"priceOutPerM":       p.PriceOutPerM,
 		"connections":        pub,
 		"connectionStrategy": p.ConnectionStrategy,
+		// Must be present even when empty. The admin UI round-trips the whole
+		// provider list on every save, so a field GET omits is a field the next
+		// save silently clears — an operator editing an unrelated provider would
+		// wipe every configured strategy.
+		"webSearchStrategy": p.WebSearchStrategy,
 	}
 	return out
 }
