@@ -1311,5 +1311,8 @@
   "webSearch.appendSources": "在回答中附加来源",
   "webSearch.appendSourcesHint": "在模型的最终回答后附加去重的 \"Sources: [1] ...\" 列表。",
   "webSearch.save": "保存网页搜索设置",
-  "webSearch.saved": "网页搜索设置已保存"
+  "webSearch.saved": "网页搜索设置已保存",
+  "stats.webSearchUses": "Web Search Uses",
+  "stats.backendExecs": "Executions",
+  "stats.cacheHits": "Cached"
 }

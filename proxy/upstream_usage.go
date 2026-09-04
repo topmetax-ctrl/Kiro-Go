@@ -27,6 +27,8 @@ import (
 type usageCounts struct {
 	Input  int64
 	Output int64
+	// Server-side tool uses parsed from usage.server_tool_use (Anthropic only).
+	ServerTool upstreamToolUsage
 }
 
 func (u usageCounts) known() bool { return u.Input > 0 || u.Output > 0 }
@@ -46,6 +48,10 @@ type usageEnvelope struct {
 	// OpenAI chat/completions
 	PromptTokens     int64 `json:"prompt_tokens"`
 	CompletionTokens int64 `json:"completion_tokens"`
+	// Server-side tool usage (Anthropic usage.server_tool_use)
+	ServerToolUse struct {
+		WebSearchRequests int64 `json:"web_search_requests"`
+	} `json:"server_tool_use"`
 }
 
 func (e usageEnvelope) counts() usageCounts {
@@ -57,12 +63,35 @@ func (e usageEnvelope) counts() usageCounts {
 	if out == 0 {
 		out = e.CompletionTokens
 	}
-	return usageCounts{Input: in, Output: out}
+	return usageCounts{Input: in, Output: out, ServerTool: extractServerToolUse(e)}
 }
 
 // usageFromJSONBody extracts token counts from a buffered non-stream response
 // body. It looks for a top-level "usage" object, which is where both dialects
 // put it. Returns a zero value when the body is not JSON or carries no usage.
+
+
+// upstreamToolUsage is the server-side tool usage extracted from an upstream
+// response. Only the logical use count is observable; the upstream controls
+// execution and reports no backend/cache details.
+type upstreamToolUsage struct {
+	WebSearchRequests int64
+}
+
+func (u *upstreamToolUsage) merge(other upstreamToolUsage) {
+	if other.WebSearchRequests > 0 {
+		u.WebSearchRequests = other.WebSearchRequests
+	}
+}
+
+// extractServerToolUse extracts server-side tool usage from a full upstream
+// usage envelope. Returns zero when absent.
+func extractServerToolUse(env usageEnvelope) upstreamToolUsage {
+	return upstreamToolUsage{
+		WebSearchRequests: env.ServerToolUse.WebSearchRequests,
+	}
+}
+
 func usageFromJSONBody(body []byte) usageCounts {
 	if len(body) == 0 {
 		return usageCounts{}
@@ -193,6 +222,9 @@ func (s *usageScanner) scanLine(line []byte) {
 		}
 		if c.Output > 0 {
 			s.counts.Output = c.Output
+		}
+		if c.ServerTool.WebSearchRequests > 0 {
+			s.counts.ServerTool.WebSearchRequests = c.ServerTool.WebSearchRequests
 		}
 	}
 }

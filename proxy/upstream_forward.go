@@ -546,6 +546,11 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 		internalErr = relayErr.Error()
 	}
 	recordMetric(resp.StatusCode, ok && relayErr == nil, internalErr)
+	// Emit tool observability for the forwarding path: upstream reports
+	// usage.server_tool_use which we parse into usageCounts.ServerTool.
+	if ok && relayErr == nil && usage.ServerTool.WebSearchRequests > 0 {
+		recordToolUsageForward(requestIDFromContext(r.Context()), &usage.ServerTool, up.ID)
+	}
 	return forwardOutcome{committed: true, status: resp.StatusCode}
 }
 

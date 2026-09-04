@@ -30,6 +30,13 @@ type KiroRunResult struct {
 	TotalCredits      float64
 	FinalContextPct   float64
 	SearchCalls       int
+	// BackendExecutions is the count of actual provider/backend executions. Differs
+	// from SearchCalls when duplicate queries were deduplicated or served from the
+	// per-request cache.
+	BackendExecutions int
+	// CacheHits counts searches satisfied from per-request dedup or orchestrator cache
+	// (including request-level reuse). Useful to attribute "why executions < uses".
+	CacheHits         int
 	SearchRounds      int
 	Sources           []SearchSource
 	// TavilyCredits is the total Tavily credit spend for this request, tracked
@@ -140,6 +147,11 @@ func (r *kiroConversationRunner) Run(ctx context.Context, account *config.Accoun
 			return r.finalize(ctx, account, working, result, agg, "max_searches")
 		}
 
+		// Snapshot distinct queries before executeAll populates the per-request
+		// cache: countDistinctQueries counts unique queries with NO cache entry yet,
+		// i.e. ones that will actually hit the backend. After executeAll runs, those
+		// keys are in cache, so the remainder of `internal` were dedup/cache hits.
+		distinctBefore := countDistinctQueries(internal, cache)
 		toolResults, sources, credits, invocations, execErr := r.executeAll(ctx, internal, policy, cache, sourcesByQuery)
 		if execErr != nil {
 			// A hard search error (auth/config/context). Do NOT fail the Kiro
@@ -147,6 +159,8 @@ func (r *kiroConversationRunner) Run(ctx context.Context, account *config.Accoun
 			return agg, execErr
 		}
 		agg.SearchCalls += len(internal)
+		agg.BackendExecutions += distinctBefore
+		agg.CacheHits += len(internal) - distinctBefore
 		agg.SearchRounds++
 		agg.Sources = append(agg.Sources, sources...)
 		agg.TavilyCredits += credits
@@ -352,6 +366,31 @@ func cacheKey(call KiroToolUse) string {
 
 // partitionToolUses splits a round's tool uses into those the executor handles
 // (internal, e.g. web_search) and those destined for the client (external).
+func countDistinctQueries(calls []KiroToolUse, cache map[string]KiroToolResult) int {
+	seen := make(map[string]bool, len(calls))
+	n := 0
+	for _, c := range calls {
+		k := cacheKey(c)
+		if k == "" {
+			n++
+			continue
+		}
+		if _, ok := cache[k]; ok {
+			continue
+		}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		n++
+	}
+	return n
+}
+
+func backendExecutionsForCalls(calls []KiroToolUse, cache map[string]KiroToolResult) int {
+	return countDistinctQueries(calls, cache)
+}
+
 func partitionToolUses(toolUses []KiroToolUse, executor ServerToolExecutor) (internal, external []KiroToolUse) {
 	for _, tu := range toolUses {
 		if executor.CanHandle(tu) {

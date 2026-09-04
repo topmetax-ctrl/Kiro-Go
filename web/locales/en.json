@@ -1311,5 +1311,8 @@
   "webSearch.appendSources": "Append sources to answer",
   "webSearch.appendSourcesHint": "Appends a deduplicated \"Sources: [1] ...\" list to the model's final answer.",
   "webSearch.save": "Save Web Search Settings",
-  "webSearch.saved": "Web search settings saved"
+  "webSearch.saved": "Web search settings saved",
+  "stats.webSearchUses": "Web Search Uses",
+  "stats.backendExecs": "Executions",
+  "stats.cacheHits": "Cached"
 }

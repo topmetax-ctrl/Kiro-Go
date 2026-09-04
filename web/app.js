@@ -1043,6 +1043,20 @@
     $('statFailed').textContent = d.failedRequests || 0;
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
     $('statCredits').textContent = (d.totalCredits || 0).toFixed(1);
+    // Web Search tool stats — fire-and-forget, best-effort (card hidden if API absent)
+    loadToolStats().catch(() => {});
+  }
+
+  async function loadToolStats() {
+    try {
+      const res = await api('/tool-stats?kind=web_search');
+      const d = await res.json();
+      const s = d.stats;
+      if (!s) return;
+      $('statWebSearchUses').textContent = s.uses || 0;
+      $('statWebSearchExecs').textContent = s.executions || 0;
+      $('statWebSearchCache').textContent = s.cacheHits || 0;
+    } catch (e) { /* admin API absent or error — card stays zero */ }
   }
 
   // ===== Logs =====

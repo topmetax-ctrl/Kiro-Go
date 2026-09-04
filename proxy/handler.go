@@ -1557,12 +1557,16 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		// usedRunner marks the web_search path so token aggregation below does not
 		// let the final round's context-occupancy override the summed input total.
 		usedRunner := false
+		var runnerRes *KiroRunResult // set when the conversation runner served this attempt
 		var runSources []SearchSource
 		var runSearches []WebSearchInvocation
 
 		if useRunner {
 			usedRunner = true
 			run, err := h.conversationRunner.Run(ctx, account, payload, policy)
+			if err == nil {
+				runnerRes = &run
+			}
 			if err != nil {
 				if classifyRunError(err) {
 					// Kiro/account error: identical to the CallKiroAPIContext failure
@@ -1745,6 +1749,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		// Kiro reports no token counts, so inputTokens/outputTokens are 0 on this
 		// path and the dashboard would show every pool request as 0 in / 0 out.
 		h.recordSuccessLogSplit(ctx, "claude", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
+		if usedRunner {
+			recordToolUsageFromRunner(ctx, runnerRes, "")
+		}
 
 		// Capture (write): store this turn's Q&A into memory (async, fail-open,
 		// redaction enforced in the provider). No-op unless capture is enabled
@@ -2039,6 +2046,55 @@ func (h *Handler) recordFailureWithDetails(ctx context.Context, endpoint, model,
 // which would otherwise render every Kiro response as "out 0".
 //
 // ctx carries the pool-route attribution, as in recordFailureWithDetails.
+// recordToolUsageFromRunner emits tool observability for a Kiro-managed
+// (orchestrator-backed) web_search run. Uses = logical tool uses the model
+// issued; Executions = actual backend executions; CacheHits = dedup/cache
+// saves. This is a separate signal from metrics.Event (which stays one
+// request outcome) — see metrics/tool.go.
+func recordToolUsageFromRunner(ctx context.Context, run *KiroRunResult, requestID string) {
+	if run == nil || run.SearchCalls <= 0 {
+		return
+	}
+	if requestID == "" {
+		requestID = requestIDFromContext(ctx)
+	}
+	execs := run.BackendExecutions
+	if execs <= 0 {
+		execs = run.SearchCalls // unknown granularity; do not fabricate cache
+	}
+	u := metrics.ToolUsage{
+		TimeMs:      time.Now().UnixMilli(),
+		RequestID:   requestID,
+		ToolKind:    metrics.ToolKindWebSearch,
+		Origin:      metrics.ToolOriginKiroOrchestrator,
+		ProviderID:  metrics.KiroPoolID,
+		Uses:        int64(run.SearchCalls),
+		Executions:  int64(execs),
+		CacheHits:   int64(run.CacheHits),
+		Credits:     int64(run.TavilyCredits),
+	}
+	metrics.RecordToolUsage(u)
+}
+
+// recordToolUsageForward emits tool observability for the forwarding path.
+// The upstream owns execution: only Uses are known (from usage.server_tool_use
+// reported by the provider). Executions/CacheHits stay 0 — partial
+// observability must remain unknown, not fabricated (see metrics/tool.go).
+func recordToolUsageForward(requestID string, upstreamExec *upstreamToolUsage, providerID string) {
+	if upstreamExec == nil || upstreamExec.WebSearchRequests <= 0 {
+		return
+	}
+	u := metrics.ToolUsage{
+		TimeMs:      time.Now().UnixMilli(),
+		RequestID:   requestID,
+		ToolKind:    metrics.ToolKindWebSearch,
+		Origin:      metrics.ToolOriginUpstreamNative,
+		ProviderID:  providerID,
+		Uses:        upstreamExec.WebSearchRequests,
+	}
+	metrics.RecordToolUsage(u)
+}
+
 func (h *Handler) recordSuccessLogSplit(ctx context.Context, endpoint, model, accountID string, inputTokens, outputTokens int, credits float64, durationMs int64) {
 	entry := RequestLog{
 		Time:      time.Now().Unix(),
@@ -2162,6 +2218,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		var sources []SearchSource
 		var searches []WebSearchInvocation
 		var upstreamStopReason string
+		var runnerRes *KiroRunResult // set when the conversation runner served this attempt
 
 		if useRunner {
 			// Server-side web_search path: the runner drives as many Kiro rounds as
@@ -2184,6 +2241,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 				h.sendClaudeErrorForWebSearch(w, err)
 				return attemptHandled()
 			}
+			runnerRes = &run
 			fr := run.FinalRound
 			content = fr.VisibleContent
 			thinkingContent = fr.ThinkingContent
@@ -2300,6 +2358,9 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		// Kiro reports no token counts, so inputTokens/outputTokens are 0 on this
 		// path and the dashboard would show every pool request as 0 in / 0 out.
 		h.recordSuccessLogSplit(ctx, "claude", model, account.ID, accountedInput, accountedOutput, credits, time.Since(reqStart).Milliseconds())
+		if runnerRes != nil {
+			recordToolUsageFromRunner(ctx, runnerRes, "")
+		}
 
 		// Capture (write) this turn into memory when auto-capture is on. Async +
 		// fail-open + provider-enforced redaction; never blocks or breaks the response.
@@ -3336,6 +3397,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetWebSearchConfig(w, r)
 	case path == "/websearch" && r.Method == "POST":
 		h.apiUpdateWebSearchConfig(w, r)
+	case path == "/tool-stats" && r.Method == "GET":
+		h.apiGetToolStats(w, r)
 	case path == "/memory/search" && r.Method == "GET":
 		h.apiMemorySearch(w, r)
 	case path == "/memory" && r.Method == "POST":

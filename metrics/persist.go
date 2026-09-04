@@ -16,6 +16,7 @@ type persistedState struct {
 	ByProvider map[string]persistedProvider `json:"byProvider"`
 	ByRoute    map[string]persistedRoute    `json:"byRoute"`
 	ByIP       map[string]persistedCounter  `json:"byIp,omitempty"`
+	ToolStats  map[string]persistedToolAgg  `json:"toolStats,omitempty"`
 }
 
 type persistedCounter struct {
@@ -69,6 +70,36 @@ type persistedRoute struct {
 	ClientModel string `json:"clientModel"`
 	TargetModel string `json:"targetModel"`
 	ProviderID  string `json:"providerId"`
+}
+
+
+type persistedToolAgg struct {
+	persistedToolCounter
+	ByOrigin map[string]int64            `json:"byOrigin,omitempty"`
+	ByBackend map[string]int64            `json:"byBackend,omitempty"`
+	Hours    []persistedToolBucket       `json:"hours,omitempty"`
+}
+
+type persistedToolCounter struct {
+	Uses        int64 `json:"uses"`
+	Executions  int64 `json:"executions"`
+	CacheHits   int64 `json:"cacheHits,omitempty"`
+	Failures    int64 `json:"failures,omitempty"`
+	Requests    int64 `json:"requests,omitempty"`
+	TotalLatencyMs int64 `json:"totalLatencyMs,omitempty"`
+	Credits     int64 `json:"credits,omitempty"`
+	LastUsed    int64 `json:"lastUsed"`
+}
+
+type persistedToolBucket struct {
+	Hour         int64 `json:"h"`
+	Uses         int64 `json:"u"`
+	Executions   int64 `json:"e"`
+	CacheHits    int64 `json:"ch,omitempty"`
+	Failures     int64 `json:"f,omitempty"`
+	Requests     int64 `json:"r,omitempty"`
+	Credits      int64 `json:"c,omitempty"`
+	SumLatencyMs int64 `json:"l,omitempty"`
 }
 
 func toPersistedCounter(c counter) persistedCounter {
@@ -150,6 +181,47 @@ func Save(path string) error {
 	for ip, c := range s.byIP {
 		st.ByIP[ip] = toPersistedCounter(*c)
 	}
+	// Tool stats (bounded, additive)
+	ts.mu.Lock()
+	if len(ts.overall) > 0 {
+		st.ToolStats = make(map[string]persistedToolAgg, len(ts.overall))
+		for kind, a := range ts.overall {
+			ta := persistedToolAgg{
+				persistedToolCounter: persistedToolCounter{
+					Uses:           a.uses,
+					Executions:     a.executions,
+					CacheHits:      a.cacheHits,
+					Failures:       a.failures,
+					Requests:       a.requests,
+					TotalLatencyMs: a.totalLatencyMs,
+					Credits:        a.credits,
+					LastUsed:       a.lastUsed,
+				},
+			}
+			if len(a.byOrigin) > 0 {
+				ta.ByOrigin = make(map[string]int64, len(a.byOrigin))
+				for k, v := range a.byOrigin {
+					ta.ByOrigin[string(k)] = v.uses
+				}
+			}
+			if len(a.byBackend) > 0 {
+				ta.ByBackend = make(map[string]int64, len(a.byBackend))
+				for k, v := range a.byBackend {
+					ta.ByBackend[k] = v.executions
+				}
+			}
+			for h, b := range a.hours {
+				if h < cutoffHour {
+					continue
+				}
+				ta.Hours = append(ta.Hours, persistedToolBucket{
+					Hour: h, Uses: b.Uses, Executions: b.Executions, CacheHits: b.CacheHits, Failures: b.Failures, Requests: b.Requests, Credits: b.Credits, SumLatencyMs: b.SumLatencyMs,
+				})
+			}
+			st.ToolStats[string(kind)] = ta
+		}
+	}
+	ts.mu.Unlock()
 	for id, p := range s.byProvider {
 		pp := persistedProvider{
 			persistedCounter: toPersistedCounter(p.counter),
@@ -304,5 +376,35 @@ func Load(path string) error {
 		cc := fromPersistedCounter(c)
 		s.byIP[ip] = &cc
 	}
+	// Restore tool stats (additive: old files lack toolStats, loads as zero)
+	ts.mu.Lock()
+	ts.overall = make(map[ToolKind]*toolAgg, len(st.ToolStats))
+	for k, ta := range st.ToolStats {
+		agg := newToolAgg()
+		agg.uses = ta.Uses
+		agg.executions = ta.Executions
+		agg.cacheHits = ta.CacheHits
+		agg.failures = ta.Failures
+		agg.requests = ta.Requests
+		agg.totalLatencyMs = ta.TotalLatencyMs
+		agg.credits = ta.Credits
+		agg.lastUsed = ta.LastUsed
+		for o, v := range ta.ByOrigin {
+			oc := &toolCounter{uses: v}
+			agg.byOrigin[ToolOrigin(o)] = oc
+		}
+		for b, v := range ta.ByBackend {
+			bc := &toolCounter{executions: v}
+			agg.byBackend[b] = bc
+		}
+		for _, bh := range ta.Hours {
+			if bh.Hour < cutoffHour {
+				continue
+			}
+			agg.hours[bh.Hour] = &toolBucket{Hour: bh.Hour, Uses: bh.Uses, Executions: bh.Executions, CacheHits: bh.CacheHits, Failures: bh.Failures, Requests: bh.Requests, Credits: bh.Credits, SumLatencyMs: bh.SumLatencyMs}
+		}
+		ts.overall[ToolKind(k)] = agg
+	}
+	ts.mu.Unlock()
 	return nil
 }

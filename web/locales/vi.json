@@ -1311,5 +1311,8 @@
   "webSearch.appendSources": "Thêm nguồn vào câu trả lời",
   "webSearch.appendSourcesHint": "Thêm danh sách nguồn \"Sources: [1] ...\" vào câu trả lời cuối của mô hình.",
   "webSearch.save": "Lưu cài đặt tìm kiếm",
-  "webSearch.saved": "Đã lưu cài đặt tìm kiếm"
+  "webSearch.saved": "Đã lưu cài đặt tìm kiếm",
+  "stats.webSearchUses": "Web Search Uses",
+  "stats.backendExecs": "Executions",
+  "stats.cacheHits": "Cached"
 }

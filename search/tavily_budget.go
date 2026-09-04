@@ -11,11 +11,30 @@ import (
 	"kiro-go/logger"
 )
 
-// tavilyBudget tracks Tavily credit spend against a monthly free-tier limit and
-// persists it across restarts. The free tier (1000 credits/month) has no
-// per-response "remaining balance" field, so we sum usage.credits client-side
-// and refuse further Tavily calls once the month's budget is spent — the core of
-// the "no accidental paid usage" guarantee.
+
+// BudgetStore is the pluggable seam for paid-provider monthly budget accounting.
+// The current implementation (tavilyBudget) is a per-process file store: single-
+// instance safe. For multi-replica deployments the budget MUST live in a store
+// with atomic credit reservation (Allow + Reserve in one step), e.g. Redis or
+// a DB row with a conditional update — otherwise each replica enforces its own
+// limit against the same market and the real spend exceeds the cap.
+//
+// TODO(scale): introduce a RedisBudgetStore / DBBudgetStore implementing this
+// interface; swap it in via the factory the same way SearchCache swaps LRU -> Redis.
+type BudgetStore interface {
+	// Allow reports whether one more unit of budget may be spent.
+	Allow() bool
+	// Remaining returns credits left this period (-1 = unlimited).
+	Remaining() int
+	// Record adds spent credits and persists the new state.
+	Record(credits int)
+}
+
+// tavilyBudget is the FileBudgetStore: it tracks Tavily credit spend against a
+// monthly free-tier limit and persists it across restarts. The free tier (1000
+// credits/month) has no per-response "remaining balance" field, so we sum
+// usage.credits client-side and refuse further Tavily calls once the month's
+// budget is spent — the core of the "no accidental paid usage" guarantee.
 //
 // The counter resets when the calendar month (UTC) rolls over. State is a small
 // JSON file written atomically (tmp+rename, 0600) alongside the config.
