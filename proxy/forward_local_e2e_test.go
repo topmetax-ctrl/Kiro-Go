@@ -81,6 +81,27 @@ func assertKiroPoolUntouched(t *testing.T, context string) {
 	}
 }
 
+// decodedSSE is one SSE frame with its data JSON already unmarshaled, so a test
+// can assert on the event grammar rather than on substrings.
+type decodedSSE struct {
+	name string
+	data map[string]interface{}
+}
+
+// decodeSSEEvents wraps the package's parseSSEEvents, decoding each frame's data.
+func decodeSSEEvents(t *testing.T, raw string) []decodedSSE {
+	t.Helper()
+	var out []decodedSSE
+	for _, ev := range parseSSEEvents(t, raw) {
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(ev.data), &m); err != nil {
+			t.Fatalf("event %q has undecodable data %q: %v", ev.event, ev.data, err)
+		}
+		out = append(out, decodedSSE{name: ev.event, data: m})
+	}
+	return out
+}
+
 // fakeUpstreamRound is one scripted reply from the fake provider.
 type fakeUpstreamRound struct {
 	status int
@@ -526,14 +547,32 @@ func TestForwardLocalDedupRunsOneBackendCall(t *testing.T) {
 	}
 }
 
-// TestForwardLocalRejectsStreaming pins the documented limitation rather than
-// letting a streaming request silently take a different path.
-func TestForwardLocalRejectsStreaming(t *testing.T) {
-	searxng := newFakeSearxng(t, nil)
-	upstream := newFakeUpstream(t, fakeUpstreamRound{body: `{"content":[]}`})
+// TestForwardLocalStreamsToStreamingClients is the regression for the constraint
+// that mattered most in practice: Claude Code ALWAYS sends stream=true, so a
+// local-strategy route that rejected streaming rejected every real request.
+//
+// The loop stays buffered upstream — that is required to inspect tool uses — but
+// the completed result is replayed to the client as a well-formed SSE sequence.
+// The test asserts the event grammar a client actually depends on: message_start
+// first, every content block opened and closed on its own index, the native
+// server-tool pair present, the search counter on message_delta, message_stop
+// last.
+func TestForwardLocalStreamsToStreamingClients(t *testing.T) {
+	searxng := newFakeSearxng(t, []map[string]interface{}{
+		{"url": "https://example.org/streamed", "title": "Streamed", "content": "streamed fact", "score": 1},
+	})
+	upstream := newFakeUpstream(t,
+		fakeUpstreamRound{body: `{"id":"m1","type":"message","role":"assistant",
+			"content":[{"type":"tool_use","id":"toolu_stream","name":"web_search","input":{"query":"stream q"}}],
+			"stop_reason":"tool_use","usage":{"input_tokens":30,"output_tokens":10}}`},
+		fakeUpstreamRound{body: `{"id":"m2","type":"message","role":"assistant",
+			"content":[{"type":"text","text":"The streamed fact is here."}],
+			"stop_reason":"end_turn","usage":{"input_tokens":40,"output_tokens":12}}`},
+	)
 	setupLocalStrategyRoute(t, "claude-stream-local", upstream.server.URL, searxng.server.URL, "upstream-model")
+	metrics.Reset()
 
-	body := `{"model":"claude-stream-local","stream":true,"max_tokens":16,` +
+	body := `{"model":"claude-stream-local","stream":true,"max_tokens":256,` +
 		`"messages":[{"role":"user","content":"hi"}],` +
 		`"tools":[{"name":"web_search","type":"web_search_20250305"}]}`
 	rec := httptest.NewRecorder()
@@ -541,10 +580,220 @@ func TestForwardLocalRejectsStreaming(t *testing.T) {
 	r = r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, ""))
 	(&Handler{}).handleClaudeMessagesInternal(rec, r)
 
-	if rec.Code != 400 {
-		t.Fatalf("status = %d, want 400 for streaming under the local strategy; body = %s", rec.Code, rec.Body.String())
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200: a streaming client must be served, not rejected; body = %s",
+			rec.Code, rec.Body.String())
 	}
-	if len(upstream.requests()) != 0 {
-		t.Errorf("upstream was called %d times; a rejected request must not reach the provider", len(upstream.requests()))
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+	if len(upstream.requests()) != 2 {
+		t.Fatalf("upstream rounds = %d, want 2 (the loop still runs for a streaming client)", len(upstream.requests()))
+	}
+	if got := searxng.seen(); len(got) != 1 {
+		t.Fatalf("searxng queries = %v, want 1", got)
+	}
+
+	events := decodeSSEEvents(t, rec.Body.String())
+	if len(events) == 0 {
+		t.Fatal("no SSE events emitted")
+	}
+	if events[0].name != "message_start" {
+		t.Errorf("first event = %q, want message_start", events[0].name)
+	}
+	if last := events[len(events)-1].name; last != "message_stop" {
+		t.Errorf("last event = %q, want message_stop", last)
+	}
+
+	// Every opened block must be closed, exactly once, on its own index.
+	opened := map[float64]string{}
+	closed := map[float64]int{}
+	var sawServerTool, sawResult, sawText bool
+	var serverToolID string
+	for _, ev := range events {
+		switch ev.name {
+		case "content_block_start":
+			idx, _ := ev.data["index"].(float64)
+			if prev, dup := opened[idx]; dup {
+				t.Errorf("index %v opened twice (first as %s)", idx, prev)
+			}
+			cb, _ := ev.data["content_block"].(map[string]interface{})
+			typ, _ := cb["type"].(string)
+			opened[idx] = typ
+			switch typ {
+			case "server_tool_use":
+				sawServerTool = true
+				serverToolID, _ = cb["id"].(string)
+				// The query must be complete in the start frame: this path emits no
+				// input_json_delta, matching the pure path's synthesized stream.
+				input, _ := cb["input"].(map[string]interface{})
+				if q, _ := input["query"].(string); q != "stream q" {
+					t.Errorf("server_tool_use input.query = %q, want %q", q, "stream q")
+				}
+			case "web_search_tool_result":
+				sawResult = true
+				if got, _ := cb["tool_use_id"].(string); got != serverToolID {
+					t.Errorf("web_search_tool_result.tool_use_id = %q, want %q", got, serverToolID)
+				}
+				items, _ := cb["content"].([]interface{})
+				if len(items) == 0 {
+					t.Error("streamed web_search_tool_result carries no results")
+				}
+				for _, it := range items {
+					m, _ := it.(map[string]interface{})
+					if m["type"] != "web_search_result" {
+						t.Errorf("streamed result item type = %v, want web_search_result", m["type"])
+					}
+				}
+			case "text":
+				sawText = true
+			}
+		case "content_block_stop":
+			idx, _ := ev.data["index"].(float64)
+			closed[idx]++
+		}
+	}
+	if !sawServerTool || !sawResult || !sawText {
+		t.Errorf("streamed blocks incomplete: serverTool=%v result=%v text=%v", sawServerTool, sawResult, sawText)
+	}
+	for idx := range opened {
+		if closed[idx] != 1 {
+			t.Errorf("index %v closed %d times, want exactly 1", idx, closed[idx])
+		}
+	}
+	for idx := range closed {
+		if _, ok := opened[idx]; !ok {
+			t.Errorf("index %v was closed without being opened", idx)
+		}
+	}
+
+	// The text must arrive as deltas and carry the answer.
+	var streamed string
+	for _, ev := range events {
+		if ev.name != "content_block_delta" {
+			continue
+		}
+		delta, _ := ev.data["delta"].(map[string]interface{})
+		if delta["type"] == "text_delta" {
+			t, _ := delta["text"].(string)
+			streamed += t
+		}
+	}
+	if !strings.Contains(streamed, "streamed fact") {
+		t.Errorf("streamed text does not contain the answer: %q", streamed)
+	}
+
+	// message_delta carries the stop reason and the search counter.
+	var sawDelta bool
+	for _, ev := range events {
+		if ev.name != "message_delta" {
+			continue
+		}
+		sawDelta = true
+		delta, _ := ev.data["delta"].(map[string]interface{})
+		if delta["stop_reason"] != "end_turn" {
+			t.Errorf("message_delta stop_reason = %v, want end_turn", delta["stop_reason"])
+		}
+		usage, _ := ev.data["usage"].(map[string]interface{})
+		stu, _ := usage["server_tool_use"].(map[string]interface{})
+		if stu == nil || stu["web_search_requests"] != float64(1) {
+			t.Errorf("message_delta usage.server_tool_use = %v, want web_search_requests=1", stu)
+		}
+	}
+	if !sawDelta {
+		t.Error("no message_delta event: the client would never learn the stop reason or search count")
+	}
+
+	// The metric must record how the CLIENT was served. Reading the flag off an
+	// upstream round would report every local-loop request as non-streamed, since
+	// the rounds are always buffered.
+	evs, _ := metrics.Events(metrics.EventFilter{Limit: 10})
+	if len(evs) != 1 {
+		t.Fatalf("metrics events = %d, want 1", len(evs))
+	}
+	if !evs[0].Stream {
+		t.Error("Event.Stream = false for a streaming client; the streamed counter would undercount")
+	}
+	if evs[0].ModelRounds != 2 {
+		t.Errorf("Event.ModelRounds = %d, want 2", evs[0].ModelRounds)
+	}
+}
+
+// TestForwardLocalForcesNonStreamOnEveryRound pins the buffered contract at the
+// wire. ClaudeRequest.Stream is `omitempty`, so a serialized continuation drops
+// the field entirely — and an upstream that streams by default would then answer
+// round 2 with SSE, which the round parser cannot read. Every round must
+// therefore say stream:false explicitly.
+func TestForwardLocalForcesNonStreamOnEveryRound(t *testing.T) {
+	searxng := newFakeSearxng(t, []map[string]interface{}{
+		{"url": "https://example.org/s", "title": "S", "content": "fact", "score": 1},
+	})
+	upstream := newFakeUpstream(t,
+		fakeUpstreamRound{body: `{"id":"m1","type":"message","role":"assistant",
+			"content":[{"type":"tool_use","id":"toolu_ns","name":"web_search","input":{"query":"q"}}],
+			"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":2}}`},
+		fakeUpstreamRound{body: `{"id":"m2","type":"message","role":"assistant",
+			"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn",
+			"usage":{"input_tokens":6,"output_tokens":2}}`},
+	)
+	setupLocalStrategyRoute(t, "claude-nonstream", upstream.server.URL, searxng.server.URL, "upstream-model")
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(nativeWebSearchRequestBody("claude-nonstream", "q")))
+	r = r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, ""))
+	(&Handler{}).handleClaudeMessagesInternal(rec, r)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	reqs := upstream.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("upstream rounds = %d, want 2", len(reqs))
+	}
+	for i, raw := range reqs {
+		var m map[string]interface{}
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("round %d body not JSON: %v", i+1, err)
+		}
+		v, present := m["stream"]
+		if !present {
+			t.Errorf("round %d omits stream; an upstream defaulting to SSE would break the loop", i+1)
+			continue
+		}
+		if v != false {
+			t.Errorf("round %d stream = %v, want false", i+1, v)
+		}
+	}
+}
+
+// TestForwardLocalReportsUpstreamStreamingAsCapabilityMismatch covers the
+// provider that streams anyway. The failure must name the real cause — a
+// provider that cannot serve buffered rounds — instead of surfacing the JSON
+// parse error for the 'e' of "event:".
+func TestForwardLocalReportsUpstreamStreamingAsCapabilityMismatch(t *testing.T) {
+	searxng := newFakeSearxng(t, nil)
+	sse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"))
+	}))
+	defer sse.Close()
+	setupLocalStrategyRoute(t, "claude-sse-upstream", sse.URL, searxng.server.URL, "upstream-model")
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(nativeWebSearchRequestBody("claude-sse-upstream", "q")))
+	r = r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, ""))
+	(&Handler{}).handleClaudeMessagesInternal(rec, r)
+
+	if rec.Code != 502 {
+		t.Fatalf("status = %d, want 502; body = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "streamed a response to a non-stream request") {
+		t.Errorf("error does not name the capability mismatch: %s", body)
+	}
+	if strings.Contains(body, "invalid character") {
+		t.Errorf("error surfaces a raw JSON parse failure instead of the real cause: %s", body)
 	}
 }

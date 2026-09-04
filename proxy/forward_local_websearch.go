@@ -53,6 +53,10 @@ type forwardLocalConsumption struct {
 	outputTokens int64
 	costUSD      float64
 	latencyMs    int64
+	// stream is how the CLIENT asked to be served, which is what the metrics
+	// store's streamed counter means. The upstream rounds are always buffered, so
+	// reading the flag off a round would report every request as non-streamed.
+	stream bool
 }
 
 // addRound folds one completed upstream round into the totals.
@@ -72,16 +76,14 @@ func (c *forwardLocalConsumption) addRound(usage usageCounts, provider config.Up
 // __kiro_pool__ target in a later tier is only consulted by tryForwardUpstream
 // when the local loop explicitly declines.
 //
-// Non-stream only: buffering a full response per round is required to inspect
-// tool uses before committing a response to the client. Streaming with tool
-// interleaving would require a different contract and is rejected with 400
-// under the local strategy.
+// The loop is always buffered UPSTREAM: a full response per round has to be read
+// before its tool uses can be inspected, and nothing may be committed to the
+// client until the last round is known. That is an upstream constraint, not a
+// client-facing one, so a client asking for stream=true still gets SSE — the
+// completed result is replayed as a well-formed event sequence at the terminal
+// point (see renderForwardLocalFinalStream). Claude Code always streams, so
+// rejecting stream=true here would reject every real request.
 func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, origBody []byte, origReq ClaudeRequest, policy WebSearchPolicy, route *config.ModelRoute, targets []config.ResolvedTarget, captureUserText string) bool {
-	if origReq.Stream {
-		h.sendClaudeError(w, 400, "invalid_request_error", "web_search with local strategy does not support streaming; send stream=false or configure the provider as native")
-		return true
-	}
-
 	// Pin to the first non-pool target that declared local, then never reassign
 	// `pinned` for the lifetime of this loop. That is the mid-conversation
 	// invariant: once the provider has produced an intermediate tool call, the
@@ -133,7 +135,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 	sourcesByQuery := map[string][]SearchSource{}
 	// Provider consumption across every round of this ONE logical request. Filed
 	// as a single metrics.Event at whichever terminal point ends the loop.
-	var consumed forwardLocalConsumption
+	consumed := forwardLocalConsumption{stream: origReq.Stream}
 
 	// fail closes out the request on any non-success exit: one failure Event
 	// carrying the consumption incurred so far, plus the tool usage already
@@ -317,6 +319,14 @@ func (h *Handler) forwardRoundBuffered(ctx context.Context, provider config.Upst
 	client := GetForwardClientForProxy(proxyURL)
 	url := strings.TrimRight(provider.BaseURL, "/") + "/messages"
 
+	// Force stream:false on every round. This function's whole contract is a
+	// buffered JSON round-trip, and it must not depend on the upstream's default:
+	// ClaudeRequest.Stream is `omitempty`, so a serialized continuation drops the
+	// field entirely, and an upstream that streams by default then answers with SSE
+	// that parseClaudeContentForForwardLocal cannot read. Setting it here rather
+	// than at each call site means no round can forget.
+	body = forceNonStreamBody(body)
+
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, usageCounts{}, newProviderForwardError(500, "failed to build upstream request: "+err.Error())
@@ -347,6 +357,14 @@ func (h *Handler) forwardRoundBuffered(ctx context.Context, provider config.Upst
 		return nil, usageCounts{}, classifyForwardError(resp.StatusCode, b, resp.Header, provider, conn, clientModel, route)
 	}
 
+	// An upstream that streamed anyway (ignoring stream:false) is a capability
+	// mismatch, not malformed JSON. Say so, because "invalid character 'e'" — the
+	// 'e' of "event:" — tells the operator nothing about the real cause.
+	if isSSEResponse(resp.Header, b) {
+		return nil, usageCounts{}, newProviderForwardError(502,
+			"upstream streamed a response to a non-stream request; the local web_search strategy needs buffered rounds — configure this provider as native or unspecified")
+	}
+
 	usage := usageFromJSONBody(b)
 	res, err := parseClaudeContentForForwardLocal(b)
 	if err != nil {
@@ -355,6 +373,36 @@ func (h *Handler) forwardRoundBuffered(ctx context.Context, provider config.Upst
 	res.inputTokens = int(usage.Input)
 	res.outputTokens = int(usage.Output)
 	return res, usage, nil
+}
+
+// isSSEResponse reports whether a buffered read got an event stream instead of
+// JSON, by content type or by the leading SSE field name.
+func isSSEResponse(header http.Header, body []byte) bool {
+	if strings.Contains(strings.ToLower(header.Get("Content-Type")), "text/event-stream") {
+		return true
+	}
+	trimmed := bytes.TrimLeft(body, " \t\r\n")
+	return bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte("data:"))
+}
+
+// forceNonStreamBody sets "stream": false on a request body, so a buffered round
+// cannot receive SSE. Returns the body unchanged if it is not JSON — the caller
+// would fail on it anyway, and a parse error is reported with better context
+// downstream.
+func forceNonStreamBody(body []byte) []byte {
+	var m map[string]interface{}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	if v, ok := m["stream"].(bool); ok && !v {
+		return body // already explicit
+	}
+	m["stream"] = false
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // rewriteModelField replaces body.model with targetModel when set.
@@ -589,12 +637,16 @@ func syntheticWebSearchTools(tools []ClaudeTool) []ClaudeTool {
 	return out
 }
 
-// renderForwardLocalFinal writes the final non-stream JSON response, synthesizing
-// native server_tool_use blocks when searches ran so the client renders
-// "Did N searches" with citations.
+// renderForwardLocalFinal is the single completion point for a successful local
+// loop. It performs the logical-request accounting once and then hands the
+// rendering to whichever wire format the CLIENT asked for: a buffered JSON body,
+// or the equivalent SSE event sequence when the client sent stream=true.
+//
+// Streaming is a client-side concern only. The loop upstream is always buffered
+// (tool uses must be inspected before anything is committed), so what streams
+// here is a completed result replayed as well-formed events — not a live relay.
+// Claude Code always streams, so this is the path real traffic takes.
 func (h *Handler) renderForwardLocalFinal(ctx context.Context, w http.ResponseWriter, origReq ClaudeRequest, agg KiroRunResult, finalText string, policy WebSearchPolicy, requestID, apiKeyID, providerID string) bool {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-
 	// Logical-request accounting happens exactly ONCE here, at the single point
 	// where the whole loop has succeeded — not per provider round. The token
 	// figures are the AGGREGATE across every round (provider consumption), while
@@ -618,29 +670,10 @@ func (h *Handler) renderForwardLocalFinal(ctx context.Context, w http.ResponseWr
 		finalText = finalText + formatSourcesList(agg.Sources)
 	}
 
-	content := buildForwardLocalContentBlocks(agg, finalText)
-
-	// Build usage with server_tool_use counter when searches happened.
-	usage := map[string]interface{}{
-		"input_tokens":  agg.TotalInputTokens,
-		"output_tokens": agg.TotalOutputTokens,
-	}
-	if len(agg.Searches) > 0 {
-		usage["server_tool_use"] = map[string]interface{}{"web_search_requests": len(agg.Searches)}
-	}
-
-	resp := map[string]interface{}{
-		"id":          "msg_" + randomMessageID(),
-		"type":        "message",
-		"role":        "assistant",
-		"content":     content,
-		"model":       origReq.Model,
-		"stop_reason": "end_turn",
-		"usage":       usage,
-	}
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		logger.Warnf("[ForwardLocal] final encode failed: %v", err)
-		return true
+	if origReq.Stream {
+		h.renderForwardLocalFinalStream(w, origReq, agg, finalText)
+	} else {
+		h.renderForwardLocalFinalJSON(w, origReq, agg, finalText)
 	}
 	// Tool observability, once per logical request, with real backend attribution
 	// (see recordWebSearchToolUsage). The failure path calls the same helper, and
@@ -681,6 +714,7 @@ func (h *Handler) finishForwardLocalFailure(ctx context.Context, consumed forwar
 		OutputTokens: consumed.outputTokens,
 		CostUSD:      consumed.costUSD,
 		ModelRounds:  consumed.rounds,
+		Stream:       consumed.stream,
 		Canceled:     canceled,
 		Ok:           false,
 		ErrorMsg:     errMsg,
@@ -755,6 +789,112 @@ func backendNamesInOrder(agg KiroRunResult) []string {
 		}
 	}
 	return out
+}
+
+// forwardLocalUsageMap is the client-visible usage for a completed local loop:
+// tokens summed across every round, plus the server-tool counter that makes a
+// client display "Did N searches". Shared by both renderers so the JSON body and
+// the SSE message_delta cannot disagree.
+func forwardLocalUsageMap(agg KiroRunResult) map[string]interface{} {
+	usage := map[string]interface{}{
+		"input_tokens":  agg.TotalInputTokens,
+		"output_tokens": agg.TotalOutputTokens,
+	}
+	if len(agg.Searches) > 0 {
+		usage["server_tool_use"] = map[string]interface{}{"web_search_requests": len(agg.Searches)}
+	}
+	return usage
+}
+
+// renderForwardLocalFinalJSON writes the buffered response body.
+func (h *Handler) renderForwardLocalFinalJSON(w http.ResponseWriter, origReq ClaudeRequest, agg KiroRunResult, finalText string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	resp := map[string]interface{}{
+		"id":          randomMessageID(),
+		"type":        "message",
+		"role":        "assistant",
+		"content":     buildForwardLocalContentBlocks(agg, finalText),
+		"model":       origReq.Model,
+		"stop_reason": "end_turn",
+		"usage":       forwardLocalUsageMap(agg),
+	}
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		logger.Warnf("[ForwardLocal] final encode failed: %v", err)
+	}
+}
+
+// renderForwardLocalFinalStream replays the completed result as an Anthropic SSE
+// sequence: message_start, then one content block per element of the same array
+// the JSON renderer builds, then message_delta/message_stop.
+//
+// Block indices are assigned in emission order, and every block is opened and
+// closed, because a client tracks them positionally. server_tool_use carries its
+// full input in content_block_start (no input_json_delta), matching the pure
+// path's synthesized stream; text is chunked so a client renders it
+// progressively rather than in one jump.
+func (h *Handler) renderForwardLocalFinalStream(w http.ResponseWriter, origReq ClaudeRequest, agg KiroRunResult, finalText string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		// No flusher (a buffering middlebox or a test recorder): fall back to the
+		// buffered body rather than emitting an SSE stream nothing will flush.
+		h.renderForwardLocalFinalJSON(w, origReq, agg, finalText)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	h.sendSSE(w, flusher, "message_start", map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":            randomMessageID(),
+			"type":          "message",
+			"role":          "assistant",
+			"model":         origReq.Model,
+			"content":       []interface{}{},
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage": map[string]interface{}{
+				"input_tokens":  agg.TotalInputTokens,
+				"output_tokens": 0,
+			},
+		},
+	})
+
+	for idx, block := range buildForwardLocalContentBlocks(agg, finalText) {
+		if block["type"] == "text" {
+			text, _ := block["text"].(string)
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         idx,
+				"content_block": map[string]interface{}{"type": "text", "text": ""},
+			})
+			for _, chunk := range chunkByRunes(text, webSearchSummaryChunkSize) {
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": idx,
+					"delta": map[string]interface{}{"type": "text_delta", "text": chunk},
+				})
+			}
+		} else {
+			h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         idx,
+				"content_block": block,
+			})
+		}
+		h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": idx,
+		})
+	}
+
+	h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+		"type":  "message_delta",
+		"delta": map[string]interface{}{"stop_reason": "end_turn"},
+		"usage": forwardLocalUsageMap(agg),
+	})
+	h.sendSSE(w, flusher, "message_stop", map[string]interface{}{"type": "message_stop"})
 }
 
 // buildForwardLocalContentBlocks renders the CLIENT-facing content array: the
@@ -847,6 +987,7 @@ func (h *Handler) recordForwardLocalRequest(ctx context.Context, consumed forwar
 		OutputTokens: consumed.outputTokens,
 		CostUSD:      consumed.costUSD,
 		ModelRounds:  consumed.rounds,
+		Stream:       consumed.stream,
 		Ok:           true,
 	})
 }
