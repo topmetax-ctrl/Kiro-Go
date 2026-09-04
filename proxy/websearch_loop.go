@@ -325,8 +325,10 @@ func appendSearchRound(
 			"input": map[string]interface{}{"query": query},
 		})
 		*presentation = append(*presentation, map[string]interface{}{
-			"type":    "web_search_tool_result",
-			"content": webSearchResultContent(results),
+			// tool_use_id pairs this result with the server_tool_use above.
+			"type":        "web_search_tool_result",
+			"tool_use_id": srvID,
+			"content":     webSearchResultContent(results),
 		})
 	}
 	req.Messages = append(req.Messages, ClaudeMessage{
@@ -366,8 +368,10 @@ func buildFlushContent(
 				"input": map[string]interface{}{"query": query},
 			})
 			content = append(content, map[string]interface{}{
-				"type":    "web_search_tool_result",
-				"content": webSearchResultContent(results),
+				// tool_use_id pairs this result with the server_tool_use above.
+				"type":        "web_search_tool_result",
+				"tool_use_id": srvID,
+				"content":     webSearchResultContent(results),
 			})
 			continue
 		}

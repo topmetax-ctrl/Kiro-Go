@@ -1541,15 +1541,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 					"index": stuIdx,
 				})
 
-				items := make([]map[string]interface{}, 0, len(s.Sources))
-				for _, src := range s.Sources {
-					items = append(items, map[string]interface{}{
-						"type":              "web_search_result",
-						"title":             src.Title,
-						"url":               src.URL,
-						"encrypted_content": "",
-					})
-				}
+				items := webSearchResultItems(s.Sources)
 				resIdx := nextContentIndex
 				nextContentIndex++
 				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{

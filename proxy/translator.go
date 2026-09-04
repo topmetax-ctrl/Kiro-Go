@@ -1163,25 +1163,65 @@ func buildWebSearchNativeBlocks(searches []WebSearchInvocation) []ClaudeContentB
 			Name:  "web_search",
 			Input: map[string]interface{}{"query": s.Query},
 		})
-		// content is always a (possibly empty) array; the field is interface{} with
-		// omitempty, so a non-nil empty slice still serializes as [] rather than
-		// being dropped.
-		items := make([]map[string]interface{}, 0, len(s.Sources))
-		for _, src := range s.Sources {
-			items = append(items, map[string]interface{}{
-				"type":              "web_search_result",
-				"title":             src.Title,
-				"url":               src.URL,
-				"encrypted_content": "",
-			})
-		}
 		blocks = append(blocks, ClaudeContentBlock{
 			Type:      "web_search_tool_result",
 			ToolUseID: s.ToolUseID,
-			Content:   items,
+			Content:   webSearchResultItems(s.Sources),
 		})
 	}
 	return blocks
+}
+
+// webSearchResultItems renders the content[] array of a web_search_tool_result
+// block. This is the ONE place the per-result item schema lives, so the pure
+// (MCP) path, the Kiro runner and the forwarded-local loop cannot drift apart.
+//
+// Anthropic's contract for each item (docs: web-search-tool):
+//
+//	{"type":"web_search_result","url":...,"title":...,"encrypted_content":...,"page_age":...}
+//
+// "type" is REQUIRED — a bare {title,url} pair is not a valid web_search_result.
+// encrypted_content is Anthropic's server-signed state for citation replay; the
+// proxy cannot mint it, so an empty placeholder is emitted (never fabricated).
+// That limitation is precisely why the whole synthesis is behind the
+// webSearch.emitNativeToolBlocks kill-switch.
+//
+// The returned slice is always non-nil so it serializes as [] and never null.
+func webSearchResultItems(sources []SearchSource) []map[string]interface{} {
+	items := make([]map[string]interface{}, 0, len(sources))
+	for _, src := range sources {
+		items = append(items, map[string]interface{}{
+			"type":              "web_search_result",
+			"title":             src.Title,
+			"url":               src.URL,
+			"encrypted_content": "",
+		})
+	}
+	return items
+}
+
+// buildWebSearchNativeBlockMaps is buildWebSearchNativeBlocks as plain maps, for
+// the non-stream renderers that assemble content[] as []map[string]interface{}
+// rather than []ClaudeContentBlock. Same schema, same tool_use_id correlation.
+func buildWebSearchNativeBlockMaps(searches []WebSearchInvocation) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(searches)*2)
+	for _, s := range searches {
+		out = append(out, map[string]interface{}{
+			"type":  "server_tool_use",
+			"id":    s.ToolUseID,
+			"name":  webSearchToolName,
+			"input": map[string]interface{}{"query": s.Query},
+		})
+		out = append(out, map[string]interface{}{
+			// tool_use_id correlates this result with the server_tool_use above.
+			// Anthropic sends it on both the streamed content_block_start and the
+			// non-stream content[] entry; clients use it to pair the two.
+			"type":        "web_search_tool_result",
+			"tool_use_id": s.ToolUseID,
+			"content":     webSearchResultItems(s.Sources),
+		})
+	}
+	return out
 }
 
 func mapClaudeStopReason(reason string, toolCount int) string {

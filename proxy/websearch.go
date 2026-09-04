@@ -495,8 +495,12 @@ func buildWebSearchContentBlocks(query, toolUseID string, results *WebSearchResu
 			"input": map[string]interface{}{"query": query},
 		},
 		{
-			"type":    "web_search_tool_result",
-			"content": webSearchResultContent(results),
+			// tool_use_id correlates this result with the server_tool_use above.
+			// Anthropic's contract carries it on both the streamed
+			// content_block_start and the non-stream content[] entry.
+			"type":        "web_search_tool_result",
+			"tool_use_id": toolUseID,
+			"content":     webSearchResultContent(results),
 		},
 		{"type": "text", "text": generateSearchSummary(query, results)},
 	}
@@ -654,13 +658,15 @@ func (h *Handler) streamWebSearchSSE(
 		"index": 1,
 	})
 
-	// 4. web_search_tool_result (no tool_use_id field — matches official API)
+	// 4. web_search_tool_result — carries tool_use_id so the client can pair it
+	// with the server_tool_use block emitted at index 1 (Anthropic contract).
 	h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
 		"type":  "content_block_start",
 		"index": 2,
 		"content_block": map[string]interface{}{
-			"type":    "web_search_tool_result",
-			"content": webSearchResultContent(results),
+			"type":        "web_search_tool_result",
+			"tool_use_id": toolUseID,
+			"content":     webSearchResultContent(results),
 		},
 	})
 	h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{

@@ -22,8 +22,13 @@ import (
 // forwardLocalRoundResult is the parsed outcome of one buffered upstream round
 // in the forward local loop.
 type forwardLocalRoundResult struct {
-	text         string
-	toolUses     []KiroToolUse
+	text     string
+	toolUses []KiroToolUse
+	// raw is the provider's content[] verbatim. It is what gets replayed into the
+	// next round's assistant turn, so structured blocks (notably tool_use, whose
+	// id the following tool_result references) survive the continuation instead of
+	// being flattened into text.
+	raw          []map[string]interface{}
 	inputTokens  int
 	outputTokens int
 	stopReason   string
@@ -47,8 +52,19 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 		return true
 	}
 
-	// Pin to the first non-pool target that declared local; that is definitionally
-	// the "same provider" for the rest of the loop (ProviderID + route tie).
+	// Pin to the first non-pool target that declared local, then never reassign
+	// `pinned` for the lifetime of this loop. That is the mid-conversation
+	// invariant: once the provider has produced an intermediate tool call, the
+	// transcript belongs to THAT provider, so continuation must go back to the
+	// same ProviderID and the same targetModel mapping.
+	//
+	// This is deliberately different from pre-conversation failover: before the
+	// first successful round, tryForwardUpstream may walk the route's targets.
+	// After it, a silent switch would hand a foreign provider a transcript
+	// containing another provider's tool_use ids (and, for a differently-mapped
+	// target, a different model) — so a mid-loop round failure surfaces as an
+	// error instead of failing over. Mid-loop failover would need an explicit
+	// documented policy plus transcript-compatibility guarantees; there is none.
 	var pinned *config.ResolvedTarget
 	for i := range targets {
 		if targets[i].Provider.ID == config.KiroPoolTargetID {
@@ -132,6 +148,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 			}
 		}
 
+		roundStart := time.Now()
 		res, forwardUsage, forwardErr := h.forwardRoundBuffered(ctx, pinned.Provider, *pinned, body, clientModel, route, captureUserText, round == 0)
 		if forwardErr != nil {
 			// Upstream failure before any byte committed; surface the classified error.
@@ -143,16 +160,11 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 		// Attribute request metrics to the pinned provider/route (same ProviderID
 		// every round). Record after each successful upstream round so dashboards
 		// reflect the provider actually used, not the Kiro pool.
-		h.recordForwardLocalSuccess(forwardUsage, pinned.Provider, route, clientModel, ctx, apiKeyID)
-		// Per-key usage accounting: match the forwarding path's contract so quota
-		// enforcement and per-key dashboards see forwarded-local requests.
-		inTok, outTok := int(forwardUsage.Input), int(forwardUsage.Output)
-		if inTok == 0 && outTok == 0 {
-			outTok = 1 // request-count charge, same as forwardedUsageTokens fallback
-		}
-		noteAPIKeyUsage(ctx, int64(inTok), int64(outTok), 0, apikey.UsageSourceUpstream, false)
-		h.recordSuccessForApiKey(ctx, apiKeyID, inTok, outTok, 0)
-
+		h.recordForwardLocalRound(ctx, forwardUsage, pinned.Provider, *pinned, route, clientModel, apiKeyID, time.Since(roundStart).Milliseconds())
+		// Provider consumption accrues per round; the LOGICAL request is counted
+		// once, at the end. recordSuccessForApiKey must NOT be called here: it goes
+		// through recordSuccess, which increments totalRequests/successRequests, so
+		// an N-round loop would report N client requests for one client request.
 		agg.TotalInputTokens += res.inputTokens
 		agg.TotalOutputTokens += res.outputTokens
 
@@ -165,7 +177,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 				VisibleContent: res.text,
 				ToolUses:       external,
 			}
-			return h.renderForwardLocalFinal(w, origReq, agg, res.text, policy, requestID)
+			return h.renderForwardLocalFinal(ctx, w, origReq, agg, res.text, policy, requestID, apiKeyID)
 		}
 		if len(external) > 0 {
 			h.sendClaudeError(w, 400, "invalid_request_error", fmt.Sprintf("mixed tool uses in one turn: web_search with %v is not supported in forwarded local mode", toolUseNames(external)))
@@ -187,16 +199,17 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 			if tm := strings.TrimSpace(pinned.Target.TargetModel); tm != "" {
 				strippedBody, _ = rewriteModelField(strippedBody, tm)
 			}
+			finalStart := time.Now()
 			finalRes, finalUsage, ferr := h.forwardRoundBuffered(ctx, pinned.Provider, *pinned, strippedBody, clientModel, route, captureUserText, false)
 			if ferr != nil {
 				h.sendPublicForwardError(w, true, ferr.Public())
 				return true
 			}
-			h.recordForwardLocalSuccess(finalUsage, pinned.Provider, route, clientModel, ctx, apiKeyID)
+			h.recordForwardLocalRound(ctx, finalUsage, pinned.Provider, *pinned, route, clientModel, apiKeyID, time.Since(finalStart).Milliseconds())
 			agg.TotalInputTokens += finalRes.inputTokens
 			agg.TotalOutputTokens += finalRes.outputTokens
 			agg.FinalRound = KiroRoundResult{VisibleContent: finalRes.text, ToolUses: finalRes.toolUses}
-			return h.renderForwardLocalFinal(w, origReq, agg, finalRes.text, policy, requestID)
+			return h.renderForwardLocalFinal(ctx, w, origReq, agg, finalRes.text, policy, requestID, apiKeyID)
 		}
 
 		distinctBefore := countDistinctQueries(internal, cache)
@@ -223,16 +236,17 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 		strippedBody, _ = rewriteModelField(strippedBody, tm)
 	}
 	p2 := *pinned
+	finalStart := time.Now()
 	finalRes, finalUsage, ferr := h.forwardRoundBuffered(ctx, p2.Provider, p2, strippedBody, clientModel, route, captureUserText, false)
 	if ferr != nil {
 		h.sendPublicForwardError(w, true, ferr.Public())
 		return true
 	}
-	h.recordForwardLocalSuccess(finalUsage, p2.Provider, route, clientModel, ctx, apiKeyID)
+	h.recordForwardLocalRound(ctx, finalUsage, p2.Provider, p2, route, clientModel, apiKeyID, time.Since(finalStart).Milliseconds())
 	agg.TotalInputTokens += finalRes.inputTokens
 	agg.TotalOutputTokens += finalRes.outputTokens
 	agg.FinalRound = KiroRoundResult{VisibleContent: finalRes.text, ToolUses: finalRes.toolUses}
-	return h.renderForwardLocalFinal(w, origReq, agg, finalRes.text, policy, requestID)
+	return h.renderForwardLocalFinal(ctx, w, origReq, agg, finalRes.text, policy, requestID, apiKeyID)
 }
 
 // forwardRoundBuffered does one buffered (non-stream) POST to the pinned provider
@@ -404,28 +418,61 @@ func parseClaudeContentForForwardLocal(body []byte) (*forwardLocalRoundResult, e
 	if env.StopReason != nil {
 		stop = *env.StopReason
 	}
-	return &forwardLocalRoundResult{text: text, toolUses: toolUses, stopReason: stop}, nil
+	return &forwardLocalRoundResult{text: text, toolUses: toolUses, raw: env.Content, stopReason: stop}, nil
 }
 
 // advanceForwardWorking appends one assistant+tool_result turn to working (Claude shape).
+// advanceForwardWorking appends one provider round-trip to the INTERNAL provider
+// transcript, in the provider's ordinary CLIENT-tool contract.
+//
+// Protocol boundary (do not conflate — see buildForwardLocalContentBlocks for the
+// other side): under strategy=local the provider was handed a synthetic ORDINARY
+// web_search client tool, so the continuation it receives must be the standard
+// Anthropic client-tool shape:
+//
+//	assistant: [ ...verbatim structured blocks..., tool_use{id:X} ]
+//	user:      [ tool_result{tool_use_id:X, content:...} ]
+//
+// It must NEVER be server_tool_use / web_search_tool_result — those are the
+// CLIENT-facing native server-tool representation, and a provider that actually
+// executed a native server tool would have been strategy=native instead.
+//
+// The assistant content is preserved STRUCTURALLY (res.raw, the upstream's own
+// content[] verbatim) rather than flattened to text: flattening would drop the
+// tool_use block whose id the following tool_result references, leaving a
+// dangling tool_use_id the provider would reject. Text concatenation is only
+// valid for display/memory, never for canonical conversation state.
 func advanceForwardWorking(working ClaudeRequest, res *forwardLocalRoundResult, toolResults []KiroToolResult) ClaudeRequest {
-	// Assistant turn with text + tool_use blocks.
-	assistantBlocks := make([]interface{}, 0, 1+len(res.toolUses))
-	if res.text != "" {
-		assistantBlocks = append(assistantBlocks, map[string]interface{}{"type": "text", "text": res.text})
-	}
-	for _, tu := range res.toolUses {
-		assistantBlocks = append(assistantBlocks, map[string]interface{}{
-			"type": "tool_use", "id": tu.ToolUseID, "name": tu.Name, "input": tu.Input,
-		})
+	// Assistant turn: replay the provider's own structured content verbatim when
+	// available, so every block (text, thinking, tool_use, and any block type this
+	// proxy does not model) survives into the next round exactly as sent.
+	var assistantBlocks []interface{}
+	if len(res.raw) > 0 {
+		assistantBlocks = make([]interface{}, 0, len(res.raw))
+		for _, b := range res.raw {
+			assistantBlocks = append(assistantBlocks, b)
+		}
+	} else {
+		// Fallback (no raw content captured): rebuild the minimum the protocol
+		// needs — text plus the structured tool_use blocks being answered.
+		assistantBlocks = make([]interface{}, 0, 1+len(res.toolUses))
+		if res.text != "" {
+			assistantBlocks = append(assistantBlocks, map[string]interface{}{"type": "text", "text": res.text})
+		}
+		for _, tu := range res.toolUses {
+			assistantBlocks = append(assistantBlocks, map[string]interface{}{
+				"type": "tool_use", "id": tu.ToolUseID, "name": tu.Name, "input": tu.Input,
+			})
+		}
 	}
 	working.Messages = append(working.Messages, ClaudeMessage{Role: "assistant", Content: assistantBlocks})
 
-	// User turn with tool_result blocks.
+	// User turn: one tool_result per executed call, keyed to the tool_use id it
+	// answers. All content segments are joined — a search result body may span
+	// several Text segments and truncating to the first would feed the model
+	// partial evidence.
 	userBlocks := make([]interface{}, 0, len(toolResults))
 	for _, tr := range toolResults {
-		// Concatenate ALL content blocks — search results may span multiple
-		// Text segments with URLs, titles, and snippets interleaved.
 		var text string
 		for _, c := range tr.Content {
 			text += c.Text
@@ -497,8 +544,25 @@ func syntheticWebSearchTools(tools []ClaudeTool) []ClaudeTool {
 // renderForwardLocalFinal writes the final non-stream JSON response, synthesizing
 // native server_tool_use blocks when searches ran so the client renders
 // "Did N searches" with citations.
-func (h *Handler) renderForwardLocalFinal(w http.ResponseWriter, origReq ClaudeRequest, agg KiroRunResult, finalText string, policy WebSearchPolicy, requestID string) bool {
+func (h *Handler) renderForwardLocalFinal(ctx context.Context, w http.ResponseWriter, origReq ClaudeRequest, agg KiroRunResult, finalText string, policy WebSearchPolicy, requestID, apiKeyID string) bool {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+
+	// Logical-request accounting happens exactly ONCE here, at the single point
+	// where the whole loop has succeeded — not per provider round. The token
+	// figures are the AGGREGATE across every round (provider consumption), while
+	// the request counters advance by one (one client request). Calling this per
+	// round would inflate totalRequests/successRequests by the round count.
+	inTok, outTok := agg.TotalInputTokens, agg.TotalOutputTokens
+	usageSource := apikey.UsageSourceUpstream
+	if inTok == 0 && outTok == 0 {
+		// No upstream usage signal across any round: charge one request unit so
+		// per-key quota still advances, and mark it estimated rather than claiming
+		// upstream-accurate zeros (same contract as forwardedUsageTokens).
+		outTok = 1
+		usageSource = apikey.UsageSourceEstimator
+	}
+	noteAPIKeyUsage(ctx, int64(inTok), int64(outTok), 0, usageSource, usageSource == apikey.UsageSourceEstimator)
+	h.recordSuccessForApiKey(ctx, apiKeyID, inTok, outTok, 0)
 
 	// Append deterministic Sources list BEFORE building content so the amended
 	// final text (with citations) is what the client sees.
@@ -546,23 +610,20 @@ func (h *Handler) renderForwardLocalFinal(w http.ResponseWriter, origReq ClaudeR
 	return true
 }
 
+// buildForwardLocalContentBlocks renders the CLIENT-facing content array: the
+// synthetic Anthropic-native server_tool_use / web_search_tool_result pairs for
+// the searches the gateway ran, followed by the final answer text.
+//
+// This is deliberately a DIFFERENT protocol from the internal provider
+// continuation (see advanceForwardWorking): downstream the client sees native
+// SERVER-tool blocks so Claude Code renders "Did N searches"; upstream the
+// provider only ever sees ordinary CLIENT-tool tool_use/tool_result, because
+// under strategy=local the provider is not executing an Anthropic server tool.
+//
+// Schema comes from the shared buildWebSearchNativeBlockMaps so this path cannot
+// drift from the pure/MCP path or the Kiro runner path.
 func buildForwardLocalContentBlocks(agg KiroRunResult, finalText string) []map[string]interface{} {
-	var out []map[string]interface{}
-	for _, inv := range agg.Searches {
-		out = append(out, map[string]interface{}{
-			"type": "server_tool_use", "id": inv.ToolUseID, "name": "web_search", "input": map[string]interface{}{"query": inv.Query},
-		})
-		// No tool_use_id field — matches the official Anthropic API shape
-		// and is consistent with the pure-path streamWebSearchSSE.
-		sourcesArr := make([]map[string]interface{}, 0, len(inv.Sources))
-		for _, s := range inv.Sources {
-			sourcesArr = append(sourcesArr, map[string]interface{}{"title": s.Title, "url": s.URL})
-		}
-		out = append(out, map[string]interface{}{
-			"type":    "web_search_tool_result",
-			"content": sourcesArr,
-		})
-	}
+	out := buildWebSearchNativeBlockMaps(agg.Searches)
 	out = append(out, map[string]interface{}{"type": "text", "text": finalText})
 	return out
 }
@@ -600,15 +661,31 @@ func classifyForwardError(status int, body []byte, header http.Header, provider 
 	return newProviderForwardError(pub.HTTPStatus, pub.Message)
 }
 
-// recordForwardLocalSuccess records metrics for one successful buffered upstream round.
-func (h *Handler) recordForwardLocalSuccess(usage usageCounts, provider config.UpstreamProvider, route *config.ModelRoute, clientModel string, ctx context.Context, apiKeyID string) {
+// recordForwardLocalRound files one metrics.Event per PROVIDER ROUND, which is
+// what the Event invariant means on this path: one Event = one upstream attempt
+// outcome. A three-round local loop legitimately files three provider events —
+// that is provider consumption, and the dashboard's per-provider latency/token
+// figures depend on it.
+//
+// The LOGICAL client request is counted separately, exactly once, in
+// renderForwardLocalFinal (recordSuccessForApiKey). The two must not be merged:
+// provider rounds and client requests are different denominators.
+func (h *Handler) recordForwardLocalRound(ctx context.Context, usage usageCounts, provider config.UpstreamProvider, rt config.ResolvedTarget, route *config.ModelRoute, clientModel, apiKeyID string, latencyMs int64) {
 	metrics.Record(metrics.Event{
 		ClientModel:  clientModel,
+		TargetModel:  strings.TrimSpace(rt.Target.TargetModel),
 		RouteID:      route.ID,
 		ProviderID:   provider.ID,
 		ProviderName: provider.Name,
 		Endpoint:     "claude",
+		ClientIP:     clientIPFromContext(ctx),
+		ApiKeyID:     apiKeyID,
+		RequestID:    requestIDFromContext(ctx),
 		Status:       200,
+		LatencyMs:    latencyMs,
+		InputTokens:  usage.Input,
+		OutputTokens: usage.Output,
+		CostUSD:      provider.CostUSD(usage.Input, usage.Output),
 		Ok:           true,
 	})
 }
