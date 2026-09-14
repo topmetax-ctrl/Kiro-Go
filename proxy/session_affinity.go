@@ -156,3 +156,41 @@ func logSessionAffinity(sess clientSession, upstreamHeader string) {
 	logger.Infof("[Forward] session_affinity_present=true session_source=%s upstream_session_header=%s",
 		sess.Source, upstreamHeader)
 }
+
+// ProbeSessionPrefix marks a synthetic session id carried by an admin Test
+// probe. It is diagnostic traffic, not a conversation: the prefix keeps probe
+// sessions recognizable upstream, and each probe gets its own id so one Test
+// click can never be confused with another probe or with real traffic.
+const ProbeSessionPrefix = "kiro-go-probe-"
+
+// probeSessionID derives a fresh synthetic probe session id from the admin
+// request's own request id (generated when the middleware gave none).
+func probeSessionID(requestID string) string {
+	if requestID == "" {
+		requestID = config.GenerateMachineId()
+	}
+	return ProbeSessionPrefix + requestID
+}
+
+// applyProbeSessionAffinityInto writes the session headers a Test probe presents
+// to an upstream, into the probe's extra-header map (probeUpstreamOnce builds
+// the actual request from it). The probe carries a clearly-marked synthetic
+// session id and runs through the SAME egress policy as real traffic —
+// including the provider's SessionHeader mapping — because the Test button must
+// answer the question an operator actually has: "would a real forwarded request
+// work?". A sessionless probe would exercise a path no real client takes and
+// read backends that demand session identity (OpenCode Go answers
+// MissingSessionID) as broken targets while live forwarding works fine.
+//
+// The synthetic id is scoped to the probe: nothing here touches the no-
+// generation rule for client traffic, which stays absolute (see
+// clientSessionAffinity).
+func applyProbeSessionAffinityInto(dst map[string]string, probeID string, up config.UpstreamProvider) {
+	if probeID == "" {
+		return
+	}
+	dst[HeaderClaudeCodeSession] = probeID
+	if name := strings.TrimSpace(up.SessionHeader); name != "" && validHeaderName(name) {
+		dst[name] = probeID
+	}
+}

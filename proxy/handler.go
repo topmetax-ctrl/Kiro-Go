@@ -5901,7 +5901,20 @@ func (h *Handler) runUpstreamTest(w http.ResponseWriter, r *http.Request, id, co
 	defer cancel()
 	client := GetClientForProxy(proxyURL)
 
-	status, latency, body, hdr, path, err := probeUpstream(ctx, client, baseURL, apiKey, payload)
+	// The probe presents a synthetic session id through the same egress policy as
+	// real forwarded traffic, so the Test verdict matches what a live client would
+	// see — a backend that demands session identity (OpenCode Go) must not read as
+	// a broken target while real requests sail through. The stored provider's
+	// SessionHeader mapping participates; an id-less probe request (no stored
+	// provider, ad-hoc baseUrl) probes without any mapping, which is exactly what
+	// such a request would get forwarded with.
+	var up config.UpstreamProvider
+	if stored, ok := findStoredProvider(id); ok {
+		up = stored
+	}
+	probeSess := probeSessionID(requestIDFromContext(r.Context()))
+
+	status, latency, body, hdr, path, err := probeUpstream(ctx, client, baseURL, apiKey, payload, probeSess, up)
 	if err != nil {
 		// Transport failure: nothing answered, so there is no status or body to
 		// report — only what went wrong reaching the host. The classification comes
@@ -6016,7 +6029,11 @@ func upstreamTestErrMsg(ctx context.Context, err error, diag providererr.Diagnos
 // own, and must be reported as-is rather than masked by a second probe. A
 // transport error stops immediately: nothing answered, so the path is not the
 // question.
-func probeUpstream(ctx context.Context, client *http.Client, baseURL, apiKey string, payload []byte) (int, int64, []byte, http.Header, string, error) {
+//
+// probeSession carries the synthetic probe session id ("" = none) through the
+// session-affinity egress policy on BOTH shapes: the forward path applies it
+// regardless of dialect, so the probe must too.
+func probeUpstream(ctx context.Context, client *http.Client, baseURL, apiKey string, payload []byte, probeSession string, up config.UpstreamProvider) (int, int64, []byte, http.Header, string, error) {
 	shapes := []struct {
 		path  string
 		extra map[string]string
@@ -6033,8 +6050,18 @@ func probeUpstream(ctx context.Context, client *http.Client, baseURL, apiKey str
 		err     error
 	)
 	for _, shape := range shapes {
+		extra := make(map[string]string, len(shape.extra)+2)
+		for k, v := range shape.extra {
+			extra[k] = v
+		}
+		if probeSession != "" {
+			// Applied through the shared policy rather than set directly, so a
+			// provider-configured SessionHeader mapping cannot drift from what
+			// real forwarding does.
+			applyProbeSessionAffinityInto(extra, probeSession, up)
+		}
 		path = shape.path
-		status, latency, body, hdr, err = probeUpstreamOnce(ctx, client, baseURL, apiKey, shape.path, payload, shape.extra)
+		status, latency, body, hdr, err = probeUpstreamOnce(ctx, client, baseURL, apiKey, shape.path, payload, extra)
 		if err != nil {
 			return status, latency, body, hdr, path, err
 		}

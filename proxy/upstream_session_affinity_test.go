@@ -14,6 +14,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -280,6 +281,126 @@ func TestForwardPreservesNativeOpencodeSession(t *testing.T) {
 	forwardWithHeaders(t, "m", map[string]string{"X-Opencode-Session": "opencode-session-1"})
 	if gotOpencode != "opencode-session-1" {
 		t.Fatalf("native OpenCode session = %q, want opencode-session-1", gotOpencode)
+	}
+}
+
+// The admin Test probe must exercise the same session path real traffic takes:
+// a marked synthetic session id, plus the provider's SessionHeader mapping.
+// A sessionless probe made OpenCode Go's backend answer 400 MissingSessionID,
+// so the panel read a perfectly working target as "HTTP 400 Provider rejected".
+func TestUpstreamTestProbeCarriesSessionAffinity(t *testing.T) {
+	metrics.Reset()
+	var mu sync.Mutex
+	seen := map[string]map[string]string{} // path -> header -> value
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen[r.URL.Path] = map[string]string{
+			HeaderClaudeCodeSession: r.Header.Get(HeaderClaudeCodeSession),
+			HeaderOpencodeSession:   r.Header.Get(HeaderOpencodeSession),
+		}
+		mu.Unlock()
+		if r.URL.Path == "/chat/completions" {
+			// Only the Anthropic shape is served here, so the probe falls through
+			// to /messages exactly as it would for a real Claude route target.
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"probe-ok"}`))
+	}))
+	defer upstream.Close()
+
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	provider := config.UpstreamProvider{
+		ID: "probe-up", Name: "probe-provider", BaseURL: upstream.URL,
+		ApiKey: "s", Enabled: true, SessionHeader: "X-Opencode-Session",
+	}
+	if err := config.UpdateUpstreamConfig([]config.UpstreamProvider{provider}, nil); err != nil {
+		t.Fatalf("UpdateUpstreamConfig: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	body := strings.NewReader(`{"id":"probe-up","model":"m"}`)
+	r := httptest.NewRequest(http.MethodPost, "/admin/api/upstream-test", body)
+	h := &Handler{}
+	h.runUpstreamTest(rec, r, "probe-up", "", "", "", "", "m")
+
+	var res struct {
+		Ok   bool   `json:"ok"`
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&res); err != nil {
+		t.Fatalf("test result not JSON: %v; body=%s", err, rec.Body.String())
+	}
+	if !res.Ok {
+		t.Fatalf("probe failed: %s", rec.Body.String())
+	}
+	if res.Path != "/messages" {
+		t.Fatalf("probe answered on %q, want /messages", res.Path)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	msg := seen["/messages"]
+	claude, opencode := msg[HeaderClaudeCodeSession], msg[HeaderOpencodeSession]
+	if !strings.HasPrefix(claude, ProbeSessionPrefix) {
+		t.Errorf("probe session id = %q, want the %q prefix", claude, ProbeSessionPrefix)
+	}
+	if opencode != claude {
+		t.Errorf("mapped X-Opencode-Session = %q, want the same synthetic id (%q)", opencode, claude)
+	}
+}
+
+// Without a configured mapping the probe still carries the synthetic native
+// session id, but must not invent a mapping header.
+func TestUpstreamTestProbeWithoutMappingHasNoMappedHeader(t *testing.T) {
+	metrics.Reset()
+	var mu sync.Mutex
+	var claude, opencode string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		claude = r.Header.Get(HeaderClaudeCodeSession)
+		opencode = r.Header.Get(HeaderOpencodeSession)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"probe-ok"}`))
+	}))
+	defer upstream.Close()
+
+	if err := config.Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	provider := config.UpstreamProvider{
+		ID: "probe-up", Name: "probe-provider", BaseURL: upstream.URL,
+		ApiKey: "s", Enabled: true,
+	}
+	if err := config.UpdateUpstreamConfig([]config.UpstreamProvider{provider}, nil); err != nil {
+		t.Fatalf("UpdateUpstreamConfig: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/admin/api/upstream-test", strings.NewReader(`{"id":"probe-up","model":"m"}`))
+	h := &Handler{}
+	h.runUpstreamTest(rec, r, "probe-up", "", "", "", "", "m")
+
+	var res struct {
+		Ok bool `json:"ok"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&res); err != nil {
+		t.Fatalf("test result not JSON: %v", err)
+	}
+	if !res.Ok {
+		t.Fatalf("probe failed: %s", rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.HasPrefix(claude, ProbeSessionPrefix) {
+		t.Errorf("probe session id = %q, want the %q prefix", claude, ProbeSessionPrefix)
+	}
+	if opencode != "" {
+		t.Errorf("unmapped provider received X-Opencode-Session %q; probes must not invent mappings", opencode)
 	}
 }
 
