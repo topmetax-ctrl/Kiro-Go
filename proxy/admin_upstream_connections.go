@@ -85,6 +85,9 @@ func publicProvider(p config.UpstreamProvider) map[string]interface{} {
 		// save silently clears — an operator editing an unrelated provider would
 		// wipe every configured strategy.
 		"webSearchStrategy": p.WebSearchStrategy,
+		// Same round-trip rule as webSearchStrategy: an operator editing any
+		// provider must not silently drop another provider's session mapping.
+		"sessionHeader": p.SessionHeader,
 	}
 	return out
 }

@@ -921,6 +921,8 @@
   "upstreams.webSearchStrategyHintNative": "Provider phải tự hỗ trợ web search phía server theo chuẩn Anthropic. Yêu cầu được chuyển đi nguyên vẹn và kết quả tìm kiếm của provider được dùng trực tiếp.",
   "upstreams.webSearchStrategyHintLocal": "Model vẫn chạy trên provider này; Kiro-Go thực hiện tìm kiếm qua SearchOrchestrator nội bộ (SearXNG/Tavily) rồi tiếp tục hội thoại trên cùng provider đó.",
   "upstreams.webSearchStrategyHintDisabled": "Yêu cầu web_search tới provider này sẽ bị từ chối, hoặc đi theo chính sách dự phòng đã cấu hình rõ ràng.",
+  "upstreams.sessionHeader": "Session header",
+  "upstreams.sessionHeaderHint": "Tùy chọn: header upstream mà provider này yêu cầu chứa session id của client (ví dụ X-Opencode-Session với backend OpenCode Go). Session id gốc của client luôn được giữ nguyên; chỉ đặt khi backend bắt buộc header riêng.",
   "upstreams.routeModel": "Mô hình phía client",
   "upstreams.routeModelPlaceholder": "ví dụ coding",
   "upstreams.routeModelHint": "Tên mô hình mà client gửi lên. Khớp chính xác.",

@@ -390,6 +390,14 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 	// credential is set above from the route config).
 	forwardRequestHeaders(req, r)
 
+	// Session identity is its own egress policy, layered on top of the allow-list:
+	// preserve the client's canonical session header and, when this provider
+	// configures one, map it to the provider-specific session header (OpenCode Go).
+	// It survives retries, connection rotation and provider failover for free —
+	// every attempt re-derives it from the same inbound request.
+	sess := applyUpstreamSessionAffinity(req, r, up)
+	logSessionAffinity(sess, strings.TrimSpace(up.SessionHeader))
+
 	proxyURL := up.ProxyURL
 	if proxyURL == "" {
 		proxyURL = config.GetProxyURL()

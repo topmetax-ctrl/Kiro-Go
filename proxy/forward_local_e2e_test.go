@@ -116,7 +116,10 @@ type fakeUpstream struct {
 	got      [][]byte
 	paths    []string
 	authSeen []string
-	server   *httptest.Server
+	// headers records the full inbound header set of every request, so tests
+	// can assert session affinity across rounds.
+	headers []http.Header
+	server  *httptest.Server
 }
 
 func newFakeUpstream(t *testing.T, rounds ...fakeUpstreamRound) *fakeUpstream {
@@ -129,6 +132,7 @@ func newFakeUpstream(t *testing.T, rounds ...fakeUpstreamRound) *fakeUpstream {
 		u.got = append(u.got, body)
 		u.paths = append(u.paths, r.URL.Path)
 		u.authSeen = append(u.authSeen, r.Header.Get("Authorization"))
+		u.headers = append(u.headers, r.Header.Clone())
 		var round fakeUpstreamRound
 		if idx < len(u.rounds) {
 			round = u.rounds[idx]
@@ -145,6 +149,16 @@ func newFakeUpstream(t *testing.T, rounds ...fakeUpstreamRound) *fakeUpstream {
 	}))
 	t.Cleanup(u.server.Close)
 	return u
+}
+
+// header returns the value the i-th upstream request carried for name.
+func (u *fakeUpstream) header(i int, name string) string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if i < 0 || i >= len(u.headers) {
+		return ""
+	}
+	return u.headers[i].Get(name)
 }
 
 func (u *fakeUpstream) requests() [][]byte {

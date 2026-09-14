@@ -3755,6 +3755,7 @@
       strategySelect.value = ['native', 'local', 'unsupported'].includes(stored) ? stored : '';
       updateWebSearchStrategyHint();
     }
+    $('upstreamForm_sessionHeader').value = entry ? (entry.sessionHeader || '') : '';
     openDialog('upstreamModal');
   }
 
@@ -3790,6 +3791,10 @@
     const enabled = $('upstreamForm_enabled').checked;
     const strategySelect = $('upstreamForm_webSearchStrategy');
     const webSearchStrategy = strategySelect ? strategySelect.value : '';
+    // Session affinity mapping (e.g. "X-Opencode-Session" for an OpenCode Go
+    // backend). Empty means "no mapping": only the client's own session headers
+    // are preserved upstream.
+    const sessionHeader = $('upstreamForm_sessionHeader').value.trim();
     if (!baseUrl) { toast(t('upstreams.baseUrlRequired'), 'error'); return; }
     if (priceInPerM < 0 || priceOutPerM < 0) { toast(t('upstreams.priceInvalid'), 'error'); return; }
     const prev = JSON.parse(JSON.stringify(upstreamCache));
@@ -3800,10 +3805,11 @@
           p.name = name; p.baseUrl = baseUrl; p.proxyURL = proxyURL; p.enabled = enabled;
           p.priceInPerM = priceInPerM; p.priceOutPerM = priceOutPerM;
           p.webSearchStrategy = webSearchStrategy;
+          p.sessionHeader = sessionHeader;
         }
       } else {
         upstreamCache.providers.push({
-          id: '', name, baseUrl, apiKey, proxyURL, enabled, priceInPerM, priceOutPerM, webSearchStrategy
+          id: '', name, baseUrl, apiKey, proxyURL, enabled, priceInPerM, priceOutPerM, webSearchStrategy, sessionHeader
         });
       }
       await persistUpstreams();

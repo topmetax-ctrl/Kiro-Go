@@ -258,6 +258,23 @@ type UpstreamProvider struct {
 	// which normalizes once at the config boundary to a typed ProviderWebSearchStrategy.
 	WebSearchStrategy string `json:"webSearchStrategy,omitempty"`
 
+	// SessionHeader, when set, names the upstream request header this provider
+	// expects to carry the client's canonical session identity, mapped from
+	// whatever session header the client actually sent (see the proxy's
+	// session-affinity policy). It exists for backends whose error paths demand a
+	// provider-specific session header — an OpenCode Go backend, for instance,
+	// recognizes Claude Code's native X-Claude-Code-Session-Id on the main path
+	// but some backend flows still answer "MissingSessionID" unless
+	// X-Opencode-Session is present.
+	//
+	// Empty (the default) means no mapping: the forwarder then only preserves the
+	// session headers the client itself sent, never injects one. The value must be
+	// a valid MIME header name ("X-Opencode-Session"); anything else is ignored at
+	// request time rather than corrupting the upstream request. This is a session
+	// affinity hint, never a credential channel: the value carried is the client's
+	// own session id, and only when the client actually presented one.
+	SessionHeader string `json:"sessionHeader,omitempty"`
+
 	// Operator-supplied prices in USD per 1M tokens, used only to estimate the
 	// cost shown in the stats dashboard. Zero means "unpriced": no cost is
 	// attributed, and the UI shows "—" rather than a misleading $0.00. Nothing

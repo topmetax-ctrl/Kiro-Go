@@ -1018,6 +1018,8 @@
   "upstreams.webSearchStrategyHintNative": "该提供方必须自身支持 Anthropic 服务端网页搜索。请求原样转发，并直接采用提供方返回的搜索结果。",
   "upstreams.webSearchStrategyHintLocal": "模型仍留在该提供方；Kiro-Go 通过本地 SearchOrchestrator（SearXNG/Tavily）执行搜索，然后在同一提供方上继续对话。",
   "upstreams.webSearchStrategyHintDisabled": "发往该提供方的 web_search 请求将被拒绝，或走明确配置的回退策略。",
+  "upstreams.sessionHeader": "会话标头",
+  "upstreams.sessionHeaderHint": "可选：该提供方要求承载客户端会话 ID 的上游标头（例如 OpenCode Go 后端使用 X-Opencode-Session）。客户端自身的会话 ID 始终保留；仅在后端强制要求特定标头时设置。",
   "upstreams.routeModalCreate": "添加路由",
   "upstreams.routeModalEdit": "编辑路由",
   "upstreams.routeModel": "客户端模型名",

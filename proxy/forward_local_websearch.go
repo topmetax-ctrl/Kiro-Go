@@ -116,6 +116,10 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 	requestID := requestIDFromContext(ctx)
 	apiKeyID := apiKeyIDFromContext(ctx)
 	clientModel := origReq.Model
+	// Resolve the canonical session identity once from the inbound request; every
+	// continuation round replays it, so the whole local loop stays one logical
+	// session for the pinned provider.
+	sess := clientSessionAffinity(r)
 	executor := newWebSearchExecutor(search.NewOrchestratorFromConfig(
 		func() *http.Client { return GetForwardClientForProxy(config.GetProxyURL()) },
 	))
@@ -195,7 +199,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 		}
 
 		roundStart := time.Now()
-		res, forwardUsage, forwardErr := h.forwardRoundBuffered(ctx, pinned.Provider, *pinned, body, clientModel, route, captureUserText, round == 0)
+		res, forwardUsage, forwardErr := h.forwardRoundBuffered(ctx, pinned.Provider, *pinned, sess, body, clientModel, route, captureUserText, round == 0)
 		if forwardErr != nil {
 			// Upstream failure before any byte committed; surface the classified error.
 			// Do not silently fall through to Kiro pool — that would change provider.
@@ -245,7 +249,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 				strippedBody, _ = rewriteModelField(strippedBody, tm)
 			}
 			finalStart := time.Now()
-			finalRes, finalUsage, ferr := h.forwardRoundBuffered(ctx, pinned.Provider, *pinned, strippedBody, clientModel, route, captureUserText, false)
+			finalRes, finalUsage, ferr := h.forwardRoundBuffered(ctx, pinned.Provider, *pinned, sess, strippedBody, clientModel, route, captureUserText, false)
 			if ferr != nil {
 				h.sendPublicForwardError(w, true, ferr.Public())
 				return fail(ferr.status, ferr.message)
@@ -286,7 +290,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 	}
 	p2 := *pinned
 	finalStart := time.Now()
-	finalRes, finalUsage, ferr := h.forwardRoundBuffered(ctx, p2.Provider, p2, strippedBody, clientModel, route, captureUserText, false)
+	finalRes, finalUsage, ferr := h.forwardRoundBuffered(ctx, p2.Provider, p2, sess, strippedBody, clientModel, route, captureUserText, false)
 	if ferr != nil {
 		h.sendPublicForwardError(w, true, ferr.Public())
 		return fail(ferr.status, ferr.message)
@@ -302,7 +306,11 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 // forwardRoundBuffered does one buffered (non-stream) POST to the pinned provider
 // and parses content[] for text/tool_use. It records no client response itself;
 // the caller owns the ResponseWriter. Returns usage for metrics.
-func (h *Handler) forwardRoundBuffered(ctx context.Context, provider config.UpstreamProvider, rt config.ResolvedTarget, body []byte, clientModel string, route *config.ModelRoute, captureUserText string, isFirstRound bool) (*forwardLocalRoundResult, usageCounts, *providerForwardError) {
+//
+// sess is the canonical client session identity resolved once by the caller; it
+// is replayed onto every round's request so all continuation rounds of one
+// logical request carry the same upstream session affinity.
+func (h *Handler) forwardRoundBuffered(ctx context.Context, provider config.UpstreamProvider, rt config.ResolvedTarget, sess clientSession, body []byte, clientModel string, route *config.ModelRoute, captureUserText string, isFirstRound bool) (*forwardLocalRoundResult, usageCounts, *providerForwardError) {
 	// Pick the first healthy connection for this provider (same determinism as
 	// orderProviderConnections; pinning is at ProviderID level, not connection,
 	// so rotating within the provider is still "same provider" per spec).
@@ -338,10 +346,14 @@ func (h *Handler) forwardRoundBuffered(ctx context.Context, provider config.Upst
 		req.Header.Set("Authorization", "Bearer "+conn.ApiKey)
 		req.Header.Set("X-Api-Key", conn.ApiKey)
 	}
-	// No extra forwarded headers for local rounds; the per-round body already
-	// carries the full Claude request including beta/tool headers if needed.
-	// Top-level r headers (anthropic-beta etc.) are intentionally not replayed
-	// here per round to keep the loop hermetic.
+	// Replayed session identity, but nothing else from the top-level r headers:
+	// the per-round body already carries the full Claude request including
+	// beta/tool headers if needed, and anthropic-beta etc. are intentionally
+	// not replayed here per round to keep the loop hermetic. Session affinity is
+	// the one exception — all rounds of this ONE logical request must present
+	// the same session to the pinned provider, or the upstream treats each
+	// continuation as a new conversation.
+	applyClientSessionAffinity(req, sess, provider)
 
 	resp, err := client.Do(req)
 	if err != nil {

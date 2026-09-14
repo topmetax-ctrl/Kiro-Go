@@ -840,6 +840,8 @@
   "upstreams.webSearchStrategyHintNative": "The provider must itself support Anthropic server-side web search. The request is relayed unchanged and the provider's own search results are trusted.",
   "upstreams.webSearchStrategyHintLocal": "The model stays on this provider; Kiro-Go runs the search through the local SearchOrchestrator (SearXNG/Tavily) and continues the conversation on the same provider.",
   "upstreams.webSearchStrategyHintDisabled": "web_search requests to this provider are rejected, or follow the explicitly configured fallback policy.",
+  "upstreams.sessionHeader": "Session header",
+  "upstreams.sessionHeaderHint": "Optional: the upstream header this provider expects to carry the client's session id (e.g. X-Opencode-Session for an OpenCode Go backend). The client's own session id is always preserved; only set this when the backend demands a provider-specific header.",
   "upstreams.routeModel": "Client Model",
   "upstreams.routeModelPlaceholder": "e.g. coding",
   "upstreams.routeModelHint": "The model name clients send. Matched exactly.",
