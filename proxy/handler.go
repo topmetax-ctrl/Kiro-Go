@@ -5761,7 +5761,6 @@ func (h *Handler) apiUpstreamModels(w http.ResponseWriter, r *http.Request) {
 	if apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 		httpReq.Header.Set("X-Api-Key", apiKey)
-		httpReq.Header.Set("anthropic-version", "2023-06-01")
 	}
 
 	client := GetClientForProxy(proxyURL)

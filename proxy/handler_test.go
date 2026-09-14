@@ -856,6 +856,70 @@ func TestOpenAIStreamPreservesUpstreamMaxTokensFinishReason(t *testing.T) {
 	}
 }
 
+// Generic model discovery must not select an upstream's Anthropic model-list
+// handler. Some gateways use anthropic-version as that protocol selector and
+// cloak non-Claude IDs in the response, which would make provider suggestions
+// unusable for OpenAI forwarding routes.
+func TestAPIUpstreamModelsDoesNotSendAnthropicVersion(t *testing.T) {
+	const apiKey = "upstream-key"
+	var (
+		gotMethod, gotPath, gotAuthorization, gotAPIKey, gotAnthropicVersion string
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAuthorization = r.Header.Get("Authorization")
+		gotAPIKey = r.Header.Get("X-Api-Key")
+		gotAnthropicVersion = r.Header.Get("Anthropic-Version")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.3-codex-spark"},{"id":"gpt-5.6-terra"}]}`))
+	}))
+	defer upstream.Close()
+
+	body, err := json.Marshal(map[string]string{
+		"baseUrl": upstream.URL,
+		"apiKey":  apiKey,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/upstream-models", bytes.NewReader(body))
+	(&Handler{}).apiUpstreamModels(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if gotMethod != http.MethodGet || gotPath != "/models" {
+		t.Fatalf("upstream request = %s %s, want GET /models", gotMethod, gotPath)
+	}
+	if gotAuthorization != "Bearer "+apiKey {
+		t.Errorf("Authorization = %q, want upstream Bearer credential", gotAuthorization)
+	}
+	if gotAPIKey != apiKey {
+		t.Errorf("X-Api-Key = %q, want upstream credential", gotAPIKey)
+	}
+	if gotAnthropicVersion != "" {
+		t.Errorf("Anthropic-Version = %q, want it absent for generic model discovery", gotAnthropicVersion)
+	}
+
+	var response struct {
+		Models []string `json:"models"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v; body = %s", err, rec.Body.String())
+	}
+	want := []string{"gpt-5.3-codex-spark", "gpt-5.6-terra"}
+	if len(response.Models) != len(want) {
+		t.Fatalf("models = %#v, want %#v", response.Models, want)
+	}
+	for i := range want {
+		if response.Models[i] != want[i] {
+			t.Errorf("models[%d] = %q, want %q", i, response.Models[i], want[i])
+		}
+	}
+}
+
 // An upstream that implements only Anthropic's /messages must probe OK. Which path
 // a real request takes is decided by the client API the caller hit, not by the
 // provider, so reporting the OpenAI 404 would label a working target broken.
