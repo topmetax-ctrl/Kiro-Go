@@ -120,20 +120,28 @@ func withBodySessionFallbackFromRequest(r *http.Request, req *ClaudeRequest) *ht
 // all. Both known shapes are far smaller; anything longer is not an identity.
 const maxMetadataUserIDLen = 4096
 
+// maxSessionTokenLen caps an extracted session token, matching the producer's
+// own limit on the JSON envelope's session_id field.
+const maxSessionTokenLen = 256
+
 // metadataSessionID extracts the canonical Claude Code session id from a body
 // metadata.user_id, in one of exactly two known shapes:
 //
 //   - Claude Code's native envelope: "user_<hex>_account_<uuid>_session_<uuid>"
 //   - the JSON envelope gateways write when rebuilding the identity:
-//     {"device_id":"...","account_uuid":"...","session_id":"<uuid>"}
+//     {"device_id":"...","account_uuid":"...","session_id":"..."}
 //
 // Only the session id is ever taken — device_id and account_uuid are
-// account-scoped and never stand in for a session — and the value must be a
-// well-formed UUID, which Claude Code session ids are. Anything else yields
-// "": a sessionless request stays sessionless rather than gaining an invented
-// identity. Validation bounds what passes as an identity, not whether the
-// client can plant one — headers are equally client-controlled, so the id
-// remains an untrusted routing hint throughout.
+// account-scoped and never stand in for a session. The two shapes validate
+// differently: the native suffix is position-derived, so it must be a
+// well-formed UUID (which Claude Code session ids are), while the JSON field
+// is written by the aggregator's own session resolver and may be any bounded,
+// whitespace-free token (9router's fallback resolver mints UUIDs with a
+// timestamp suffix). Anything else yields "": a sessionless request stays
+// sessionless rather than gaining an invented identity. Validation bounds
+// what passes as an identity, not whether the client can plant one — headers
+// are equally client-controlled, so the id remains an untrusted routing hint
+// throughout.
 func metadataSessionID(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || len(raw) > maxMetadataUserIDLen {
@@ -146,7 +154,7 @@ func metadataSessionID(raw string) string {
 }
 
 // sessionIDFromJSONUserID reads the session_id field of the JSON envelope and
-// nothing else. Non-objects, missing fields, and non-UUID values all yield "".
+// nothing else. Non-objects, missing fields, and unusable values all yield "".
 func sessionIDFromJSONUserID(raw string) string {
 	if !strings.HasPrefix(raw, "{") {
 		return ""
@@ -157,7 +165,7 @@ func sessionIDFromJSONUserID(raw string) string {
 	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
 		return ""
 	}
-	return strictUUID(envelope.SessionID)
+	return sanitizedSessionToken(envelope.SessionID)
 }
 
 // sessionIDFromNativeUserID reads the trailing _session_<uuid> of Claude
@@ -169,6 +177,22 @@ func sessionIDFromNativeUserID(raw string) string {
 		return ""
 	}
 	return strictUUID(raw[i+len(marker):])
+}
+
+// sanitizedSessionToken accepts a bounded, whitespace-free session token and
+// returns it as sent — the acceptance rule the JSON envelope's producer
+// (9router's normalizeSessionId: trim, ≤256 chars) applies to the same field.
+func sanitizedSessionToken(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || len(v) > maxSessionTokenLen {
+		return ""
+	}
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; c <= ' ' || c == 0x7f {
+			return ""
+		}
+	}
+	return v
 }
 
 // strictUUID accepts exactly a canonical 36-character UUID (hex, with dashes)

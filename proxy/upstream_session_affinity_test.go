@@ -564,8 +564,10 @@ func TestMetadataSessionIDExtractor(t *testing.T) {
 	}{
 		{"json envelope", `{"device_id":"` + strings.Repeat("a", 64) + `","account_uuid":"` + other + `","session_id":"` + valid + `"}`, valid},
 		{"json uppercase uuid kept as sent", `{"session_id":"AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"}`, "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"},
+		{"json aggregator token is not uuid-gated", `{"session_id":"not-a-uuid"}`, "not-a-uuid"},
+		{"json binary-style id (uuid + timestamp)", `{"session_id":"` + valid + `1768012345678"}`, valid + "1768012345678"},
+		{"json whitespace token rejected", `{"session_id":"ab cd"}`, ""},
 		{"json without session_id", `{"device_id":"` + valid + `","account_uuid":"` + other + `"}`, ""},
-		{"json session_id not a uuid", `{"session_id":"not-a-uuid"}`, ""},
 		{"json array is not an envelope", `["` + valid + `"]`, ""},
 		{"json malformed", `{"session_id":`, ""},
 		{"native envelope", "user_" + strings.Repeat("b", 64) + "_account_" + other + "_session_" + valid, valid},
@@ -636,6 +638,31 @@ func TestForwardRecoversSessionFromBodyMetadata(t *testing.T) {
 	}
 }
 
+// Aggregator-resolved session tokens are not always UUIDs (9router's fallback
+// resolver appends a timestamp to a random UUID): the JSON envelope's explicit
+// session_id field is accepted as a bounded token, not UUID-gated — the live
+// MissingSessionID at 11:44 was exactly such an id rejected by the first cut.
+func TestForwardRecoversSessionFromNonUUIDToken(t *testing.T) {
+	metrics.Reset()
+	const sid = "11111111-2222-4333-8444-5555555555551768012345678"
+	var rec headerRecorder
+	upstream := newSessionRecordingUpstream(t, &rec)
+	setupSessionAffinityRoute(t, "m", "X-Opencode-Session", upstream.URL)
+
+	body := bodyWithMetadataUserID(t, `{"session_id":"`+sid+`"}`)
+	if _, err := forwardBodyViaHandler(t, body, nil); err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+
+	claude, opencode, _ := rec.values()
+	if len(claude) != 1 {
+		t.Fatalf("upstream saw %d requests, want 1", len(claude))
+	}
+	if claude[0] != sid || opencode[0] != sid {
+		t.Errorf("upstream session headers = (%q, %q), want the token twice", claude[0], opencode[0])
+	}
+}
+
 // Claude Code's native user_id envelope is recognized the same way.
 func TestForwardRecoversSessionFromNativeMetadataEnvelope(t *testing.T) {
 	metrics.Reset()
@@ -694,7 +721,7 @@ func TestForwardMalformedMetadataStaysSessionless(t *testing.T) {
 		{"free-form string", "totally-not-a-session"},
 		{"device_id never taken", `{"device_id":"` + uuidLike + `"}`},
 		{"account_uuid never taken", `{"account_uuid":"` + uuidLike + `"}`},
-		{"non-uuid session", `{"session_id":"kiro-go-probe-x"}`},
+		{"whitespace token", `{"session_id":"ab cd"}`},
 		{"native junk suffix", "user_x_account_y_session_zzz"},
 		{"oversized", strings.Repeat("x", 5000)},
 	}
