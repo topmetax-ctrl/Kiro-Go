@@ -6554,6 +6554,63 @@
     return new Date(ms).toLocaleString();
   }
 
+  // fwdFmtTokens renders one token count compactly for a table cell. null or
+  // undefined means the upstream never reported the figure and must read as
+  // unknown, never as zero.
+  function fwdFmtTokens(n) {
+    if (n == null) return '—';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+    return String(n);
+  }
+
+  // fwdTokenCell renders an IN/OUT cell. The flat totals use 0 = "not reported"
+  // (the Event schema's long-standing unknown sentinel), but when a usage
+  // breakdown exists the upstream DID report — an explicit zero then reads as 0.
+  function fwdTokenCell(e, field) {
+    const v = e[field];
+    if (v) return fwdFmtTokens(v);
+    return e.usage ? '0' : '—';
+  }
+
+  // fwdCacheCell renders the CACHE cell: read tokens (+ writes when reported),
+  // then the hit ratio derived from the raw fields — never stored, always
+  // computed from this event's own totals. "—" distinguishes "upstream reported
+  // no cache telemetry" from an explicit "0 · 0%".
+  function fwdCacheCell(e) {
+    const u = e.usage;
+    if (!u) return '—';
+    const read = u.cacheReadInputTokens;
+    const create = u.cacheCreationInputTokens;
+    if (read == null && create == null) return '—';
+    let cell = fwdFmtTokens(read);
+    if (create != null && create > 0) cell += ' +' + fwdFmtTokens(create);
+    if (read != null && e.inputTokens > 0) {
+      cell += ' · ' + Math.round(read * 100 / e.inputTokens) + '%';
+    }
+    // A ratio above 100% is left visible on purpose: it is the symptom of an
+    // upstream whose cache numbers exceed its own input total.
+    return cell;
+  }
+
+  // fwdUsageSourcePrefix marks estimated usage. Upstream-reported figures (the
+  // only kind the forward path records today) render unadorned.
+  function fwdUsageSourcePrefix(e) {
+    return e.usage && e.usage.source === 'estimated' ? '~' : '';
+  }
+
+  // fwdProtoLabel maps the wire-protocol label recorded on the event's usage to
+  // display text. The values come from response-shape detection on the backend.
+  function fwdProtoLabel(p) {
+    const labels = {
+      anthropic: t('forward.protoAnthropic'),
+      openai: t('forward.protoOpenai'),
+      responses: t('forward.protoResponses'),
+      gemini: t('forward.protoGemini'),
+    };
+    return labels[p] || p;
+  }
+
   // statusClass buckets an HTTP status into the badge colors already used by the
   // event table.
   function statusClass(code) {
@@ -6639,7 +6696,14 @@
         t('stats.tilePeak', String(d.peakInFlight || 0))) +
       metricTile(t('stats.tileStream'), formatNum(d.streamed || 0),
         t('stats.tileCanceled', String(d.canceled || 0))) +
-      metricTile(t('stats.tileLastOk'), fwdFmtWhen(d.lastOk), '');
+      metricTile(t('stats.tileLastOk'), fwdFmtWhen(d.lastOk), '') +
+      // Cache hit is token-weighted over only the requests whose upstream
+      // reported cache telemetry; the sub-line names that population so an
+      // 87% over 340 observable requests cannot read as 87% over all traffic.
+      (d.cacheObservedRequests
+        ? metricTile(t('stats.tileCacheHit'), fwdFmtPct(d.cacheHitRate),
+            t('stats.tileCacheHitSub', formatNum(d.cacheReadInputTokens || 0), String(d.cacheObservedRequests)))
+        : '');
 
     // When headline numbers are scoped to a time window, show a badge so the
     // numbers in the tiles cannot be mistaken for all-time figures.
@@ -7458,7 +7522,7 @@
       fwdEventsTotal = d.total || 0;
       renderForwardEvents(Array.isArray(d.items) ? d.items : []);
     } catch (e) {
-      body.innerHTML = '<tr class="fwd-empty-row"><td colspan="6" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('common.failed')) + '</td></tr>';
+      body.innerHTML = '<tr class="fwd-empty-row"><td colspan="9" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('common.failed')) + '</td></tr>';
     }
   }
 
@@ -7466,7 +7530,7 @@
     const body = $('fwdEventsBody');
     if (!body) return;
     if (!items.length) {
-      body.innerHTML = '<tr class="fwd-empty-row"><td colspan="6" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('forward.noEvents')) + '</td></tr>';
+      body.innerHTML = '<tr class="fwd-empty-row"><td colspan="9" class="muted-text text-xs" style="padding:0.75rem;">' + escapeHtml(t('forward.noEvents')) + '</td></tr>';
     } else {
       // A fresh page invalidates every retained event: uids are never reused, so
       // stale entries would otherwise accumulate for the life of the tab.
@@ -7516,10 +7580,13 @@
       '<td class="font-mono text-xs">' + model + '</td>' +
       '<td class="text-xs">' + prov + '</td>' +
       '<td>' + badge + hint + '</td>' +
+      '<td class="font-mono text-xs">' + escapeHtml(fwdUsageSourcePrefix(e) + fwdTokenCell(e, 'inputTokens')) + '</td>' +
+      '<td class="font-mono text-xs">' + escapeHtml(fwdUsageSourcePrefix(e) + fwdTokenCell(e, 'outputTokens')) + '</td>' +
+      '<td class="font-mono text-xs">' + escapeHtml(fwdUsageSourcePrefix(e) + fwdCacheCell(e)) + '</td>' +
       '<td class="font-mono text-xs">' + escapeHtml(fwdFmtLatency(e.latencyMs)) + '</td>' +
       '<td class="fwd-chev"><i class="fa-solid fa-chevron-down" aria-hidden="true"></i></td>' +
       '</tr>' +
-      '<tr class="fwd-detail-row hidden" data-fwd-detail="' + uid + '"><td colspan="6"></td></tr>';
+      '<tr class="fwd-detail-row hidden" data-fwd-detail="' + uid + '"><td colspan="9"></td></tr>';
   }
 
   function fwdTruncate(s, n) {
@@ -7579,8 +7646,37 @@
     add(t('forward.detailStatus'), String(e.status || '—'));
     add(t('forward.detailLatency'), escapeHtml(fwdFmtLatency(e.latencyMs)));
     add(t('forward.detailTtfb'), e.ttfbMs ? escapeHtml(fwdFmtLatency(e.ttfbMs)) : '—');
-    add(t('forward.detailTokensIn'), String(e.inputTokens || 0));
-    add(t('forward.detailTokensOut'), String(e.outputTokens || 0));
+    // Token breakdown. The nested usage object, when present, is the upstream's
+    // own reported detail; its absence means "not reported", rendered as "—"
+    // rather than a misleading 0.
+    const u = e.usage;
+    const readN = u && u.cacheReadInputTokens != null ? u.cacheReadInputTokens : null;
+    const createN = u && u.cacheCreationInputTokens != null ? u.cacheCreationInputTokens : null;
+    const reasoningN = u && u.reasoningOutputTokens != null ? u.reasoningOutputTokens : null;
+    const hasTotals = u || e.inputTokens || e.outputTokens;
+    if (hasTotals) {
+      add(t('forward.detailTokensIn'), u ? fwdFmtTokens(e.inputTokens) : fwdTokenCell(e, 'inputTokens'));
+      add(t('forward.detailTokensOut'), u ? fwdFmtTokens(e.outputTokens) : fwdTokenCell(e, 'outputTokens'));
+      if (readN != null) add(t('forward.detailCacheRead'), fwdFmtTokens(readN));
+      if (createN != null) add(t('forward.detailCacheCreate'), fwdFmtTokens(createN));
+      // Uncached input is derived, never stored: input minus what the cache
+      // served (reads plus writes). Anthropic's input_tokens is billed input
+      // EXCLUDING cache, so subtracting the canonical cache fields yields the
+      // uncached remainder; for subset dialects (OpenAI/DeepSeek/Gemini) the
+      // same subtraction is exact by definition.
+      if (readN != null || createN != null) {
+        add(t('forward.detailUncached'), fwdFmtTokens(Math.max(0, (e.inputTokens || 0) - (readN || 0) - (createN || 0))));
+      }
+      if (reasoningN != null) add(t('forward.detailReasoning'), fwdFmtTokens(reasoningN));
+      if (readN != null && e.inputTokens > 0) {
+        add(t('forward.detailCacheHit'), Math.round(readN * 100 / e.inputTokens) + '%');
+      }
+      if (u && u.source) add(t('forward.detailUsageSource'), escapeHtml(u.source === 'estimated' ? t('forward.sourceEstimated') : t('forward.sourceUpstream')));
+      if (u && u.protocol) add(t('forward.detailProtocol'), escapeHtml(fwdProtoLabel(u.protocol)));
+    } else {
+      add(t('forward.detailTokensIn'), '—');
+      add(t('forward.detailTokensOut'), '—');
+    }
     add(t('forward.detailCost'), escapeHtml(fwdFmtCost(e.costUsd, isPool)));
     add(t('forward.detailStream'), e.stream ? t('forward.detailYes') : t('forward.detailNo'));
     if (e.canceled) add(t('forward.detailCanceled'), t('forward.detailYes'));

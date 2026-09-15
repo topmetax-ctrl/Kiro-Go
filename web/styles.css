@@ -3232,6 +3232,9 @@ img.brand-icon {
 .fwd-events-scroll {
   max-height: 55vh;
   overflow-y: auto;
+  /* The usage columns keep the table wider than a phone viewport; scroll the
+     table itself rather than clip a column. */
+  overflow-x: auto;
   margin-top: 0.5rem;
 }
 .fwd-events-table {
