@@ -1,5 +1,5 @@
 {
-  "version": "1.2.8",
-  "changelog": "Forwarding: session identity is now also recovered from body metadata.user_id (strictly validated) when an aggregator drops the session headers — 9router-style hops stop hitting OpenCode Go's MissingSessionID without any client-side change.\nChuyển tiếp: khi aggregator làm rơi header session, identity giờ được khôi phục từ metadata.user_id trong body (kiểm tra shape nghiêm ngặt) — các hop kiểu 9router hết bị OpenCode Go từ chối MissingSessionID mà không cần đổi gì phía client.",
+  "version": "1.2.9",
+  "changelog": "Forwarding: accept aggregator-resolved session tokens (not only UUIDs) in metadata.user_id — a real 9router request still hit MissingSessionID when its fallback resolver minted a UUID+timestamp id.\nChuyển tiếp: chấp nhận session token do aggregator tự sinh (không chỉ UUID) trong metadata.user_id — một request 9router thật vẫn dính MissingSessionID khi resolver dự phòng của nó sinh id dạng UUID+timestamp.",
   "download": "https://github.com/Quorinex/Kiro-Go"
 }
