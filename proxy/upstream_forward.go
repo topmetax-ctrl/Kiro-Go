@@ -346,6 +346,15 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 			ErrorMsg:       errMsg,
 			Attempt:        attempt,
 		}
+		if usage.known() || usage.cacheKnown() || usage.ReasoningOutputTokens != nil {
+			ev.Usage = &metrics.EventUsage{
+				CacheReadInputTokens:     usage.CacheReadInputTokens,
+				CacheCreationInputTokens: usage.CacheCreationInputTokens,
+				ReasoningOutputTokens:    usage.ReasoningOutputTokens,
+				Source:                   metrics.UsageSourceUpstream,
+				Protocol:                 usageProtocol(usage, subPath),
+			}
+		}
 		metrics.Record(ev)
 		if status == 499 {
 			return
@@ -579,6 +588,13 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 	internalErr := ""
 	if relayErr != nil {
 		internalErr = relayErr.Error()
+	}
+	// A lying upstream (cache reads exceeding total input) is recorded verbatim —
+	// the >100% ratio on the activity table is the visible symptom — but noted
+	// once per attempt so it can be chased in the logs.
+	if cr := usage.CacheReadInputTokens; cr != nil && usage.Input > 0 && *cr > usage.Input {
+		logger.Debugf("[Forward] %s: usage invariant violated: cache_read %d > input %d (protocol %s)",
+			model, *cr, usage.Input, usageProtocol(usage, subPath))
 	}
 	recordMetric(resp.StatusCode, ok && relayErr == nil, internalErr)
 	// Emit tool observability for the forwarding path: upstream reports

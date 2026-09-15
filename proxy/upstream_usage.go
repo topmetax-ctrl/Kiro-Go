@@ -24,52 +24,250 @@ import (
 
 // usageCounts is the token pair extracted from an upstream response. Zero means
 // "not reported", which the metrics layer records as unknown rather than free.
+//
+// Canonical semantics (matching OpenTelemetry GenAI conventions):
+// Input and Output are TOTALS. CacheRead and CacheCreation are subsets of
+// Input; Reasoning is a subset of Output. Per-dialect derivation happens in
+// usageEnvelope.normalize, so these invariants hold no matter which provider
+// dialect the response spoke.
 type usageCounts struct {
 	Input  int64
 	Output int64
 	// Server-side tool uses parsed from usage.server_tool_use (Anthropic only).
 	ServerTool upstreamToolUsage
+
+	// The subset figures are pointers: nil means the upstream did not report
+	// the figure at all, a non-nil zero means it reported an exact zero.
+	// Collapsing either into a bare int64 would make "provider says zero cache"
+	// indistinguishable from "provider says nothing", which is the difference
+	// between "0 · 0%" and "—" on the activity table.
+	CacheReadInputTokens     *int64
+	CacheCreationInputTokens *int64
+	ReasoningOutputTokens    *int64
+	// Protocol names the response dialect the figures were read from. It is
+	// detected from the wire shape, never from the provider's display name, so
+	// any provider speaking a known dialect is covered without per-name hacks.
+	// Empty until the first usage frame is seen.
+	Protocol string
 }
 
 func (u usageCounts) known() bool { return u.Input > 0 || u.Output > 0 }
 
-// usageEnvelope covers both provider dialects in one decode. Every field is a
-// pointer-free int64 because absent keys decode to 0, which is exactly the
-// "unknown" sentinel.
+// cacheKnown reports whether the upstream reported a cache breakdown at all.
+// Only then is a cache-hit ratio meaningful (rather than zero).
+func (u usageCounts) cacheKnown() bool {
+	return u.CacheReadInputTokens != nil || u.CacheCreationInputTokens != nil
+}
+
+// cacheReadOrZero dereferences the cache-read figure for callers that have
+// already established a breakdown was reported.
+func (u usageCounts) cacheReadOrZero() int64 {
+	if u.CacheReadInputTokens == nil {
+		return 0
+	}
+	return *u.CacheReadInputTokens
+}
+
+// usageEnvelope covers every provider dialect this relay can receive in one
+// decode. Presence-sensitive fields are pointers: absent decodes to nil, an
+// explicit zero decodes to a non-nil zero, and that distinction is exactly the
+// "0% vs unknown" cache question. Every shape is documented upstream behavior,
+// not guesswork:
+//
+//   - Anthropic Messages: {input_tokens, output_tokens, cache_creation_input_tokens,
+//     cache_read_input_tokens, server_tool_use}. Cached tokens are reported OUTSIDE
+//     input_tokens; the canonical total is their sum.
+//   - OpenAI Chat Completions: {prompt_tokens, completion_tokens,
+//     prompt_tokens_details{cached_tokens, cache_write_tokens},
+//     completion_tokens_details{reasoning_tokens}}. Details are subsets of the
+//     parent totals (cached tokens are already inside prompt_tokens).
+//   - OpenAI Responses: {input_tokens, output_tokens,
+//     input_tokens_details{cached_tokens, cache_write_tokens},
+//     output_tokens_details{reasoning_tokens}} — subsets again.
+//   - DeepSeek: {prompt_tokens, completion_tokens, prompt_cache_hit_tokens,
+//     prompt_cache_miss_tokens} with prompt_tokens = hit + miss.
+//   - Gemini generateContent: {usageMetadata:{promptTokenCount, candidatesTokenCount,
+//     cachedContentTokenCount, thoughtsTokenCount}}; cachedContentTokenCount is part
+//     of promptTokenCount.
 type usageEnvelope struct {
-	// Anthropic Messages
-	InputTokens  int64 `json:"input_tokens"`
-	OutputTokens int64 `json:"output_tokens"`
-	// Anthropic prompt caching: these are input tokens the upstream billed
-	// separately. Counting them keeps the input total comparable with a
-	// non-cached request.
-	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
-	// OpenAI chat/completions
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
+	// Anthropic Messages (and, by name collision, OpenAI Responses) totals.
+	InputTokens  *int64 `json:"input_tokens"`
+	OutputTokens *int64 `json:"output_tokens"`
+	// Anthropic prompt caching: input tokens the upstream billed separately from
+	// input_tokens. Their presence is what marks the Anthropic dialect.
+	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens"`
+
+	// OpenAI Chat Completions
+	PromptTokens        *int64 `json:"prompt_tokens"`
+	CompletionTokens    *int64 `json:"completion_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens     *int64 `json:"cached_tokens"`
+		CacheWriteTokens *int64 `json:"cache_write_tokens"`
+	} `json:"prompt_tokens_details"`
+	CompletionTokensDetails struct {
+		ReasoningTokens *int64 `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
+
+	// OpenAI Responses details (subsets of input_tokens / output_tokens).
+	InputTokensDetails struct {
+		CachedTokens     *int64 `json:"cached_tokens"`
+		CacheWriteTokens *int64 `json:"cache_write_tokens"`
+	} `json:"input_tokens_details"`
+	OutputTokensDetails struct {
+		ReasoningTokens *int64 `json:"reasoning_tokens"`
+	} `json:"output_tokens_details"`
+
+	// DeepSeek cache extensions
+	PromptCacheHitTokens  *int64 `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens *int64 `json:"prompt_cache_miss_tokens"`
+
+	// Gemini generateContent usageMetadata (camelCase, "Count" suffix).
+	PromptTokenCount        *int64 `json:"promptTokenCount"`
+	CandidatesTokenCount    *int64 `json:"candidatesTokenCount"`
+	CachedContentTokenCount *int64 `json:"cachedContentTokenCount"`
+	ThoughtsTokenCount      *int64 `json:"thoughtsTokenCount"`
+
+	// Gemini nests its usage one level deeper than the other dialects.
+	UsageMetadata *usageEnvelope `json:"usageMetadata"`
+
 	// Server-side tool usage (Anthropic usage.server_tool_use)
 	ServerToolUse struct {
 		WebSearchRequests int64 `json:"web_search_requests"`
 	} `json:"server_tool_use"`
 }
 
-func (e usageEnvelope) counts() usageCounts {
-	in := e.InputTokens + e.CacheCreationInputTokens + e.CacheReadInputTokens
-	if in == 0 {
-		in = e.PromptTokens
+// protocol names label the dialects for metrics.Event usage attribution.
+const (
+	protocolAnthropic = "anthropic"
+	protocolOpenAI    = "openai"
+	protocolResponses = "responses"
+	protocolGemini    = "gemini"
+)
+
+// normalize converts one decoded envelope into the canonical usage. The
+// dialect branches are separate because the semantics genuinely differ: only
+// Anthropic reports cached input outside its input total.
+//
+// An invariant violation (cache reads exceeding total input) is logged once and
+// left unclamped: the raw numbers are the evidence, and a ratio above 100% on
+// the activity table is itself the visible symptom of a lying upstream.
+func (e usageEnvelope) normalize() usageCounts {
+	c := usageCounts{}
+
+	// DeepSeek first: its responses also carry prompt_tokens, and its cache
+	// figures are the top-level extension fields.
+	switch {
+	case e.PromptCacheHitTokens != nil || e.PromptCacheMissTokens != nil:
+		c.Input = derefOr(e.PromptTokens, derefOr(e.PromptCacheHitTokens, 0)+derefOr(e.PromptCacheMissTokens, 0))
+		c.CacheReadInputTokens = e.PromptCacheHitTokens
+		c.Output = derefOr(e.CompletionTokens, 0)
+		c.ReasoningOutputTokens = e.CompletionTokensDetails.ReasoningTokens
+		c.Protocol = protocolOpenAI
+
+	case e.PromptTokens != nil || e.CompletionTokens != nil:
+		// OpenAI Chat Completions: details are subsets, never additions.
+		c.Input = derefOr(e.PromptTokens, 0)
+		c.Output = derefOr(e.CompletionTokens, 0)
+		c.CacheReadInputTokens = e.PromptTokensDetails.CachedTokens
+		c.CacheCreationInputTokens = e.PromptTokensDetails.CacheWriteTokens
+		c.ReasoningOutputTokens = e.CompletionTokensDetails.ReasoningTokens
+		c.Protocol = protocolOpenAI
+
+	case e.CacheReadInputTokens != nil || e.CacheCreationInputTokens != nil:
+		// Anthropic Messages: cached input is reported OUTSIDE input_tokens, so
+		// the canonical total is the sum. This branch must run before the plain
+		// input_tokens fallback below or the totals would lose the cache.
+		c.Input = derefOr(e.InputTokens, 0)
+		if e.CacheReadInputTokens != nil {
+			c.Input += *e.CacheReadInputTokens
+		}
+		if e.CacheCreationInputTokens != nil {
+			c.Input += *e.CacheCreationInputTokens
+		}
+		c.CacheReadInputTokens = e.CacheReadInputTokens
+		c.CacheCreationInputTokens = e.CacheCreationInputTokens
+		c.Output = derefOr(e.OutputTokens, 0)
+		c.Protocol = protocolAnthropic
+
+	case e.InputTokensDetails.CachedTokens != nil || e.InputTokensDetails.CacheWriteTokens != nil:
+		// OpenAI Responses: input_tokens already includes the cached share.
+		c.Input = derefOr(e.InputTokens, 0)
+		c.CacheReadInputTokens = e.InputTokensDetails.CachedTokens
+		c.CacheCreationInputTokens = e.InputTokensDetails.CacheWriteTokens
+		c.Output = derefOr(e.OutputTokens, 0)
+		c.ReasoningOutputTokens = e.OutputTokensDetails.ReasoningTokens
+		c.Protocol = protocolResponses
+
+	case e.InputTokens != nil || e.OutputTokens != nil:
+		// Bare input_tokens/output_tokens with no cache detail: either an
+		// Anthropic response without caching or an OpenAI Responses one. The
+		// totals read identically under both semantics, so no dialect call is
+		// made here; the caller resolves the protocol from the request path
+		// (usageProtocol) rather than guessing.
+		c.Input = derefOr(e.InputTokens, 0)
+		c.Output = derefOr(e.OutputTokens, 0)
+
+	case geminiUsagePresent(e):
+		// Gemini generateContent: promptTokenCount already includes the cached
+		// share, and thoughtsTokenCount is part of the output side.
+		c.Input = derefOr(e.PromptTokenCount, 0)
+		c.CacheReadInputTokens = e.CachedContentTokenCount
+		c.Output = derefOr(e.CandidatesTokenCount, 0)
+		c.ReasoningOutputTokens = e.ThoughtsTokenCount
+		c.Protocol = protocolGemini
+
+	default:
+		// usageMetadata nested one level deeper (non-stream Gemini body).
+		if e.UsageMetadata != nil {
+			c = e.UsageMetadata.normalize()
+		}
 	}
-	out := e.OutputTokens
-	if out == 0 {
-		out = e.CompletionTokens
+
+	// Anthropic reports server_tool_use; other dialects leave it zero. Applied
+	// after the switch so the early default branch keeps it too.
+	c.ServerTool = extractServerToolUse(e)
+	if e.UsageMetadata != nil && c.ServerTool.WebSearchRequests == 0 {
+		c.ServerTool = extractServerToolUse(*e.UsageMetadata)
 	}
-	return usageCounts{Input: in, Output: out, ServerTool: extractServerToolUse(e)}
+	return c
+}
+
+// geminiUsagePresent reports whether the envelope carries Gemini's camelCase
+// usageMetadata fields, which no other dialect uses.
+func geminiUsagePresent(e usageEnvelope) bool {
+	return e.PromptTokenCount != nil || e.CandidatesTokenCount != nil || e.CachedContentTokenCount != nil
+}
+
+func derefOr(p *int64, or int64) int64 {
+	if p != nil {
+		return *p
+	}
+	return or
+}
+
+// usageProtocol resolves the protocol label for a parsed usage: the
+// shape-detected dialect when the response shape was unambiguous, otherwise the
+// dialect the request path implied (/messages speaks Anthropic, /responses
+// speaks OpenAI Responses, anything else OpenAI Chat). This is a property of
+// the wire protocol, never of the provider's display name.
+func usageProtocol(u usageCounts, subPath string) string {
+	if u.Protocol != "" {
+		return u.Protocol
+	}
+	switch subPath {
+	case "/messages":
+		return protocolAnthropic
+	case "/responses":
+		return protocolResponses
+	default:
+		return protocolOpenAI
+	}
 }
 
 // usageFromJSONBody extracts token counts from a buffered non-stream response
 // body. It looks for a top-level "usage" object, which is where both dialects
 // put it. Returns a zero value when the body is not JSON or carries no usage.
-
 
 // upstreamToolUsage is the server-side tool usage extracted from an upstream
 // response. Only the logical use count is observable; the upstream controls
@@ -102,7 +300,21 @@ func usageFromJSONBody(body []byte) usageCounts {
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return usageCounts{}
 	}
-	return envelope.Usage.counts()
+	c := envelope.Usage.normalize()
+	if c.Protocol == "" {
+		// Non-stream Gemini bodies nest usage under "usageMetadata" instead.
+		var gem struct {
+			UsageMetadata usageEnvelope `json:"usageMetadata"`
+		}
+		if json.Unmarshal(body, &gem) == nil {
+			g := gem.UsageMetadata.normalize()
+			if g.Protocol != "" {
+				g.Protocol = protocolGemini
+				return g
+			}
+		}
+	}
+	return c
 }
 
 // maxUsageScanBuffer caps the partial-line buffer held by usageScanner. SSE data
@@ -118,10 +330,15 @@ const maxUsageScanBuffer = 64 * 1024
 // to the client, so scanning cannot alter or delay the relay — the caller writes
 // to the client first and feeds the scanner after.
 //
-// Later frames overwrite earlier ones because both dialects report cumulative
-// (not incremental) usage: Anthropic's message_start carries input tokens and
-// its final message_delta carries the output total; OpenAI sends one usage
-// object in the last chunk.
+// Frame merge semantics per field: every supported dialect reports usage
+// cumulatively on the final authoritative frame (Anthropic's message_start
+// carries the input side and its message_delta may carry the full final usage,
+// OpenAI sends one usage object in the last chunk, Gemini one usageMetadata at
+// the end), so the merge keeps the LAST reported value per field — never a
+// sum. Presence-sensitive fields (cache, reasoning) merge per-field: a frame
+// reporting only output_tokens leaves an already-seen cache breakdown intact,
+// and a later frame reporting an explicit cache zero overwrites an earlier
+// nonzero value, because the later frame is the authoritative one.
 type usageScanner struct {
 	partial []byte
 	counts  usageCounts
@@ -209,23 +426,56 @@ func (s *usageScanner) scanLine(line []byte) {
 		Message struct {
 			Usage usageEnvelope `json:"usage"`
 		} `json:"message"`
+		Response struct {
+			Usage usageEnvelope `json:"usage"`
+		} `json:"response"`
+		// Gemini chunks nest the dialect's fields under usageMetadata; the
+		// envelope reuses that field name for the same purpose.
+		UsageMetadata *usageEnvelope `json:"usageMetadata"`
 	}
 	if err := json.Unmarshal(payload, &frame); err != nil {
 		return
 	}
 
 	// Anthropic message_start nests usage under "message"; message_delta and the
-	// OpenAI final chunk put it at the top level.
-	for _, c := range []usageCounts{frame.Message.Usage.counts(), frame.Usage.counts()} {
-		if c.Input > 0 {
-			s.counts.Input = c.Input
-		}
-		if c.Output > 0 {
-			s.counts.Output = c.Output
-		}
-		if c.ServerTool.WebSearchRequests > 0 {
-			s.counts.ServerTool.WebSearchRequests = c.ServerTool.WebSearchRequests
-		}
+	// OpenAI final chunk put it at the top level; OpenAI Responses' terminal
+	// response.completed event nests it under "response"; Gemini chunks carry
+	// usageMetadata.
+	mergeUsage(&s.counts, frame.Message.Usage)
+	mergeUsage(&s.counts, frame.Usage)
+	mergeUsage(&s.counts, frame.Response.Usage)
+	if frame.UsageMetadata != nil {
+		mergeUsage(&s.counts, *frame.UsageMetadata)
+	}
+}
+
+// mergeUsage folds one frame's normalized usage into the running totals.
+// Input/Output merge last-wins (cumulative); the pointer fields merge
+// last-NON-NIL-wins so a frame reporting only an output total cannot erase a
+// cache breakdown an earlier frame carried, while an explicit later zero does
+// overwrite.
+func mergeUsage(dst *usageCounts, env usageEnvelope) {
+	c := env.normalize()
+	if c.Input > 0 {
+		dst.Input = c.Input
+	}
+	if c.Output > 0 {
+		dst.Output = c.Output
+	}
+	if c.CacheReadInputTokens != nil {
+		dst.CacheReadInputTokens = c.CacheReadInputTokens
+	}
+	if c.CacheCreationInputTokens != nil {
+		dst.CacheCreationInputTokens = c.CacheCreationInputTokens
+	}
+	if c.ReasoningOutputTokens != nil {
+		dst.ReasoningOutputTokens = c.ReasoningOutputTokens
+	}
+	if c.Protocol != "" {
+		dst.Protocol = c.Protocol
+	}
+	if c.ServerTool.WebSearchRequests > 0 {
+		dst.ServerTool.WebSearchRequests = c.ServerTool.WebSearchRequests
 	}
 }
 

@@ -57,6 +57,15 @@ type forwardLocalConsumption struct {
 	// store's streamed counter means. The upstream rounds are always buffered, so
 	// reading the flag off a round would report every request as non-streamed.
 	stream bool
+
+	// Cache/reasoning sums across rounds, with per-field presence: a round that
+	// reported no breakdown must not turn a sum into a false zero, so the
+	// figure is only published on the Event when at least one round reported it.
+	cacheReadTokens     int64
+	cacheCreationTokens int64
+	reasoningTokens     int64
+	cacheReported       bool
+	reasoningReported   bool
 }
 
 // addRound folds one completed upstream round into the totals.
@@ -66,6 +75,37 @@ func (c *forwardLocalConsumption) addRound(usage usageCounts, provider config.Up
 	c.outputTokens += usage.Output
 	c.costUSD += provider.CostUSD(usage.Input, usage.Output)
 	c.latencyMs += latencyMs
+	if usage.cacheKnown() {
+		c.cacheReported = true
+		c.cacheReadTokens += usage.cacheReadOrZero()
+		if usage.CacheCreationInputTokens != nil {
+			c.cacheCreationTokens += *usage.CacheCreationInputTokens
+		}
+	}
+	if usage.ReasoningOutputTokens != nil {
+		c.reasoningReported = true
+		c.reasoningTokens += *usage.ReasoningOutputTokens
+	}
+}
+
+// usage builds the Event's nested usage object for the whole loop, or nil when
+// no round reported anything beyond the flat totals.
+func (c *forwardLocalConsumption) usage() *metrics.EventUsage {
+	if !c.cacheReported && !c.reasoningReported {
+		return nil
+	}
+	u := &metrics.EventUsage{Source: metrics.UsageSourceUpstream, Protocol: protocolAnthropic}
+	if c.cacheReported {
+		read := c.cacheReadTokens
+		create := c.cacheCreationTokens
+		u.CacheReadInputTokens = &read
+		u.CacheCreationInputTokens = &create
+	}
+	if c.reasoningReported {
+		r := c.reasoningTokens
+		u.ReasoningOutputTokens = &r
+	}
+	return u
 }
 
 // forwardLocalWebSearch handles the "local" web_search strategy for a forwarded
@@ -710,7 +750,7 @@ func (h *Handler) finishForwardLocalFailure(ctx context.Context, consumed forwar
 		routeID = route.ID
 	}
 	canceled := status == 499
-	metrics.Record(metrics.Event{
+	ev := metrics.Event{
 		ClientModel:  clientModel,
 		TargetModel:  strings.TrimSpace(rt.Target.TargetModel),
 		RouteID:      routeID,
@@ -730,7 +770,9 @@ func (h *Handler) finishForwardLocalFailure(ctx context.Context, consumed forwar
 		Canceled:     canceled,
 		Ok:           false,
 		ErrorMsg:     errMsg,
-	})
+		Usage:        consumed.usage(),
+	}
+	metrics.Record(ev)
 	if !canceled {
 		// A client disconnect is not a failed request (same rule as the forward
 		// path): it advances neither the success nor the failure counter.
@@ -1001,5 +1043,6 @@ func (h *Handler) recordForwardLocalRequest(ctx context.Context, consumed forwar
 		ModelRounds:  consumed.rounds,
 		Stream:       consumed.stream,
 		Ok:           true,
+		Usage:        consumed.usage(),
 	})
 }
