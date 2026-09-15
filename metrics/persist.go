@@ -35,7 +35,14 @@ type persistedCounter struct {
 	// 0, and fromPersistedCounter then backfills it from Requests so history keeps
 	// the pre-existing "one round per request" meaning instead of reading as zero.
 	ModelRounds int64 `json:"modelRounds,omitempty"`
-	LastUsed    int64 `json:"lastUsed"`
+	// Cache telemetry sums, additive the same way: a pre-cache file loads with
+	// zero observable requests, which the cache-hit rate reads as "unknown"
+	// rather than a misleading 0%.
+	CacheReadInputTokens     int64 `json:"cacheReadInputTokens,omitempty"`
+	CacheCreationInputTokens int64 `json:"cacheCreationInputTokens,omitempty"`
+	CacheObservedInputTokens int64 `json:"cacheObservedInputTokens,omitempty"`
+	CacheObservedRequests    int64 `json:"cacheObservedRequests,omitempty"`
+	LastUsed                 int64 `json:"lastUsed"`
 }
 
 type persistedProvider struct {
@@ -77,23 +84,22 @@ type persistedRoute struct {
 	ProviderID  string `json:"providerId"`
 }
 
-
 type persistedToolAgg struct {
 	persistedToolCounter
-	ByOrigin map[string]int64            `json:"byOrigin,omitempty"`
-	ByBackend map[string]int64            `json:"byBackend,omitempty"`
-	Hours    []persistedToolBucket       `json:"hours,omitempty"`
+	ByOrigin  map[string]int64      `json:"byOrigin,omitempty"`
+	ByBackend map[string]int64      `json:"byBackend,omitempty"`
+	Hours     []persistedToolBucket `json:"hours,omitempty"`
 }
 
 type persistedToolCounter struct {
-	Uses        int64 `json:"uses"`
-	Executions  int64 `json:"executions"`
-	CacheHits   int64 `json:"cacheHits,omitempty"`
-	Failures    int64 `json:"failures,omitempty"`
-	Requests    int64 `json:"requests,omitempty"`
+	Uses           int64 `json:"uses"`
+	Executions     int64 `json:"executions"`
+	CacheHits      int64 `json:"cacheHits,omitempty"`
+	Failures       int64 `json:"failures,omitempty"`
+	Requests       int64 `json:"requests,omitempty"`
 	TotalLatencyMs int64 `json:"totalLatencyMs,omitempty"`
-	Credits     int64 `json:"credits,omitempty"`
-	LastUsed    int64 `json:"lastUsed"`
+	Credits        int64 `json:"credits,omitempty"`
+	LastUsed       int64 `json:"lastUsed"`
 }
 
 type persistedToolBucket struct {
@@ -109,37 +115,45 @@ type persistedToolBucket struct {
 
 func toPersistedCounter(c counter) persistedCounter {
 	return persistedCounter{
-		Requests:       c.requests,
-		Success:        c.success,
-		Failed:         c.failed,
-		Canceled:       c.canceled,
-		Streamed:       c.streamed,
-		TotalLatencyMs: c.totalLatencyMs,
-		TotalTTFBMs:    c.totalTTFBMs,
-		TTFBCount:      c.ttfbCount,
-		InputTokens:    c.inputTokens,
-		OutputTokens:   c.outputTokens,
-		CostUSD:        c.costUSD,
-		ModelRounds:    c.modelRounds,
-		LastUsed:       c.lastUsed,
+		Requests:                 c.requests,
+		Success:                  c.success,
+		Failed:                   c.failed,
+		Canceled:                 c.canceled,
+		Streamed:                 c.streamed,
+		TotalLatencyMs:           c.totalLatencyMs,
+		TotalTTFBMs:              c.totalTTFBMs,
+		TTFBCount:                c.ttfbCount,
+		InputTokens:              c.inputTokens,
+		OutputTokens:             c.outputTokens,
+		CostUSD:                  c.costUSD,
+		ModelRounds:              c.modelRounds,
+		CacheReadInputTokens:     c.cacheReadInputTokens,
+		CacheCreationInputTokens: c.cacheCreationInputTokens,
+		CacheObservedInputTokens: c.cacheObservedInputTokens,
+		CacheObservedRequests:    c.cacheObservedRequests,
+		LastUsed:                 c.lastUsed,
 	}
 }
 
 func fromPersistedCounter(p persistedCounter) counter {
 	c := counter{
-		requests:       p.Requests,
-		success:        p.Success,
-		failed:         p.Failed,
-		canceled:       p.Canceled,
-		streamed:       p.Streamed,
-		totalLatencyMs: p.TotalLatencyMs,
-		totalTTFBMs:    p.TotalTTFBMs,
-		ttfbCount:      p.TTFBCount,
-		inputTokens:    p.InputTokens,
-		outputTokens:   p.OutputTokens,
-		costUSD:        p.CostUSD,
-		modelRounds:    p.ModelRounds,
-		lastUsed:       p.LastUsed,
+		requests:                 p.Requests,
+		success:                  p.Success,
+		failed:                   p.Failed,
+		canceled:                 p.Canceled,
+		streamed:                 p.Streamed,
+		totalLatencyMs:           p.TotalLatencyMs,
+		totalTTFBMs:              p.TotalTTFBMs,
+		ttfbCount:                p.TTFBCount,
+		inputTokens:              p.InputTokens,
+		outputTokens:             p.OutputTokens,
+		costUSD:                  p.CostUSD,
+		modelRounds:              p.ModelRounds,
+		cacheReadInputTokens:     p.CacheReadInputTokens,
+		cacheCreationInputTokens: p.CacheCreationInputTokens,
+		cacheObservedInputTokens: p.CacheObservedInputTokens,
+		cacheObservedRequests:    p.CacheObservedRequests,
+		lastUsed:                 p.LastUsed,
 	}
 	if c.modelRounds == 0 && c.requests > 0 {
 		// Pre-ModelRounds file: every recorded request was one model round, which

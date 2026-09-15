@@ -37,6 +37,36 @@ const (
 	KiroPoolName = "Kiro Pool"
 )
 
+// Usage-source labels for Event.Usage.Source. Forwarded traffic records what
+// the upstream itself reported; the estimator value is reserved for callers
+// that substitute a local estimate (none do today — estimated numbers never
+// masquerade as upstream telemetry).
+const (
+	UsageSourceUpstream  = "upstream"
+	UsageSourceEstimated = "estimated"
+)
+
+// EventUsage carries the usage detail the flat Event totals cannot express:
+// the cache/reasoning breakdown and where the figures came from. Every token
+// field is a pointer so nil (upstream did not report it) stays distinct from
+// an explicit zero (upstream reported "no cache hits") — the difference
+// between "—" and "0 · 0%" on the activity table.
+//
+// The flat Event.InputTokens/OutputTokens remain the canonical TOTALS (input
+// including cached tokens); this object only adds what those fields cannot
+// hold, so no number is stored twice.
+type EventUsage struct {
+	CacheReadInputTokens     *int64 `json:"cacheReadInputTokens,omitempty"`
+	CacheCreationInputTokens *int64 `json:"cacheCreationInputTokens,omitempty"`
+	ReasoningOutputTokens    *int64 `json:"reasoningOutputTokens,omitempty"`
+	// Source names where the figures came from ("upstream" today).
+	Source string `json:"source,omitempty"`
+	// Protocol names the response dialect the usage was read from
+	// ("anthropic" | "openai" | "responses" | "gemini"), detected from the wire
+	// shape — never from a provider display name.
+	Protocol string `json:"protocol,omitempty"`
+}
+
 // Event is a single request outcome. It is retained in the ring buffer and
 // broadcast to live subscribers. TimeMs is Unix milliseconds.
 //
@@ -64,10 +94,14 @@ type Event struct {
 	InputTokens    int64   `json:"inputTokens,omitempty"`
 	OutputTokens   int64   `json:"outputTokens,omitempty"`
 	CostUSD        float64 `json:"costUsd,omitempty"`
-	Stream         bool    `json:"stream"`
-	Canceled       bool    `json:"canceled,omitempty"` // client disconnected mid-flight
-	Ok             bool    `json:"ok"`
-	ErrorMsg       string  `json:"errorMsg,omitempty"`
+	// Usage carries the cache/reasoning breakdown and its provenance when the
+	// upstream reported it. Nil means no usage telemetry was observed at all;
+	// the flat totals above stay the canonical IN/OUT figures.
+	Usage    *EventUsage `json:"usage,omitempty"`
+	Stream   bool        `json:"stream"`
+	Canceled bool        `json:"canceled,omitempty"` // client disconnected mid-flight
+	Ok       bool        `json:"ok"`
+	ErrorMsg string      `json:"errorMsg,omitempty"`
 	// Attempt is the zero-based index of this try within a route's ranked target
 	// list. 0 means the route's preferred provider served it; >0 means a failover
 	// happened, which is the signal that a higher-priority target is unhealthy.
@@ -118,6 +152,48 @@ type counter struct {
 	// tool loop served a request. Kept as its own total rather than folded into
 	// requests so provider consumption is observable without inflating volume.
 	modelRounds int64
+
+	// Cache telemetry, aggregated on the population that reported it. A
+	// provider that reports no cache fields contributes nothing here — missing
+	// telemetry must never dilute the ratio into a fake 0%.
+	cacheReadInputTokens     int64 // sum of reported cache-read tokens
+	cacheCreationInputTokens int64 // sum of reported cache-creation tokens
+	// cacheObservedInputTokens is the input-total sum over exactly the events
+	// that reported cache telemetry — the weighted ratio's denominator. It is
+	// deliberately separate from inputTokens, which sums every event.
+	cacheObservedInputTokens int64
+	cacheObservedRequests    int64 // events that reported cache telemetry
+}
+
+// addUsage folds ev.Usage into the cache aggregates. Only events that actually
+// reported a cache breakdown advance the observability counters, so the
+// cache-hit ratio below is computed over the population that can support it.
+func (c *counter) addUsage(ev Event) {
+	u := ev.Usage
+	if u == nil {
+		return
+	}
+	if u.CacheReadInputTokens != nil || u.CacheCreationInputTokens != nil {
+		if u.CacheReadInputTokens != nil && *u.CacheReadInputTokens > 0 {
+			c.cacheReadInputTokens += *u.CacheReadInputTokens
+		}
+		if u.CacheCreationInputTokens != nil && *u.CacheCreationInputTokens > 0 {
+			c.cacheCreationInputTokens += *u.CacheCreationInputTokens
+		}
+		c.cacheObservedInputTokens += ev.InputTokens
+		c.cacheObservedRequests++
+	}
+}
+
+// cacheHitRate returns the token-weighted cache-hit share (0..100) over the
+// cache-observable population, or -1 when nothing observable was recorded.
+// Weighted — sum(reads)/sum(inputs) — never an average of per-request
+// percentages, which would let a 1k-token 100% hit outweigh a 100k-token miss.
+func (c *counter) cacheHitRate() float64 {
+	if c.cacheObservedInputTokens <= 0 {
+		return -1
+	}
+	return float64(c.cacheReadInputTokens) * 100 / float64(c.cacheObservedInputTokens)
 }
 
 func (c *counter) add(ev Event) {
@@ -146,6 +222,7 @@ func (c *counter) add(ev Event) {
 	c.outputTokens += ev.OutputTokens
 	c.costUSD += ev.CostUSD
 	c.modelRounds += eventModelRounds(ev)
+	c.addUsage(ev)
 	if ev.TimeMs > c.lastUsed {
 		c.lastUsed = ev.TimeMs
 	}
@@ -167,6 +244,10 @@ func (c *counter) sub(o counter) {
 	c.outputTokens -= o.outputTokens
 	c.costUSD -= o.costUSD
 	c.modelRounds -= o.modelRounds
+	c.cacheReadInputTokens -= o.cacheReadInputTokens
+	c.cacheCreationInputTokens -= o.cacheCreationInputTokens
+	c.cacheObservedInputTokens -= o.cacheObservedInputTokens
+	c.cacheObservedRequests -= o.cacheObservedRequests
 	// lastUsed is a max, not a sum: it cannot be un-mixed, so it is left as is
 	// rather than guessed at.
 	c.clampNonNegative()
@@ -211,6 +292,18 @@ func (c *counter) clampNonNegative() {
 	}
 	if c.modelRounds < 0 {
 		c.modelRounds = 0
+	}
+	if c.cacheReadInputTokens < 0 {
+		c.cacheReadInputTokens = 0
+	}
+	if c.cacheCreationInputTokens < 0 {
+		c.cacheCreationInputTokens = 0
+	}
+	if c.cacheObservedInputTokens < 0 {
+		c.cacheObservedInputTokens = 0
+	}
+	if c.cacheObservedRequests < 0 {
+		c.cacheObservedRequests = 0
 	}
 }
 
@@ -559,6 +652,14 @@ type OverallStat struct {
 	// number of client requests.
 	ModelRounds int64 `json:"modelRounds"`
 	LastUsed    int64 `json:"lastUsed"`
+	// Cache telemetry, weighted over the events that reported it.
+	CacheReadInputTokens     int64 `json:"cacheReadInputTokens,omitempty"`
+	CacheCreationInputTokens int64 `json:"cacheCreationInputTokens,omitempty"`
+	// CacheHitRate is sum(cacheRead)/sum(input over cache-observable events) as
+	// a percentage, -1 when no event reported cache telemetry. Not omitempty: a
+	// genuine 0% must serialize, only -1 means "nothing observable".
+	CacheHitRate          float64 `json:"cacheHitRate"`
+	CacheObservedRequests int64   `json:"cacheObservedRequests,omitempty"`
 }
 
 // Overall returns the aggregate across every recorded request.
@@ -567,17 +668,21 @@ func Overall() OverallStat {
 	defer s.mu.Unlock()
 	c := s.overall
 	return OverallStat{
-		Requests:     c.requests,
-		Success:      c.success,
-		Failed:       c.failed,
-		Canceled:     c.canceled,
-		AvgLatencyMs: c.avg(),
-		AvgTTFBMs:    c.avgTTFB(),
-		InputTokens:  c.inputTokens,
-		OutputTokens: c.outputTokens,
-		CostUSD:      c.costUSD,
-		ModelRounds:  c.modelRounds,
-		LastUsed:     c.lastUsed,
+		Requests:                 c.requests,
+		Success:                  c.success,
+		Failed:                   c.failed,
+		Canceled:                 c.canceled,
+		AvgLatencyMs:             c.avg(),
+		AvgTTFBMs:                c.avgTTFB(),
+		InputTokens:              c.inputTokens,
+		OutputTokens:             c.outputTokens,
+		CostUSD:                  c.costUSD,
+		ModelRounds:              c.modelRounds,
+		LastUsed:                 c.lastUsed,
+		CacheReadInputTokens:     c.cacheReadInputTokens,
+		CacheCreationInputTokens: c.cacheCreationInputTokens,
+		CacheHitRate:             c.cacheHitRate(),
+		CacheObservedRequests:    c.cacheObservedRequests,
 	}
 }
 
@@ -611,6 +716,14 @@ type ProviderStat struct {
 	LastFail     int64   `json:"lastFail"`
 	LastUsed     int64   `json:"lastUsed"`
 	Healthy      bool    `json:"healthy"`
+	// Cache telemetry, weighted over this provider's events that reported it.
+	CacheReadInputTokens     int64 `json:"cacheReadInputTokens,omitempty"`
+	CacheCreationInputTokens int64 `json:"cacheCreationInputTokens,omitempty"`
+	// CacheHitRate is the token-weighted cache-read share of input, in percent,
+	// -1 when no event reported cache telemetry (so the UI renders "—"). Not
+	// omitempty: a genuine 0% must serialize, only -1 means "nothing observable".
+	CacheHitRate          float64 `json:"cacheHitRate"`
+	CacheObservedRequests int64   `json:"cacheObservedRequests,omitempty"`
 }
 
 // successRate returns the success percentage, or -1 when there is no traffic so
@@ -695,7 +808,11 @@ func (s *store) providerStatLocked(id string, p *providerAgg, nowMinute int64) P
 		LastUsed:     p.lastUsed,
 		// Healthy is a live signal, not a historical one: three consecutive
 		// failures with no success since marks a provider as down.
-		Healthy: p.curStreak < 3,
+		Healthy:                  p.curStreak < 3,
+		CacheReadInputTokens:     p.cacheReadInputTokens,
+		CacheCreationInputTokens: p.cacheCreationInputTokens,
+		CacheHitRate:             p.cacheHitRate(),
+		CacheObservedRequests:    p.cacheObservedRequests,
 	}
 }
 
@@ -755,6 +872,9 @@ func ProviderStats() []ProviderStat {
 //
 // AvgTTFBMs, Canceled, Streamed and TokensPerSec are left zero: buckets do not
 // record them, and a windowed view must not silently substitute all-time values.
+// The cache aggregates follow the same rule (CacheHitRate is -1: buckets carry
+// no cache telemetry), so a windowed view reports "unknown" rather than a
+// figure summed outside the window.
 func ProviderStatsWindow(hours int) []ProviderStat {
 	if hours <= 0 {
 		return ProviderStats()
@@ -810,6 +930,8 @@ func ProviderStatsWindow(hours int) []ProviderStat {
 			OutputTokens: agg.OutputTokens,
 			CostUSD:      agg.CostUSD,
 			ModelRounds:  agg.ModelRounds,
+			// Windowed buckets carry no cache telemetry: unknown, not zero.
+			CacheHitRate: -1,
 			// Live signals, deliberately not windowed.
 			InFlight:     p.inFlight,
 			PeakInFlight: p.peakFlight,
@@ -1049,6 +1171,8 @@ func ProviderDetailWindow(id string, hours, minutes int) (ProviderDetail, bool) 
 		InputTokens:  agg.InputTokens,
 		OutputTokens: agg.OutputTokens,
 		CostUSD:      agg.CostUSD,
+		// Windowed buckets carry no cache telemetry: unknown, not zero.
+		CacheHitRate: -1,
 		// Live signals.
 		InFlight:     p.inFlight,
 		PeakInFlight: p.peakFlight,

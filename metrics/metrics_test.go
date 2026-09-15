@@ -1,8 +1,10 @@
 package metrics
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -641,5 +643,167 @@ func TestHourlyBucketCostRoundTrips(t *testing.T) {
 	got := ProviderStatsWindow(24)
 	if len(got) != 1 || got[0].CostUSD != 2.5 {
 		t.Fatalf("windowed cost did not survive persist: %+v", got)
+	}
+}
+
+// ptrOf is a test shorthand for the tri-state cache fields.
+func ptrOf(n int64) *int64 { return &n }
+
+// usageEvent builds an event with the given canonical totals plus a nested
+// cache breakdown (nil = not reported).
+func usageEvent(in, out int64, read, create *int64) Event {
+	e := ev("p1", true, 200, 100)
+	e.InputTokens = in
+	e.OutputTokens = out
+	e.Usage = &EventUsage{CacheReadInputTokens: read, CacheCreationInputTokens: create, Source: UsageSourceUpstream}
+	return e
+}
+
+func TestCacheAggregationWeightedNotAveraged(t *testing.T) {
+	reset(t)
+	// A: 1000 in, 1000 cached = 100%. B: 100000 in, 0 cached = 0%.
+	// The weighted aggregate is 1000/101000 (~1%), NOT the 50% request average.
+	Record(usageEvent(1000, 10, ptrOf(1000), ptrOf(0)))
+	Record(usageEvent(100000, 500, ptrOf(0), nil))
+
+	o := Overall()
+	if o.CacheObservedRequests != 2 {
+		t.Fatalf("observed = %d, want 2", o.CacheObservedRequests)
+	}
+	if o.CacheReadInputTokens != 1000 {
+		t.Fatalf("reads = %d, want 1000", o.CacheReadInputTokens)
+	}
+	if o.CacheCreationInputTokens != 0 {
+		t.Fatalf("creations = %d, want 0", o.CacheCreationInputTokens)
+	}
+	// 1000/101000 = 0.9901% — never 50.
+	if want := 1000.0 * 100 / 101000.0; o.CacheHitRate < want-0.001 || o.CacheHitRate > want+0.001 {
+		t.Fatalf("hit rate = %v, want ~%v (weighted)", o.CacheHitRate, want)
+	}
+
+	p := ProviderStats()
+	if len(p) != 1 || p[0].CacheHitRate != o.CacheHitRate {
+		t.Fatalf("provider cache hit = %+v", p)
+	}
+}
+
+func TestCacheAggregationUnknownIsNotZero(t *testing.T) {
+	reset(t)
+	// Events without a cache breakdown must not enter the ratio's population:
+	// no telemetry means unknown (-1), never a diluted 0%.
+	Record(usageEvent(5000, 50, nil, nil))
+	Record(ev("p1", true, 200, 10)) // no usage object at all (pool-style)
+
+	o := Overall()
+	if o.CacheObservedRequests != 0 {
+		t.Fatalf("observed = %d, want 0", o.CacheObservedRequests)
+	}
+	if o.CacheHitRate != -1 {
+		t.Fatalf("hit rate = %v, want -1 (unknown)", o.CacheHitRate)
+	}
+}
+
+func TestCacheGenuineZeroHitIsZero(t *testing.T) {
+	reset(t)
+	// An upstream that explicitly reports cached_tokens: 0 has real telemetry:
+	// a genuine 0% is a meaningful answer, not unknown.
+	Record(usageEvent(800, 20, ptrOf(0), nil))
+	o := Overall()
+	if o.CacheHitRate != 0 {
+		t.Fatalf("hit rate = %v, want 0 (explicitly reported)", o.CacheHitRate)
+	}
+}
+
+func TestCacheAggregationSubtractsOnProviderReset(t *testing.T) {
+	reset(t)
+	Record(usageEvent(1000, 10, ptrOf(800), ptrOf(50)))
+	Record(usageEvent(2000, 20, nil, nil)) // other provider
+	Record(usageEvent(3000, 30, ptrOf(1500), nil))
+	// Attribute one cache-reporting event to a second provider, then reset it.
+	e := usageEvent(4000, 40, ptrOf(3200), nil)
+	e.ProviderID = "p2"
+	e.ProviderName = "P-p2"
+	Record(e)
+
+	if !ResetProvider("p2") {
+		t.Fatal("ResetProvider(p2) = false")
+	}
+	o := Overall()
+	if o.CacheObservedRequests != 2 || o.CacheReadInputTokens != 2300 {
+		t.Fatalf("after reset: observed=%d reads=%d, want 2/2300", o.CacheObservedRequests, o.CacheReadInputTokens)
+	}
+	if want := 2300.0 * 100 / (1000 + 3000); o.CacheHitRate < want-0.001 || o.CacheHitRate > want+0.001 {
+		t.Fatalf("hit rate = %v, want ~%v", o.CacheHitRate, want)
+	}
+}
+
+func TestCachePersistRoundTrip(t *testing.T) {
+	reset(t)
+	Record(usageEvent(1000, 10, ptrOf(800), ptrOf(40)))
+	Record(usageEvent(500, 5, nil, nil))
+
+	path := filepath.Join(t.TempDir(), "metrics.json")
+	if err := Save(path); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	s = newStore()
+	if err := Load(path); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	o := Overall()
+	if o.CacheReadInputTokens != 800 || o.CacheCreationInputTokens != 40 || o.CacheObservedRequests != 1 {
+		t.Fatalf("reloaded cache totals = %+v", o)
+	}
+	if want := 800.0 * 100 / 1000.0; o.CacheHitRate < want-0.001 || o.CacheHitRate > want+0.001 {
+		t.Fatalf("reloaded hit rate = %v, want %v (denominator preserved across restart)", o.CacheHitRate, want)
+	}
+}
+
+func TestCacheFieldsAbsentInOldPersistedFile(t *testing.T) {
+	reset(t)
+	// A snapshot written before cache telemetry existed must load cleanly and
+	// read as "unknown" hit rate, not a fabricated 0%.
+	old := `{"overall":{"requests":3,"success":3,"inputTokens":50000,"outputTokens":2000},
+		"byProvider":{"p-old":{"requests":3,"success":3,"inputTokens":50000,"outputTokens":2000,"name":"old"}}}`
+	path := filepath.Join(t.TempDir(), "old.json")
+	if err := os.WriteFile(path, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Load(path); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	o := Overall()
+	if o.Requests != 3 || o.InputTokens != 50000 {
+		t.Fatalf("legacy totals = %+v", o)
+	}
+	if o.CacheHitRate != -1 || o.CacheObservedRequests != 0 {
+		t.Fatalf("legacy cache = rate %v observed %d, want -1/0", o.CacheHitRate, o.CacheObservedRequests)
+	}
+}
+
+func TestEventJSONBackwardCompatible(t *testing.T) {
+	// Old consumers see no "usage" key on events without a breakdown, and a
+	// pointer field that is absent stays distinct from an explicit zero.
+	e := ev("p1", true, 200, 5)
+	e.InputTokens = 100
+	e.OutputTokens = 10
+	b, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "usage") {
+		t.Fatalf("no-usage event serialized %s, want no usage key", b)
+	}
+	// Explicit zero cache survives the round trip as an explicit zero.
+	e.Usage = &EventUsage{CacheReadInputTokens: ptrOf(0)}
+	b, _ = json.Marshal(e)
+	var back struct {
+		Usage *EventUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Usage == nil || back.Usage.CacheReadInputTokens == nil || *back.Usage.CacheReadInputTokens != 0 {
+		t.Fatalf("explicit zero did not survive: %s", b)
 	}
 }
