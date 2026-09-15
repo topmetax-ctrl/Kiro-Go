@@ -1,5 +1,5 @@
 {
-  "version": "1.2.7",
-  "changelog": "Forwarding: session affinity — the client's canonical session id (x-claude-code-session-id / x-opencode-session) is preserved to every upstream across retries, failover and web-search continuation rounds, with an optional per-provider session header mapping (e.g. X-Opencode-Session for OpenCode Go backends).\nChuyển tiếp: session affinity — session id gốc của client (x-claude-code-session-id / x-opencode-session) được giữ nguyên tới mọi upstream qua retry, failover và các vòng web-search, kèm map header session theo từng provider (ví dụ X-Opencode-Session cho backend OpenCode Go).",
+  "version": "1.2.8",
+  "changelog": "Forwarding: session identity is now also recovered from body metadata.user_id (strictly validated) when an aggregator drops the session headers — 9router-style hops stop hitting OpenCode Go's MissingSessionID without any client-side change.\nChuyển tiếp: khi aggregator làm rơi header session, identity giờ được khôi phục từ metadata.user_id trong body (kiểm tra shape nghiêm ngặt) — các hop kiểu 9router hết bị OpenCode Go từ chối MissingSessionID mà không cần đổi gì phía client.",
   "download": "https://github.com/Quorinex/Kiro-Go"
 }
