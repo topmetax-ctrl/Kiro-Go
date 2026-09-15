@@ -191,6 +191,20 @@ type ClaudeRequest struct {
 	// to control reasoning depth. It supersedes thinking.budget_tokens, which
 	// is deprecated on the 4.6 models and rejected outright by 4.7 and later.
 	OutputConfig *ClaudeOutputConfig `json:"output_config,omitempty"`
+
+	// Metadata mirrors Anthropic's request metadata envelope (only user_id is
+	// recognized). Carrying the field keeps it faithful across local
+	// re-marshals (memory injection) instead of silently stripping client
+	// identity from the forwarded body, and lets session_affinity.go read it
+	// as the last-resort identity carrier.
+	Metadata *ClaudeRequestMetadata `json:"metadata,omitempty"`
+}
+
+// ClaudeRequestMetadata mirrors the Anthropic request metadata object. Only
+// user_id is recognized; unknown members are ignored, matching how the proxy
+// treats the rest of the request body.
+type ClaudeRequestMetadata struct {
+	UserID string `json:"user_id,omitempty"`
 }
 
 type ClaudeThinkingConfig struct {

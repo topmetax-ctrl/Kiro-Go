@@ -14,12 +14,23 @@ package proxy
 // the provider-specific spelling happens at egress only, so routing logic never
 // grows per-backend header knowledge.
 //
+// A third carrier exists for compatibility: aggregators that rebuild requests
+// (9router's DefaultExecutor builds outbound headers from scratch) drop the
+// session headers yet still relay the same Claude Code identity inside the
+// body's metadata.user_id — Claude Code itself sends it in both places. That
+// body value is a LAST-RESORT source behind both headers, validated against
+// strict known shapes only, and it stays an UNTRUSTED routing hint: like the
+// headers, it may steer session affinity, but it never feeds authentication,
+// billing, or tenant decisions.
+//
 // The forwarder never manufactures a session id. A request without one stays
 // without one: generating a per-request UUID would silently give every request
 // of the same conversation a different logical session, which is exactly the
 // affinity this exists to preserve.
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/textproto"
 	"strings"
@@ -39,13 +50,14 @@ const (
 
 // session sources, for observability only (never logged with the id itself).
 const (
-	sessionSourceClaudeCode = "claude-code"
-	sessionSourceOpencode   = "opencode"
-	sessionSourceNone       = "none"
+	sessionSourceClaudeCode     = "claude-code"
+	sessionSourceClaudeMetadata = "claude-metadata"
+	sessionSourceOpencode       = "opencode"
+	sessionSourceNone           = "none"
 )
 
 // clientSession is the canonical session identity of one inbound request.
-// ID is "" when the client presented no session header at all.
+// ID is "" when the client presented no recognizable session identity at all.
 type clientSession struct {
 	ID     string
 	Source string
@@ -56,7 +68,8 @@ func (s clientSession) present() bool { return s.ID != "" }
 
 // clientSessionAffinity resolves the canonical session identity from the
 // inbound request. Precedence: Claude Code's native header, then the native
-// OpenCode header. Nothing is generated: no header, no affinity.
+// OpenCode header, then the strict body-metadata fallback extracted where the
+// handler parsed the body. Nothing is generated: no identity, no affinity.
 func clientSessionAffinity(r *http.Request) clientSession {
 	if v := strings.TrimSpace(r.Header.Get(HeaderClaudeCodeSession)); v != "" {
 		return clientSession{ID: v, Source: sessionSourceClaudeCode}
@@ -64,7 +77,126 @@ func clientSessionAffinity(r *http.Request) clientSession {
 	if v := strings.TrimSpace(r.Header.Get(HeaderOpencodeSession)); v != "" {
 		return clientSession{ID: v, Source: sessionSourceOpencode}
 	}
+	if v := bodySessionFallback(r.Context()); v != "" {
+		return clientSession{ID: v, Source: sessionSourceClaudeMetadata}
+	}
 	return clientSession{Source: sessionSourceNone}
+}
+
+// bodySessionContextKey carries the body-derived session fallback of one
+// request. It is populated exactly once — where the handler has already parsed
+// the body — so the resolver never needs to touch a body it does not own.
+type bodySessionContextKey struct{}
+
+// withBodySessionFallback attaches a body-derived session fallback to the
+// request context.
+func withBodySessionFallback(r *http.Request, id string) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), bodySessionContextKey{}, id))
+}
+
+// bodySessionFallback returns the body-derived session fallback; "" when the
+// request carries none.
+func bodySessionFallback(ctx context.Context) string {
+	id, _ := ctx.Value(bodySessionContextKey{}).(string)
+	return id
+}
+
+// withBodySessionFallbackFromRequest extracts the session identity that
+// reached the gateway only inside the body (aggregators that rebuild requests
+// drop the session headers) and attaches it to the request context. Headers
+// keep precedence: the fallback is read only when neither session header is
+// present. A no-op when the body carries no recognizable identity.
+func withBodySessionFallbackFromRequest(r *http.Request, req *ClaudeRequest) *http.Request {
+	if req == nil || req.Metadata == nil {
+		return r
+	}
+	if id := metadataSessionID(req.Metadata.UserID); id != "" {
+		return withBodySessionFallback(r, id)
+	}
+	return r
+}
+
+// maxMetadataUserIDLen bounds how much of metadata.user_id is considered at
+// all. Both known shapes are far smaller; anything longer is not an identity.
+const maxMetadataUserIDLen = 4096
+
+// metadataSessionID extracts the canonical Claude Code session id from a body
+// metadata.user_id, in one of exactly two known shapes:
+//
+//   - Claude Code's native envelope: "user_<hex>_account_<uuid>_session_<uuid>"
+//   - the JSON envelope gateways write when rebuilding the identity:
+//     {"device_id":"...","account_uuid":"...","session_id":"<uuid>"}
+//
+// Only the session id is ever taken — device_id and account_uuid are
+// account-scoped and never stand in for a session — and the value must be a
+// well-formed UUID, which Claude Code session ids are. Anything else yields
+// "": a sessionless request stays sessionless rather than gaining an invented
+// identity. Validation bounds what passes as an identity, not whether the
+// client can plant one — headers are equally client-controlled, so the id
+// remains an untrusted routing hint throughout.
+func metadataSessionID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > maxMetadataUserIDLen {
+		return ""
+	}
+	if sid := sessionIDFromJSONUserID(raw); sid != "" {
+		return sid
+	}
+	return sessionIDFromNativeUserID(raw)
+}
+
+// sessionIDFromJSONUserID reads the session_id field of the JSON envelope and
+// nothing else. Non-objects, missing fields, and non-UUID values all yield "".
+func sessionIDFromJSONUserID(raw string) string {
+	if !strings.HasPrefix(raw, "{") {
+		return ""
+	}
+	var envelope struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		return ""
+	}
+	return strictUUID(envelope.SessionID)
+}
+
+// sessionIDFromNativeUserID reads the trailing _session_<uuid> of Claude
+// Code's native user_id envelope; any other trailing shape yields "".
+func sessionIDFromNativeUserID(raw string) string {
+	const marker = "_session_"
+	i := strings.LastIndex(raw, marker)
+	if i < 0 {
+		return ""
+	}
+	return strictUUID(raw[i+len(marker):])
+}
+
+// strictUUID accepts exactly a canonical 36-character UUID (hex, with dashes)
+// and returns it as sent. Claude Code session ids are UUIDs — the CLI's
+// --session-id requires one — so this keeps account fields, request ids, and
+// free-form junk from ever passing as a session identity.
+func strictUUID(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) != 36 {
+		return ""
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return ""
+			}
+			continue
+		}
+		if !isHexDigit(c) {
+			return ""
+		}
+	}
+	return v
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
 // validHeaderName reports whether name is a well-formed MIME header key after
@@ -87,7 +219,10 @@ func validHeaderName(name string) bool {
 //     is relayed with the canonical value. A client that sent both headers keeps
 //     both, reconciled to one value (the Claude Code one wins) so the upstream
 //     never sees two different logical sessions on one request.
-//  2. Provider mapping: when the provider configures SessionHeader, that header
+//  2. Body-derived identity (aggregators that dropped the headers) has no
+//     session header to preserve; the canonical Claude spelling is written
+//     instead, so native-header upstreams see the same session.
+//  3. Provider mapping: when the provider configures SessionHeader, that header
 //     is set to the canonical value as well — this is the adapter that satisfies
 //     an OpenCode Go backend path demanding X-Opencode-Session from a Claude
 //     Code conversation, always with the EXACT same value. An invalid
@@ -107,6 +242,12 @@ func applyUpstreamSessionAffinity(dst *http.Request, src *http.Request, up confi
 	if src.Header.Get(HeaderOpencodeSession) != "" {
 		dst.Header.Set(HeaderOpencodeSession, sess.ID)
 	}
+	if sess.Source == sessionSourceClaudeMetadata {
+		// The identity arrived in the body, so there is no session header to
+		// preserve; write the canonical Claude spelling so upstreams reading
+		// the native header see the session the mapping header carries.
+		dst.Header.Set(HeaderClaudeCodeSession, sess.ID)
+	}
 	applyProviderSessionMapping(dst, sess, up)
 	return sess
 }
@@ -121,7 +262,7 @@ func applyClientSessionAffinity(dst *http.Request, sess clientSession, up config
 		return
 	}
 	switch sess.Source {
-	case sessionSourceClaudeCode:
+	case sessionSourceClaudeCode, sessionSourceClaudeMetadata:
 		dst.Header.Set(HeaderClaudeCodeSession, sess.ID)
 	case sessionSourceOpencode:
 		dst.Header.Set(HeaderOpencodeSession, sess.ID)

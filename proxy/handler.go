@@ -995,6 +995,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
 	}
+	// Session-identity fallback: aggregators that rebuild requests drop the
+	// session headers but relay the same Claude Code identity inside
+	// metadata.user_id. Extract it ONCE here — the body is already parsed —
+	// and carry it in the request context; the resolver reads it as the last
+	// source, below both session headers. Strict shapes only; the value stays
+	// an untrusted routing hint (session_affinity.go).
+	r = withBodySessionFallbackFromRequest(r, &req)
 	clientModel := req.Model
 	noteAPIKeyMeta(r.Context(), "claude", clientModel, "", req.Stream)
 
