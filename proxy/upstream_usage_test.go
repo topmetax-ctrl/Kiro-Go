@@ -6,6 +6,20 @@ import (
 	"testing"
 )
 
+// ptr returns a pointer to v — the canonical presence encoding every usage
+// field now uses. Test totals use it wherever the wire carried the figure.
+func ptr(v int64) *int64 { return &v }
+
+// tot dereferences a canonical total for numeric comparison, reading nil as 0.
+// For assertions about the NUMBER; presence assertions check the pointer
+// against nil explicitly.
+func tot(p *int64) int64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
 // newRespWithHeaders builds a bare response carrying only the given headers,
 // which is all forwardedUsageTokens inspects.
 func newRespWithHeaders(hdrs map[string]string) *http.Response {
@@ -20,7 +34,7 @@ func TestUsageFromJSONBodyAnthropic(t *testing.T) {
 	body := []byte(`{"id":"msg_1","content":[{"type":"text","text":"hi"}],
 		"usage":{"input_tokens":120,"output_tokens":45}}`)
 	got := usageFromJSONBody(body)
-	if got.Input != 120 || got.Output != 45 {
+	if tot(got.Input) != 120 || tot(got.Output) != 45 {
 		t.Fatalf("got %+v, want 120/45", got)
 	}
 }
@@ -31,7 +45,7 @@ func TestUsageFromJSONBodyAnthropicCountsCacheTokens(t *testing.T) {
 	body := []byte(`{"usage":{"input_tokens":10,"cache_creation_input_tokens":100,
 		"cache_read_input_tokens":900,"output_tokens":5}}`)
 	got := usageFromJSONBody(body)
-	if got.Input != 1010 || got.Output != 5 {
+	if tot(got.Input) != 1010 || tot(got.Output) != 5 {
 		t.Fatalf("got %+v, want 1010/5", got)
 	}
 }
@@ -40,7 +54,7 @@ func TestUsageFromJSONBodyOpenAI(t *testing.T) {
 	body := []byte(`{"id":"chatcmpl-1","choices":[{"message":{"content":"hi"}}],
 		"usage":{"prompt_tokens":300,"completion_tokens":80,"total_tokens":380}}`)
 	got := usageFromJSONBody(body)
-	if got.Input != 300 || got.Output != 80 {
+	if tot(got.Input) != 300 || tot(got.Output) != 80 {
 		t.Fatalf("got %+v, want 300/80", got)
 	}
 }
@@ -83,7 +97,7 @@ func TestUsageScannerAnthropicStream(t *testing.T) {
 	feed(t, s, anthropicStream, 4096)
 	got := s.Counts()
 	// input from message_start, output from the final message_delta
-	if got.Input != 25 || got.Output != 99 {
+	if tot(got.Input) != 25 || tot(got.Output) != 99 {
 		t.Fatalf("got %+v, want 25/99", got)
 	}
 }
@@ -94,7 +108,7 @@ func TestUsageScannerHandlesChunkBoundaries(t *testing.T) {
 		s := &usageScanner{}
 		feed(t, s, anthropicStream, chunk)
 		got := s.Counts()
-		if got.Input != 25 || got.Output != 99 {
+		if tot(got.Input) != 25 || tot(got.Output) != 99 {
 			t.Fatalf("chunk=%d: got %+v, want 25/99", chunk, got)
 		}
 	}
@@ -107,7 +121,7 @@ func TestUsageScannerOpenAIStream(t *testing.T) {
 	s := &usageScanner{}
 	feed(t, s, stream, 8)
 	got := s.Counts()
-	if got.Input != 500 || got.Output != 150 {
+	if tot(got.Input) != 500 || tot(got.Output) != 150 {
 		t.Fatalf("got %+v, want 500/150", got)
 	}
 }
@@ -118,7 +132,7 @@ func TestUsageScannerCRLFLineEndings(t *testing.T) {
 	s := &usageScanner{}
 	feed(t, s, stream, 5)
 	got := s.Counts()
-	if got.Input != 7 || got.Output != 8 {
+	if tot(got.Input) != 7 || tot(got.Output) != 8 {
 		t.Fatalf("got %+v, want 7/8", got)
 	}
 }
@@ -129,7 +143,7 @@ func TestUsageScannerNoTrailingNewline(t *testing.T) {
 	s := &usageScanner{}
 	feed(t, s, `data: {"usage":{"input_tokens":3,"output_tokens":4}}`, 512)
 	got := s.Counts()
-	if got.Input != 3 || got.Output != 4 {
+	if tot(got.Input) != 3 || tot(got.Output) != 4 {
 		t.Fatalf("got %+v, want 3/4", got)
 	}
 }
@@ -151,7 +165,7 @@ func TestUsageScannerLastFrameWins(t *testing.T) {
 		`data: {"usage":{"output_tokens":250}}` + "\n"
 	s := &usageScanner{}
 	feed(t, s, stream, 32)
-	if got := s.Counts(); got.Output != 250 {
+	if got := s.Counts(); tot(got.Output) != 250 {
 		t.Fatalf("got %+v, want output 250", got)
 	}
 }
@@ -174,7 +188,7 @@ func TestUsageScannerStillFindsUsageAfterOverflow(t *testing.T) {
 	feed(t, s, "data: "+strings.Repeat("x", maxUsageScanBuffer*2)+"\n", 8192)
 	feed(t, s, `data: {"usage":{"input_tokens":11,"output_tokens":22}}`+"\n", 64)
 	got := s.Counts()
-	if got.Input != 11 || got.Output != 22 {
+	if tot(got.Input) != 11 || tot(got.Output) != 22 {
 		t.Fatalf("got %+v, want 11/22", got)
 	}
 }
@@ -195,7 +209,7 @@ func TestForwardedUsageTokensPrefersParsedUsage(t *testing.T) {
 		"X-Usage-Input-Tokens":  "1",
 		"X-Usage-Output-Tokens": "2",
 	})
-	in, out := forwardedUsageTokens(resp, usageCounts{Input: 900, Output: 300})
+	in, out := forwardedUsageTokens(resp, usageCounts{Input: ptr(900), Output: ptr(300)})
 	if in != 900 || out != 300 {
 		t.Fatalf("got %d/%d, want 900/300 (parsed usage must win)", in, out)
 	}

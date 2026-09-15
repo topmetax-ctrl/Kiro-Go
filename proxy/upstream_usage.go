@@ -11,7 +11,10 @@ package proxy
 //   - Stream: usage arrives in a late SSE frame — Anthropic's message_delta (and
 //     message_start for the input count), OpenAI's final chunk when the caller
 //     requested stream_options.include_usage. usageScanner watches the bytes as
-//     they pass through the relay and keeps only the last counts it sees.
+//     they pass through the relay and keeps only the last counts it sees. A data
+//     line too large for the scan buffer (OpenAI Responses' response.completed
+//     carries the whole generated output beside its usage) is streamed through
+//     bigLineFilter, which extracts the usage object without buffering the line.
 //
 // Both readers are best-effort: a shape we do not recognize yields zero tokens
 // rather than an error, because token accounting must never fail a relay.
@@ -31,8 +34,16 @@ import (
 // usageEnvelope.normalize, so these invariants hold no matter which provider
 // dialect the response spoke.
 type usageCounts struct {
-	Input  int64
-	Output int64
+	// Totals are pointers, same presence encoding as the subsets below: nil
+	// means the upstream did not report the figure at all, a non-nil zero means
+	// it reported an exact zero. Keeping presence here — rather than collapsing
+	// it into a bare int64 — is what lets the activity table show "0" for a
+	// reported zero and "—" for unknown. Every supported dialect reports
+	// cumulative totals on its authoritative frames, so an explicit zero IS the
+	// upstream's answer whenever it says one; placeholder-zero suppression
+	// belongs to the stream merge, which sees whole frames, not to this parser.
+	Input  *int64
+	Output *int64
 	// Server-side tool uses parsed from usage.server_tool_use (Anthropic only).
 	ServerTool upstreamToolUsage
 
@@ -51,7 +62,7 @@ type usageCounts struct {
 	Protocol string
 }
 
-func (u usageCounts) known() bool { return u.Input > 0 || u.Output > 0 }
+func (u usageCounts) known() bool { return u.Input != nil || u.Output != nil }
 
 // cacheKnown reports whether the upstream reported a cache breakdown at all.
 // Only then is a cache-hit ratio meaningful (rather than zero).
@@ -147,7 +158,11 @@ const (
 
 // normalize converts one decoded envelope into the canonical usage. The
 // dialect branches are separate because the semantics genuinely differ: only
-// Anthropic reports cached input outside its input total.
+// Anthropic reports cached input outside its input total, and only Gemini
+// reports reasoning tokens OUTSIDE its candidate output count.
+//
+// Totals keep their wire presence exactly (nil stays nil, an explicit zero
+// stays a pointer to zero): placeholder suppression is the stream merge's job.
 //
 // An invariant violation (cache reads exceeding total input) is logged once and
 // left unclamped: the raw numbers are the evidence, and a ratio above 100% on
@@ -159,16 +174,16 @@ func (e usageEnvelope) normalize() usageCounts {
 	// figures are the top-level extension fields.
 	switch {
 	case e.PromptCacheHitTokens != nil || e.PromptCacheMissTokens != nil:
-		c.Input = derefOr(e.PromptTokens, derefOr(e.PromptCacheHitTokens, 0)+derefOr(e.PromptCacheMissTokens, 0))
+		c.Input = firstNonNil(e.PromptTokens, sumIntPtr(e.PromptCacheHitTokens, e.PromptCacheMissTokens))
 		c.CacheReadInputTokens = e.PromptCacheHitTokens
-		c.Output = derefOr(e.CompletionTokens, 0)
+		c.Output = e.CompletionTokens
 		c.ReasoningOutputTokens = e.CompletionTokensDetails.ReasoningTokens
 		c.Protocol = protocolOpenAI
 
 	case e.PromptTokens != nil || e.CompletionTokens != nil:
 		// OpenAI Chat Completions: details are subsets, never additions.
-		c.Input = derefOr(e.PromptTokens, 0)
-		c.Output = derefOr(e.CompletionTokens, 0)
+		c.Input = e.PromptTokens
+		c.Output = e.CompletionTokens
 		c.CacheReadInputTokens = e.PromptTokensDetails.CachedTokens
 		c.CacheCreationInputTokens = e.PromptTokensDetails.CacheWriteTokens
 		c.ReasoningOutputTokens = e.CompletionTokensDetails.ReasoningTokens
@@ -178,24 +193,18 @@ func (e usageEnvelope) normalize() usageCounts {
 		// Anthropic Messages: cached input is reported OUTSIDE input_tokens, so
 		// the canonical total is the sum. This branch must run before the plain
 		// input_tokens fallback below or the totals would lose the cache.
-		c.Input = derefOr(e.InputTokens, 0)
-		if e.CacheReadInputTokens != nil {
-			c.Input += *e.CacheReadInputTokens
-		}
-		if e.CacheCreationInputTokens != nil {
-			c.Input += *e.CacheCreationInputTokens
-		}
+		c.Input = sumIntPtr(e.InputTokens, e.CacheReadInputTokens, e.CacheCreationInputTokens)
 		c.CacheReadInputTokens = e.CacheReadInputTokens
 		c.CacheCreationInputTokens = e.CacheCreationInputTokens
-		c.Output = derefOr(e.OutputTokens, 0)
+		c.Output = e.OutputTokens
 		c.Protocol = protocolAnthropic
 
 	case e.InputTokensDetails.CachedTokens != nil || e.InputTokensDetails.CacheWriteTokens != nil:
 		// OpenAI Responses: input_tokens already includes the cached share.
-		c.Input = derefOr(e.InputTokens, 0)
+		c.Input = e.InputTokens
 		c.CacheReadInputTokens = e.InputTokensDetails.CachedTokens
 		c.CacheCreationInputTokens = e.InputTokensDetails.CacheWriteTokens
-		c.Output = derefOr(e.OutputTokens, 0)
+		c.Output = e.OutputTokens
 		c.ReasoningOutputTokens = e.OutputTokensDetails.ReasoningTokens
 		c.Protocol = protocolResponses
 
@@ -205,15 +214,22 @@ func (e usageEnvelope) normalize() usageCounts {
 		// totals read identically under both semantics, so no dialect call is
 		// made here; the caller resolves the protocol from the request path
 		// (usageProtocol) rather than guessing.
-		c.Input = derefOr(e.InputTokens, 0)
-		c.Output = derefOr(e.OutputTokens, 0)
+		c.Input = e.InputTokens
+		c.Output = e.OutputTokens
 
 	case geminiUsagePresent(e):
-		// Gemini generateContent: promptTokenCount already includes the cached
-		// share, and thoughtsTokenCount is part of the output side.
-		c.Input = derefOr(e.PromptTokenCount, 0)
+		// Gemini generateContent. Verified against the official reference
+		// (ai.google.dev/api/generate-content): totalTokenCount is documented
+		// as "prompt + thoughts + response candidates" — three ADDITIVE
+		// components — and the thinking guide bills "output tokens AND
+		// thinking tokens" separately. thoughtsTokenCount is therefore NOT
+		// inside candidatesTokenCount, so the canonical output side is their
+		// sum; counting candidates alone would understate output and let
+		// reasoning exceed it (a 1000-candidate/4000-thought answer would
+		// record reasoning 4000 > output 1000).
+		c.Input = e.PromptTokenCount
 		c.CacheReadInputTokens = e.CachedContentTokenCount
-		c.Output = derefOr(e.CandidatesTokenCount, 0)
+		c.Output = sumIntPtr(e.CandidatesTokenCount, e.ThoughtsTokenCount)
 		c.ReasoningOutputTokens = e.ThoughtsTokenCount
 		c.Protocol = protocolGemini
 
@@ -236,7 +252,8 @@ func (e usageEnvelope) normalize() usageCounts {
 // geminiUsagePresent reports whether the envelope carries Gemini's camelCase
 // usageMetadata fields, which no other dialect uses.
 func geminiUsagePresent(e usageEnvelope) bool {
-	return e.PromptTokenCount != nil || e.CandidatesTokenCount != nil || e.CachedContentTokenCount != nil
+	return e.PromptTokenCount != nil || e.CandidatesTokenCount != nil ||
+		e.CachedContentTokenCount != nil || e.ThoughtsTokenCount != nil
 }
 
 func derefOr(p *int64, or int64) int64 {
@@ -244,6 +261,38 @@ func derefOr(p *int64, or int64) int64 {
 		return *p
 	}
 	return or
+}
+
+// firstNonNil returns the first non-nil pointer, or nil when every argument is
+// absent. It preserves presence: a reported zero is returned as a reported
+// zero, not collapsed into a fallback's zero.
+func firstNonNil(ps ...*int64) *int64 {
+	for _, p := range ps {
+		if p != nil {
+			return p
+		}
+	}
+	return nil
+}
+
+// sumIntPtr adds the pointed-at values, treating nil as absent rather than
+// zero. It returns nil only when every argument is absent — the sum keeps
+// presence whenever any component was reported. Used for totals that the wire
+// reports as separate additive components (Anthropic's input + cache fields,
+// Gemini's candidates + thoughts).
+func sumIntPtr(ps ...*int64) *int64 {
+	any := false
+	sum := int64(0)
+	for _, p := range ps {
+		if p != nil {
+			any = true
+			sum += *p
+		}
+	}
+	if !any {
+		return nil
+	}
+	return &sum
 }
 
 // usageProtocol resolves the protocol label for a parsed usage: the
@@ -319,29 +368,39 @@ func usageFromJSONBody(body []byte) usageCounts {
 
 // maxUsageScanBuffer caps the partial-line buffer held by usageScanner. SSE data
 // lines carrying usage are small (a few hundred bytes); a line larger than this
-// is content, not accounting, so we drop it rather than grow without bound on a
-// pathological upstream that never emits a newline.
+// is content-heavy, so instead of growing without bound the scanner hands the
+// line to bigLineFilter, which needs no buffering at all.
 const maxUsageScanBuffer = 64 * 1024
+
+// maxUsageCapture caps one usage object captured from an oversized line. Real
+// usage objects are a few hundred bytes; the cap exists so a hostile or
+// pathological frame cannot turn the observer into a buffer. A capture that
+// exceeds it is abandoned whole — nothing partial is ever decoded.
+const maxUsageCapture = 16 * 1024
 
 // usageScanner extracts token usage from an SSE byte stream as it is relayed.
 //
-// It never buffers the whole stream: it holds at most one partial line and
-// forgets each line once inspected. Write is called with the same slices handed
-// to the client, so scanning cannot alter or delay the relay — the caller writes
-// to the client first and feeds the scanner after.
+// It never buffers the whole stream: it holds at most one partial line, and a
+// line that outgrows that buffer is streamed through bigLineFilter, which
+// retains nothing but scanner state and the current usage object. Write is
+// called with the same slices handed to the client, so scanning cannot alter or
+// delay the relay — the caller writes to the client first and feeds the scanner
+// after.
 //
 // Frame merge semantics per field: every supported dialect reports usage
-// cumulatively on the final authoritative frame (Anthropic's message_start
-// carries the input side and its message_delta may carry the full final usage,
-// OpenAI sends one usage object in the last chunk, Gemini one usageMetadata at
-// the end), so the merge keeps the LAST reported value per field — never a
-// sum. Presence-sensitive fields (cache, reasoning) merge per-field: a frame
-// reporting only output_tokens leaves an already-seen cache breakdown intact,
-// and a later frame reporting an explicit cache zero overwrites an earlier
-// nonzero value, because the later frame is the authoritative one.
+// cumulatively on its usage-bearing frames (Anthropic's message_delta usage is
+// documented cumulative and message_start opens the stream with the input side,
+// OpenAI sends one usage object in the last chunk, Responses' response.completed
+// carries the full usage, DeepSeek's last pre-[DONE] chunk carries the entire
+// request, Gemini reports usageMetadata on the final chunk), so the merge keeps
+// the LAST reported value per field — never a sum.
 type usageScanner struct {
 	partial []byte
-	counts  usageCounts
+	// big carries the state machine for the one line that outgrew partial.
+	// While it is active, partial is empty: every byte of the oversized line
+	// flows through the filter instead.
+	big    bigLineFilter
+	counts usageCounts
 
 	// sawContent records whether the stream delivered any client-visible answer:
 	// assistant text, or a tool call. Thinking/reasoning deltas deliberately do
@@ -351,32 +410,229 @@ type usageScanner struct {
 	sawContent bool
 	// sawTerminal records whether the upstream sent a frame that means "this turn
 	// is over": Anthropic's message_stop or a message_delta carrying stop_reason,
-	// OpenAI's [DONE] or a non-null finish_reason, or an explicit error event.
-	// Its absence at EOF is how a truncated relay is detected.
+	// OpenAI's [DONE] or a non-null finish_reason, Responses'
+	// response.completed/failed/incomplete, or an explicit error event. Its
+	// absence at EOF is how a truncated relay is detected.
 	sawTerminal bool
 }
 
 // Write feeds relayed bytes to the scanner. It always reports success: this is
 // an observer, and a parse problem must never surface as a relay error.
 func (s *usageScanner) Write(p []byte) (int, error) {
-	if len(s.partial)+len(p) > maxUsageScanBuffer {
-		// Keep only the tail: usage frames are short, so a boundary split can be
-		// recovered from the last bytes, while a giant content line is discarded.
-		s.partial = s.partial[:0]
-		if len(p) > maxUsageScanBuffer {
-			p = p[len(p)-maxUsageScanBuffer:]
+	n := len(p)
+	for len(p) > 0 {
+		if s.big.active {
+			// An oversized line is in progress: stream the rest of it through
+			// the filter. feed consumes up to and including the line's newline,
+			// after which normal buffered scanning resumes.
+			p = p[s.big.feed(s, p):]
+			continue
+		}
+		s.partial = append(s.partial, p...)
+		p = nil
+		for {
+			i := bytes.IndexByte(s.partial, '\n')
+			if i < 0 {
+				break
+			}
+			s.scanLine(s.partial[:i])
+			s.partial = s.partial[i+1:]
+		}
+		if len(s.partial) > maxUsageScanBuffer {
+			// The growing line will not fit in the buffer — and its beginning,
+			// which may already contain the usage object, is exactly the part a
+			// keep-the-tail policy would throw away. Hand everything seen so
+			// far to the streaming filter and feed the remainder of the line
+			// the same way as it arrives.
+			s.big.begin(s, s.partial)
+			s.partial = s.partial[:0]
 		}
 	}
-	s.partial = append(s.partial, p...)
+	return n, nil
+}
 
-	for {
-		i := bytes.IndexByte(s.partial, '\n')
-		if i < 0 {
-			return len(p), nil
+// bigLineFilter scans a single oversized SSE data line byte-by-byte and
+// captures only the JSON objects the accounting needs: values of the keys
+// "usage" and "usageMetadata" at object depth 1 or 2 — the exact positions the
+// dialects put them (top level for OpenAI Chat, inside "message" for Anthropic
+// message_start, inside "response" for OpenAI Responses, top level for Gemini).
+// Deeper matches (e.g. per-item usage inside a future output[] entry) are
+// ignored, mirroring what the whole-frame decoder reads.
+//
+// It exists for one wire shape in particular: OpenAI Responses'
+// response.completed, whose "response" object carries the ENTIRE generated
+// output alongside the authoritative usage — a long answer makes the frame far
+// larger than any sane line buffer, and dropping the frame would drop the only
+// usage the stream ever reports. Filtering instead of buffering keeps memory
+// bounded (never more than one captured usage object) while never losing that
+// usage, and string/escape tracking means a "usage" spelled inside response
+// text can never trigger a capture.
+//
+// Captured objects are merged through the same mergeUsage path as whole-frame
+// decodes, in the order they close — so the last one wins, exactly as with
+// small frames.
+type bigLineFilter struct {
+	active bool
+	// JSON lexical state.
+	inString bool
+	escaped  bool
+	depth    int
+	// Key-recognition state: keyBuf holds the last string's content until the
+	// following byte decides whether that string was an object key.
+	keyBuf     [16]byte
+	keyLen     int
+	keyLong    bool
+	keyIsUsage bool // the closed string was "usage"/"usageMetadata" at depth ≤ 2
+	keySeen    bool // a string just closed; the next bytes decide key vs value
+	awaitObj   bool // matched key seen with ':'; waiting for the '{' that opens it
+	// Capture state.
+	capturing    bool
+	captureDepth int
+	overCap      bool
+	capture      []byte
+}
+
+// begin hands the accumulated head of an oversized line to the filter. The head
+// necessarily starts at the line's first byte (partial is always cleared at
+// newlines), so lexical state starts clean — and the head may already contain a
+// complete usage object, which is merged immediately.
+func (f *bigLineFilter) begin(s *usageScanner, head []byte) {
+	f.stop()
+	f.active = true
+	f.feed(s, head)
+}
+
+// stop deactivates the filter. Usage objects that already closed were merged
+// as they closed; anything still open when the line ends is malformed JSON and
+// is abandoned whole.
+func (f *bigLineFilter) stop() {
+	*f = bigLineFilter{}
+}
+
+// feed runs one chunk of the oversized line through the state machine, merging
+// each usage object as it closes. It consumes up to and including the line's
+// terminating newline and then deactivates itself; the return value is the
+// number of bytes consumed.
+func (f *bigLineFilter) feed(s *usageScanner, p []byte) int {
+	for i, b := range p {
+		if b == '\n' {
+			// JSON strings cannot contain raw newlines, so a raw one really
+			// ends the SSE line. Closed captures were already merged.
+			f.stop()
+			return i + 1
 		}
-		line := s.partial[:i]
-		s.partial = s.partial[i+1:]
-		s.scanLine(line)
+		f.scanByte(b, s)
+	}
+	return len(p)
+}
+
+// scanByte advances the lexical state machine by one byte. While a capture is
+// open every byte is recorded too — the capture is a verbatim copy of the
+// object's bytes — and the state machine keeps running underneath so a capture
+// abandoned for size still knows where its object ends.
+func (f *bigLineFilter) scanByte(b byte, s *usageScanner) {
+	if f.capturing {
+		f.note(b)
+	}
+	if f.inString {
+		switch {
+		case f.escaped:
+			f.escaped = false
+		case b == '\\':
+			f.escaped = true
+		case b == '"':
+			// The string closed; whether it was a key is decided by the next
+			// structural byte (a ':' makes it one). The depth at close time is
+			// the depth of the object holding the key, so depth ≤ 2 admits the
+			// dialect positions (frame root, or one nesting level in) and
+			// rejects deep per-item usage the whole-frame decoder also ignores.
+			f.inString = false
+			f.keySeen = true
+			f.keyIsUsage = !f.keyLong && f.depth <= 2 && f.keyMatches()
+		default:
+			// Record candidate key bytes. Escaped or oversized strings can
+			// never match ("usage" is short and unescaped) — keyLong pins the
+			// decision for this string.
+			if f.keyLen < len(f.keyBuf) {
+				f.keyBuf[f.keyLen] = b
+				f.keyLen++
+			} else {
+				f.keyLong = true
+			}
+		}
+		return
+	}
+	if f.keySeen && (b == ':' || b == ' ' || b == '\t' || b == '\r') {
+		if b == ':' {
+			f.keySeen = false
+			if f.keyIsUsage {
+				f.awaitObj = true
+			}
+		}
+		return
+	}
+	f.keySeen = false
+	startCapture := false
+	if f.awaitObj {
+		if b == ' ' || b == '\t' || b == '\r' {
+			return
+		}
+		f.awaitObj = false
+		startCapture = b == '{'
+	}
+	switch b {
+	case '"':
+		f.inString = true
+		f.keyLen, f.keyLong = 0, false
+	case '{', '[':
+		f.depth++
+		if startCapture && !f.capturing {
+			f.capturing = true
+			f.overCap = false
+			f.capture = f.capture[:0]
+			f.captureDepth = f.depth
+			f.note('{')
+		}
+	case '}', ']':
+		f.depth--
+		if f.capturing && f.depth < f.captureDepth {
+			f.finishCapture(s)
+		}
+	}
+}
+
+// keyMatches reports whether the buffered key is one the dialects use for their
+// usage object.
+func (f *bigLineFilter) keyMatches() bool {
+	return bytes.Equal(f.keyBuf[:f.keyLen], []byte("usage")) ||
+		bytes.Equal(f.keyBuf[:f.keyLen], []byte("usageMetadata"))
+}
+
+// note records one byte of the capture, abandoning the whole capture once it
+// outgrows maxUsageCapture.
+func (f *bigLineFilter) note(b byte) {
+	if f.overCap {
+		return
+	}
+	if len(f.capture) >= maxUsageCapture {
+		f.overCap = true
+		f.capture = f.capture[:0]
+		return
+	}
+	f.capture = append(f.capture, b)
+}
+
+// finishCapture decodes one closed usage object and folds it into the running
+// counts. A capture abandoned for size is discarded whole: nothing is ever
+// decoded from a truncated body, and an object that large is not accounting.
+func (f *bigLineFilter) finishCapture(s *usageScanner) {
+	f.capturing = false
+	if f.overCap {
+		return
+	}
+	var env usageEnvelope
+	if err := json.Unmarshal(f.capture, &env); err == nil {
+		mergeUsage(&s.counts, env)
 	}
 }
 
@@ -387,13 +643,18 @@ func (s *usageScanner) scanLine(line []byte) {
 	if len(line) == 0 {
 		return
 	}
-	// An SSE "event:" line names the frame type. Anthropic sends the terminal
-	// signal as `event: message_stop`, and signals a mid-stream failure as
-	// `event: error`; both settle the turn without any "usage" payload, so they
-	// must be read here rather than in the JSON branch below.
+	// An SSE "event:" line names the frame type. Several of these settle the
+	// turn without any "usage" payload and must be read here rather than in the
+	// JSON branch below: Anthropic's message_stop and mid-stream error, and —
+	// because the Responses API terminates its stream with the envelope events
+	// themselves and no documented [DONE] sentinel (the terminal markers are
+	// response.completed / response.incomplete / response.failed, per the
+	// official streaming reference; the SDKs only break on [DONE] if one
+	// happens to arrive) — the Responses terminal events. Without them every
+	// successful Responses relay would read as truncated.
 	if rest, ok := bytes.CutPrefix(line, []byte("event:")); ok {
 		switch string(bytes.TrimSpace(rest)) {
-		case "message_stop", "error":
+		case "message_stop", "error", "response.completed", "response.failed", "response.incomplete":
 			s.sawTerminal = true
 		}
 		return
@@ -450,16 +711,28 @@ func (s *usageScanner) scanLine(line []byte) {
 }
 
 // mergeUsage folds one frame's normalized usage into the running totals.
-// Input/Output merge last-wins (cumulative); the pointer fields merge
-// last-NON-NIL-wins so a frame reporting only an output total cannot erase a
-// cache breakdown an earlier frame carried, while an explicit later zero does
-// overwrite.
+// Every field merges last-NON-NIL-wins: a frame that did not report a figure
+// leaves whatever an earlier frame carried intact, and a later frame that DID
+// report — including an explicit zero — is authoritative over it.
+//
+// The last-wins policy on totals is verified per dialect against official
+// behavior — Anthropic's message_delta usage is documented cumulative,
+// OpenAI Chat emits one final include_usage chunk carrying "token usage
+// statistics for the entire request", Responses' response.completed carries the
+// full usage, DeepSeek's last pre-[DONE] chunk carries the entire request, and
+// Gemini reports usageMetadata only on the final chunk. Cumulative reporting is
+// what makes last-wins-with-zeros safe: a zero on a usage-bearing frame is the
+// upstream's real running total, and the final frame always carries the
+// authoritative answer. A future dialect whose frames carry PER-CHUNK DELTAS
+// rather than cumulative totals must accumulate inside its own normalize branch
+// (emitting running totals) — this merge must not silently inherit the wrong
+// semantics.
 func mergeUsage(dst *usageCounts, env usageEnvelope) {
 	c := env.normalize()
-	if c.Input > 0 {
+	if c.Input != nil {
 		dst.Input = c.Input
 	}
-	if c.Output > 0 {
+	if c.Output != nil {
 		dst.Output = c.Output
 	}
 	if c.CacheReadInputTokens != nil {
@@ -517,10 +790,12 @@ func (s *usageScanner) scanFrameMarkers(payload []byte) {
 	switch frame.Type {
 	case "message_stop":
 		s.sawTerminal = true
-	case "error":
-		// A mid-stream error frame settles the turn: the client is being told the
-		// request failed, which is a complete (if unhappy) outcome, not a silent
-		// truncation.
+	case "error", "response.completed", "response.failed", "response.incomplete":
+		// A terminal event settles the turn: the client is being told the
+		// outcome — failed, complete, or explicitly incomplete — which is a
+		// complete (if unhappy) outcome, not a silent truncation. Redundant
+		// with the event: line when one is present, but some relays strip
+		// event: fields and forward bare data frames.
 		s.sawTerminal = true
 	case "message_delta":
 		// stop_reason on a message_delta is Anthropic's real end-of-turn signal.

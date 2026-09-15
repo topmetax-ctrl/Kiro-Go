@@ -10,8 +10,8 @@ import (
 func TestUsageFromJSONBodyServerToolUse(t *testing.T) {
 	body := `{"id":"msg_1","usage":{"input_tokens":10,"output_tokens":20,"server_tool_use":{"web_search_requests":2}}}`
 	u := usageFromJSONBody([]byte(body))
-	if u.Input != 10 || u.Output != 20 {
-		t.Fatalf("tokens = %d/%d, want 10/20", u.Input, u.Output)
+	if tot(u.Input) != 10 || tot(u.Output) != 20 {
+		t.Fatalf("tokens = %d/%d, want 10/20", tot(u.Input), tot(u.Output))
 	}
 	if u.ServerTool.WebSearchRequests != 2 {
 		t.Fatalf("web_search_requests = %d, want 2", u.ServerTool.WebSearchRequests)
@@ -46,8 +46,8 @@ data: {"type":"message_stop"}`,
 		}
 	}
 	u := s.Counts()
-	if u.Output != 20 {
-		t.Fatalf("output = %d, want 20", u.Output)
+	if tot(u.Output) != 20 {
+		t.Fatalf("output = %d, want 20", tot(u.Output))
 	}
 	if u.ServerTool.WebSearchRequests != 3 {
 		t.Fatalf("server web_search_requests = %d, want 3", u.ServerTool.WebSearchRequests)

@@ -40,7 +40,7 @@ func TestScannerCompleteAnthropicStreamNotTruncated(t *testing.T) {
 	if !s.hadContent() {
 		t.Error("text_delta did not register as content")
 	}
-	if got := s.Counts(); got.Input != 10 || got.Output != 5 {
+	if got := s.Counts(); tot(got.Input) != 10 || tot(got.Output) != 5 {
 		t.Errorf("usage = %+v, want input 10 output 5", got)
 	}
 }
@@ -205,8 +205,8 @@ func TestScannerAccessorsIdempotent(t *testing.T) {
 	if s.Truncated() != first {
 		t.Error("Truncated() changed on second call")
 	}
-	if s.Counts().Input != 0 {
-		t.Error("unexpected usage")
+	if s.Counts().Input != nil {
+		t.Error("unexpected usage: input total should stay unknown")
 	}
 }
 

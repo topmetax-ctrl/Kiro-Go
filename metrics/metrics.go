@@ -47,15 +47,31 @@ const (
 )
 
 // EventUsage carries the usage detail the flat Event totals cannot express:
-// the cache/reasoning breakdown and where the figures came from. Every token
-// field is a pointer so nil (upstream did not report it) stays distinct from
-// an explicit zero (upstream reported "no cache hits") — the difference
-// between "—" and "0 · 0%" on the activity table.
+// the canonical per-figure presence plus the cache/reasoning breakdown and
+// where the figures came from. Every token field is a pointer so nil (upstream
+// did not report it) stays distinct from an explicit zero (upstream reported
+// "no cache hits") — the difference between "—" and "0 · 0%" on the activity
+// table.
 //
-// The flat Event.InputTokens/OutputTokens remain the canonical TOTALS (input
-// including cached tokens); this object only adds what those fields cannot
-// hold, so no number is stored twice.
+// The flat Event.InputTokens/OutputTokens remain the counters' source (0 there
+// means "nothing to add", which is true for both unknown and a reported zero),
+// while the pointer fields here are the canonical presence record: nil means
+// the upstream did not report the figure, a non-nil zero means it reported an
+// exact zero. The two are written together by the same call site, so they
+// cannot drift.
+//
+// Every token field here is a full tri-state. For totals this rests on verified
+// per-dialect reporting: all supported dialects report cumulative totals on
+// their usage-bearing frames (see the parser's mergeUsage), so an explicit zero
+// is the upstream's real answer whenever it says one — placeholder suppression
+// happens in the stream merge, which sees whole frames, never here. Cache and
+// reasoning keep the same semantics because there the distinction between
+// "0 · 0%" and "—" is the whole point.
 type EventUsage struct {
+	// InputTokens/OutputTokens are the canonical totals: nil = not reported,
+	// non-nil = exactly what the upstream reported (zero included).
+	InputTokens              *int64 `json:"inputTokens,omitempty"`
+	OutputTokens             *int64 `json:"outputTokens,omitempty"`
 	CacheReadInputTokens     *int64 `json:"cacheReadInputTokens,omitempty"`
 	CacheCreationInputTokens *int64 `json:"cacheCreationInputTokens,omitempty"`
 	ReasoningOutputTokens    *int64 `json:"reasoningOutputTokens,omitempty"`
@@ -128,6 +144,80 @@ func eventModelRounds(ev Event) int64 {
 	return 1
 }
 
+// cacheAgg is the population-bounded cache aggregate shared by the request
+// counters and the time-series buckets. A provider that reports no cache
+// fields contributes nothing here — missing telemetry must never dilute the
+// ratio into a fake 0%, and an explicit "0 cached" report must still join the
+// population (it is a real observation, not a gap).
+type cacheAgg struct {
+	cacheReadInputTokens     int64 // sum of reported cache-read tokens
+	cacheCreationInputTokens int64 // sum of reported cache-creation tokens
+	// cacheObservedInputTokens is the input-total sum over exactly the events
+	// that reported cache telemetry — the weighted ratio's denominator. It is
+	// deliberately separate from the unbounded inputTokens sum, which counts
+	// every event.
+	cacheObservedInputTokens int64
+	cacheObservedRequests    int64 // events that reported cache telemetry
+}
+
+// addUsage folds ev.Usage into the cache aggregates. Only events that actually
+// reported a cache breakdown advance the observability counters, so the
+// cache-hit ratio below is computed over the population that can support it.
+// An event reporting a cache breakdown but no input total joins the population
+// with a zero denominator contribution — it cannot distort the ratio, only the
+// coverage count.
+func (a *cacheAgg) addUsage(ev Event) {
+	u := ev.Usage
+	if u == nil {
+		return
+	}
+	if u.CacheReadInputTokens == nil && u.CacheCreationInputTokens == nil {
+		return
+	}
+	if u.CacheReadInputTokens != nil && *u.CacheReadInputTokens > 0 {
+		a.cacheReadInputTokens += *u.CacheReadInputTokens
+	}
+	if u.CacheCreationInputTokens != nil && *u.CacheCreationInputTokens > 0 {
+		a.cacheCreationInputTokens += *u.CacheCreationInputTokens
+	}
+	a.cacheObservedInputTokens += ev.InputTokens
+	a.cacheObservedRequests++
+}
+
+// hitRate returns the token-weighted cache-hit share (0..100) over the
+// cache-observable population, or -1 when nothing observable was recorded.
+// Weighted — sum(reads)/sum(inputs) — never an average of per-request
+// percentages, which would let a 1k-token 100% hit outweigh a 100k-token miss.
+func (a cacheAgg) hitRate() float64 {
+	if a.cacheObservedInputTokens <= 0 {
+		return -1
+	}
+	return float64(a.cacheReadInputTokens) * 100 / float64(a.cacheObservedInputTokens)
+}
+
+// sub removes another aggregate's totals from this one (provider reset).
+func (a *cacheAgg) sub(o cacheAgg) {
+	a.cacheReadInputTokens -= o.cacheReadInputTokens
+	a.cacheCreationInputTokens -= o.cacheCreationInputTokens
+	a.cacheObservedInputTokens -= o.cacheObservedInputTokens
+	a.cacheObservedRequests -= o.cacheObservedRequests
+}
+
+func (a *cacheAgg) clampNonNegative() {
+	if a.cacheReadInputTokens < 0 {
+		a.cacheReadInputTokens = 0
+	}
+	if a.cacheCreationInputTokens < 0 {
+		a.cacheCreationInputTokens = 0
+	}
+	if a.cacheObservedInputTokens < 0 {
+		a.cacheObservedInputTokens = 0
+	}
+	if a.cacheObservedRequests < 0 {
+		a.cacheObservedRequests = 0
+	}
+}
+
 // counter aggregates outcomes for the overall stream or one provider/route/model.
 //
 // Latency and token totals are running sums; averages are derived on read. TTFB
@@ -153,47 +243,8 @@ type counter struct {
 	// requests so provider consumption is observable without inflating volume.
 	modelRounds int64
 
-	// Cache telemetry, aggregated on the population that reported it. A
-	// provider that reports no cache fields contributes nothing here — missing
-	// telemetry must never dilute the ratio into a fake 0%.
-	cacheReadInputTokens     int64 // sum of reported cache-read tokens
-	cacheCreationInputTokens int64 // sum of reported cache-creation tokens
-	// cacheObservedInputTokens is the input-total sum over exactly the events
-	// that reported cache telemetry — the weighted ratio's denominator. It is
-	// deliberately separate from inputTokens, which sums every event.
-	cacheObservedInputTokens int64
-	cacheObservedRequests    int64 // events that reported cache telemetry
-}
-
-// addUsage folds ev.Usage into the cache aggregates. Only events that actually
-// reported a cache breakdown advance the observability counters, so the
-// cache-hit ratio below is computed over the population that can support it.
-func (c *counter) addUsage(ev Event) {
-	u := ev.Usage
-	if u == nil {
-		return
-	}
-	if u.CacheReadInputTokens != nil || u.CacheCreationInputTokens != nil {
-		if u.CacheReadInputTokens != nil && *u.CacheReadInputTokens > 0 {
-			c.cacheReadInputTokens += *u.CacheReadInputTokens
-		}
-		if u.CacheCreationInputTokens != nil && *u.CacheCreationInputTokens > 0 {
-			c.cacheCreationInputTokens += *u.CacheCreationInputTokens
-		}
-		c.cacheObservedInputTokens += ev.InputTokens
-		c.cacheObservedRequests++
-	}
-}
-
-// cacheHitRate returns the token-weighted cache-hit share (0..100) over the
-// cache-observable population, or -1 when nothing observable was recorded.
-// Weighted — sum(reads)/sum(inputs) — never an average of per-request
-// percentages, which would let a 1k-token 100% hit outweigh a 100k-token miss.
-func (c *counter) cacheHitRate() float64 {
-	if c.cacheObservedInputTokens <= 0 {
-		return -1
-	}
-	return float64(c.cacheReadInputTokens) * 100 / float64(c.cacheObservedInputTokens)
+	// Cache telemetry over the reporting population (see cacheAgg).
+	cacheAgg
 }
 
 func (c *counter) add(ev Event) {
@@ -222,7 +273,7 @@ func (c *counter) add(ev Event) {
 	c.outputTokens += ev.OutputTokens
 	c.costUSD += ev.CostUSD
 	c.modelRounds += eventModelRounds(ev)
-	c.addUsage(ev)
+	c.cacheAgg.addUsage(ev)
 	if ev.TimeMs > c.lastUsed {
 		c.lastUsed = ev.TimeMs
 	}
@@ -244,13 +295,11 @@ func (c *counter) sub(o counter) {
 	c.outputTokens -= o.outputTokens
 	c.costUSD -= o.costUSD
 	c.modelRounds -= o.modelRounds
-	c.cacheReadInputTokens -= o.cacheReadInputTokens
-	c.cacheCreationInputTokens -= o.cacheCreationInputTokens
-	c.cacheObservedInputTokens -= o.cacheObservedInputTokens
-	c.cacheObservedRequests -= o.cacheObservedRequests
+	c.cacheAgg.sub(o.cacheAgg)
 	// lastUsed is a max, not a sum: it cannot be un-mixed, so it is left as is
 	// rather than guessed at.
 	c.clampNonNegative()
+	c.cacheAgg.clampNonNegative()
 }
 
 // clampNonNegative guards against drift: counters loaded from an older on-disk
@@ -292,18 +341,6 @@ func (c *counter) clampNonNegative() {
 	}
 	if c.modelRounds < 0 {
 		c.modelRounds = 0
-	}
-	if c.cacheReadInputTokens < 0 {
-		c.cacheReadInputTokens = 0
-	}
-	if c.cacheCreationInputTokens < 0 {
-		c.cacheCreationInputTokens = 0
-	}
-	if c.cacheObservedInputTokens < 0 {
-		c.cacheObservedInputTokens = 0
-	}
-	if c.cacheObservedRequests < 0 {
-		c.cacheObservedRequests = 0
 	}
 }
 
@@ -387,9 +424,18 @@ type Bucket struct {
 	CostUSD float64 `json:"costUsd"`
 	// ModelRounds is upstream model rounds in this bucket; equals Requests for
 	// ordinary traffic and exceeds it when a multi-round tool loop ran.
-	ModelRounds  int64 `json:"modelRounds,omitempty"`
-	SumLatencyMs int64 `json:"-"`
-	AvgLatencyMs int64 `json:"avgLatencyMs"`
+	ModelRounds int64 `json:"modelRounds,omitempty"`
+	// Cache telemetry over exactly the events in this bucket that reported a
+	// breakdown (same population rule as the lifetime counters), so a windowed
+	// view can show a real ratio instead of falling back to "unknown".
+	// omitempty: buckets persisted before this field existed load as zero and
+	// simply read as "nothing observable" for their windows.
+	CacheReadInputTokens     int64 `json:"cacheReadInputTokens,omitempty"`
+	CacheCreationInputTokens int64 `json:"cacheCreationInputTokens,omitempty"`
+	CacheObservedInputTokens int64 `json:"cacheObservedInputTokens,omitempty"`
+	CacheObservedRequests    int64 `json:"cacheObservedRequests,omitempty"`
+	SumLatencyMs             int64 `json:"-"`
+	AvgLatencyMs             int64 `json:"avgLatencyMs"`
 }
 
 func (b *Bucket) add(ev Event) {
@@ -409,6 +455,28 @@ func (b *Bucket) add(ev Event) {
 	b.CostUSD += ev.CostUSD
 	b.ModelRounds += eventModelRounds(ev)
 	b.SumLatencyMs += ev.LatencyMs
+	b.addUsage(ev)
+}
+
+// addUsage folds the event's cache breakdown into the bucket's population
+// (same rule as the lifetime counter's cacheAgg.addUsage).
+func (b *Bucket) addUsage(ev Event) {
+	var a cacheAgg
+	a.addUsage(ev)
+	b.CacheReadInputTokens += a.cacheReadInputTokens
+	b.CacheCreationInputTokens += a.cacheCreationInputTokens
+	b.CacheObservedInputTokens += a.cacheObservedInputTokens
+	b.CacheObservedRequests += a.cacheObservedRequests
+}
+
+// cacheHitRate derives the weighted cache ratio from this bucket's summed
+// population (a windowed aggregate is a big virtual bucket), or -1 when the
+// window saw no cache telemetry.
+func (b Bucket) cacheHitRate() float64 {
+	if b.CacheObservedInputTokens <= 0 {
+		return -1
+	}
+	return float64(b.CacheReadInputTokens) * 100 / float64(b.CacheObservedInputTokens)
 }
 
 // derive fills AvgLatencyMs on a copy for output.
@@ -681,7 +749,7 @@ func Overall() OverallStat {
 		LastUsed:                 c.lastUsed,
 		CacheReadInputTokens:     c.cacheReadInputTokens,
 		CacheCreationInputTokens: c.cacheCreationInputTokens,
-		CacheHitRate:             c.cacheHitRate(),
+		CacheHitRate:             c.cacheAgg.hitRate(),
 		CacheObservedRequests:    c.cacheObservedRequests,
 	}
 }
@@ -811,7 +879,7 @@ func (s *store) providerStatLocked(id string, p *providerAgg, nowMinute int64) P
 		Healthy:                  p.curStreak < 3,
 		CacheReadInputTokens:     p.cacheReadInputTokens,
 		CacheCreationInputTokens: p.cacheCreationInputTokens,
-		CacheHitRate:             p.cacheHitRate(),
+		CacheHitRate:             p.cacheAgg.hitRate(),
 		CacheObservedRequests:    p.cacheObservedRequests,
 	}
 }
@@ -872,9 +940,10 @@ func ProviderStats() []ProviderStat {
 //
 // AvgTTFBMs, Canceled, Streamed and TokensPerSec are left zero: buckets do not
 // record them, and a windowed view must not silently substitute all-time values.
-// The cache aggregates follow the same rule (CacheHitRate is -1: buckets carry
-// no cache telemetry), so a windowed view reports "unknown" rather than a
-// figure summed outside the window.
+// The cache ratio, by contrast, is derived strictly from the buckets inside the
+// window (buckets carry the same population-bounded cache sums the lifetime
+// counter does): a window that saw no cache telemetry reports -1 ("unknown"),
+// never a figure summed outside the window.
 func ProviderStatsWindow(hours int) []ProviderStat {
 	if hours <= 0 {
 		return ProviderStats()
@@ -917,6 +986,10 @@ func ProviderStatsWindow(hours int) []ProviderStat {
 			agg.CostUSD += b.CostUSD
 			agg.ModelRounds += b.ModelRounds
 			agg.SumLatencyMs += b.SumLatencyMs
+			agg.CacheReadInputTokens += b.CacheReadInputTokens
+			agg.CacheCreationInputTokens += b.CacheCreationInputTokens
+			agg.CacheObservedInputTokens += b.CacheObservedInputTokens
+			agg.CacheObservedRequests += b.CacheObservedRequests
 		}
 
 		st := ProviderStat{
@@ -930,8 +1003,13 @@ func ProviderStatsWindow(hours int) []ProviderStat {
 			OutputTokens: agg.OutputTokens,
 			CostUSD:      agg.CostUSD,
 			ModelRounds:  agg.ModelRounds,
-			// Windowed buckets carry no cache telemetry: unknown, not zero.
-			CacheHitRate: -1,
+			// Cache ratio derived from exactly the buckets in the window, over the
+			// reporting population — never the lifetime figure, never an average
+			// of per-bucket rates. -1 when the window saw no cache telemetry.
+			CacheReadInputTokens:     agg.CacheReadInputTokens,
+			CacheCreationInputTokens: agg.CacheCreationInputTokens,
+			CacheHitRate:             agg.cacheHitRate(),
+			CacheObservedRequests:    agg.CacheObservedRequests,
 			// Live signals, deliberately not windowed.
 			InFlight:     p.inFlight,
 			PeakInFlight: p.peakFlight,
@@ -1159,6 +1237,10 @@ func ProviderDetailWindow(id string, hours, minutes int) (ProviderDetail, bool) 
 		agg.OutputTokens += b.OutputTokens
 		agg.CostUSD += b.CostUSD
 		agg.SumLatencyMs += b.SumLatencyMs
+		agg.CacheReadInputTokens += b.CacheReadInputTokens
+		agg.CacheCreationInputTokens += b.CacheCreationInputTokens
+		agg.CacheObservedInputTokens += b.CacheObservedInputTokens
+		agg.CacheObservedRequests += b.CacheObservedRequests
 	}
 	rpm, tpm := ratesLocked(p.minutes, nowMinute)
 	windowed := ProviderStat{
@@ -1171,8 +1253,12 @@ func ProviderDetailWindow(id string, hours, minutes int) (ProviderDetail, bool) 
 		InputTokens:  agg.InputTokens,
 		OutputTokens: agg.OutputTokens,
 		CostUSD:      agg.CostUSD,
-		// Windowed buckets carry no cache telemetry: unknown, not zero.
-		CacheHitRate: -1,
+		// Cache ratio derived from exactly the buckets in the window (same
+		// population rule as ProviderStatsWindow), never the lifetime figure.
+		CacheReadInputTokens:     agg.CacheReadInputTokens,
+		CacheCreationInputTokens: agg.CacheCreationInputTokens,
+		CacheHitRate:             agg.cacheHitRate(),
+		CacheObservedRequests:    agg.CacheObservedRequests,
 		// Live signals.
 		InFlight:     p.inFlight,
 		PeakInFlight: p.peakFlight,
@@ -1330,6 +1416,10 @@ func HistoryFor(id string, hours int) []Bucket {
 			t.OutputTokens += b.OutputTokens
 			t.CostUSD += b.CostUSD
 			t.SumLatencyMs += b.SumLatencyMs
+			t.CacheReadInputTokens += b.CacheReadInputTokens
+			t.CacheCreationInputTokens += b.CacheCreationInputTokens
+			t.CacheObservedInputTokens += b.CacheObservedInputTokens
+			t.CacheObservedRequests += b.CacheObservedRequests
 		}
 	}
 	return seriesLocked(merged, nowHour, hours, 1)

@@ -48,11 +48,18 @@ type forwardLocalRoundResult struct {
 // requests, so "1 request, 3 model rounds, 450 tokens" is expressible without
 // inflating volume.
 type forwardLocalConsumption struct {
-	rounds       int
+	rounds    int
+	costUSD   float64
+	latencyMs int64
+	// inputTokens/outputTokens sum only the rounds that REPORTED that side;
+	// inputKnown/outputKnown record whether any round did. A round reporting an
+	// explicit zero is a reporter too — its zero joins the sum and marks the
+	// side known — while a round with no figure leaves both untouched, so the
+	// Event can tell a summed zero from a summed unknown.
 	inputTokens  int64
 	outputTokens int64
-	costUSD      float64
-	latencyMs    int64
+	inputKnown   bool
+	outputKnown  bool
 	// stream is how the CLIENT asked to be served, which is what the metrics
 	// store's streamed counter means. The upstream rounds are always buffered, so
 	// reading the flag off a round would report every request as non-streamed.
@@ -68,12 +75,30 @@ type forwardLocalConsumption struct {
 	reasoningReported   bool
 }
 
+// addFailedRoundIfKnown folds a round that ENDED IN FAILURE into the totals
+// when the upstream nonetheless reported real telemetry for it (error != zero
+// usage): the tokens were consumed, the round happened, and ModelRounds should
+// say so. A failure without telemetry leaves everything untouched — no phantom
+// rounds, no invented tokens.
+func (c *forwardLocalConsumption) addFailedRoundIfKnown(usage usageCounts, provider config.UpstreamProvider, latencyMs int64) {
+	if !usage.known() && !usage.cacheKnown() && usage.ReasoningOutputTokens == nil {
+		return
+	}
+	c.addRound(usage, provider, latencyMs)
+}
+
 // addRound folds one completed upstream round into the totals.
 func (c *forwardLocalConsumption) addRound(usage usageCounts, provider config.UpstreamProvider, latencyMs int64) {
 	c.rounds++
-	c.inputTokens += usage.Input
-	c.outputTokens += usage.Output
-	c.costUSD += provider.CostUSD(usage.Input, usage.Output)
+	if usage.Input != nil {
+		c.inputKnown = true
+		c.inputTokens += *usage.Input
+	}
+	if usage.Output != nil {
+		c.outputKnown = true
+		c.outputTokens += *usage.Output
+	}
+	c.costUSD += provider.CostUSD(derefOr(usage.Input, 0), derefOr(usage.Output, 0))
 	c.latencyMs += latencyMs
 	if usage.cacheKnown() {
 		c.cacheReported = true
@@ -89,12 +114,26 @@ func (c *forwardLocalConsumption) addRound(usage usageCounts, provider config.Up
 }
 
 // usage builds the Event's nested usage object for the whole loop, or nil when
-// no round reported anything beyond the flat totals.
+// no round reported anything at all. Each figure is published only when some
+// round reported that figure, so the activity table can tell a summed unknown
+// from a summed zero (an explicit round zero is real telemetry and publishes
+// as 0, not —).
 func (c *forwardLocalConsumption) usage() *metrics.EventUsage {
-	if !c.cacheReported && !c.reasoningReported {
+	if !c.cacheReported && !c.reasoningReported && !c.inputKnown && !c.outputKnown {
 		return nil
 	}
-	u := &metrics.EventUsage{Source: metrics.UsageSourceUpstream, Protocol: protocolAnthropic}
+	u := &metrics.EventUsage{
+		Source:   metrics.UsageSourceUpstream,
+		Protocol: protocolAnthropic,
+	}
+	if c.inputKnown {
+		in := c.inputTokens
+		u.InputTokens = &in
+	}
+	if c.outputKnown {
+		out := c.outputTokens
+		u.OutputTokens = &out
+	}
 	if c.cacheReported {
 		read := c.cacheReadTokens
 		create := c.cacheCreationTokens
@@ -241,6 +280,8 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 		roundStart := time.Now()
 		res, forwardUsage, forwardErr := h.forwardRoundBuffered(ctx, pinned.Provider, *pinned, sess, body, clientModel, route, captureUserText, round == 0)
 		if forwardErr != nil {
+			// Keep whatever the failing round really consumed before erroring.
+			consumed.addFailedRoundIfKnown(forwardUsage, pinned.Provider, time.Since(roundStart).Milliseconds())
 			// Upstream failure before any byte committed; surface the classified error.
 			// Do not silently fall through to Kiro pool — that would change provider.
 			h.sendPublicForwardError(w, true, forwardErr.Public())
@@ -291,6 +332,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 			finalStart := time.Now()
 			finalRes, finalUsage, ferr := h.forwardRoundBuffered(ctx, pinned.Provider, *pinned, sess, strippedBody, clientModel, route, captureUserText, false)
 			if ferr != nil {
+				consumed.addFailedRoundIfKnown(finalUsage, pinned.Provider, time.Since(finalStart).Milliseconds())
 				h.sendPublicForwardError(w, true, ferr.Public())
 				return fail(ferr.status, ferr.message)
 			}
@@ -332,6 +374,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 	finalStart := time.Now()
 	finalRes, finalUsage, ferr := h.forwardRoundBuffered(ctx, p2.Provider, p2, sess, strippedBody, clientModel, route, captureUserText, false)
 	if ferr != nil {
+		consumed.addFailedRoundIfKnown(finalUsage, p2.Provider, time.Since(finalStart).Milliseconds())
 		h.sendPublicForwardError(w, true, ferr.Public())
 		return fail(ferr.status, ferr.message)
 	}
@@ -406,7 +449,11 @@ func (h *Handler) forwardRoundBuffered(ctx context.Context, provider config.Upst
 		return nil, usageCounts{}, newProviderForwardError(502, "upstream read failed: "+err.Error())
 	}
 	if resp.StatusCode != 200 {
-		return nil, usageCounts{}, classifyForwardError(resp.StatusCode, b, resp.Header, provider, conn, clientModel, route)
+		// Error != zero usage: an upstream that processed the round before
+		// failing may still report what it consumed in the error body. Returned
+		// so the caller can fold it into the loop's consumption; nil-equivalent
+		// when absent.
+		return nil, usageFromJSONBody(b), classifyForwardError(resp.StatusCode, b, resp.Header, provider, conn, clientModel, route)
 	}
 
 	// An upstream that streamed anyway (ignoring stream:false) is a capability
@@ -422,8 +469,8 @@ func (h *Handler) forwardRoundBuffered(ctx context.Context, provider config.Upst
 	if err != nil {
 		return nil, usage, newProviderForwardError(502, err.Error())
 	}
-	res.inputTokens = int(usage.Input)
-	res.outputTokens = int(usage.Output)
+	res.inputTokens = int(derefOr(usage.Input, 0))
+	res.outputTokens = int(derefOr(usage.Output, 0))
 	return res, usage, nil
 }
 

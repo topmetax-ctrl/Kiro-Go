@@ -650,13 +650,28 @@ func TestHourlyBucketCostRoundTrips(t *testing.T) {
 func ptrOf(n int64) *int64 { return &n }
 
 // usageEvent builds an event with the given canonical totals plus a nested
-// cache breakdown (nil = not reported).
+// cache breakdown (nil = not reported). The canonical totals pointers mirror
+// what the forwarding publisher writes: non-nil exactly when the flat total is
+// positive.
 func usageEvent(in, out int64, read, create *int64) Event {
 	e := ev("p1", true, 200, 100)
 	e.InputTokens = in
 	e.OutputTokens = out
-	e.Usage = &EventUsage{CacheReadInputTokens: read, CacheCreationInputTokens: create, Source: UsageSourceUpstream}
+	e.Usage = &EventUsage{
+		InputTokens:              ptrOfPositive(in),
+		OutputTokens:             ptrOfPositive(out),
+		CacheReadInputTokens:     read,
+		CacheCreationInputTokens: create,
+		Source:                   UsageSourceUpstream,
+	}
 	return e
+}
+
+func ptrOfPositive(n int64) *int64 {
+	if n <= 0 {
+		return nil
+	}
+	return &n
 }
 
 func TestCacheAggregationWeightedNotAveraged(t *testing.T) {
@@ -805,5 +820,167 @@ func TestEventJSONBackwardCompatible(t *testing.T) {
 	}
 	if back.Usage == nil || back.Usage.CacheReadInputTokens == nil || *back.Usage.CacheReadInputTokens != 0 {
 		t.Fatalf("explicit zero did not survive: %s", b)
+	}
+}
+
+func TestUsageTotalsPresenceTriState(t *testing.T) {
+	reset(t)
+	// A stream that carried its input side but died before the final output
+	// total: IN known, OUT unknown. The canonical pointers must keep that
+	// distinction across the JSON round trip — unknown is not zero.
+	e := ev("p1", true, 200, 5)
+	e.InputTokens = 5079
+	e.Usage = &EventUsage{
+		InputTokens:          ptrOf(5079),
+		CacheReadInputTokens: ptrOf(2400),
+		Source:               UsageSourceUpstream,
+		Protocol:             "anthropic",
+	}
+	b, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back struct {
+		Usage *EventUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Usage == nil {
+		t.Fatal("usage lost")
+	}
+	if back.Usage.InputTokens == nil || *back.Usage.InputTokens != 5079 {
+		t.Fatalf("canonical input = %v, want 5079", back.Usage.InputTokens)
+	}
+	if back.Usage.OutputTokens != nil {
+		t.Fatalf("canonical output = %v, want nil (never reported)", back.Usage.OutputTokens)
+	}
+	if strings.Contains(string(b), `"outputTokens":0`) {
+		t.Fatalf("unknown output serialized as zero: %s", b)
+	}
+}
+
+func TestCachePopulationExplicitZeroInUnknownOut(t *testing.T) {
+	reset(t)
+	// The exact audit scenario: input known with NO cache opinion stays out of
+	// the ratio's population; an explicit cache zero stays in (as a real
+	// observation); the reporting event contributes both numerator and
+	// denominator. 500/2000 = 25%, coverage 2 of 3.
+	Record(usageEvent(1000, 5, nil, nil))        // A: input known, cache unknown
+	Record(usageEvent(1000, 5, ptrOf(0), nil))   // B: cache explicitly zero
+	Record(usageEvent(1000, 5, ptrOf(500), nil)) // C: cache 500
+
+	o := Overall()
+	if o.CacheReadInputTokens != 500 {
+		t.Fatalf("reads = %d, want 500", o.CacheReadInputTokens)
+	}
+	if o.CacheObservedRequests != 2 {
+		t.Fatalf("observed = %d, want 2 (unknown excluded, zero included)", o.CacheObservedRequests)
+	}
+	if want := 500.0 * 100 / 2000.0; o.CacheHitRate < want-0.001 || o.CacheHitRate > want+0.001 {
+		t.Fatalf("hit rate = %v, want %v", o.CacheHitRate, want)
+	}
+}
+
+func TestWindowedCacheAggregation(t *testing.T) {
+	reset(t)
+	// Two cache-reporting events in the current minute: weighted over the
+	// population, 1000/4000 = 25% — never the 50% request average, and never
+	// the lifetime figure of a different window.
+	Record(usageEvent(1000, 10, ptrOf(1000), nil))
+	Record(usageEvent(3000, 30, ptrOf(0), nil))
+	// A third event that reports no cache must not enter the population.
+	Record(usageEvent(7000, 70, nil, nil))
+
+	w := ProviderStatsWindow(1)
+	if len(w) != 1 {
+		t.Fatalf("want 1 provider, got %d", len(w))
+	}
+	if w[0].CacheObservedRequests != 2 {
+		t.Fatalf("windowed observed = %d, want 2", w[0].CacheObservedRequests)
+	}
+	if w[0].CacheReadInputTokens != 1000 {
+		t.Fatalf("windowed reads = %d, want 1000", w[0].CacheReadInputTokens)
+	}
+	if want := 1000.0 * 100 / 4000.0; w[0].CacheHitRate < want-0.001 || w[0].CacheHitRate > want+0.001 {
+		t.Fatalf("windowed hit rate = %v, want %v (population-weighted)", w[0].CacheHitRate, want)
+	}
+
+	d, ok := ProviderDetailFor("p1", 60)
+	if !ok || d.CacheHitRate != w[0].CacheHitRate {
+		t.Fatalf("detail window cache = %+v ok=%v, want %v", d.CacheHitRate, ok, w[0].CacheHitRate)
+	}
+}
+
+func TestWindowWithoutCacheTelemetryIsUnknown(t *testing.T) {
+	reset(t)
+	// Traffic in the window, but nothing cache-reporting: the windowed rate is
+	// unknown (-1), never a fabricated 0%.
+	Record(usageEvent(1000, 10, nil, nil))
+
+	w := ProviderStatsWindow(1)
+	if len(w) != 1 || w[0].Requests != 1 {
+		t.Fatalf("window traffic missing: %+v", w)
+	}
+	if w[0].CacheHitRate != -1 || w[0].CacheObservedRequests != 0 {
+		t.Fatalf("windowed cache = %v/%d, want -1/0", w[0].CacheHitRate, w[0].CacheObservedRequests)
+	}
+}
+
+func TestPersistRoundTripsBucketCache(t *testing.T) {
+	reset(t)
+	// An old event lands in the hourly rollup (per-minute buckets are
+	// memory-only), so the windowed cache figures must survive a restart.
+	e := usageEvent(1000, 10, ptrOf(800), ptrOf(40))
+	e.TimeMs = nowMs() - 2*3600000
+	Record(e)
+
+	path := filepath.Join(t.TempDir(), "metrics.json")
+	if err := Save(path); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	s = newStore()
+	if err := Load(path); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	w := ProviderStatsWindow(24)
+	if len(w) != 1 {
+		t.Fatalf("want 1 provider after reload, got %d", len(w))
+	}
+	if w[0].CacheReadInputTokens != 800 || w[0].CacheCreationInputTokens != 40 || w[0].CacheObservedRequests != 1 {
+		t.Fatalf("reloaded bucket cache = %+v", w[0])
+	}
+	if want := 80.0; w[0].CacheHitRate < want-0.01 || w[0].CacheHitRate > want+0.01 {
+		t.Fatalf("reloaded windowed hit rate = %v, want %v", w[0].CacheHitRate, want)
+	}
+}
+
+func TestUsageTotalsExplicitZeroSerializes(t *testing.T) {
+	reset(t)
+	// The other half of tri-state: an upstream-reported zero must reach the
+	// activity table as an explicit 0, not collapse into the unknown "—".
+	// omitempty drops only nil pointers, so a pointed-at zero serializes.
+	e := ev("p1", true, 200, 5)
+	e.Usage = &EventUsage{
+		InputTokens:  ptrOf(0),
+		OutputTokens: ptrOf(0),
+		Source:       UsageSourceUpstream,
+		Protocol:     "openai",
+	}
+	b, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back struct {
+		Usage *EventUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Usage.InputTokens == nil || *back.Usage.InputTokens != 0 || back.Usage.OutputTokens == nil || *back.Usage.OutputTokens != 0 {
+		t.Fatalf("round trip lost the explicit zeros: %s", b)
+	}
+	if !strings.Contains(string(b), `"inputTokens":0`) || !strings.Contains(string(b), `"outputTokens":0`) {
+		t.Fatalf("explicit zero dropped from serialization: %s", b)
 	}
 }

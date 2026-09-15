@@ -75,6 +75,13 @@ type persistedBucket struct {
 	CostUSD      float64 `json:"c,omitempty"`
 	ModelRounds  int64   `json:"mr,omitempty"`
 	SumLatencyMs int64   `json:"l,omitempty"`
+	// Population-bounded cache sums (see Bucket). omitempty so files written
+	// before these fields existed load unchanged, and so windows over those
+	// buckets keep reporting "unknown" rather than a fake 0%.
+	CacheReadInputTokens     int64 `json:"cr,omitempty"`
+	CacheCreationInputTokens int64 `json:"cc,omitempty"`
+	CacheObservedInputTokens int64 `json:"ci,omitempty"`
+	CacheObservedRequests    int64 `json:"cq,omitempty"`
 }
 
 type persistedRoute struct {
@@ -127,33 +134,35 @@ func toPersistedCounter(c counter) persistedCounter {
 		OutputTokens:             c.outputTokens,
 		CostUSD:                  c.costUSD,
 		ModelRounds:              c.modelRounds,
-		CacheReadInputTokens:     c.cacheReadInputTokens,
-		CacheCreationInputTokens: c.cacheCreationInputTokens,
-		CacheObservedInputTokens: c.cacheObservedInputTokens,
-		CacheObservedRequests:    c.cacheObservedRequests,
+		CacheReadInputTokens:     c.cacheAgg.cacheReadInputTokens,
+		CacheCreationInputTokens: c.cacheAgg.cacheCreationInputTokens,
+		CacheObservedInputTokens: c.cacheAgg.cacheObservedInputTokens,
+		CacheObservedRequests:    c.cacheAgg.cacheObservedRequests,
 		LastUsed:                 c.lastUsed,
 	}
 }
 
 func fromPersistedCounter(p persistedCounter) counter {
 	c := counter{
-		requests:                 p.Requests,
-		success:                  p.Success,
-		failed:                   p.Failed,
-		canceled:                 p.Canceled,
-		streamed:                 p.Streamed,
-		totalLatencyMs:           p.TotalLatencyMs,
-		totalTTFBMs:              p.TotalTTFBMs,
-		ttfbCount:                p.TTFBCount,
-		inputTokens:              p.InputTokens,
-		outputTokens:             p.OutputTokens,
-		costUSD:                  p.CostUSD,
-		modelRounds:              p.ModelRounds,
-		cacheReadInputTokens:     p.CacheReadInputTokens,
-		cacheCreationInputTokens: p.CacheCreationInputTokens,
-		cacheObservedInputTokens: p.CacheObservedInputTokens,
-		cacheObservedRequests:    p.CacheObservedRequests,
-		lastUsed:                 p.LastUsed,
+		requests:       p.Requests,
+		success:        p.Success,
+		failed:         p.Failed,
+		canceled:       p.Canceled,
+		streamed:       p.Streamed,
+		totalLatencyMs: p.TotalLatencyMs,
+		totalTTFBMs:    p.TotalTTFBMs,
+		ttfbCount:      p.TTFBCount,
+		inputTokens:    p.InputTokens,
+		outputTokens:   p.OutputTokens,
+		costUSD:        p.CostUSD,
+		modelRounds:    p.ModelRounds,
+		cacheAgg: cacheAgg{
+			cacheReadInputTokens:     p.CacheReadInputTokens,
+			cacheCreationInputTokens: p.CacheCreationInputTokens,
+			cacheObservedInputTokens: p.CacheObservedInputTokens,
+			cacheObservedRequests:    p.CacheObservedRequests,
+		},
+		lastUsed: p.LastUsed,
 	}
 	if c.modelRounds == 0 && c.requests > 0 {
 		// Pre-ModelRounds file: every recorded request was one model round, which
@@ -288,15 +297,19 @@ func Save(path string) error {
 				continue
 			}
 			pp.Hours = append(pp.Hours, persistedBucket{
-				Hour:         h,
-				Requests:     b.Requests,
-				Success:      b.Success,
-				Failed:       b.Failed,
-				InputTokens:  b.InputTokens,
-				OutputTokens: b.OutputTokens,
-				CostUSD:      b.CostUSD,
-				ModelRounds:  b.ModelRounds,
-				SumLatencyMs: b.SumLatencyMs,
+				Hour:                     h,
+				Requests:                 b.Requests,
+				Success:                  b.Success,
+				Failed:                   b.Failed,
+				InputTokens:              b.InputTokens,
+				OutputTokens:             b.OutputTokens,
+				CostUSD:                  b.CostUSD,
+				ModelRounds:              b.ModelRounds,
+				SumLatencyMs:             b.SumLatencyMs,
+				CacheReadInputTokens:     b.CacheReadInputTokens,
+				CacheCreationInputTokens: b.CacheCreationInputTokens,
+				CacheObservedInputTokens: b.CacheObservedInputTokens,
+				CacheObservedRequests:    b.CacheObservedRequests,
 			})
 		}
 		st.ByProvider[id] = pp
@@ -389,6 +402,11 @@ func Load(path string) error {
 				CostUSD:      b.CostUSD,
 				ModelRounds:  mr,
 				SumLatencyMs: b.SumLatencyMs,
+
+				CacheReadInputTokens:     b.CacheReadInputTokens,
+				CacheCreationInputTokens: b.CacheCreationInputTokens,
+				CacheObservedInputTokens: b.CacheObservedInputTokens,
+				CacheObservedRequests:    b.CacheObservedRequests,
 			}
 		}
 		s.byProvider[id] = agg

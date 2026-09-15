@@ -33,7 +33,7 @@ import (
 func threeRoundConsumption(p config.UpstreamProvider) forwardLocalConsumption {
 	var c forwardLocalConsumption
 	for i := 0; i < 3; i++ {
-		c.addRound(usageCounts{Input: 100, Output: 50}, p, 40)
+		c.addRound(usageCounts{Input: ptr(100), Output: ptr(50)}, p, 40)
 	}
 	return c
 }
@@ -195,8 +195,8 @@ func TestForwardLocalFailureKeepsConsumptionAndDoesNotFakeSuccess(t *testing.T) 
 
 	// Two rounds consumed, one search executed, then the third round fails 429.
 	var consumed forwardLocalConsumption
-	consumed.addRound(usageCounts{Input: 100, Output: 50}, provider, 40)
-	consumed.addRound(usageCounts{Input: 100, Output: 50}, provider, 40)
+	consumed.addRound(usageCounts{Input: ptr(100), Output: ptr(50)}, provider, 40)
+	consumed.addRound(usageCounts{Input: ptr(100), Output: ptr(50)}, provider, 40)
 	agg := KiroRunResult{
 		SearchCalls:         1,
 		BackendExecutions:   1,

@@ -6564,13 +6564,18 @@
     return String(n);
   }
 
-  // fwdTokenCell renders an IN/OUT cell. The flat totals use 0 = "not reported"
-  // (the Event schema's long-standing unknown sentinel), but when a usage
-  // breakdown exists the upstream DID report — an explicit zero then reads as 0.
+  // fwdTokenCell renders an IN/OUT cell, strictly tri-state. The nested usage
+  // object's inputTokens/outputTokens pointers are the canonical presence
+  // record: non-nil = the upstream reported the figure (0 renders as "0"), nil
+  // = unknown (renders as "—", even when other breakdowns exist — a stream
+  // that died before the final usage frame knows its input but not its
+  // output). Events without a usage object fall back to the flat totals, whose
+  // 0 means "not reported".
   function fwdTokenCell(e, field) {
-    const v = e[field];
+    const canonical = e.usage ? e.usage[field] : null;
+    const v = canonical != null ? canonical : e[field];
     if (v) return fwdFmtTokens(v);
-    return e.usage ? '0' : '—';
+    return canonical != null ? '0' : '—';
   }
 
   // fwdCacheCell renders the CACHE cell: read tokens (+ writes when reported),
@@ -7655,17 +7660,21 @@
     const reasoningN = u && u.reasoningOutputTokens != null ? u.reasoningOutputTokens : null;
     const hasTotals = u || e.inputTokens || e.outputTokens;
     if (hasTotals) {
-      add(t('forward.detailTokensIn'), u ? fwdFmtTokens(e.inputTokens) : fwdTokenCell(e, 'inputTokens'));
-      add(t('forward.detailTokensOut'), u ? fwdFmtTokens(e.outputTokens) : fwdTokenCell(e, 'outputTokens'));
+      // Both cells go through the tri-state renderer: with a usage object the
+      // canonical pointers decide "reported" vs "unknown", so a missing output
+      // total reads "—" rather than a misleading 0.
+      add(t('forward.detailTokensIn'), fwdTokenCell(e, 'inputTokens'));
+      add(t('forward.detailTokensOut'), fwdTokenCell(e, 'outputTokens'));
       if (readN != null) add(t('forward.detailCacheRead'), fwdFmtTokens(readN));
       if (createN != null) add(t('forward.detailCacheCreate'), fwdFmtTokens(createN));
       // Uncached input is derived, never stored: input minus what the cache
       // served (reads plus writes). Anthropic's input_tokens is billed input
       // EXCLUDING cache, so subtracting the canonical cache fields yields the
       // uncached remainder; for subset dialects (OpenAI/DeepSeek/Gemini) the
-      // same subtraction is exact by definition.
-      if (readN != null || createN != null) {
-        add(t('forward.detailUncached'), fwdFmtTokens(Math.max(0, (e.inputTokens || 0) - (readN || 0) - (createN || 0))));
+      // same subtraction is exact by definition. Skipped when the input total
+      // is unknown — a derivation from nothing would read as a fake 0.
+      if ((readN != null || createN != null) && e.inputTokens > 0) {
+        add(t('forward.detailUncached'), fwdFmtTokens(Math.max(0, e.inputTokens - (readN || 0) - (createN || 0))));
       }
       if (reasoningN != null) add(t('forward.detailReasoning'), fwdFmtTokens(reasoningN));
       if (readN != null && e.inputTokens > 0) {

@@ -337,9 +337,9 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 			Status:         status,
 			LatencyMs:      time.Since(start).Milliseconds(),
 			TTFBMs:         ttfb.Milliseconds(),
-			InputTokens:    usage.Input,
-			OutputTokens:   usage.Output,
-			CostUSD:        up.CostUSD(usage.Input, usage.Output),
+			InputTokens:    derefOr(usage.Input, 0),
+			OutputTokens:   derefOr(usage.Output, 0),
+			CostUSD:        up.CostUSD(derefOr(usage.Input, 0), derefOr(usage.Output, 0)),
 			Stream:         stream,
 			Canceled:       status == 499,
 			Ok:             ok,
@@ -348,6 +348,13 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 		}
 		if usage.known() || usage.cacheKnown() || usage.ReasoningOutputTokens != nil {
 			ev.Usage = &metrics.EventUsage{
+				// Canonical tri-state: every field is a direct pointer from the
+				// parse layer, so nil stays unknown and an explicit zero stays
+				// an explicit zero (see EventUsage). The flat fields above
+				// stay the counters' source; these pointers are what the
+				// activity table reads to tell unknown from zero.
+				InputTokens:              usage.Input,
+				OutputTokens:             usage.Output,
 				CacheReadInputTokens:     usage.CacheReadInputTokens,
 				CacheCreationInputTokens: usage.CacheCreationInputTokens,
 				ReasoningOutputTokens:    usage.ReasoningOutputTokens,
@@ -452,6 +459,12 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 		// the client must end up with the classified public error — never the raw
 		// upstream body, which can carry host, proxy or account detail.
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, providererr.MaxParseBytes))
+		// Best-effort usage extraction: error != zero usage. An upstream that
+		// processed the prompt (or generated part of an answer) before failing
+		// may still report what it consumed, and that telemetry is real spend —
+		// discarding it would silently understate the provider's tokens. A body
+		// without usage leaves the figures unknown, as before.
+		usage = usageFromJSONBody(errBody)
 		in := providererr.FromHTTP(resp.StatusCode, errBody, resp.Header)
 		in.RequestID = requestIDFromContext(r.Context())
 		in.ProviderID, in.ProviderName = up.ID, up.Name
@@ -483,7 +496,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 		h.recordFailure()
 		h.sendPublicForwardError(w, isClaudeRoute, pub)
 		recordMetric(resp.StatusCode, false, upstreamErrMsg)
-		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, pub.Code, pub.Message, pub.HTTPStatus, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
+		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, pub.Code, pub.Message, pub.HTTPStatus, int(derefOr(usage.Input, 0)), int(derefOr(usage.Output, 0)), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
 		return forwardOutcome{committed: true, status: pub.HTTPStatus, clientMsg: pub.MessageOrDefault(), internalMsg: upstreamErrMsg}
 	}
 
@@ -549,7 +562,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 		h.sendForwardStreamError(w, isClaudeRoute, pub.Message)
 		h.recordFailure()
 		recordMetric(resp.StatusCode, false, "truncated stream")
-		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, pub.Code, pub.Message, resp.StatusCode, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
+		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, pub.Code, pub.Message, resp.StatusCode, int(derefOr(usage.Input, 0)), int(derefOr(usage.Output, 0)), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
 		return forwardOutcome{committed: true, status: resp.StatusCode}
 	}
 
@@ -582,7 +595,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 	if relayErr != nil && r.Context().Err() != nil {
 		logger.Debugf("[Forward] client disconnected mid-relay from %s", up.Name)
 		recordMetric(499, false, "client canceled")
-		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeCancelled, forwardEndpointKind(isClaudeRoute), model, apikey.ErrorClientCancelled, "client canceled", 499, int(usage.Input), int(usage.Output), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
+		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeCancelled, forwardEndpointKind(isClaudeRoute), model, apikey.ErrorClientCancelled, "client canceled", 499, int(derefOr(usage.Input, 0)), int(derefOr(usage.Output, 0)), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
 		return forwardOutcome{committed: true, canceled: true, status: 499}
 	}
 	internalErr := ""
@@ -592,9 +605,9 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 	// A lying upstream (cache reads exceeding total input) is recorded verbatim —
 	// the >100% ratio on the activity table is the visible symptom — but noted
 	// once per attempt so it can be chased in the logs.
-	if cr := usage.CacheReadInputTokens; cr != nil && usage.Input > 0 && *cr > usage.Input {
+	if cr := usage.CacheReadInputTokens; cr != nil && usage.Input != nil && *cr > *usage.Input {
 		logger.Debugf("[Forward] %s: usage invariant violated: cache_read %d > input %d (protocol %s)",
-			model, *cr, usage.Input, usageProtocol(usage, subPath))
+			model, *cr, *usage.Input, usageProtocol(usage, subPath))
 	}
 	recordMetric(resp.StatusCode, ok && relayErr == nil, internalErr)
 	// Emit tool observability for the forwarding path: upstream reports
@@ -710,16 +723,23 @@ func truncateForLog(s string, max int) string {
 //     advances the key's usage counter.
 //
 // It never fabricates token pricing.
+// It never fabricates token pricing. The estimator fallback keys on a POSITIVE
+// signal, exactly as before the canonical tri-state: a reported explicit zero
+// joins the canonical usage (the activity table shows "0"), but quota still
+// falls through to the headers and the one-unit floor, because the estimator
+// contract is that a forwarded request always advances the key's usage counter.
 func forwardedUsageTokens(resp *http.Response, parsed usageCounts) (inTok, outTok int) {
-	if parsed.known() {
-		return int(parsed.Input), int(parsed.Output)
-	}
-	inTok = atoiHeader(resp.Header.Get("X-Usage-Input-Tokens"))
-	outTok = atoiHeader(resp.Header.Get("X-Usage-Output-Tokens"))
+	inTok = int(derefOr(parsed.Input, 0))
+	outTok = int(derefOr(parsed.Output, 0))
 	if inTok == 0 && outTok == 0 {
-		// No upstream usage signal: charge one request unit so usage is non-zero
-		// and per-key limits still apply to forwarded traffic.
-		outTok = 1
+		// No positive usage signal (nothing reported, or a reported zero):
+		// try the usage headers, then charge one request unit so usage is
+		// non-zero and per-key limits still apply to forwarded traffic.
+		inTok = atoiHeader(resp.Header.Get("X-Usage-Input-Tokens"))
+		outTok = atoiHeader(resp.Header.Get("X-Usage-Output-Tokens"))
+		if inTok == 0 && outTok == 0 {
+			outTok = 1
+		}
 	}
 	return inTok, outTok
 }
