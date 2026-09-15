@@ -118,6 +118,15 @@ type Event struct {
 	Canceled bool        `json:"canceled,omitempty"` // client disconnected mid-flight
 	Ok       bool        `json:"ok"`
 	ErrorMsg string      `json:"errorMsg,omitempty"`
+	// StreamOutcome is the generation outcome the upstream's terminal SSE
+	// frame itself reported: "completed", "failed", or "incomplete" (a
+	// configured limit ended the turn, e.g. max_output_tokens). Empty for
+	// non-stream requests and for streams that ended with no terminal frame at
+	// all (truncation), so it never states an outcome the wire did not. It
+	// exists because terminal is not success: an HTTP 200 stream the upstream
+	// ended with response.failed records Ok=false, and this field says why.
+	// Low cardinality by construction — three wire-defined values plus empty.
+	StreamOutcome string `json:"streamOutcome,omitempty"`
 	// Attempt is the zero-based index of this try within a route's ranked target
 	// list. 0 means the route's preferred provider served it; >0 means a failover
 	// happened, which is the signal that a higher-priority target is unhealthy.

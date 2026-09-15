@@ -316,6 +316,16 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 	// a half-delivered turn for a complete one. truncatedHadContent only shapes the
 	// message: it says whether any answer text made it out before the stream died.
 	var streamTruncated bool
+	// streamOutcome carries the generation outcome the upstream's own terminal
+	// frame reported ("completed"/"failed"/"incomplete"); empty when no terminal
+	// was seen. Terminal is not the same thing as success: a 200 stream the
+	// upstream ended with response.failed is recorded Ok=false below, and this
+	// label is what keeps that failure distinguishable from a transport error.
+	var streamOutcome string
+	// streamErrCode is the upstream's own error type/code from a failed
+	// terminal frame ("server_error", "overloaded_error", …) — short protocol
+	// metadata for the metric, never the error message.
+	var streamErrCode string
 
 	// recordMetric is called once, at the end of the attempt (after the body/stream
 	// finishes), so LatencyMs reflects the full relay — not just time-to-headers.
@@ -345,6 +355,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 			Ok:             ok,
 			ErrorMsg:       errMsg,
 			Attempt:        attempt,
+			StreamOutcome:  streamOutcome,
 		}
 		if usage.known() || usage.cacheKnown() || usage.ReasoningOutputTokens != nil {
 			ev.Usage = &metrics.EventUsage{
@@ -446,6 +457,15 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 	}
 	defer resp.Body.Close()
 
+	// The observer can only read what the transport decoded. Go's client
+	// decodes transparent gzip itself and strips the header when it does, so a
+	// SURVIVING Content-Encoding means compressed bytes this observer cannot
+	// read: usage is silently unknown. Count the blindness — an aggregate
+	// signal is the only trace such a loss leaves.
+	if resp.Header.Get("Content-Encoding") != "" {
+		incUsageObserverDegrade(degradeUnsupportedEncoding)
+	}
+
 	// Headers are in: this is the upstream's time-to-first-byte. For streams the
 	// remaining latency is generation time, so the two figures separate a slow
 	// provider from a long answer.
@@ -503,14 +523,29 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 	// From here on we are committed to this target: everything below writes to the
 	// client, so the outcome is committed=true regardless of how the relay ends.
 	// Non-2xx already returned above; 200 streams pass through the SSE public filter.
+	//
+	// The public filter's dialect must match the stream's protocol: a Responses
+	// stream whose provider error is rewritten must surface in the Responses
+	// error shape, or Responses clients cannot parse the failure.
+	streamDialect := providererr.DialectOpenAI
+	switch {
+	case isClaudeRoute:
+		streamDialect = providererr.DialectClaude
+	case subPath == "/responses":
+		streamDialect = providererr.DialectResponses
+	}
 	var relayErr error
 	switch {
 	case stream && resp.StatusCode == 200:
 		scanner := &usageScanner{}
-		relayErr = h.streamUpstreamResponse(w, resp, scanner, isClaudeRoute, requestIDFromContext(r.Context()))
+		relayErr = h.streamUpstreamResponse(w, resp, scanner, streamDialect, requestIDFromContext(r.Context()))
 		usage = scanner.Counts()
-		if relayErr == nil && r.Context().Err() == nil && scanner.Truncated() {
-			streamTruncated = true
+		streamOutcome = scanner.Terminal().String()
+		if relayErr == nil && r.Context().Err() == nil {
+			if scanner.Truncated() {
+				streamTruncated = true
+			}
+			streamErrCode = scanner.ErrCode()
 		}
 	case ok && captureUserText != "" && config.MemoryCaptureEnabled() && resp.Header.Get("Content-Encoding") == "":
 		// Non-stream success with capture on: buffer the body so we can BOTH relay it
@@ -563,6 +598,29 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 		h.recordFailure()
 		recordMetric(resp.StatusCode, false, "truncated stream")
 		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, pub.Code, pub.Message, resp.StatusCode, int(derefOr(usage.Input, 0)), int(derefOr(usage.Output, 0)), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
+		return forwardOutcome{committed: true, status: resp.StatusCode}
+	}
+
+	// An upstream that FAILED its own generation (response.failed, or a
+	// mid-stream error frame) also ended the transport cleanly: the client
+	// already received a terminal failure frame — rewritten into the public
+	// error shape by ssePublicFilter, so nothing is appended here and no
+	// upstream detail leaks. The outcome is committed, so no retry happens and
+	// none may: the answer's bytes are already on the wire. What must change is
+	// the RECORD. A provider that reports its own failure is not a success —
+	// recording one would reset the failure streak a cooldown depends on — so
+	// this downgrades the metric exactly like a 500 on the last attempt does.
+	// The upstream's own code is kept as short protocol metadata; the message
+	// itself is never recorded.
+	if streamOutcome == "failed" {
+		msg := "stream failed"
+		if streamErrCode != "" {
+			msg += ": " + streamErrCode
+		}
+		logger.Warnf("[Forward] %s: upstream stream failed (code=%s) request=%s", up.Name, streamErrCode, requestIDFromContext(r.Context()))
+		h.recordFailure()
+		recordMetric(resp.StatusCode, false, msg)
+		h.commitAPIKeyOutcome(r.Context(), apikey.OutcomeFailed, forwardEndpointKind(isClaudeRoute), model, providererr.CodeError, providererr.MsgError, resp.StatusCode, int(derefOr(usage.Input, 0)), int(derefOr(usage.Output, 0)), 0, time.Since(start).Milliseconds(), ttfb.Milliseconds(), true, stream)
 		return forwardOutcome{committed: true, status: resp.StatusCode}
 	}
 
@@ -813,7 +871,7 @@ func copyForwardableResponseHeaders(w http.ResponseWriter, resp *http.Response) 
 // been written and flushed to the client. It is used to extract token usage from
 // the trailing usage frame; it can neither modify nor delay the relay, and its
 // writes never fail the request.
-func (h *Handler) streamUpstreamResponse(w http.ResponseWriter, resp *http.Response, observer io.Writer, isClaude bool, requestID string) error {
+func (h *Handler) streamUpstreamResponse(w http.ResponseWriter, resp *http.Response, observer io.Writer, dialect providererr.Dialect, requestID string) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
@@ -824,14 +882,10 @@ func (h *Handler) streamUpstreamResponse(w http.ResponseWriter, resp *http.Respo
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	d := providererr.DialectOpenAI
-	if isClaude {
-		d = providererr.DialectClaude
-	}
 	filter := &ssePublicFilter{
 		dst:     w,
 		flusher: flusher,
-		dialect: d,
+		dialect: dialect,
 		pub: providererr.PublicError{
 			Code:      providererr.CodeError,
 			Message:   providererr.MsgError,

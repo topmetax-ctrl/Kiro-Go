@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+	"sync/atomic"
 )
 
 // usageCounts is the token pair extracted from an upstream response. Zero means
@@ -366,6 +367,117 @@ func usageFromJSONBody(body []byte) usageCounts {
 	return c
 }
 
+// streamTerminalKind is the GENERATION outcome the stream itself reported, as
+// distinct from transport integrity. Official Responses semantics (and their
+// dialect equivalents) end a turn three different ways, and they are not the
+// same outcome: response.completed is a full answer, response.failed is the
+// upstream reporting its own generation error, and response.incomplete is a
+// turn cut short by a documented limit (incomplete_details.reason, e.g.
+// max_output_tokens). All three settle the transport — none of them means the
+// stream was silently cut — but treating failed the same as completed would
+// record a provider's own error as a success, and treating incomplete as an
+// outage would cooldown a healthy provider for enforcing its output limit.
+//
+// The kind never changes what bytes reach the client: it only labels the
+// recorded metric and decides whether an upstream-reported failure counts
+// against provider health.
+type streamTerminalKind uint8
+
+const (
+	// terminalNone: no terminal frame was ever seen. The stream ended without
+	// the upstream saying why — the only state Truncated() reports.
+	terminalNone streamTerminalKind = iota
+	terminalCompleted
+	terminalFailed
+	terminalIncomplete
+)
+
+// String renders the kind for metrics.Event.StreamOutcome. The empty string is
+// reserved for "no terminal seen / not a stream", so an old event or a
+// truncated one reads as unknown rather than as a fabricated outcome.
+func (k streamTerminalKind) String() string {
+	switch k {
+	case terminalCompleted:
+		return "completed"
+	case terminalFailed:
+		return "failed"
+	case terminalIncomplete:
+		return "incomplete"
+	default:
+		return ""
+	}
+}
+
+// terminalFromTypeName maps a wire frame-type name to its terminal kind. It is
+// shared by the named-event reader, the data-frame decoder and the oversized
+// line probe so all three paths classify identically. Names outside the
+// terminal set (message_start, ping, …) return false and change nothing.
+func terminalFromTypeName(name string) (streamTerminalKind, bool) {
+	switch name {
+	case "message_stop", "response.completed":
+		return terminalCompleted, true
+	case "error", "response.failed":
+		return terminalFailed, true
+	case "response.incomplete":
+		return terminalIncomplete, true
+	default:
+		return terminalNone, false
+	}
+}
+
+// limitStopReasons are the Anthropic stop_reason / OpenAI finish_reason values
+// that mean "the turn ended because a configured limit was hit". These are the
+// chat-completions dialects' equivalent of Responses'
+// incomplete_details.reason=max_output_tokens: the provider is healthy, the
+// turn simply reached its cap. They map to terminalIncomplete, everything else
+// maps to terminalCompleted.
+var limitStopReasons = map[string]bool{
+	"max_tokens":     true, // Anthropic
+	"length":         true, // OpenAI chat
+	"content_filter": true, // OpenAI chat (limit-triggered refusal)
+}
+
+// Degradation counters for the usage observer. The observer is best-effort by
+// contract — it must never fail a relay — which means when it loses usage it
+// loses it SILENTLY unless something counts the loss. These are that something:
+// low-cardinality, reason-labeled counters in the house style of
+// providererr's classifiedTotal (plain atomic counters plus reader functions,
+// no new framework, no per-request labels). The reasons are exactly the ways
+// the observer can give up on usage it saw evidence of:
+type usageObserverReason uint8
+
+const (
+	// degradeOversizedUsage: a usage object captured from an oversized line
+	// outgrew maxUsageCapture and was abandoned whole.
+	degradeOversizedUsage usageObserverReason = iota
+	// degradeMalformedUsage: a captured usage object did not decode. The
+	// capture is verbatim wire bytes, so this means a hostile or corrupt
+	// upstream, never a scanner bug per se.
+	degradeMalformedUsage
+	// degradeUnsupportedEncoding: the upstream answered with a Content-Encoding
+	// the transport does not decode transparently, so the observer sees
+	// compressed bytes and can extract nothing.
+	degradeUnsupportedEncoding
+	usageObserverReasonCount
+)
+
+var usageObserverDegrades [usageObserverReasonCount]atomic.Int64
+
+func incUsageObserverDegrade(r usageObserverReason) {
+	usageObserverDegrades[r].Add(1)
+}
+
+// UsageObserverDegradeTotals returns the lifetime counts of lost-usage events
+// by reason, for admin introspection. Index order: oversized usage, malformed
+// usage JSON, unsupported content encoding.
+func UsageObserverDegradeTotals() [usageObserverReasonCount]int64 {
+	var out [usageObserverReasonCount]int64
+	for i := range usageObserverDegrades {
+		out[i] = usageObserverDegrades[i].Load()
+	}
+	return out
+}
+
 // maxUsageScanBuffer caps the partial-line buffer held by usageScanner. SSE data
 // lines carrying usage are small (a few hundred bytes); a line larger than this
 // is content-heavy, so instead of growing without bound the scanner hands the
@@ -408,12 +520,28 @@ type usageScanner struct {
 	// exact failure this tracking exists to catch, so counting reasoning as
 	// content would make that case indistinguishable from a real answer.
 	sawContent bool
-	// sawTerminal records whether the upstream sent a frame that means "this turn
-	// is over": Anthropic's message_stop or a message_delta carrying stop_reason,
-	// OpenAI's [DONE] or a non-null finish_reason, Responses'
-	// response.completed/failed/incomplete, or an explicit error event. Its
-	// absence at EOF is how a truncated relay is detected.
-	sawTerminal bool
+	// terminal records which terminal frame — if any — ended the turn, and
+	// therefore the generation outcome the upstream itself reported. None means
+	// the stream ended without one (the truncated case). terminalFailed and
+	// terminalIncomplete are still terminals: the transport ended cleanly and
+	// the client was told the outcome, so neither is a silent truncation — but
+	// only terminalCompleted records as a success, and terminalIncomplete never
+	// counts against provider health (see the kind's doc above).
+	terminal streamTerminalKind
+	// streamErrCode carries the upstream's own error type/code from a failed
+	// terminal frame ("overloaded_error", "server_error", …). Protocol metadata
+	// only — bounded, and never the error message, which can carry upstream
+	// topology that must not reach the metrics ring.
+	streamErrCode string
+}
+
+// noteTerminal settles the turn with the given outcome, keeping the first
+// terminal seen (a second terminal frame after the first is noise or a
+// mid-stream error already accounted for).
+func (s *usageScanner) noteTerminal(k streamTerminalKind) {
+	if s.terminal == terminalNone && k != terminalNone {
+		s.terminal = k
+	}
 }
 
 // Write feeds relayed bytes to the scanner. It always reports success: this is
@@ -485,6 +613,12 @@ type bigLineFilter struct {
 	keyIsUsage bool // the closed string was "usage"/"usageMetadata" at depth ≤ 2
 	keySeen    bool // a string just closed; the next bytes decide key vs value
 	awaitObj   bool // matched key seen with ':'; waiting for the '{' that opens it
+	// parentDialect records that the last depth-1 key was "message" or
+	// "response" — the only parents whose nested "usage" the whole-frame
+	// decoder reads. A depth-2 "usage" under ANY other parent is ignored, so
+	// the filter stays byte-consistent with the small-frame decoder: both
+	// extract exactly the dialect positions and nothing more.
+	parentDialect bool
 	// Capture state.
 	capturing    bool
 	captureDepth int
@@ -496,10 +630,70 @@ type bigLineFilter struct {
 // necessarily starts at the line's first byte (partial is always cleared at
 // newlines), so lexical state starts clean — and the head may already contain a
 // complete usage object, which is merged immediately.
+//
+// The head also contains the frame's root "type" field — every dialect leads
+// its envelope with it — which is probed HERE because a data-only oversized
+// terminal frame (some relays strip event: lines) would otherwise never settle
+// the turn: the filter streams the line through without buffering it, so
+// scanFrameMarkers never sees the frame, and a legitimate giant
+// response.completed would be recorded as a truncation. The probe is bounded:
+// it stops after the first few root keys, so it costs nothing regardless of
+// how long the line grows.
 func (f *bigLineFilter) begin(s *usageScanner, head []byte) {
 	f.stop()
 	f.active = true
+	if kind, known := terminalFromTypeName(probeRootType(head)); known {
+		s.noteTerminal(kind)
+	}
 	f.feed(s, head)
+}
+
+// probeRootType reads the FIRST few root-level keys of a (possibly huge) JSON
+// object and returns the value of the "type" key if it appears among them.
+// Responses and Anthropic envelopes lead with "type", so in practice the very
+// first key answers; probing a few guards against cosmetic key-order variance.
+// Anything malformed, non-object, or without an early "type" returns "" — the
+// caller treats that as "no terminal signal", which is the pre-existing
+// behavior for unknown shapes.
+func probeRootType(head []byte) string {
+	// The scanner's oversized-line head still carries the SSE "data:" prefix;
+	// the filter-side caller may have already cut it. A json.Decoder skips
+	// leading whitespace itself, so only the prefix needs removing.
+	if rest, ok := bytes.CutPrefix(head, []byte("data:")); ok {
+		head = rest
+	}
+	dec := json.NewDecoder(bytes.NewReader(head))
+	tok, err := dec.Token()
+	if err != nil {
+		return ""
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return ""
+	}
+	for i := 0; i < 8; i++ {
+		key, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		if d, ok := key.(json.Delim); ok && d == '}' {
+			return ""
+		}
+		name, ok := key.(string)
+		if !ok {
+			return ""
+		}
+		val, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		if name == "type" {
+			if s, ok := val.(string); ok {
+				return s
+			}
+			return ""
+		}
+	}
+	return ""
 }
 
 // stop deactivates the filter. Usage objects that already closed were merged
@@ -549,6 +743,14 @@ func (f *bigLineFilter) scanByte(b byte, s *usageScanner) {
 			f.inString = false
 			f.keySeen = true
 			f.keyIsUsage = !f.keyLong && f.depth <= 2 && f.keyMatches()
+			if f.depth == 1 {
+				// A depth-1 key names the object any depth-2 usage would sit
+				// in. Only the dialect parents the decoder reads may arm one —
+				// matched case-insensitively for the same reason keyMatches is.
+				f.parentDialect = !f.keyLong &&
+					(asciiFoldEqual(f.keyBuf[:f.keyLen], "message") ||
+						asciiFoldEqual(f.keyBuf[:f.keyLen], "response"))
+			}
 		default:
 			// Record candidate key bytes. Escaped or oversized strings can
 			// never match ("usage" is short and unescaped) — keyLong pins the
@@ -565,7 +767,9 @@ func (f *bigLineFilter) scanByte(b byte, s *usageScanner) {
 	if f.keySeen && (b == ':' || b == ' ' || b == '\t' || b == '\r') {
 		if b == ':' {
 			f.keySeen = false
-			if f.keyIsUsage {
+			// Arm a capture only for the positions the whole-frame decoder
+			// reads: root-level keys, or "usage" inside message/response.
+			if f.keyIsUsage && (f.depth == 1 || f.parentDialect) {
 				f.awaitObj = true
 			}
 		}
@@ -598,18 +802,50 @@ func (f *bigLineFilter) scanByte(b byte, s *usageScanner) {
 		if f.capturing && f.depth < f.captureDepth {
 			f.finishCapture(s)
 		}
+		if f.depth == 1 {
+			// A nested object under the frame root just closed; whatever key
+			// named it no longer governs following depth-2 keys.
+			f.parentDialect = false
+		}
 	}
 }
 
 // keyMatches reports whether the buffered key is one the dialects use for their
-// usage object.
+// usage object. The comparison is case-insensitive because the whole-frame
+// decoder is: Go's encoding/json matches struct tags ignoring ASCII case, so a
+// small frame carrying {"Usage":…} extracts usage there. The giant-frame path
+// must recognize the same keys, or a frame's usage would depend on whether it
+// happened to cross the scan buffer — the exact size-dependent divergence the
+// oracle fuzz test forbids.
 func (f *bigLineFilter) keyMatches() bool {
-	return bytes.Equal(f.keyBuf[:f.keyLen], []byte("usage")) ||
-		bytes.Equal(f.keyBuf[:f.keyLen], []byte("usageMetadata"))
+	return asciiFoldEqual(f.keyBuf[:f.keyLen], "usage") ||
+		asciiFoldEqual(f.keyBuf[:f.keyLen], "usagemetadata")
+}
+
+// asciiFoldEqual reports whether buf equals want ignoring ASCII case; want must
+// already be lowercase. It mirrors encoding/json's case-insensitive key match
+// over the small, fixed set of dialect keys this filter recognizes (none of
+// which collide under case folding, so the "prefer exact match" rule json also
+// applies never changes the result here).
+func asciiFoldEqual(buf []byte, want string) bool {
+	if len(buf) != len(want) {
+		return false
+	}
+	for i := 0; i < len(buf); i++ {
+		c := buf[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // note records one byte of the capture, abandoning the whole capture once it
-// outgrows maxUsageCapture.
+// outgrows maxUsageCapture. Abandonment is counted: this is a usage the
+// upstream DID report being dropped, and it must not be lost silently.
 func (f *bigLineFilter) note(b byte) {
 	if f.overCap {
 		return
@@ -617,6 +853,7 @@ func (f *bigLineFilter) note(b byte) {
 	if len(f.capture) >= maxUsageCapture {
 		f.overCap = true
 		f.capture = f.capture[:0]
+		incUsageObserverDegrade(degradeOversizedUsage)
 		return
 	}
 	f.capture = append(f.capture, b)
@@ -625,15 +862,19 @@ func (f *bigLineFilter) note(b byte) {
 // finishCapture decodes one closed usage object and folds it into the running
 // counts. A capture abandoned for size is discarded whole: nothing is ever
 // decoded from a truncated body, and an object that large is not accounting.
+// A capture that fails to DECODE whole is counted as malformed — verbatim wire
+// bytes that do not parse mean a corrupt or hostile upstream.
 func (f *bigLineFilter) finishCapture(s *usageScanner) {
 	f.capturing = false
 	if f.overCap {
 		return
 	}
 	var env usageEnvelope
-	if err := json.Unmarshal(f.capture, &env); err == nil {
-		mergeUsage(&s.counts, env)
+	if err := json.Unmarshal(f.capture, &env); err != nil {
+		incUsageObserverDegrade(degradeMalformedUsage)
+		return
 	}
+	mergeUsage(&s.counts, env)
 }
 
 // scanLine inspects one complete SSE line for a usage object and for the
@@ -653,9 +894,8 @@ func (s *usageScanner) scanLine(line []byte) {
 	// happens to arrive) — the Responses terminal events. Without them every
 	// successful Responses relay would read as truncated.
 	if rest, ok := bytes.CutPrefix(line, []byte("event:")); ok {
-		switch string(bytes.TrimSpace(rest)) {
-		case "message_stop", "error", "response.completed", "response.failed", "response.incomplete":
-			s.sawTerminal = true
+		if kind, known := terminalFromTypeName(string(bytes.TrimSpace(rest))); known {
+			s.noteTerminal(kind)
 		}
 		return
 	}
@@ -670,7 +910,7 @@ func (s *usageScanner) scanLine(line []byte) {
 	}
 	// OpenAI's stream sentinel: a clean end of turn with no JSON to decode.
 	if bytes.Equal(payload, []byte("[DONE]")) {
-		s.sawTerminal = true
+		s.noteTerminal(terminalCompleted)
 		return
 	}
 
@@ -695,6 +935,12 @@ func (s *usageScanner) scanLine(line []byte) {
 		UsageMetadata *usageEnvelope `json:"usageMetadata"`
 	}
 	if err := json.Unmarshal(payload, &frame); err != nil {
+		// The frame mentioned usage but did not decode: whatever usage it
+		// carried is lost. Count it — silently dropped usage must at least
+		// leave an aggregate signal. (A frame that merely says "usage" inside
+		// content can inflate this; as a degradation signal that is the right
+		// bias — an unparseable frame deserves attention either way.)
+		incUsageObserverDegrade(degradeMalformedUsage)
 		return
 	}
 
@@ -775,6 +1021,22 @@ func (s *usageScanner) scanFrameMarkers(payload []byte) {
 		ContentBlock struct {
 			Type string `json:"type"`
 		} `json:"content_block"`
+		// Error carries the upstream's own error identity from a mid-stream
+		// failure frame — Anthropic's {type:"error",error:{type:…}}, or OpenAI
+		// chat's top-level {"error":{code,type}}. Only the short type/code
+		// strings are read, never the message.
+		Error struct {
+			Type string `json:"type"`
+			Code string `json:"code"`
+		} `json:"error"`
+		// Response re-reads the Responses envelope far enough to catch
+		// response.failed's error identity, which nests under response.error.
+		Response struct {
+			Error struct {
+				Type string `json:"type"`
+				Code string `json:"code"`
+			} `json:"error"`
+		} `json:"response"`
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
 			Delta        struct {
@@ -789,18 +1051,35 @@ func (s *usageScanner) scanFrameMarkers(payload []byte) {
 
 	switch frame.Type {
 	case "message_stop":
-		s.sawTerminal = true
-	case "error", "response.completed", "response.failed", "response.incomplete":
-		// A terminal event settles the turn: the client is being told the
-		// outcome — failed, complete, or explicitly incomplete — which is a
-		// complete (if unhappy) outcome, not a silent truncation. Redundant
-		// with the event: line when one is present, but some relays strip
-		// event: fields and forward bare data frames.
-		s.sawTerminal = true
+		s.noteTerminal(terminalCompleted)
+	case "response.completed":
+		s.noteTerminal(terminalCompleted)
+	case "error", "response.failed":
+		// A terminal failure frame settles the turn: the client is being told
+		// the upstream's own error, which is a complete (if unhappy) outcome,
+		// not a silent truncation — but it is also NOT a success, and it does
+		// implicate the provider (mid-stream generation failures are
+		// provider-side; request-level problems fail before the stream starts
+		// with a 4xx). See forwardOneConnection for how the outcome is recorded.
+		s.noteTerminal(terminalFailed)
+		// Anthropic/OpenAI chat put the error identity top-level; Responses'
+		// response.failed nests it under response.error.
+		s.noteStreamErrCode(frame.Error.Type, frame.Error.Code)
+		s.noteStreamErrCode(frame.Response.Error.Type, frame.Response.Error.Code)
+	case "response.incomplete":
+		// A limit ended the turn (incomplete_details.reason, e.g.
+		// max_output_tokens). The provider enforced its own configured cap —
+		// that is healthy behavior, never an outage.
+		s.noteTerminal(terminalIncomplete)
 	case "message_delta":
 		// stop_reason on a message_delta is Anthropic's real end-of-turn signal.
+		// max_tokens is the limit-triggered flavor: incomplete, not failed.
 		if strings.TrimSpace(frame.Delta.StopReason) != "" {
-			s.sawTerminal = true
+			if limitStopReasons[strings.TrimSpace(frame.Delta.StopReason)] {
+				s.noteTerminal(terminalIncomplete)
+			} else {
+				s.noteTerminal(terminalCompleted)
+			}
 		}
 	case "content_block_start":
 		// A tool call is client-visible output even though it carries no text.
@@ -823,12 +1102,39 @@ func (s *usageScanner) scanFrameMarkers(payload []byte) {
 	for i := range frame.Choices {
 		c := &frame.Choices[i]
 		if strings.TrimSpace(c.FinishReason) != "" {
-			s.sawTerminal = true
+			// length/content_filter mirror Responses' incomplete: the turn hit
+			// a configured limit, which is not a provider failure.
+			if limitStopReasons[strings.TrimSpace(c.FinishReason)] {
+				s.noteTerminal(terminalIncomplete)
+			} else {
+				s.noteTerminal(terminalCompleted)
+			}
 		}
 		if c.Delta.Content != "" || len(c.Delta.ToolCalls) > 0 {
 			s.sawContent = true
 		}
 	}
+}
+
+// noteStreamErrCode records the upstream's error identity from a failed
+// terminal frame. It prefers the error "type" (Anthropic's overloaded_error,
+// OpenAI's server_error) over "code", keeps it short, and keeps only the first
+// one seen.
+func (s *usageScanner) noteStreamErrCode(errType, errCode string) {
+	if s.streamErrCode != "" {
+		return
+	}
+	code := strings.TrimSpace(errType)
+	if code == "" {
+		code = strings.TrimSpace(errCode)
+	}
+	if code == "" {
+		return
+	}
+	if len(code) > 64 {
+		code = code[:64]
+	}
+	s.streamErrCode = code
 }
 
 // Counts returns the usage seen so far, after flushing any trailing partial line
@@ -847,14 +1153,27 @@ func (s *usageScanner) Counts() usageCounts {
 // would then be recorded as a 200 success while the client sees a stream that
 // simply stops, with no error to explain it.
 //
-// Deliberately conservative: only the absence of a terminal marker counts. A
-// turn that produced no content but did terminate (a refusal, an empty answer,
-// an error frame) is left alone, so this can only fire on a genuinely
-// unterminated stream. hadContent distinguishes the two shapes for the log/metric
-// without changing the verdict.
+// Only the ABSENCE of a terminal frame counts. A failed or incomplete terminal
+// still settled the turn — the client was told the outcome — so neither is a
+// truncation; they are distinguished through Terminal() instead, because
+// terminal is not the same thing as success.
 func (s *usageScanner) Truncated() bool {
 	s.flushPartial()
-	return !s.sawTerminal
+	return s.terminal == terminalNone
+}
+
+// Terminal reports the generation outcome the stream's terminal frame reported,
+// after flushing any trailing partial line. terminalNone means no terminal was
+// ever seen (see Truncated).
+func (s *usageScanner) Terminal() streamTerminalKind {
+	s.flushPartial()
+	return s.terminal
+}
+
+// ErrCode reports the upstream's own error type/code from a failed terminal
+// frame, or "" when the outcome was not a failure or none was legible.
+func (s *usageScanner) ErrCode() string {
+	return s.streamErrCode
 }
 
 // hadContent reports whether any client-visible answer (text or tool call) was
