@@ -3759,7 +3759,31 @@
       updateWebSearchStrategyHint();
     }
     $('upstreamForm_sessionHeader').value = entry ? (entry.sessionHeader || '') : '';
+    // Same unset-stays-unset rule as webSearchStrategy: an unrecognized stored
+    // value shows as pass-through rather than being rewritten to a policy the
+    // operator never chose.
+    const missingSelect = $('upstreamForm_sessionMissingPolicy');
+    if (missingSelect) {
+      const storedPolicy = entry && typeof entry.sessionMissingPolicy === 'string'
+        ? entry.sessionMissingPolicy.trim().toLowerCase() : '';
+      missingSelect.value = storedPolicy === 'synthetic_request' ? storedPolicy : '';
+      updateSessionMissingPolicyHint();
+    }
     openDialog('upstreamModal');
+  }
+
+  // updateSessionMissingPolicyHint swaps the help text for the selected policy,
+  // because the cost of the synthetic option (availability now, no cross-turn
+  // affinity) is not visible from its label alone.
+  function updateSessionMissingPolicyHint() {
+    const sel = $('upstreamForm_sessionMissingPolicy');
+    const hint = $('upstreamForm_sessionMissingPolicyHint');
+    if (!sel || !hint) return;
+    const key = sel.value === 'synthetic_request'
+      ? 'upstreams.sessionMissingPolicyHintSynthetic'
+      : 'upstreams.sessionMissingPolicyHintPassthrough';
+    hint.setAttribute('data-i18n', key);
+    hint.textContent = t(key);
   }
 
   // updateWebSearchStrategyHint swaps the help text to describe the selected
@@ -3798,8 +3822,16 @@
     // backend). Empty means "no mapping": only the client's own session headers
     // are preserved upstream.
     const sessionHeader = $('upstreamForm_sessionHeader').value.trim();
+    const missingPolicySelect = $('upstreamForm_sessionMissingPolicy');
+    const sessionMissingPolicy = missingPolicySelect ? missingPolicySelect.value : '';
     if (!baseUrl) { toast(t('upstreams.baseUrlRequired'), 'error'); return; }
     if (priceInPerM < 0 || priceOutPerM < 0) { toast(t('upstreams.priceInvalid'), 'error'); return; }
+    // A generated session needs a header to travel in; the server refuses this
+    // combination too, but saying so here keeps the operator in the form.
+    if (sessionMissingPolicy === 'synthetic_request' && !sessionHeader) {
+      toast(t('upstreams.sessionMissingPolicyNeedsHeader'), 'error');
+      return;
+    }
     const prev = JSON.parse(JSON.stringify(upstreamCache));
     try {
       if (upstreamEditingId) {
@@ -3809,10 +3841,12 @@
           p.priceInPerM = priceInPerM; p.priceOutPerM = priceOutPerM;
           p.webSearchStrategy = webSearchStrategy;
           p.sessionHeader = sessionHeader;
+          p.sessionMissingPolicy = sessionMissingPolicy;
         }
       } else {
         upstreamCache.providers.push({
-          id: '', name, baseUrl, apiKey, proxyURL, enabled, priceInPerM, priceOutPerM, webSearchStrategy, sessionHeader
+          id: '', name, baseUrl, apiKey, proxyURL, enabled, priceInPerM, priceOutPerM, webSearchStrategy,
+          sessionHeader, sessionMissingPolicy
         });
       }
       await persistUpstreams();
@@ -6023,6 +6057,8 @@
     if (upClose) upClose.addEventListener('click', closeUpstreamModal);
     const upStrategy = $('upstreamForm_webSearchStrategy');
     if (upStrategy) upStrategy.addEventListener('change', updateWebSearchStrategyHint);
+    const upMissingPolicy = $('upstreamForm_sessionMissingPolicy');
+    if (upMissingPolicy) upMissingPolicy.addEventListener('change', updateSessionMissingPolicyHint);
     const rtSave = $('modelRouteModalSaveBtn');
     if (rtSave) rtSave.addEventListener('click', submitRouteModal);
     const rtCancel = $('modelRouteModalCancelBtn');
@@ -8074,6 +8110,19 @@
     add(t('forward.detailCost'), escapeHtml(fwdFmtCost(e.costUsd, isPool)));
     add(t('forward.detailStream'), e.stream ? t('forward.detailYes') : t('forward.detailNo'));
     if (e.canceled) add(t('forward.detailCanceled'), t('forward.detailYes'));
+    // Session identity of the attempt: which carrier it came from, whether it
+    // groups a conversation or only this request, and whether the provider's
+    // configured header actually carried it. The id itself is never recorded, so
+    // there is nothing here to leak. Absent on events from before this shipped,
+    // which is why each row is conditional.
+    // Source and scope stay in their wire spelling on purpose: they are the exact
+    // tokens the logs and metrics carry, so an operator can grep for what the UI
+    // showed. Only the yes/no reading below is localized.
+    if (e.sessionSource) add(t('forward.detailSessionSource'), '<span class="font-mono">' + escapeHtml(e.sessionSource) + '</span>');
+    if (e.sessionScope) add(t('forward.detailSessionScope'), '<span class="font-mono">' + escapeHtml(e.sessionScope) + '</span>');
+    if (e.sessionSource && e.sessionSource !== 'none') {
+      add(t('forward.detailSessionMapped'), e.sessionMapped ? t('forward.detailYes') : t('forward.detailNo'));
+    }
 
     let err = '';
     const attempts = extra && Array.isArray(extra.attempts) ? extra.attempts : [];

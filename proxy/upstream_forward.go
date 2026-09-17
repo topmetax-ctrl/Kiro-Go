@@ -326,6 +326,11 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 	// terminal frame ("server_error", "overloaded_error", …) — short protocol
 	// metadata for the metric, never the error message.
 	var streamErrCode string
+	// sess is the effective session identity this attempt presented upstream,
+	// resolved once the outbound request exists. Declared here so recordMetric
+	// reports it; it stays zero (recorded as no session) for the failure paths
+	// that abort before the request is built.
+	var sess clientSession
 
 	// recordMetric is called once, at the end of the attempt (after the body/stream
 	// finishes), so LatencyMs reflects the full relay — not just time-to-headers.
@@ -357,6 +362,9 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 			ErrorMsg:       errMsg,
 			Attempt:        attempt,
 			StreamOutcome:  streamOutcome,
+			SessionSource:  sess.Source,
+			SessionScope:   sess.Scope.String(),
+			SessionMapped:  sessionMappedUpstream(sess, up),
 		}
 		if usage.known() || usage.cacheKnown() || usage.ReasoningOutputTokens != nil {
 			ev.Usage = &metrics.EventUsage{
@@ -423,7 +431,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 	// configures one, map it to the provider-specific session header (OpenCode Go).
 	// It survives retries, connection rotation and provider failover for free —
 	// every attempt re-derives it from the same inbound request.
-	sess := applyUpstreamSessionAffinity(req, r, up)
+	sess = applyUpstreamSessionAffinity(req, r, up)
 	logSessionAffinity(sess, strings.TrimSpace(up.SessionHeader))
 
 	proxyURL := up.ProxyURL

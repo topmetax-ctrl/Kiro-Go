@@ -87,7 +87,8 @@ func publicProvider(p config.UpstreamProvider) map[string]interface{} {
 		"webSearchStrategy": p.WebSearchStrategy,
 		// Same round-trip rule as webSearchStrategy: an operator editing any
 		// provider must not silently drop another provider's session mapping.
-		"sessionHeader": p.SessionHeader,
+		"sessionHeader":        p.SessionHeader,
+		"sessionMissingPolicy": p.SessionMissingPolicy,
 	}
 	return out
 }

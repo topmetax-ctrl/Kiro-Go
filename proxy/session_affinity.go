@@ -14,19 +14,32 @@ package proxy
 // the provider-specific spelling happens at egress only, so routing logic never
 // grows per-backend header knowledge.
 //
-// A third carrier exists for compatibility: aggregators that rebuild requests
+// Clients that are neither Claude Code nor a native OpenCode client may still
+// carry a real conversation session under a generic spelling — X-Session-
+// Affinity, X-Session-Id or Session-Id. Those are accepted behind both native
+// headers, on the same terms: an explicit, client-supplied conversation id.
+//
+// A body carrier exists for compatibility: aggregators that rebuild requests
 // (9router's DefaultExecutor builds outbound headers from scratch) drop the
 // session headers yet still relay the same Claude Code identity inside the
 // body's metadata.user_id — Claude Code itself sends it in both places. That
-// body value is a LAST-RESORT source behind both headers, validated against
+// body value is a LAST-RESORT source behind every header, validated against
 // strict known shapes only, and it stays an UNTRUSTED routing hint: like the
 // headers, it may steer session affinity, but it never feeds authentication,
 // billing, or tenant decisions.
 //
-// The forwarder never manufactures a session id. A request without one stays
-// without one: generating a per-request UUID would silently give every request
-// of the same conversation a different logical session, which is exactly the
-// affinity this exists to preserve.
+// Only carriers whose conversation semantics are established are read. Notably
+// absent, and deliberately so: X-Client-Request-Id (request-level for Claude
+// Code even though some clients overload it with a session), prompt_cache_key
+// (a cache bucketing key with no one-key-per-conversation guarantee) and
+// previous_response_id (a per-response chain pointer that changes every turn).
+// A field is not a session because its name sounds like one.
+//
+// Session RESOLUTION never manufactures an id: a request without one resolves
+// to no identity, because giving every request of a conversation a different
+// logical session would destroy the affinity this exists to preserve. Whether a
+// sessionless request may still proceed is a separate, per-provider EGRESS
+// decision — see effectiveSessionForProvider and config.SessionMissingPolicy.
 
 import (
 	"context"
@@ -34,6 +47,9 @@ import (
 	"net/http"
 	"net/textproto"
 	"strings"
+	"sync"
+
+	"github.com/google/uuid"
 
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -46,41 +62,126 @@ const (
 	// HeaderOpencodeSession is the native OpenCode client's session header, and
 	// also the header an OpenCode Go upstream's backend paths require.
 	HeaderOpencodeSession = "X-Opencode-Session"
+	// HeaderSessionAffinity is the generic affinity spelling emitted by clients
+	// that are neither Claude Code nor OpenCode (OpenClaw sends it on both its
+	// Anthropic and OpenAI paths when session affinity is enabled).
+	HeaderSessionAffinity = "X-Session-Affinity"
+	// HeaderSessionID and HeaderSessionIDBare are the two remaining generic
+	// spellings in circulation; aggregators read both interchangeably.
+	HeaderSessionID     = "X-Session-Id"
+	HeaderSessionIDBare = "Session-Id"
 )
 
 // session sources, for observability only (never logged with the id itself).
+// Deliberately low-cardinality: a fixed, closed set of labels, never a value
+// derived from the session id.
 const (
-	sessionSourceClaudeCode     = "claude-code"
-	sessionSourceClaudeMetadata = "claude-metadata"
-	sessionSourceOpencode       = "opencode"
-	sessionSourceNone           = "none"
+	sessionSourceClaudeCode       = "claude-code"
+	sessionSourceClaudeMetadata   = "claude-metadata"
+	sessionSourceOpencode         = "opencode"
+	sessionSourceGenericAffinity  = "generic-affinity"
+	sessionSourceGenericSession   = "generic-session"
+	sessionSourceSyntheticRequest = "synthetic-request"
+	sessionSourceNone             = "none"
 )
+
+// sessionScope separates an identity that groups a whole conversation from one
+// that is only valid for a single logical request. The distinction is the whole
+// reason a synthetic fallback is safe to have: it tells every consumer that this
+// identity must not be presented as conversation continuity.
+type sessionScope uint8
+
+const (
+	// scopeUnknown is the zero value and means "no identity". It must never be
+	// read as conversation scope — a zero-valued clientSession claiming to group
+	// a conversation is exactly the bug this ordering prevents.
+	scopeUnknown sessionScope = iota
+	// scopeConversation is a client-supplied identity that groups turns.
+	scopeConversation
+	// scopeRequest is valid for ONE logical request only (all its retries,
+	// failovers and tool rounds), and deliberately differs on the next turn.
+	scopeRequest
+)
+
+func (s sessionScope) String() string {
+	switch s {
+	case scopeConversation:
+		return "conversation"
+	case scopeRequest:
+		return "request"
+	default:
+		return ""
+	}
+}
 
 // clientSession is the canonical session identity of one inbound request.
 // ID is "" when the client presented no recognizable session identity at all.
 type clientSession struct {
 	ID     string
 	Source string
+	Scope  sessionScope
 }
 
-// present reports whether the client actually carried a session identity.
+// present reports whether the session carries an identity at all.
 func (s clientSession) present() bool { return s.ID != "" }
 
-// clientSessionAffinity resolves the canonical session identity from the
-// inbound request. Precedence: Claude Code's native header, then the native
-// OpenCode header, then the strict body-metadata fallback extracted where the
-// handler parsed the body. Nothing is generated: no identity, no affinity.
-func clientSessionAffinity(r *http.Request) clientSession {
-	if v := strings.TrimSpace(r.Header.Get(HeaderClaudeCodeSession)); v != "" {
-		return clientSession{ID: v, Source: sessionSourceClaudeCode}
+// sessionHeaderCarriers is the ordered precedence of header carriers. Native
+// spellings first (they are unambiguous), then the generic ones. Order is the
+// contract: it is what makes the resolution deterministic when a client sends
+// several, and it is asserted by tests rather than left to map iteration.
+var sessionHeaderCarriers = []struct {
+	Header string
+	Source string
+}{
+	{HeaderClaudeCodeSession, sessionSourceClaudeCode},
+	{HeaderOpencodeSession, sessionSourceOpencode},
+	{HeaderSessionAffinity, sessionSourceGenericAffinity},
+	{HeaderSessionID, sessionSourceGenericSession},
+	{HeaderSessionIDBare, sessionSourceGenericSession},
+}
+
+// sessionSourceHeader is the header a source is echoed back under when the
+// caller has no inbound request to compare against (the local web-search loop
+// replays a pre-resolved identity). A body-derived identity has no header of its
+// own, so it takes the canonical Claude spelling — the same rule the normal
+// forward path applies.
+func sessionSourceHeader(source string) string {
+	switch source {
+	case sessionSourceClaudeCode, sessionSourceClaudeMetadata:
+		return HeaderClaudeCodeSession
+	case sessionSourceOpencode:
+		return HeaderOpencodeSession
+	case sessionSourceGenericAffinity:
+		return HeaderSessionAffinity
+	case sessionSourceGenericSession:
+		return HeaderSessionID
+	default:
+		return ""
 	}
-	if v := strings.TrimSpace(r.Header.Get(HeaderOpencodeSession)); v != "" {
-		return clientSession{ID: v, Source: sessionSourceOpencode}
+}
+
+// clientSessionAffinity resolves the canonical session identity the CLIENT
+// presented. Precedence: the native Claude Code header, the native OpenCode
+// header, the generic affinity/session headers, then the strict body-metadata
+// fallback extracted where the handler parsed the body.
+//
+// Every header carrier goes through the same bounded validation as the body
+// carrier, so an oversized or control-character-bearing value is not an
+// identity: that carrier is skipped and the next source is tried, exactly as if
+// it had been absent. A duplicate header keeps Go's first-value semantics.
+//
+// Nothing is generated here. A sessionless request resolves to no identity; the
+// per-provider fallback lives in effectiveSessionForProvider.
+func clientSessionAffinity(r *http.Request) clientSession {
+	for _, c := range sessionHeaderCarriers {
+		if v := sanitizedSessionToken(r.Header.Get(c.Header)); v != "" {
+			return clientSession{ID: v, Source: c.Source, Scope: scopeConversation}
+		}
 	}
 	if v := bodySessionFallback(r.Context()); v != "" {
-		return clientSession{ID: v, Source: sessionSourceClaudeMetadata}
+		return clientSession{ID: v, Source: sessionSourceClaudeMetadata, Scope: scopeConversation}
 	}
-	return clientSession{Source: sessionSourceNone}
+	return clientSession{Source: sessionSourceNone, Scope: scopeUnknown}
 }
 
 // bodySessionContextKey carries the body-derived session fallback of one
@@ -231,18 +332,94 @@ func validHeaderName(name string) bool {
 	return c != "" && c == textproto.CanonicalMIMEHeaderKey(name)
 }
 
-// applyUpstreamSessionAffinity writes the client's canonical session identity
-// onto the outbound request. This is the single egress point for session
-// headers — the generic forwardableRequestHeaders allow-list deliberately does
-// not carry them, because the OpenCode mapping is a per-provider policy, not a
-// header every upstream should receive.
+// requestSyntheticSession is the ONE synthetic identity a single logical
+// inference request may use. It is attached at the request boundary
+// (serveInference) and materialized lazily, so a request that never reaches a
+// provider needing one never mints an id at all.
+//
+// The value is generated exactly once per logical request and reused by every
+// attempt beneath it — key rotation, failover to another target, and every
+// local web-search round — because those are all the same client turn. The lock
+// is request-local by construction: the holder lives in one request's context
+// and is never shared, so there is no cross-request contention and no global
+// state to scale or evict.
+type requestSyntheticSession struct {
+	once sync.Once
+	id   string
+}
+
+// value returns this request's synthetic session id, generating it on first use.
+func (s *requestSyntheticSession) value() string {
+	if s == nil {
+		return ""
+	}
+	s.once.Do(func() { s.id = uuid.NewString() })
+	return s.id
+}
+
+type requestSyntheticSessionKey struct{}
+
+// withRequestSyntheticSession attaches an unmaterialized synthetic-session
+// holder to a request. Called once per logical inference request; attaching the
+// holder costs nothing until a provider policy actually asks for the value.
+func withRequestSyntheticSession(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), requestSyntheticSessionKey{}, &requestSyntheticSession{}))
+}
+
+// requestSyntheticSessionID returns this request's synthetic session id,
+// generating it on first use. Empty when no holder was attached, which keeps
+// non-inference paths (and any caller outside serveInference) from silently
+// gaining a per-attempt identity: no holder means no synthetic fallback.
+func requestSyntheticSessionID(ctx context.Context) string {
+	holder, _ := ctx.Value(requestSyntheticSessionKey{}).(*requestSyntheticSession)
+	return holder.value()
+}
+
+// effectiveSessionForProvider is the SINGLE place the missing-session question
+// is answered, for both the normal forward path and the local web-search loop.
+// Letting each call site decide is how the two paths drift apart.
+//
+//	real client identity        -> that identity, conversation-scoped
+//	none + passthrough          -> no identity (existing behavior)
+//	none + synthetic_request    -> this request's one synthetic UUID, request-scoped
+//
+// The synthetic branch requires a usable SessionHeader: that header is the only
+// channel the generated value can travel in, so without it the policy could only
+// produce an identity nothing carries. That combination is refused at admin
+// write time and warned about here rather than silently doing nothing.
+func effectiveSessionForProvider(r *http.Request, up config.UpstreamProvider) clientSession {
+	sess := clientSessionAffinity(r)
+	if sess.present() {
+		return sess
+	}
+	if up.SessionMissingPolicyResolved() != config.SessionMissingSyntheticRequest {
+		return sess
+	}
+	name := strings.TrimSpace(up.SessionHeader)
+	if name == "" || !validHeaderName(name) {
+		logger.Warnf("[Forward] provider %s requests a synthetic session but its sessionHeader %q cannot carry one; request stays sessionless", up.Name, up.SessionHeader)
+		return sess
+	}
+	id := requestSyntheticSessionID(r.Context())
+	if id == "" {
+		return sess
+	}
+	return clientSession{ID: id, Source: sessionSourceSyntheticRequest, Scope: scopeRequest}
+}
+
+// applyUpstreamSessionAffinity writes the effective session identity onto the
+// outbound request. This is the single egress point for session headers — the
+// generic forwardableRequestHeaders allow-list deliberately does not carry them,
+// because the provider mapping is a per-provider policy, not a header every
+// upstream should receive.
 //
 // Egress policy, in order:
 //
-//  1. Preserve what the client actually sent: the header the identity came from
-//     is relayed with the canonical value. A client that sent both headers keeps
-//     both, reconciled to one value (the Claude Code one wins) so the upstream
-//     never sees two different logical sessions on one request.
+//  1. Preserve what the client actually sent: every session header present on
+//     the inbound request is relayed with the ONE canonical value. A client that
+//     sent several keeps them all, reconciled (the highest-precedence carrier
+//     wins) so the upstream never sees two different logical sessions on one
+//     request.
 //  2. Body-derived identity (aggregators that dropped the headers) has no
 //     session header to preserve; the canonical Claude spelling is written
 //     instead, so native-header upstreams see the same session.
@@ -253,51 +430,63 @@ func validHeaderName(name string) bool {
 //     configured name is warned about once and ignored rather than corrupting
 //     the request.
 //
-// A request without session identity gets nothing: no preserve, no inject, no
-// generated stand-in.
+// A REQUEST-SCOPED synthetic identity skips step 1 and 2 entirely: it travels
+// only through the provider's own configured header. Writing it into a native
+// header would tell that upstream a real client conversation id had arrived,
+// which is the one thing a synthetic value must never claim. An operator who
+// genuinely wants the native spelling configures SessionHeader as that header.
+//
+// A request with no effective identity gets nothing: no preserve, no inject.
 func applyUpstreamSessionAffinity(dst *http.Request, src *http.Request, up config.UpstreamProvider) clientSession {
-	sess := clientSessionAffinity(src)
+	sess := effectiveSessionForProvider(src, up)
 	if !sess.present() {
 		return sess
 	}
-	if src.Header.Get(HeaderClaudeCodeSession) != "" {
-		dst.Header.Set(HeaderClaudeCodeSession, sess.ID)
-	}
-	if src.Header.Get(HeaderOpencodeSession) != "" {
-		dst.Header.Set(HeaderOpencodeSession, sess.ID)
-	}
-	if sess.Source == sessionSourceClaudeMetadata {
-		// The identity arrived in the body, so there is no session header to
-		// preserve; write the canonical Claude spelling so upstreams reading
-		// the native header see the session the mapping header carries.
-		dst.Header.Set(HeaderClaudeCodeSession, sess.ID)
+	if sess.Scope == scopeConversation {
+		// Reconcile every carrier the client presented a USABLE value in. The
+		// same validation decides what counts as a carrier here as during
+		// resolution: a carrier whose value could not be an identity is treated
+		// as absent, so it is neither relayed nor rewritten to the winning value
+		// — writing it would state a claim (a Claude Code session id, say) that
+		// the client never validly made.
+		for _, c := range sessionHeaderCarriers {
+			if sanitizedSessionToken(src.Header.Get(c.Header)) != "" {
+				dst.Header.Set(c.Header, sess.ID)
+			}
+		}
+		if sess.Source == sessionSourceClaudeMetadata {
+			// The identity arrived in the body, so there is no session header to
+			// preserve; write the canonical Claude spelling so upstreams reading
+			// the native header see the session the mapping header carries.
+			dst.Header.Set(HeaderClaudeCodeSession, sess.ID)
+		}
 	}
 	applyProviderSessionMapping(dst, sess, up)
 	return sess
 }
 
 // applyClientSessionAffinity is the variant for callers that already resolved
-// the identity (the local web-search loop resolves once and replays it on every
-// continuation round). The header the identity came from is preserved with the
-// canonical value, plus the provider mapping when configured. A non-present
-// session writes nothing.
+// the effective identity (the local web-search loop resolves once and replays it
+// on every continuation round). The carrier the identity came from is echoed with
+// the canonical value, plus the provider mapping when configured. A
+// request-scoped synthetic identity travels only through the provider mapping,
+// exactly as on the normal forward path. A non-present session writes nothing.
 func applyClientSessionAffinity(dst *http.Request, sess clientSession, up config.UpstreamProvider) {
 	if !sess.present() {
 		return
 	}
-	switch sess.Source {
-	case sessionSourceClaudeCode, sessionSourceClaudeMetadata:
-		dst.Header.Set(HeaderClaudeCodeSession, sess.ID)
-	case sessionSourceOpencode:
-		dst.Header.Set(HeaderOpencodeSession, sess.ID)
+	if sess.Scope == scopeConversation {
+		if name := sessionSourceHeader(sess.Source); name != "" {
+			dst.Header.Set(name, sess.ID)
+		}
 	}
 	applyProviderSessionMapping(dst, sess, up)
 }
 
 // applyProviderSessionMapping writes the provider-configured session header,
-// if any, with the canonical value — the EXACT id the client presented, never
-// a regenerated one. An invalid configured name is warned about and skipped
-// rather than corrupting the upstream request.
+// if any, with the canonical value — the EXACT effective id for this request,
+// never one regenerated per attempt. An invalid configured name is warned about
+// and skipped rather than corrupting the upstream request.
 func applyProviderSessionMapping(dst *http.Request, sess clientSession, up config.UpstreamProvider) {
 	name := strings.TrimSpace(up.SessionHeader)
 	if name == "" || !sess.present() {
@@ -310,16 +499,32 @@ func applyProviderSessionMapping(dst *http.Request, sess clientSession, up confi
 	dst.Header.Set(name, sess.ID)
 }
 
+// sessionMappedUpstream reports whether the provider's configured session header
+// was actually written for this identity — the question an operator debugging a
+// MissingSessionID needs answered, and one that "SessionHeader is configured"
+// alone does not answer (an unusable name is skipped, and a sessionless request
+// writes nothing).
+func sessionMappedUpstream(sess clientSession, up config.UpstreamProvider) bool {
+	name := strings.TrimSpace(up.SessionHeader)
+	return sess.present() && name != "" && validHeaderName(name)
+}
+
 // logSessionAffinity records the session-affinity metadata for one upstream
-// attempt. Deliberately id-free: the session id is client conversation state,
-// so only presence, source and the mapped upstream header reach the log.
+// attempt. Deliberately id-free: the session id is client conversation state, so
+// only presence, source, scope and the mapped upstream header reach the log.
+//
+// A sessionless request stays at Debug on purpose. For a provider whose policy
+// is passthrough it is the normal, correct state, and promoting it would turn
+// ordinary traffic into a warning stream. The exceptional cases — a synthetic
+// policy that cannot map, an invalid configured header — warn from where they are
+// detected instead.
 func logSessionAffinity(sess clientSession, upstreamHeader string) {
 	if !sess.present() {
 		logger.Debugf("[Forward] session_affinity_present=false session_source=none upstream_session_header=none")
 		return
 	}
-	logger.Infof("[Forward] session_affinity_present=true session_source=%s upstream_session_header=%s",
-		sess.Source, upstreamHeader)
+	logger.Infof("[Forward] session_affinity_present=true session_source=%s session_scope=%s upstream_session_header=%s",
+		sess.Source, sess.Scope, upstreamHeader)
 }
 
 // ProbeSessionPrefix marks a synthetic session id carried by an admin Test

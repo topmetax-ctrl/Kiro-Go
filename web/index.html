@@ -1476,6 +1476,14 @@
           <small data-i18n="upstreams.sessionHeaderHint"></small>
         </div>
         <div class="form-group">
+          <label data-i18n="upstreams.sessionMissingPolicy"></label>
+          <select id="upstreamForm_sessionMissingPolicy">
+            <option value="" data-i18n="upstreams.sessionMissingPolicyPassthrough"></option>
+            <option value="synthetic_request" data-i18n="upstreams.sessionMissingPolicySynthetic"></option>
+          </select>
+          <small id="upstreamForm_sessionMissingPolicyHint" data-i18n="upstreams.sessionMissingPolicyHintPassthrough"></small>
+        </div>
+        <div class="form-group">
           <label class="flex items-center gap-2">
             <span class="switch"><input type="checkbox" id="upstreamForm_enabled" checked /><span class="slider"></span></span>
             <span data-i18n="upstreams.formEnabled"></span>

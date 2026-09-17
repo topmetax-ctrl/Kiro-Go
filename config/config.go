@@ -275,6 +275,20 @@ type UpstreamProvider struct {
 	// own session id, and only when the client actually presented one.
 	SessionHeader string `json:"sessionHeader,omitempty"`
 
+	// SessionMissingPolicy declares what this provider does when the client
+	// presented no recognizable session identity at all.
+	//
+	// Raw values (persisted JSON) are "" | "synthetic_request". Empty is the
+	// default and MUST preserve the existing behavior: no client session means
+	// no injected session. Runtime code must never branch on the raw string —
+	// call p.SessionMissingPolicyResolved(), which normalizes unknown values to
+	// passthrough at the config boundary (see SessionMissingPolicy).
+	//
+	// "synthetic_request" is only honored together with SessionHeader, since
+	// that is the only channel a generated identity can travel in; the admin
+	// write path refuses the combination (ValidateSessionPolicy).
+	SessionMissingPolicy string `json:"sessionMissingPolicy,omitempty"`
+
 	// Operator-supplied prices in USD per 1M tokens, used only to estimate the
 	// cost shown in the stats dashboard. Zero means "unpriced": no cost is
 	// attributed, and the UI shows "—" rather than a misleading $0.00. Nothing
@@ -2384,6 +2398,80 @@ func ParseProviderWebSearchStrategy(raw string) ProviderWebSearchStrategy {
 // WebSearchStrategy returns the normalized strategy for this provider.
 func (p UpstreamProvider) WebSearchStrategyResolved() ProviderWebSearchStrategy {
 	return ParseProviderWebSearchStrategy(p.WebSearchStrategy)
+}
+
+// SessionMissingPolicy is what a provider does when the client presented no
+// recognizable conversation session at all. It is deliberately separate from
+// SessionHeader: the header says HOW an identity is spelled upstream, this says
+// WHETHER a request may proceed without one.
+//
+//   - Passthrough (raw ""): the pre-existing behavior, and the default for
+//     every provider. No client session means no session header is injected.
+//     Correct for backends that treat session identity as optional.
+//   - SyntheticRequest (raw "synthetic_request"): when no client session
+//     exists, the forwarder mints one canonical UUID for this ONE logical
+//     request and maps it through SessionHeader. It exists for backends that
+//     reject sessionless requests outright (an OpenCode Go backend answers
+//     "MissingSessionID"), where the alternative to a request-scoped identity
+//     is not affinity — it is a failed request.
+//
+// SyntheticRequest buys availability, NOT conversation affinity: the value is
+// stable across retries, key rotation, failover and every local web-search
+// round of the same logical request, and deliberately differs on the client's
+// next turn. Only a real client-supplied session can group turns, so a
+// synthetic identity must never be described as a reconstructed conversation.
+type SessionMissingPolicy uint8
+
+const (
+	// SessionMissingPassthrough is raw "" — never inject a session the client
+	// did not send. Default; unknown raw values normalize here.
+	SessionMissingPassthrough SessionMissingPolicy = iota
+	// SessionMissingSyntheticRequest is raw "synthetic_request".
+	SessionMissingSyntheticRequest
+)
+
+// SessionMissingPolicyRaw is the persisted spelling of SyntheticRequest. It is
+// the only non-empty value config, the admin API and the UI exchange.
+const SessionMissingPolicyRaw = "synthetic_request"
+
+func (p SessionMissingPolicy) String() string {
+	if p == SessionMissingSyntheticRequest {
+		return SessionMissingPolicyRaw
+	}
+	return ""
+}
+
+// ParseSessionMissingPolicy normalizes a raw persisted string. Unknown strings
+// map to Passthrough, matching ParseProviderWebSearchStrategy: a typo must
+// preserve the provider's existing behavior, never invent a new one. Rejecting
+// a bad value at load time would take the whole gateway down over one
+// hand-edited field; the admin write path is where a bad value is refused.
+func ParseSessionMissingPolicy(raw string) SessionMissingPolicy {
+	if strings.TrimSpace(strings.ToLower(raw)) == SessionMissingPolicyRaw {
+		return SessionMissingSyntheticRequest
+	}
+	return SessionMissingPassthrough
+}
+
+// SessionMissingPolicyResolved returns the normalized missing-session policy
+// for this provider.
+func (p UpstreamProvider) SessionMissingPolicyResolved() SessionMissingPolicy {
+	return ParseSessionMissingPolicy(p.SessionMissingPolicy)
+}
+
+// ValidateSessionPolicy reports why this provider's session configuration
+// cannot be honored, or nil when it is coherent. Generating an identity the
+// provider has no header to carry it in would be a silent no-op, so the admin
+// write path refuses that combination instead of storing a policy that does
+// nothing.
+func (p UpstreamProvider) ValidateSessionPolicy() error {
+	if p.SessionMissingPolicyResolved() != SessionMissingSyntheticRequest {
+		return nil
+	}
+	if strings.TrimSpace(p.SessionHeader) == "" {
+		return fmt.Errorf("provider %q: sessionMissingPolicy %q requires a sessionHeader to carry the generated session", p.Name, SessionMissingPolicyRaw)
+	}
+	return nil
 }
 
 // TavilyAPIKeyResolved returns the effective Tavily API key, with the

@@ -147,6 +147,24 @@ type Event struct {
 	// and "model rounds" equals "requests" for ordinary traffic. Set it only to
 	// the real count (>1) from a loop that genuinely ran several rounds.
 	ModelRounds int `json:"modelRounds,omitempty"`
+
+	// SessionSource, SessionScope and SessionMapped explain the session identity
+	// this attempt presented upstream, and exist because a production
+	// MissingSessionID previously left no way to see WHY a request arrived
+	// sessionless.
+	//
+	// SessionSource is a closed low-cardinality label naming the carrier
+	// ("claude-code", "opencode", "generic-affinity", "generic-session",
+	// "claude-metadata", "synthetic-request", "none"); SessionScope is
+	// "conversation" | "request" | "". SessionMapped says whether the provider's
+	// configured session header was actually written.
+	//
+	// The session ID ITSELF is never recorded — not raw, not hashed. It is client
+	// conversation state, and a per-session value would also make an unbounded
+	// metric dimension out of something these three labels already answer.
+	SessionSource string `json:"sessionSource,omitempty"`
+	SessionScope  string `json:"sessionScope,omitempty"`
+	SessionMapped bool   `json:"sessionMapped,omitempty"`
 }
 
 // eventModelRounds is the number of model rounds an Event represents. Unset (0)

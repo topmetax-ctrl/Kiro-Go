@@ -5608,6 +5608,20 @@ func (h *Handler) apiUpdateUpstreams(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Refuse a session policy that could never take effect. Storing
+	// "generate a session" against a provider with no header to carry it would
+	// leave the operator with a setting that silently does nothing — the exact
+	// failure mode this policy exists to end. Rejected at the write boundary, not
+	// at load: a hand-edited config normalizes to passthrough instead of taking
+	// the gateway down (see config.ParseSessionMissingPolicy).
+	for _, p := range req.Providers {
+		if err := p.ValidateSessionPolicy(); err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
 	if err := config.UpdateUpstreamConfig(req.Providers, req.Routes); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})

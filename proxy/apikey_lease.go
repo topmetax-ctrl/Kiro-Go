@@ -45,6 +45,12 @@ func (h *Handler) serveInference(
 	if ar == nil {
 		return
 	}
+	// This is the logical request boundary, shared by all three inference
+	// endpoints, so it is where the one synthetic session identity a request may
+	// fall back on is attached. Attaching is free: the value is generated only if
+	// some provider's missing-session policy actually asks for it, and then
+	// exactly once for every attempt, failover and tool round beneath this call.
+	ar = withRequestSyntheticSession(ar)
 	ar = h.bindAPIKeyLease(ar, endpoint)
 	w = wrapLeaseWriter(w, ar.Context())
 	defer h.settleAPIKeyLease(ar.Context())

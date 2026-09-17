@@ -65,6 +65,12 @@ type forwardLocalConsumption struct {
 	// reading the flag off a round would report every request as non-streamed.
 	stream bool
 
+	// sess is the ONE effective session identity every round of this loop
+	// presented to the pinned provider. Carried here so the single Event this
+	// loop files can explain the identity (source/scope/mapped) exactly as the
+	// normal forward path does — the id itself is never recorded.
+	sess clientSession
+
 	// Cache/reasoning sums across rounds, with per-field presence: a round that
 	// reported no breakdown must not turn a sum into a false zero, so the
 	// figure is only published on the Event when at least one round reported it.
@@ -195,10 +201,14 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 	requestID := requestIDFromContext(ctx)
 	apiKeyID := apiKeyIDFromContext(ctx)
 	clientModel := origReq.Model
-	// Resolve the canonical session identity once from the inbound request; every
-	// continuation round replays it, so the whole local loop stays one logical
-	// session for the pinned provider.
-	sess := clientSessionAffinity(r)
+	// Resolve the EFFECTIVE session identity once, against the provider this loop
+	// is pinned to, so the local path applies the same missing-session policy as
+	// the normal forward path — including a request-scoped synthetic identity when
+	// the pinned provider requires one. Resolving here (after the pin) and
+	// replaying it keeps the whole loop one logical session: minting per round
+	// would make every continuation look like a new conversation, which is the
+	// exact failure this replay exists to prevent.
+	sess := effectiveSessionForProvider(r, pinned.Provider)
 	executor := newWebSearchExecutor(search.NewOrchestratorFromConfig(
 		func() *http.Client { return GetForwardClientForProxy(config.GetProxyURL()) },
 	))
@@ -218,7 +228,7 @@ func (h *Handler) forwardLocalWebSearch(r *http.Request, w http.ResponseWriter, 
 	sourcesByQuery := map[string][]SearchSource{}
 	// Provider consumption across every round of this ONE logical request. Filed
 	// as a single metrics.Event at whichever terminal point ends the loop.
-	consumed := forwardLocalConsumption{stream: origReq.Stream}
+	consumed := forwardLocalConsumption{stream: origReq.Stream, sess: sess}
 
 	// fail closes out the request on any non-success exit: one failure Event
 	// carrying the consumption incurred so far, plus the tool usage already
@@ -819,6 +829,10 @@ func (h *Handler) finishForwardLocalFailure(ctx context.Context, consumed forwar
 		Ok:           false,
 		ErrorMsg:     errMsg,
 		Usage:        consumed.usage(),
+
+		SessionSource: consumed.sess.Source,
+		SessionScope:  consumed.sess.Scope.String(),
+		SessionMapped: sessionMappedUpstream(consumed.sess, provider),
 	}
 	metrics.Record(ev)
 	if !canceled {
@@ -1093,5 +1107,9 @@ func (h *Handler) recordForwardLocalRequest(ctx context.Context, consumed forwar
 		Stream:       consumed.stream,
 		Ok:           true,
 		Usage:        consumed.usage(),
+
+		SessionSource: consumed.sess.Source,
+		SessionScope:  consumed.sess.Scope.String(),
+		SessionMapped: sessionMappedUpstream(consumed.sess, provider),
 	})
 }
