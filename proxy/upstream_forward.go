@@ -343,6 +343,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 			Endpoint:       forwardEndpointKind(isClaudeRoute),
 			ClientIP:       clientIPFromContext(r.Context()),
 			ApiKeyID:       apiKeyID,
+			ApiKeyName:     apiKeyNameFromContext(r.Context()),
 			RequestID:      requestIDFromContext(r.Context()),
 			Status:         status,
 			LatencyMs:      time.Since(start).Milliseconds(),

@@ -15,8 +15,17 @@ type persistedState struct {
 	Overall    persistedCounter             `json:"overall"`
 	ByProvider map[string]persistedProvider `json:"byProvider"`
 	ByRoute    map[string]persistedRoute    `json:"byRoute"`
-	ByIP       map[string]persistedCounter  `json:"byIp,omitempty"`
+	ByIP       map[string]persistedIP       `json:"byIp,omitempty"`
 	ToolStats  map[string]persistedToolAgg  `json:"toolStats,omitempty"`
+}
+
+// persistedIP is one source IP's saved state: the lifetime counters plus the
+// hourly rollups the callers tab's windowed leaderboard reads. Hours are
+// additive (a file written before this field existed loads as empty), so old
+// state files load unchanged and the window simply starts building history.
+type persistedIP struct {
+	persistedCounter
+	Hours []persistedBucket `json:"hours,omitempty"`
 }
 
 type persistedCounter struct {
@@ -212,10 +221,27 @@ func Save(path string) error {
 		Overall:    toPersistedCounter(s.overall),
 		ByProvider: make(map[string]persistedProvider, len(s.byProvider)),
 		ByRoute:    make(map[string]persistedRoute, len(s.byRoute)),
-		ByIP:       make(map[string]persistedCounter, len(s.byIP)),
+		ByIP:       make(map[string]persistedIP, len(s.byIP)),
 	}
 	for ip, c := range s.byIP {
-		st.ByIP[ip] = toPersistedCounter(*c)
+		pi := persistedIP{persistedCounter: toPersistedCounter(c.counter)}
+		for h, b := range c.hours {
+			if h < cutoffHour {
+				continue
+			}
+			pi.Hours = append(pi.Hours, persistedBucket{
+				Hour:         h,
+				Requests:     b.Requests,
+				Success:      b.Success,
+				Failed:       b.Failed,
+				InputTokens:  b.InputTokens,
+				OutputTokens: b.OutputTokens,
+				CostUSD:      b.CostUSD,
+				ModelRounds:  b.ModelRounds,
+				SumLatencyMs: b.SumLatencyMs,
+			})
+		}
+		st.ByIP[ip] = pi
 	}
 	// Tool stats (bounded, additive)
 	ts.mu.Lock()
@@ -420,13 +446,30 @@ func Load(path string) error {
 			providerID:  r.ProviderID,
 		}
 	}
-	s.byIP = make(map[string]*counter, len(st.ByIP))
+	s.byIP = make(map[string]*ipAgg, len(st.ByIP))
 	for ip, c := range st.ByIP {
 		if len(s.byIP) >= maxTrackedIPs {
 			break
 		}
-		cc := fromPersistedCounter(c)
-		s.byIP[ip] = &cc
+		agg := newIPAgg()
+		agg.counter = fromPersistedCounter(c.persistedCounter)
+		for _, bh := range c.Hours {
+			if bh.Hour < cutoffHour {
+				continue
+			}
+			agg.hours[bh.Hour] = &Bucket{
+				Minute:       bh.Hour,
+				Requests:     bh.Requests,
+				Success:      bh.Success,
+				Failed:       bh.Failed,
+				InputTokens:  bh.InputTokens,
+				OutputTokens: bh.OutputTokens,
+				CostUSD:      bh.CostUSD,
+				ModelRounds:  bh.ModelRounds,
+				SumLatencyMs: bh.SumLatencyMs,
+			}
+		}
+		s.byIP[ip] = agg
 	}
 	// Restore tool stats (additive: old files lack toolStats, loads as zero)
 	ts.mu.Lock()

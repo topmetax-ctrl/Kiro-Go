@@ -984,3 +984,128 @@ func TestUsageTotalsExplicitZeroSerializes(t *testing.T) {
 		t.Fatalf("explicit zero dropped from serialization: %s", b)
 	}
 }
+
+// ProviderStatsRange must scope to an arbitrary window the way
+// ProviderStatsWindow scopes to the hour presets — the custom-range picker is
+// inert otherwise.
+func TestProviderStatsRangeScopesToWindow(t *testing.T) {
+	reset(t)
+
+	recent := ev("p1", true, 200, 200)
+	recent.CostUSD = 0.5
+	Record(recent)
+
+	mid := ev("p1", true, 200, 200)
+	mid.TimeMs = nowMs() - 5*3600000
+	mid.CostUSD = 4
+	Record(mid)
+
+	now := nowMs()
+	oneHour := ProviderStatsRange(now-3600000, 0)
+	if len(oneHour) != 1 || oneHour[0].Requests != 1 {
+		t.Fatalf("1h range requests = %+v, want 1", oneHour)
+	}
+	if oneHour[0].CostUSD != 0.5 {
+		t.Fatalf("1h range cost = %v, want 0.5", oneHour[0].CostUSD)
+	}
+
+	day := ProviderStatsRange(now-24*3600000, 0)
+	if len(day) != 1 || day[0].Requests != 2 || day[0].CostUSD != 4.5 {
+		t.Fatalf("24h range = %d requests cost %v, want 2 / 4.5", day[0].Requests, day[0].CostUSD)
+	}
+
+	// A frozen window that ends in the past reads only what fell inside it,
+	// including the trailing edge (to=0 means now, an explicit to is honored).
+	oldOnly := ProviderStatsRange(now-6*3600000, now-4*3600000)
+	if len(oldOnly) != 1 || oldOnly[0].Requests != 1 || oldOnly[0].CostUSD != 4 {
+		t.Fatalf("closed range = %d requests cost %v, want 1 / 4", oldOnly[0].Requests, oldOnly[0].CostUSD)
+	}
+}
+
+// A window reaching into the hourly rollups counts part-cut hour buckets in
+// full — the documented "rounded out to whole hours" overcount — while a
+// window starting exactly on an hour boundary excludes the bucket that ends
+// at it.
+func TestProviderStatsRangeCountsPartialHourBucketsFully(t *testing.T) {
+	reset(t)
+	nowHour := nowMs() / 3600000
+
+	inBucket := ev("p1", true, 200, 100)
+	inBucket.TimeMs = (nowHour - 4) * 3600000
+	Record(inBucket)
+
+	// Window starts half an hour after the event, inside the event's hour: the
+	// bucket overlaps the window start, so the request counts.
+	midStart := ProviderStatsRange((nowHour-4)*3600000+30*60000, 0)
+	if len(midStart) != 1 || midStart[0].Requests != 1 {
+		t.Fatalf("overlap-start range = %d requests, want 1 (edge hour counts in full)", midStart[0].Requests)
+	}
+
+	// Window starts exactly at the next hour boundary: the event's bucket ends
+	// there, so it does not overlap.
+	nextHour := ProviderStatsRange((nowHour-3)*3600000, 0)
+	if len(nextHour) != 1 || nextHour[0].Requests != 0 {
+		t.Fatalf("boundary-start range = %d requests, want 0", nextHour[0].Requests)
+	}
+}
+
+// A window entirely inside the per-minute coverage reads minute buckets, so
+// its edges are exact rather than padded out to the hour.
+func TestProviderStatsRangeUsesMinuteBucketsInsideCoverage(t *testing.T) {
+	reset(t)
+	older := ev("p1", true, 200, 100)
+	older.TimeMs = nowMs() - 95*60000
+	Record(older)
+	inner := ev("p1", true, 200, 100)
+	inner.TimeMs = nowMs() - 89*60000
+	Record(inner)
+
+	got := ProviderStatsRange(nowMs()-90*60000, 0)
+	if len(got) != 1 || got[0].Requests != 1 {
+		t.Fatalf("minute-coverage range = %d requests, want 1", got[0].Requests)
+	}
+}
+
+// A window reaching past the 30-day hourly retention must clamp forward
+// instead of panicking or pretending the pruned data exists.
+func TestProviderStatsRangeClampsToRetention(t *testing.T) {
+	reset(t)
+	ancient := ev("p1", true, 200, 100)
+	ancient.TimeMs = nowMs() - 40*24*3600000
+	Record(ancient)
+
+	got := ProviderStatsRange(nowMs()-90*24*3600000, 0)
+	if len(got) != 1 || got[0].Requests != 0 {
+		t.Fatalf("retention-clamped range = %d requests, want 0", got[0].Requests)
+	}
+}
+
+// The custom-range drill-down mirrors the windowed headline numbers, echoes
+// the effective rounded-out coverage, and keeps the breakdown all-time.
+func TestProviderDetailRangeScopesAndEchoesWindow(t *testing.T) {
+	reset(t)
+	old := ev("p1", true, 200, 1000)
+	old.TimeMs = nowMs() - 5*3600000
+	Record(old)
+	recent := ev("p1", true, 200, 300)
+	Record(recent)
+
+	now := nowMs()
+	d, ok := ProviderDetailRange("p1", now-3600000, 0)
+	if !ok || d.Requests != 1 {
+		t.Fatalf("1h detail requests = %d ok=%v, want 1", d.Requests, ok)
+	}
+	if d.AvgLatencyMs != 300 {
+		t.Fatalf("1h detail avg = %d, want 300", d.AvgLatencyMs)
+	}
+	if d.WindowFrom == 0 || d.WindowTo < now || d.WindowTo > now+2*60000 {
+		t.Fatalf("detail window echo = [%d, %d], outside plausible coverage", d.WindowFrom, d.WindowTo)
+	}
+	total := int64(0)
+	for _, m := range d.Models {
+		total += m.Requests
+	}
+	if total != 2 {
+		t.Fatalf("detail models total = %d, want 2 (breakdown stays all-time)", total)
+	}
+}

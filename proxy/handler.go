@@ -6152,9 +6152,38 @@ func (h *Handler) apiGetPublicIP(w http.ResponseWriter, r *http.Request) {
 // the configured display name, base URL and prices for providers that exist but
 // have no traffic yet, plus the synthetic Kiro-pool entry.
 //
+// windowQuery parses an explicit from/to window (Unix milliseconds) from the
+// query string — the custom-range alternative to the hours presets. `from`
+// activates the window; `to` defaults to now. Only malformed input is
+// rejected here; clamping to what the metrics store retains happens in
+// metrics.rangeBucketBounds.
+func windowQuery(r *http.Request) (fromMs, toMs int64, ok bool, err error) {
+	q := r.URL.Query()
+	raw := strings.TrimSpace(q.Get("from"))
+	if raw == "" {
+		return 0, 0, false, nil
+	}
+	fromMs, err = strconv.ParseInt(raw, 10, 64)
+	if err != nil || fromMs <= 0 {
+		return 0, 0, false, errors.New("invalid from")
+	}
+	toMs = time.Now().UnixMilli()
+	if raw := strings.TrimSpace(q.Get("to")); raw != "" {
+		toMs, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || toMs <= 0 {
+			return 0, 0, false, errors.New("invalid to")
+		}
+	}
+	if toMs < fromMs {
+		return 0, 0, false, errors.New("to precedes from")
+	}
+	return fromMs, toMs, true, nil
+}
+
 // An `hours` query restricts the per-provider figures to that window, which is
-// what the Stats tab's range selector sends. overall/percentiles stay all-time:
-// they feed the Forwarding tab's KPI cards, which are not range-scoped.
+// what the Stats tab's range selector sends; a `from`/`to` pair carries the
+// custom range instead. overall/percentiles stay all-time: they feed the
+// Forwarding tab's KPI cards, which are not range-scoped.
 func (h *Handler) apiGetForwardStats(w http.ResponseWriter, r *http.Request) {
 	minutes := 60
 	if v := strings.TrimSpace(r.URL.Query().Get("minutes")); v != "" {
@@ -6168,13 +6197,31 @@ func (h *Handler) apiGetForwardStats(w http.ResponseWriter, r *http.Request) {
 			hours = n
 		}
 	}
+
+	fromMs, toMs, hasWindow, err := windowQuery(r)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	windowHours := hours
+	windowFrom, windowTo := int64(0), int64(0)
+	providers := mergedProviderStats(hours)
+	if hasWindow {
+		providers = mergedProviderRows(metrics.ProviderStatsRange(fromMs, toMs))
+		windowHours = 0
+		windowFrom, windowTo = fromMs, toMs
+	}
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"overall":     metrics.Overall(),
-		"providers":   mergedProviderStats(hours),
+		"providers":   providers,
 		"routes":      metrics.RouteStats(),
 		"timeseries":  metrics.TimeSeries(minutes),
 		"percentiles": metrics.LatencyPercentiles(),
-		"windowHours": hours,
+		"windowHours": windowHours,
+		"windowFrom":  windowFrom,
+		"windowTo":    windowTo,
 	})
 }
 
@@ -6187,7 +6234,27 @@ func (h *Handler) apiGetTopIPs(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	ips := metrics.TopIPs(limit)
+	// hours scopes the leaderboard to a recent window (the callers tab's range
+	// filter); absent or <=0 means all-time, matching the pre-window API. A
+	// from/to pair carries the custom range instead.
+	hours := 0
+	if v := strings.TrimSpace(r.URL.Query().Get("hours")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hours = n
+		}
+	}
+	var ips []metrics.IPStat
+	fromMs, toMs, hasWindow, err := windowQuery(r)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if hasWindow {
+		ips = metrics.TopIPsRange(fromMs, toMs, limit)
+	} else {
+		ips = metrics.TopIPsWindow(hours, limit)
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"ips":        ips,
 		"trustProxy": config.GetTrustProxy(),
@@ -6217,6 +6284,15 @@ func mergedProviderStats(hours int) []providerRow {
 	if hours > 0 {
 		stats = metrics.ProviderStatsWindow(hours)
 	}
+	return mergedProviderRows(stats)
+}
+
+// mergedProviderRows joins already-fetched per-provider stats with the
+// configured upstreams so the hours presets and the custom from/to range
+// share one join: every provider is listed, including ones configured but not
+// yet used (which would otherwise be invisible) and ones whose config was
+// deleted but whose history remains.
+func mergedProviderRows(stats []metrics.ProviderStat) []providerRow {
 	byID := make(map[string]metrics.ProviderStat, len(stats))
 	for _, p := range stats {
 		byID[p.ProviderID] = p
@@ -6271,6 +6347,16 @@ func mergedProviderStats(hours int) []providerRow {
 // matching what the Stats tab's range selector sends to /forward-stats.
 // Models/Accounts/Statuses are always all-time (buckets carry no per-dimension
 // breakdowns). Omitting hours or passing hours=0 returns all-time totals.
+// emptyProviderDetail is the zero-value drill-down for a configured provider
+// with no traffic yet — a valid, empty detail rather than a 404, so the panel
+// renders zeros instead of an error.
+func emptyProviderDetail(id string) metrics.ProviderDetail {
+	return metrics.ProviderDetail{
+		ProviderStat: metrics.ProviderStat{ProviderID: id, SuccessRate: -1},
+		Minutes:      []metrics.Bucket{},
+	}
+}
+
 func (h *Handler) apiGetProviderDetail(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
 	if id == "" {
@@ -6291,13 +6377,20 @@ func (h *Handler) apiGetProviderDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	detail, ok := metrics.ProviderDetailWindow(id, hours, minutes)
-	if !ok {
-		// A configured provider with no traffic yet is a valid, empty detail —
-		// not a 404 — so the panel renders zeros instead of an error.
-		detail = metrics.ProviderDetail{
-			ProviderStat: metrics.ProviderStat{ProviderID: id, SuccessRate: -1},
-			Minutes:      []metrics.Bucket{},
+	var detail metrics.ProviderDetail
+	if fromMs, toMs, hasWindow, err := windowQuery(r); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	} else if hasWindow {
+		var ok bool
+		if detail, ok = metrics.ProviderDetailRange(id, fromMs, toMs); !ok {
+			detail = emptyProviderDetail(id)
+		}
+	} else {
+		var ok bool
+		if detail, ok = metrics.ProviderDetailWindow(id, hours, minutes); !ok {
+			detail = emptyProviderDetail(id)
 		}
 	}
 
@@ -6326,7 +6419,9 @@ func (h *Handler) apiGetProviderDetail(w http.ResponseWriter, r *http.Request) {
 //
 // Granularity follows the requested range: hours=1 would produce a single hourly
 // bar, so sub-day ranges are served from the per-minute buckets instead and the
-// response reports which unit was used.
+// response reports which unit was used. A from/to pair carries the custom
+// range, whose granularity (minute vs hour) the metrics layer picks by how
+// much of the window the per-minute memory actually covers.
 func (h *Handler) apiGetForwardHistory(w http.ResponseWriter, r *http.Request) {
 	hours := 24
 	if v := strings.TrimSpace(r.URL.Query().Get("hours")); v != "" {
@@ -6335,6 +6430,22 @@ func (h *Handler) apiGetForwardHistory(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
+
+	if fromMs, toMs, hasWindow, err := windowQuery(r); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	} else if hasWindow {
+		unit, buckets := metrics.HistoryRangeFor(id, fromMs, toMs)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"providerId": id,
+			"from":       fromMs,
+			"to":         toMs,
+			"unit":       unit,
+			"buckets":    buckets,
+		})
+		return
+	}
 
 	if hours <= 1 {
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -6408,7 +6519,7 @@ func (h *Handler) apiExportForwardEvents(w http.ResponseWriter, r *http.Request)
 	cw := csv.NewWriter(w)
 	defer cw.Flush()
 	_ = cw.Write([]string{
-		"time", "provider", "account", "endpoint", "clientModel", "targetModel",
+		"time", "provider", "account", "apiKey", "endpoint", "clientModel", "targetModel",
 		"status", "ok", "canceled", "stream", "latencyMs", "ttfbMs",
 		"inputTokens", "outputTokens", "costUsd", "error",
 	})
@@ -6417,6 +6528,7 @@ func (h *Handler) apiExportForwardEvents(w http.ResponseWriter, r *http.Request)
 			time.UnixMilli(e.TimeMs).UTC().Format(time.RFC3339),
 			e.ProviderName,
 			e.AccountLabel,
+			e.ApiKeyName,
 			e.Endpoint,
 			e.ClientModel,
 			e.TargetModel,

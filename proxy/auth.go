@@ -15,6 +15,10 @@ import (
 // so it cannot collide with keys defined in other packages.
 type apiKeyContextKey struct{}
 
+// apiKeyNameContextKey carries the matched key's human label down the request
+// so metric recording can denormalize it without re-reading the key store.
+type apiKeyNameContextKey struct{}
+
 // clientIPContextKey carries the caller's resolved source IP down the request
 // pipeline so the metrics funnel can attribute traffic per source IP without
 // threading the IP through every function signature.
@@ -188,6 +192,9 @@ func withApiKeyContext(r *http.Request, entry *config.ApiKeyEntry) *http.Request
 		return r
 	}
 	ctx := context.WithValue(r.Context(), apiKeyContextKey{}, entry.ID)
+	// Carry the human label alongside the id so event recording can denormalize
+	// it (like ProviderName) without a second key lookup in the hot path.
+	ctx = context.WithValue(ctx, apiKeyNameContextKey{}, entry.Name)
 	return r.WithContext(ctx)
 }
 
@@ -196,6 +203,16 @@ func apiKeyIDFromContext(ctx context.Context) string {
 		return ""
 	}
 	if v, ok := ctx.Value(apiKeyContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func apiKeyNameFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(apiKeyNameContextKey{}).(string); ok {
 		return v
 	}
 	return ""

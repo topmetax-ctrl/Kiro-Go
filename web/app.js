@@ -170,6 +170,9 @@
     renderStatsTable();
     renderStatsCompare();
     renderStatsTrend(statsTrendLast.buckets, statsTrendLast.unit);
+    // The callers leaderboard caches its rows for the IP text filter, so it
+    // re-renders from cache on a language switch like the other tables.
+    renderTopIps();
     renderApiKeys();
     // Inline stats and any expanded detail panels are innerHTML-built, so they
     // need an explicit re-render to pick up the new locale.
@@ -6412,6 +6415,15 @@
   // all-time because the Forwarding tab's inline stats and provider filter
   // depend on it; null means "no window loaded yet, fall back to all-time".
   let statsWindowProviders = null;
+  // Custom range (Unix ms) active on the Stats tab; null while a preset from
+  // the selector is in effect. Presets slide with now on every refresh; a
+  // custom window is frozen — Refresh refetches the same from/to.
+  let statsCustomRange = null;
+  // Provider multi-filter for the Stats tab: an empty set shows every
+  // provider, a non-empty one restricts the table, the comparison block and
+  // the trend to the selected ids. The drill-down panel needs no filter — it
+  // is scoped per provider already.
+  const statsSelectedProviders = new Set();
   let fwdEventsOffset = 0;
   const fwdEventsLimit = 50;
   let fwdEventsTotal = 0;
@@ -6443,6 +6455,8 @@
         routes: Array.isArray(d.routes) ? d.routes : []
       };
       forwardStats.providers.forEach(p => { fwdProviderNames[p.providerId] = p.providerName || p.providerId; });
+      // The filter badge counts against the provider universe, which just changed.
+      updateStatsPfLabel();
       renderForwardStatCards(d);
       renderForwardChart(d.timeseries || [], d.percentiles || {});
       populateForwardProviderFilter();
@@ -6578,24 +6592,67 @@
     return canonical != null ? '0' : '—';
   }
 
-  // fwdCacheCell renders the CACHE cell: read tokens (+ writes when reported),
-  // then the hit ratio derived from the raw fields — never stored, always
-  // computed from this event's own totals. "—" distinguishes "upstream reported
-  // no cache telemetry" from an explicit "0 · 0%".
-  function fwdCacheCell(e) {
+  // fwdInCell renders the merged IN cell. Without cache telemetry it is the
+  // plain tri-state input total (unchanged). With cache, it stacks the real
+  // TOTAL input (the actual context footprint of the request) above the ACTIVE
+  // input in green with a bolt — the tokens actually processed this turn, i.e.
+  // everything except the cheap cache-read hits (fresh input PLUS cache writes,
+  // which were freshly processed and billed at a premium). Once a cache read is
+  // involved the total reads as the superseded gross figure and is struck
+  // through, like an old price above the one that replaced it; with only a
+  // cache write (priming, read=0) total and active coincide, so the total
+  // stays plain. A cache write adds a small "+Nk write" marker so a
+  // cache-priming request reads as heavy at a glance; the full read/write/hit
+  // breakdown is in the tooltip and the detail panel. "Active", never
+  // "fresh": it includes the cache writes.
+  function fwdInCell(e) {
+    const prefix = fwdUsageSourcePrefix(e);
     const u = e.usage;
-    if (!u) return '—';
-    const read = u.cacheReadInputTokens;
-    const create = u.cacheCreationInputTokens;
-    if (read == null && create == null) return '—';
-    let cell = fwdFmtTokens(read);
-    if (create != null && create > 0) cell += ' +' + fwdFmtTokens(create);
-    if (read != null && e.inputTokens > 0) {
-      cell += ' · ' + Math.round(read * 100 / e.inputTokens) + '%';
+    const read = u ? u.cacheReadInputTokens : null;
+    const create = u ? u.cacheCreationInputTokens : null;
+    if (read == null && create == null) {
+      return '<span>' + escapeHtml(prefix + fwdTokenCell(e, 'inputTokens')) + '</span>';
     }
-    // A ratio above 100% is left visible on purpose: it is the symptom of an
-    // upstream whose cache numbers exceed its own input total.
-    return cell;
+    const total = (u && u.inputTokens != null) ? u.inputTokens : e.inputTokens;
+    const r = read || 0;
+    const w = create || 0;
+    // Active = total minus cache-read hits (reused, not reprocessed). Cache
+    // writes stay INSIDE active — they were processed this turn. So a priming
+    // request (big write, no read) stays heavy; a cache hit (big read) drops to
+    // near its uncached size, which is exactly the "how heavy is this?" signal.
+    const active = Math.max(0, (total || 0) - r);
+    // Uncached = brand-new tokens, neither read from nor written to cache.
+    const uncached = Math.max(0, (total || 0) - r - w);
+    const hit = total > 0 ? Math.round(r * 100 / total) : null;
+    let tip = t('forward.usageTotalInput') + ' ' + fwdFmtTokens(total) +
+      '\n' + t('forward.usageActiveInput') + ' ' + fwdFmtTokens(active);
+    if (read != null) tip += '\n' + t('forward.usageCacheRead') + ' ' + fwdFmtTokens(r);
+    if (create != null) tip += '\n' + t('forward.usageCacheWrite') + ' ' + fwdFmtTokens(w);
+    tip += '\n' + t('forward.usageUncached') + ' ' + fwdFmtTokens(uncached);
+    if (hit != null) tip += '\n' + t('forward.usageCacheHit') + ' ' + hit + '%';
+    const writeTag = w > 0
+      ? '<span class="fwd-in-write" title="' + escapeAttr(t('forward.usageCacheWrite') + ' ' + fwdFmtTokens(w)) + '">+' +
+          escapeHtml(fwdFmtTokens(w)) + ' ' + escapeHtml(t('forward.usageWriteShort')) + '</span>'
+      : '';
+    return '<span class="fwd-in-merged" title="' + escapeAttr(tip) + '">' +
+      '<span class="fwd-in-total' + (r > 0 ? ' fwd-in-total-old' : '') + '">' +
+        escapeHtml(prefix + fwdFmtTokens(total)) + '</span>' +
+      '<span class="fwd-in-active"><i class="fa-solid fa-bolt" aria-hidden="true"></i>' + escapeHtml(fwdFmtTokens(active)) + '</span>' +
+      writeTag +
+      '</span>';
+  }
+
+  // fwdKeyCell renders the API key label recorded on the event. The name is
+  // snapshotted server-side, so it survives a later rename or deletion; older
+  // events without it fall back to a short id, then an em dash.
+  function fwdKeyCell(e) {
+    if (e.apiKeyName) {
+      return '<span class="fwd-key" title="' + escapeAttr(e.apiKeyName) + '">' + escapeHtml(fwdTruncate(e.apiKeyName, 20)) + '</span>';
+    }
+    if (e.apiKeyId) {
+      return '<span class="fwd-key muted-text" title="' + escapeAttr(e.apiKeyId) + '">' + escapeHtml(String(e.apiKeyId).slice(0, 8)) + '</span>';
+    }
+    return '<span class="muted-text">—</span>';
   }
 
   // fwdUsageSourcePrefix marks estimated usage. Upstream-reported figures (the
@@ -6671,6 +6728,22 @@
     return map[hours] || (hours + 'h');
   }
 
+  // fmtRangeLabel renders a custom window as an absolute range in the viewer's
+  // locale, so a frozen window reads as "15/9 08:00 → 15/9 17:00" rather than
+  // a relative preset. Same-day windows skip the repeated date.
+  function fmtRangeLabel(fromMs, toMs) {
+    if (!fromMs || !toMs) return '';
+    const from = new Date(fromMs), to = new Date(toMs);
+    const dateOpt = { day: 'numeric', month: 'short' };
+    const timeOpt = { hour: '2-digit', minute: '2-digit' };
+    const time = d => d.toLocaleTimeString(undefined, timeOpt);
+    if (from.toDateString() === to.toDateString()) {
+      return from.toLocaleDateString(undefined, dateOpt) + ' ' + time(from) + ' → ' + time(to);
+    }
+    const day = d => d.toLocaleDateString(undefined, dateOpt) + ' ' + time(d);
+    return day(from) + ' → ' + day(to);
+  }
+
   // renderProviderDetailHTML builds the whole panel from a /provider-stats
   // payload. isPool switches the cost column to credits, which is the pool's
   // real unit of spend.
@@ -6711,9 +6784,13 @@
         : '');
 
     // When headline numbers are scoped to a time window, show a badge so the
-    // numbers in the tiles cannot be mistaken for all-time figures.
+    // numbers in the tiles cannot be mistaken for all-time figures. Custom
+    // windows echo their rounded-out coverage from the server; presets map to
+    // the selector's own text.
     const wh = d.windowHours || 0;
-    const wLabel = rangeLabel(wh);
+    const wLabel = d.windowFrom
+      ? fmtRangeLabel(d.windowFrom, d.windowTo)
+      : rangeLabel(wh);
     const windowBadge = wLabel
       ? '<div class="pd-range-badge"><i class="fa-regular fa-clock" aria-hidden="true"></i>' +
           escapeHtml(wLabel) +
@@ -6810,12 +6887,16 @@
   // Stats tab so the detail panel shows the same range as its row; pass 0 (or
   // omit) for the Forwarding tab, where there is no range selector and KPI
   // cards are intentionally all-time.
-  async function loadProviderDetail(providerId, hours) {
+  // loadProviderDetail fetches one provider's drill-down. win scopes the
+  // headline numbers: null for all-time, {hours} for a preset window, or
+  // {from,to} (Unix ms) for the Stats tab's custom range.
+  async function loadProviderDetail(providerId, win) {
     const hosts = qsa('[data-provider-detail="' + cssEscape(providerId) + '"]');
     if (!hosts.length) return;
     try {
       let url = '/provider-stats?id=' + encodeURIComponent(providerId);
-      if (hours && hours > 0) url += '&hours=' + encodeURIComponent(hours);
+      if (win && win.hours && win.hours > 0) url += '&hours=' + encodeURIComponent(win.hours);
+      if (win && win.from) url += '&from=' + encodeURIComponent(win.from) + '&to=' + encodeURIComponent(win.to);
       const res = await api(url);
       if (!res.ok) throw new Error('http ' + res.status);
       const payload = await res.json();
@@ -6836,6 +6917,14 @@
   function cssEscape(s) {
     if (window.CSS && CSS.escape) return CSS.escape(s);
     return String(s).replace(/["\\]/g, '\\$&');
+  }
+
+  // statsDetailWindowParams returns the window the Stats tab's detail panels
+  // should carry: the custom from/to when active, else the preset hours — so a
+  // panel always shows the same window as its row.
+  function statsDetailWindowParams() {
+    if (statsCustomRange) return { from: statsCustomRange.from, to: statsCustomRange.to };
+    return { hours: statsHistoryHours };
   }
 
   // toggleProviderDetail expands or collapses one provider's panel.
@@ -6866,8 +6955,8 @@
     // Determine the range: panels opened from inside the Stats table carry the
     // current window; panels on the Forwarding tab have no range selector and
     // should always show all-time so the KPI cards there stay consistent.
-    const hoursForDetail = scope && scope.id === 'statsTableBody' ? statsHistoryHours : 0;
-    loadProviderDetail(providerId, hoursForDetail);
+    const inStats = scope && scope.id === 'statsTableBody';
+    loadProviderDetail(providerId, inStats ? statsDetailWindowParams() : null);
   }
 
   // refreshOpenProviderDetails re-fetches every expanded panel, so an open panel
@@ -6879,7 +6968,7 @@
       // Re-use the same scope heuristic as toggleProviderDetail: if the host
       // lives inside statsTableBody the panel respects the range selector.
       const inStats = !!host.closest('#statsTableBody');
-      loadProviderDetail(id, inStats ? statsHistoryHours : 0);
+      loadProviderDetail(id, inStats ? statsDetailWindowParams() : null);
     });
   }
 
@@ -6898,7 +6987,7 @@
       loadStatsWindow();
       // After a reset the panel is always re-opened from Stats context, so
       // pass the current range so the fresh zeros match the windowed row.
-      loadProviderDetail(providerId, statsHistoryHours);
+      loadProviderDetail(providerId, statsDetailWindowParams());
     } catch (e) {
       toastError(t('stats.resetProviderFailed'));
     }
@@ -6945,6 +7034,13 @@
   // heading and note (both are built in JS, not via data-i18n).
   let statsTrendLast = { buckets: [], unit: 'hour' };
 
+  // Callers-by-IP tab state. The fetched leaderboard is cached so the IP text
+  // filter re-renders client-side without refetching; 0 means all-time.
+  let topIpsHours = 0;
+  let topIpsQuery = '';
+  let topIpsCache = [];
+  let topIpsTrustProxy = false;
+
   // statsSortValue projects a provider row onto its sort key. tokens is derived
   // rather than stored, and lastUsed sorts unused providers last regardless of
   // direction (a never-used provider is not "oldest").
@@ -6960,8 +7056,17 @@
     return statsWindowProviders || forwardStats.providers || [];
   }
 
+  // statsFilteredRows applies the provider multi-filter. The heatmap and the
+  // comparison bars recompute over whatever this returns, so "compare the
+  // three providers I actually use" falls out of the same code path.
+  function statsFilteredRows() {
+    const rows = statsRows();
+    if (!statsSelectedProviders.size) return rows;
+    return rows.filter(p => statsSelectedProviders.has(p.providerId));
+  }
+
   function sortedStatsRows() {
-    const rows = statsRows().slice();
+    const rows = statsFilteredRows().slice();
     rows.sort((a, b) => {
       const av = statsSortValue(a, statsSortKey);
       const bv = statsSortValue(b, statsSortKey);
@@ -6986,7 +7091,7 @@
   // hand it a bogus win.
 
   function statsCompareRows() {
-    return statsRows().filter(p => (p.requests || 0) > 0);
+    return statsFilteredRows().filter(p => (p.requests || 0) > 0);
   }
 
   // costPer1M normalises spend so a low-volume provider is not flattered by a
@@ -7200,8 +7305,11 @@
     // With a single active provider there is nothing to compare against, so the
     // block would be pure decoration.
     if (rows.length < 2) {
+      // With one provider left the champion cards are decoration; point at the
+      // drill-down instead, which is the useful view for a single provider.
       host.innerHTML = rows.length
-        ? '<p class="muted-text text-xs stats-cmp-empty">' + escapeHtml(t('stats.cmpNeedTwo')) + '</p>'
+        ? '<p class="muted-text text-xs stats-cmp-empty">' + escapeHtml(t('stats.cmpNeedTwo')) + '</p>' +
+          '<p class="muted-text text-xs stats-cmp-empty">' + escapeHtml(t('stats.cmpSingleHint')) + '</p>'
         : '';
       return;
     }
@@ -7371,24 +7479,86 @@
     }
   }
 
+  // loadStatsHistory fetches the trend for the selected range and provider
+  // filter. One selected provider (or none) is a single request — the endpoint
+  // already scopes by id. Several selected providers fetch one series each and
+  // merge here: every response shares the unit (same range), and buckets line
+  // up on their raw minute/hour keys.
   async function loadStatsHistory() {
     try {
-      const res = await api('/forward-history?hours=' + encodeURIComponent(statsHistoryHours));
-      if (!res.ok) throw new Error('http ' + res.status);
-      const d = await res.json();
-      renderStatsTrend(d.buckets || [], d.unit);
+      const params = new URLSearchParams(statsRangeParams());
+      const ids = statsFilteredRows().map(p => p.providerId).filter(Boolean);
+      if (ids.length <= 1) {
+        if (ids.length === 1) params.set('id', ids[0]);
+        const res = await api('/forward-history?' + params.toString());
+        if (!res.ok) throw new Error('http ' + res.status);
+        const d = await res.json();
+        renderStatsTrend(d.buckets || [], d.unit);
+        return;
+      }
+      const responses = await Promise.all(ids.map(id => {
+        const p = new URLSearchParams(params);
+        p.set('id', id);
+        return api('/forward-history?' + p.toString()).then(res => {
+          if (!res.ok) throw new Error('http ' + res.status);
+          return res.json();
+        });
+      }));
+      const unit = responses[0] ? responses[0].unit : 'hour';
+      renderStatsTrend(mergeHistoryBuckets(responses), unit);
     } catch (e) {
-      renderStatsTrend([], statsHistoryHours <= 1 ? 'minute' : 'hour');
+      renderStatsTrend([], !statsCustomRange && statsHistoryHours <= 1 ? 'minute' : 'hour');
     }
+  }
+
+  // mergeHistoryBuckets sums same-unit series bucket-for-bucket on their raw
+  // keys, so a multi-provider trend reads exactly like a single-provider one.
+  // Per-provider responses gap-fill with empty buckets, which keeps quiet
+  // stretches visible instead of collapsing the axis.
+  function mergeHistoryBuckets(responses) {
+    const byKey = new Map();
+    responses.forEach(r => (r.buckets || []).forEach(b => {
+      const key = b.minute || 0;
+      const t = byKey.get(key);
+      if (t) {
+        t.requests += b.requests || 0;
+        t.success += b.success || 0;
+        t.failed += b.failed || 0;
+        t.inputTokens += b.inputTokens || 0;
+        t.outputTokens += b.outputTokens || 0;
+        t.costUsd += b.costUsd || 0;
+      } else {
+        byKey.set(key, {
+          minute: key,
+          requests: b.requests || 0,
+          success: b.success || 0,
+          failed: b.failed || 0,
+          inputTokens: b.inputTokens || 0,
+          outputTokens: b.outputTokens || 0,
+          costUsd: b.costUsd || 0
+        });
+      }
+    }));
+    return Array.from(byKey.values()).sort((a, b) => a.minute - b.minute);
   }
 
   // loadStatsWindow refetches the per-provider figures scoped to the selected
   // range and re-renders the two surfaces that read them. On failure the window
   // copy is dropped so the tab falls back to all-time rather than freezing on a
   // stale range.
+  // statsRangeParams renders the active Stats-tab range as query params: the
+  // custom window's from/to when one is applied, otherwise the preset's hours.
+  function statsRangeParams() {
+    if (statsCustomRange) {
+      return { from: String(statsCustomRange.from), to: String(statsCustomRange.to) };
+    }
+    return { hours: String(statsHistoryHours) };
+  }
+
   async function loadStatsWindow() {
     try {
-      const res = await api('/forward-stats?hours=' + encodeURIComponent(statsHistoryHours));
+      const params = new URLSearchParams(statsRangeParams());
+      const res = await api('/forward-stats?' + params.toString());
       if (!res.ok) throw new Error('http ' + res.status);
       const d = await res.json();
       statsWindowProviders = Array.isArray(d.providers) ? d.providers : null;
@@ -7399,27 +7569,42 @@
     renderStatsCompare();
   }
 
-  // loadTopIps fetches the per-source-IP leaderboard and renders it. Failures
-  // leave the previous table in place rather than blanking the panel.
+  // loadTopIps fetches the per-source-IP leaderboard for the selected range and
+  // renders it. Failures leave the previous table in place rather than blanking
+  // the panel. The range filter is server-side (an all-time aggregate cannot be
+  // re-cut by time), while the IP text filter is client-side over the fetched
+  // leaderboard, so typing never refetches.
   async function loadTopIps() {
     try {
-      const res = await api('/top-ips?limit=50');
+      const params = new URLSearchParams({ limit: '50' });
+      if (topIpsHours > 0) params.set('hours', String(topIpsHours));
+      const res = await api('/top-ips?' + params.toString());
       if (!res.ok) throw new Error('http ' + res.status);
       const d = await res.json();
-      renderTopIps(Array.isArray(d.ips) ? d.ips : [], !!d.trustProxy);
+      topIpsCache = Array.isArray(d.ips) ? d.ips : [];
+      topIpsTrustProxy = !!d.trustProxy;
     } catch (e) {
-      renderTopIps([], false);
+      topIpsCache = [];
     }
+    renderTopIps();
   }
 
-  function renderTopIps(ips, trustProxy) {
+  function renderTopIps() {
     const body = $('topIpsBody');
     if (!body) return;
     const note = $('statsTopIpsNote');
-    if (note) note.textContent = trustProxy ? t('stats.topIpsProxyOn') : '';
+    if (note) note.textContent = topIpsTrustProxy ? t('stats.topIpsProxyOn') : '';
+    const q = topIpsQuery.trim().toLowerCase();
+    const ips = q ? topIpsCache.filter(ip => (ip.ip || '').toLowerCase().includes(q)) : topIpsCache;
+    const countEl = $('topIpsCount');
+    if (countEl) {
+      countEl.textContent = q
+        ? t('stats.topIpsCountFiltered', String(ips.length), String(topIpsCache.length))
+        : t('stats.topIpsCount', String(ips.length));
+    }
     if (!ips.length) {
       body.innerHTML = '<tr><td colspan="6" class="muted-text" style="padding:1rem;text-align:center;">' +
-        escapeHtml(t('stats.topIpsEmpty')) + '</td></tr>';
+        escapeHtml(q ? t('stats.topIpsNoMatch') : t('stats.topIpsEmpty')) + '</td></tr>';
       return;
     }
     body.innerHTML = ips.map(ip => {
@@ -7435,11 +7620,119 @@
     }).join('');
   }
 
+  function openTopIps() {
+    loadTopIps();
+  }
+
   function openStats() {
     loadForwardStats();
     loadStatsWindow();
     loadStatsHistory();
-    loadTopIps();
+  }
+
+  // ===== Provider multi-filter (Stats tab) =====
+
+  // renderProviderFilterMenu rebuilds the checkbox list from the full provider
+  // universe, preserving the current selection. Built on open, so a provider
+  // added since the last open is listed too.
+  function renderProviderFilterMenu() {
+    const menu = $('statsPfMenu');
+    if (!menu) return;
+    const items = statsRows().map(p => {
+      const id = p.providerId || '';
+      const checked = statsSelectedProviders.has(id) ? ' checked' : '';
+      const label = p.providerName || p.providerId || t('upstreams.unnamed');
+      return '<label class="stats-pf-item">' +
+        '<input type="checkbox" data-pf-id="' + escapeAttr(id) + '"' + checked + '>' +
+        '<span class="stats-pf-name">' + escapeHtml(label) + '</span>' +
+        (p.isPool ? ' <span class="stats-tag stats-tag--pool">' + escapeHtml(t('stats.poolTag')) + '</span>' : '') +
+        '</label>';
+    }).join('');
+    menu.innerHTML =
+      '<div class="stats-pf-head">' +
+        '<span>' + escapeHtml(t('stats.providerFilterTitle')) + '</span>' +
+        '<button type="button" class="stats-pf-clear" id="statsPfClear">' +
+          escapeHtml(t('stats.providerFilterClear')) + '</button>' +
+      '</div>' +
+      '<div class="stats-pf-list">' +
+        (items || '<span class="muted-text text-xs">' + escapeHtml(t('stats.noProviders')) + '</span>') +
+      '</div>';
+  }
+
+  // applyProviderFilter refreshes every filtered surface. Table and comparison
+  // re-render from the already-fetched rows; the trend refetches because its
+  // provider cut is server-side.
+  function applyProviderFilter() {
+    updateStatsPfLabel();
+    renderStatsTable();
+    renderStatsCompare();
+    loadStatsHistory();
+  }
+
+  function updateStatsPfLabel() {
+    const el = $('statsPfLabel');
+    if (el) {
+      el.textContent = statsSelectedProviders.size
+        ? t('stats.providerFilterCount', String(statsSelectedProviders.size), String(statsRows().length))
+        : t('stats.providerFilterAll');
+    }
+    const btn = $('statsPfBtn');
+    if (btn) btn.classList.toggle('stats-pf-btn--active', statsSelectedProviders.size > 0);
+  }
+
+  function closeProviderFilterMenu() {
+    const menu = $('statsPfMenu');
+    const btn = $('statsPfBtn');
+    if (menu) menu.classList.add('hidden');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+  }
+
+  // ===== Custom range (Stats tab) =====
+
+  // toLocalInputValue formats a timestamp for a datetime-local input: local
+  // wall time, minute precision — exactly what the input round-trips.
+  function toLocalInputValue(ms) {
+    const d = new Date(ms);
+    const pad = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+
+  function showStatsCustomRange() {
+    const row = $('statsCustomRange');
+    if (!row) return;
+    // Prefill with the last day so Apply works as-is for the common case.
+    const from = $('statsCustomFrom');
+    const to = $('statsCustomTo');
+    if (from && !from.value) from.value = toLocalInputValue(Date.now() - 24 * 3600000);
+    if (to && !to.value) to.value = toLocalInputValue(Date.now());
+    row.classList.remove('hidden');
+  }
+
+  function hideStatsCustomRange() {
+    const row = $('statsCustomRange');
+    if (row) row.classList.add('hidden');
+    const err = $('statsCustomError');
+    if (err) err.textContent = '';
+  }
+
+  function applyStatsCustomRange() {
+    const fromMs = new Date(($('statsCustomFrom') || {}).value || '').getTime();
+    const toRaw = ($('statsCustomTo') || {}).value || '';
+    const toMs = toRaw ? new Date(toRaw).getTime() : Date.now();
+    const errEl = $('statsCustomError');
+    // Mirror the server-side retention clamp, so the picker never asks for
+    // data the store no longer keeps.
+    const minFrom = Date.now() - 30 * 24 * 3600000;
+    if (!isFinite(fromMs) || fromMs <= 0 || fromMs > Date.now() ||
+        (toRaw && (!isFinite(toMs) || toMs <= fromMs)) || fromMs < minFrom) {
+      if (errEl) errEl.textContent = t('stats.customInvalid');
+      return;
+    }
+    if (errEl) errEl.textContent = '';
+    statsCustomRange = { from: fromMs, to: toMs };
+    loadStatsWindow();
+    loadStatsHistory();
   }
 
   function bindStatsEvents() {
@@ -7487,20 +7780,105 @@
     const range = $('statsRangeSelect');
     if (range) {
       range.addEventListener('change', () => {
+        if (range.value === 'custom') {
+          // The Apply button commits: choosing the option only reveals the
+          // picker, so tabbing through the selector never refetches.
+          showStatsCustomRange();
+          return;
+        }
+        statsCustomRange = null;
+        hideStatsCustomRange();
         statsHistoryHours = parseInt(range.value, 10) || 24;
         loadStatsWindow();
         loadStatsHistory();
       });
     }
+
+    // Provider multi-filter: the menu is rebuilt on open (so it lists newly
+    // configured providers); checkbox changes and the reset re-filter without
+    // rebuilding, keeping scroll and focus where they are.
+    const pfBtn = $('statsPfBtn');
+    if (pfBtn) {
+      pfBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        const menu = $('statsPfMenu');
+        if (!menu) return;
+        if (menu.classList.contains('hidden')) {
+          renderProviderFilterMenu();
+          menu.classList.remove('hidden');
+          pfBtn.setAttribute('aria-expanded', 'true');
+        } else {
+          closeProviderFilterMenu();
+        }
+      });
+    }
+    const pfMenu = $('statsPfMenu');
+    if (pfMenu) {
+      pfMenu.addEventListener('change', e => {
+        const box = e.target.closest('input[data-pf-id]');
+        if (!box) return;
+        if (box.checked) statsSelectedProviders.add(box.dataset.pfId);
+        else statsSelectedProviders.delete(box.dataset.pfId);
+        applyProviderFilter();
+      });
+      pfMenu.addEventListener('click', e => {
+        if (e.target.closest('#statsPfClear')) {
+          statsSelectedProviders.clear();
+          renderProviderFilterMenu();
+          applyProviderFilter();
+          return;
+        }
+        // Menu clicks must not reach the outside-close document listener.
+        e.stopPropagation();
+      });
+    }
+    document.addEventListener('click', e => {
+      if (!e.target.closest('#statsProviderFilter')) closeProviderFilterMenu();
+    });
+
+    const customApply = $('statsCustomApply');
+    if (customApply) customApply.addEventListener('click', applyStatsCustomRange);
+
     const refresh = $('statsRefreshBtn');
     if (refresh) refresh.addEventListener('click', openStats);
     const exportBtn = $('statsExportBtn');
     if (exportBtn) {
       exportBtn.addEventListener('click', () => {
         setAdminCookie(password);
-        window.open('/admin/api/forward-events/export?format=csv', '_blank');
+        // The export honours the visible view: the active range as a time cut
+        // (presets resolve "last N hours" at click time), and a single
+        // selected provider as its filter — the events endpoint takes one id.
+        const p = new URLSearchParams({ format: 'csv' });
+        const ids = statsFilteredRows().map(x => x.providerId).filter(Boolean);
+        if (ids.length === 1) p.set('provider', ids[0]);
+        if (statsCustomRange) {
+          p.set('since', String(statsCustomRange.from));
+          p.set('until', String(statsCustomRange.to));
+        } else if (statsHistoryHours > 0) {
+          p.set('since', String(Date.now() - statsHistoryHours * 3600000));
+        }
+        window.open('/admin/api/forward-events/export?' + p.toString(), '_blank');
       });
     }
+
+    // Callers-by-IP tab: the range refetches (the time cut happens server-side),
+    // the IP filter re-renders from the cached leaderboard without refetching.
+    const ipsRange = $('topIpsRangeSelect');
+    if (ipsRange) {
+      ipsRange.addEventListener('change', () => {
+        topIpsHours = parseInt(ipsRange.value, 10) || 0;
+        loadTopIps();
+      });
+    }
+    const ipsFilter = $('topIpsFilterIp');
+    if (ipsFilter) {
+      ipsFilter.addEventListener('input', () => {
+        topIpsQuery = ipsFilter.value;
+        renderTopIps();
+      });
+    }
+    const ipsRefresh = $('topIpsRefreshBtn');
+    if (ipsRefresh) ipsRefresh.addEventListener('click', loadTopIps);
   }
 
   async function loadForwardEvents() {
@@ -7584,10 +7962,10 @@
       '<td class="font-mono text-xs">' + escapeHtml(fwdFmtTime(e.time)) + '</td>' +
       '<td class="font-mono text-xs">' + model + '</td>' +
       '<td class="text-xs">' + prov + '</td>' +
+      '<td class="text-xs">' + fwdKeyCell(e) + '</td>' +
       '<td>' + badge + hint + '</td>' +
-      '<td class="font-mono text-xs">' + escapeHtml(fwdUsageSourcePrefix(e) + fwdTokenCell(e, 'inputTokens')) + '</td>' +
+      '<td class="font-mono text-xs">' + fwdInCell(e) + '</td>' +
       '<td class="font-mono text-xs">' + escapeHtml(fwdUsageSourcePrefix(e) + fwdTokenCell(e, 'outputTokens')) + '</td>' +
-      '<td class="font-mono text-xs">' + escapeHtml(fwdUsageSourcePrefix(e) + fwdCacheCell(e)) + '</td>' +
       '<td class="font-mono text-xs">' + escapeHtml(fwdFmtLatency(e.latencyMs)) + '</td>' +
       '<td class="fwd-chev"><i class="fa-solid fa-chevron-down" aria-hidden="true"></i></td>' +
       '</tr>' +
@@ -7647,6 +8025,7 @@
     add(t('forward.detailProvider'), escapeHtml(e.providerName || fwdProviderNames[e.providerId] || e.providerId || '—'));
     if (e.connectionName) add(t('forward.detailConnection'), escapeHtml(e.connectionName));
     if (e.accountLabel || e.accountId) add(t('forward.detailAccount'), escapeHtml(e.accountLabel || e.accountId));
+    if (e.apiKeyName || e.apiKeyId) add(t('forward.detailApiKey'), escapeHtml(e.apiKeyName || e.apiKeyId));
     if (e.routeId) add(t('forward.detailRoute'), '<span class="font-mono">' + escapeHtml(e.routeId) + '</span>');
     add(t('forward.detailStatus'), String(e.status || '—'));
     add(t('forward.detailLatency'), escapeHtml(fwdFmtLatency(e.latencyMs)));
@@ -7665,6 +8044,12 @@
       // total reads "—" rather than a misleading 0.
       add(t('forward.detailTokensIn'), fwdTokenCell(e, 'inputTokens'));
       add(t('forward.detailTokensOut'), fwdTokenCell(e, 'outputTokens'));
+      // Active input = tokens actually processed this turn = total minus the
+      // cache-read hits (cache writes stay inside it). Shown only when a cache
+      // breakdown was reported; without one it would just equal the total.
+      if ((readN != null || createN != null) && e.inputTokens > 0) {
+        add(t('forward.usageActiveInput'), fwdFmtTokens(Math.max(0, e.inputTokens - (readN || 0))));
+      }
       if (readN != null) add(t('forward.detailCacheRead'), fwdFmtTokens(readN));
       if (createN != null) add(t('forward.detailCacheCreate'), fwdFmtTokens(createN));
       // Uncached input is derived, never stored: input minus what the cache
@@ -9669,6 +10054,9 @@
         { id: 'forwarding/routes', labelKey: 'upstreams.routesTitle', panel: 'fwdPaneRoutes', key: 'r' },
         { id: 'forwarding/activity', labelKey: 'forward.paneActivity', panel: 'fwdPaneActivity', key: 'e', stream: 'forward', enter: () => enterForwardActivity() },
         { id: 'forwarding/analytics', labelKey: 'tabs.stats', panel: 'tabStats', key: 't', stream: 'forward', enter: () => openStats() },
+        // The callers leaderboard lives on its own tab with its own range/text
+        // filters rather than as a fixed card under Stats.
+        { id: 'forwarding/callers', labelKey: 'tabs.topIps', panel: 'tabTopIps', key: 'w', stream: 'forward', enter: () => openTopIps() },
       ],
     },
     { id: 'console', labelKey: 'tabs.console', icon: 'fa-terminal', panel: 'tabConsole', key: 'c', stream: 'console', ownScroller: 'consoleOutput' },

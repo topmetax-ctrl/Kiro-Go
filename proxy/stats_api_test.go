@@ -6,6 +6,7 @@ package proxy
 import (
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -303,10 +304,11 @@ func TestExportForwardEventsCSV(t *testing.T) {
 	if len(rows) != 2 {
 		t.Fatalf("rows = %d, want header + 1", len(rows))
 	}
-	if rows[0][0] != "time" || rows[0][12] != "inputTokens" {
+	// apiKey sits between account and endpoint; inputTokens shifts one right.
+	if rows[0][0] != "time" || rows[0][3] != "apiKey" || rows[0][13] != "inputTokens" {
 		t.Fatalf("unexpected header: %v", rows[0])
 	}
-	if rows[1][12] != "100" || rows[1][13] != "50" {
+	if rows[1][13] != "100" || rows[1][14] != "50" {
 		t.Fatalf("token columns = %v", rows[1])
 	}
 }
@@ -418,4 +420,123 @@ func TestForwardStatsHoursStillListsIdleProvider(t *testing.T) {
 		}
 	}
 	t.Fatalf("idle provider dropped from scoped response: %v", out["providers"])
+}
+
+// historyRequests sums the requests across a /forward-history bucket list.
+func historyRequests(t *testing.T, raw interface{}) float64 {
+	t.Helper()
+	buckets, ok := raw.([]interface{})
+	if !ok {
+		t.Fatalf("buckets not a list: %v", raw)
+	}
+	sum := 0.0
+	for _, b := range buckets {
+		m, _ := b.(map[string]interface{})
+		n, _ := m["requests"].(float64)
+		sum += n
+	}
+	return sum
+}
+
+// The custom from/to window must scope the provider figures exactly like the
+// hours presets do, default `to` to now, and leave the no-params all-time
+// call untouched.
+func TestForwardStatsFromToScopesProviderFigures(t *testing.T) {
+	metrics.Reset()
+	initStatsConfig(t, config.UpstreamProvider{
+		ID: "up-1", Name: "one", BaseURL: "https://one.example/v1", Enabled: true,
+	})
+	now := time.Now().UnixMilli()
+	metrics.Record(metrics.Event{
+		TimeMs: now, ProviderID: "up-1", Ok: true, Status: 200, LatencyMs: 10,
+	})
+	metrics.Record(metrics.Event{
+		TimeMs: now - 5*3600000, ProviderID: "up-1", Ok: true, Status: 200, LatencyMs: 10,
+	})
+
+	requestsFor := func(target string) float64 {
+		out := getJSON(t, &Handler{}, target)
+		for _, p := range out["providers"].([]interface{}) {
+			m := p.(map[string]interface{})
+			if m["providerId"] == "up-1" {
+				n, _ := m["requests"].(float64)
+				return n
+			}
+		}
+		t.Fatalf("up-1 missing from %s", target)
+		return 0
+	}
+
+	if got := requestsFor(fmt.Sprintf("/admin/api/forward-stats?from=%d", now-3600000)); got != 1 {
+		t.Fatalf("from=1h ago requests = %v, want 1", got)
+	}
+	if got := requestsFor(fmt.Sprintf("/admin/api/forward-stats?from=%d&to=%d", now-24*3600000, now)); got != 2 {
+		t.Fatalf("explicit 24h window requests = %v, want 2", got)
+	}
+	// No window params keeps the existing all-time behaviour.
+	if got := requestsFor("/admin/api/forward-stats"); got != 2 {
+		t.Fatalf("unscoped requests = %v, want 2", got)
+	}
+}
+
+// Malformed custom windows must be rejected with 400 on every endpoint that
+// accepts them, not silently mis-read.
+func TestForwardStatsRejectsBadWindow(t *testing.T) {
+	targets := []string{
+		"/admin/api/forward-stats?from=abc",
+		"/admin/api/forward-stats?from=0",
+		"/admin/api/forward-stats?from=500&to=100",
+		"/admin/api/forward-history?from=abc",
+		"/admin/api/top-ips?from=abc",
+		"/admin/api/provider-stats?id=up-1&from=abc",
+	}
+	for _, target := range targets {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		switch {
+		case strings.HasPrefix(target, "/admin/api/provider-stats"):
+			(&Handler{}).apiGetProviderDetail(rec, req)
+		case strings.HasPrefix(target, "/admin/api/forward-history"):
+			(&Handler{}).apiGetForwardHistory(rec, req)
+		case strings.HasPrefix(target, "/admin/api/top-ips"):
+			(&Handler{}).apiGetTopIPs(rec, req)
+		case strings.HasPrefix(target, "/admin/api/forward-stats"):
+			(&Handler{}).apiGetForwardStats(rec, req)
+		}
+		if rec.Code != 400 {
+			t.Fatalf("%s -> %d, want 400", target, rec.Code)
+		}
+	}
+}
+
+// The trend endpoint must scope to the custom window and name the granularity
+// it picked, so the client labels the axis honestly.
+func TestForwardHistoryFromToScopesAndNamesUnit(t *testing.T) {
+	metrics.Reset()
+	initStatsConfig(t, config.UpstreamProvider{
+		ID: "up-1", Name: "one", BaseURL: "https://one.example/v1", Enabled: true,
+	})
+	now := time.Now().UnixMilli()
+	metrics.Record(metrics.Event{
+		TimeMs: now, ProviderID: "up-1", Ok: true, Status: 200, LatencyMs: 10,
+	})
+	metrics.Record(metrics.Event{
+		TimeMs: now - 5*3600000, ProviderID: "up-1", Ok: true, Status: 200, LatencyMs: 10,
+	})
+
+	out := getJSON(t, &Handler{}, fmt.Sprintf("/admin/api/forward-history?from=%d", now-3600000))
+	if out["unit"] != "minute" {
+		t.Fatalf("1h window unit = %v, want minute", out["unit"])
+	}
+	if got := historyRequests(t, out["buckets"]); got != 1 {
+		t.Fatalf("1h window buckets = %v requests, want 1", got)
+	}
+
+	out = getJSON(t, &Handler{}, fmt.Sprintf("/admin/api/forward-history?from=%d&to=%d", now-24*3600000, now))
+	if out["unit"] != "hour" {
+		t.Fatalf("24h window unit = %v, want hour", out["unit"])
+	}
+	if got := historyRequests(t, out["buckets"]); got != 2 {
+		t.Fatalf("24h window buckets = %v requests, want 2", got)
+	}
 }

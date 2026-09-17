@@ -90,26 +90,31 @@ type EventUsage struct {
 // requests it is KiroPoolID and AccountID/AccountLabel identify the account that
 // served the request.
 type Event struct {
-	TimeMs         int64   `json:"time"`
-	ClientModel    string  `json:"clientModel"`
-	TargetModel    string  `json:"targetModel,omitempty"`
-	RouteID        string  `json:"routeId,omitempty"`
-	ProviderID     string  `json:"providerId,omitempty"`
-	ProviderName   string  `json:"providerName,omitempty"`
-	ConnectionID   string  `json:"connectionId,omitempty"`
-	ConnectionName string  `json:"connectionName,omitempty"`
-	AccountID      string  `json:"accountId,omitempty"`
-	AccountLabel   string  `json:"accountLabel,omitempty"`
-	Endpoint       string  `json:"endpoint,omitempty"` // claude/openai/responses/websearch
-	ClientIP       string  `json:"clientIp,omitempty"` // caller's source IP; empty when not resolved
-	RequestID      string  `json:"requestId,omitempty"`
-	ApiKeyID       string  `json:"apiKeyId,omitempty"`
-	Status         int     `json:"status"`
-	LatencyMs      int64   `json:"latencyMs"`
-	TTFBMs         int64   `json:"ttfbMs,omitempty"` // time to first response byte; 0 when unknown
-	InputTokens    int64   `json:"inputTokens,omitempty"`
-	OutputTokens   int64   `json:"outputTokens,omitempty"`
-	CostUSD        float64 `json:"costUsd,omitempty"`
+	TimeMs         int64  `json:"time"`
+	ClientModel    string `json:"clientModel"`
+	TargetModel    string `json:"targetModel,omitempty"`
+	RouteID        string `json:"routeId,omitempty"`
+	ProviderID     string `json:"providerId,omitempty"`
+	ProviderName   string `json:"providerName,omitempty"`
+	ConnectionID   string `json:"connectionId,omitempty"`
+	ConnectionName string `json:"connectionName,omitempty"`
+	AccountID      string `json:"accountId,omitempty"`
+	AccountLabel   string `json:"accountLabel,omitempty"`
+	Endpoint       string `json:"endpoint,omitempty"` // claude/openai/responses/websearch
+	ClientIP       string `json:"clientIp,omitempty"` // caller's source IP; empty when not resolved
+	RequestID      string `json:"requestId,omitempty"`
+	ApiKeyID       string `json:"apiKeyId,omitempty"`
+	// ApiKeyName is the human label of the authenticating key, snapshotted at
+	// request time so the event survives a later rename or deletion of the key.
+	// Denormalized alongside ApiKeyID exactly as ProviderName sits beside
+	// ProviderID; resolved cheaply from the auth context (no extra key lookup).
+	ApiKeyName   string  `json:"apiKeyName,omitempty"`
+	Status       int     `json:"status"`
+	LatencyMs    int64   `json:"latencyMs"`
+	TTFBMs       int64   `json:"ttfbMs,omitempty"` // time to first response byte; 0 when unknown
+	InputTokens  int64   `json:"inputTokens,omitempty"`
+	OutputTokens int64   `json:"outputTokens,omitempty"`
+	CostUSD      float64 `json:"costUsd,omitempty"`
 	// Usage carries the cache/reasoning breakdown and its provenance when the
 	// upstream reported it. Nil means no usage telemetry was observed at all;
 	// the flat totals above stay the canonical IN/OUT figures.
@@ -504,7 +509,7 @@ type store struct {
 	overall     counter
 	byProvider  map[string]*providerAgg
 	byRoute     map[string]*routeAgg
-	byIP        map[string]*counter
+	byIP        map[string]*ipAgg
 	buckets     map[int64]*Bucket
 	subscribers map[chan Event]struct{}
 }
@@ -516,7 +521,7 @@ func newStore() *store {
 		ring:        make([]Event, eventRingCapacity),
 		byProvider:  make(map[string]*providerAgg),
 		byRoute:     make(map[string]*routeAgg),
-		byIP:        make(map[string]*counter),
+		byIP:        make(map[string]*ipAgg),
 		buckets:     make(map[int64]*Bucket),
 		subscribers: make(map[chan Event]struct{}),
 	}
@@ -678,11 +683,28 @@ func Record(ev Event) {
 		// Bound the map so a flood of distinct source IPs (e.g. a scan) cannot
 		// grow it without limit. Once full, only already-tracked IPs update.
 		if ic == nil && len(s.byIP) < maxTrackedIPs {
-			ic = &counter{}
+			ic = newIPAgg()
 			s.byIP[ev.ClientIP] = ic
 		}
 		if ic != nil {
 			ic.add(ev)
+			// Same minute/hour series the provider path keeps above, so the
+			// callers tab can rank IPs inside a selected window.
+			ib := ic.minutes[minute]
+			if ib == nil {
+				ib = &Bucket{Minute: minute}
+				ic.minutes[minute] = ib
+			}
+			ib.add(ev)
+			pruneBuckets(ic.minutes, minute-bucketWindowMins)
+
+			ih := ic.hours[hour]
+			if ih == nil {
+				ih = &Bucket{Minute: hour}
+				ic.hours[hour] = ih
+			}
+			ih.add(ev)
+			pruneBuckets(ic.hours, hour-hourWindowHours)
 		}
 	}
 
@@ -1044,6 +1066,125 @@ func ProviderStatsWindow(hours int) []ProviderStat {
 	return out
 }
 
+// rangeBucketBounds resolves an arbitrary [fromMs, toMs] window (Unix ms;
+// toMs <= 0 means now) into the granularity to read and the inclusive
+// bucket-key bounds that cover it, clamped to what retention keeps. It backs
+// the custom-range pickers on the Stats tab the way ProviderStatsWindow backs
+// the hour presets.
+//
+// A window lying entirely inside the per-minute coverage (the last
+// bucketWindowMins) is served exactly from the minute buckets. Anything older
+// can only come from the hourly rollups, whose edge buckets are counted in
+// full — a window cutting an hour part-way widens by up to an hour per side
+// rather than silently dropping the partial edge, so lo floors the window
+// start and hi keeps the last bucket that begins before the window end.
+// Windows reaching past the hourly retention clamp forward instead of
+// quietly reading as empty.
+func rangeBucketBounds(fromMs, toMs int64) (useMinutes bool, lo, hi int64, windowMins float64) {
+	now := time.Now().UnixMilli()
+	if toMs <= 0 || toMs > now {
+		toMs = now
+	}
+	if fromMs > toMs {
+		fromMs = toMs
+	}
+	if minFrom := (now/3600000 - hourWindowHours) * 3600000; fromMs < minFrom {
+		fromMs = minFrom
+	}
+	if fromMs >= now-int64(bucketWindowMins)*60000 {
+		return true, fromMs / 60000, (toMs - 1) / 60000, float64(toMs-fromMs) / 60000
+	}
+	return false, fromMs / 3600000, (toMs - 1) / 3600000, float64(toMs-fromMs) / 60000
+}
+
+// sumBucketsBetween folds the buckets whose keys lie in [lo, hi] into one
+// aggregate. Caller holds s.mu.
+func sumBucketsBetween(src map[int64]*Bucket, lo, hi int64) Bucket {
+	var agg Bucket
+	for k, b := range src {
+		if k < lo || k > hi {
+			continue
+		}
+		agg.Requests += b.Requests
+		agg.Success += b.Success
+		agg.Failed += b.Failed
+		agg.InputTokens += b.InputTokens
+		agg.OutputTokens += b.OutputTokens
+		agg.CostUSD += b.CostUSD
+		agg.ModelRounds += b.ModelRounds
+		agg.SumLatencyMs += b.SumLatencyMs
+		agg.CacheReadInputTokens += b.CacheReadInputTokens
+		agg.CacheCreationInputTokens += b.CacheCreationInputTokens
+		agg.CacheObservedInputTokens += b.CacheObservedInputTokens
+		agg.CacheObservedRequests += b.CacheObservedRequests
+	}
+	return agg
+}
+
+// ProviderStatsRange returns per-provider aggregates over the arbitrary
+// [fromMs, toMs] window (Unix ms; toMs <= 0 means now), busiest first. It
+// backs the Stats tab's custom range, where the presets' "last N hours"
+// anchoring cannot express a frozen window.
+//
+// Granularity and edge rounding follow rangeBucketBounds. The same live-signal
+// rule as ProviderStatsWindow applies: in-flight, failure streaks and
+// last-used are current rather than historical, and TTFB, canceled and
+// streamed stay zero because buckets do not record them. RPM and TPM are the
+// average over the requested span (after the retention clamp), not the
+// five-minute live rate.
+func ProviderStatsRange(fromMs, toMs int64) []ProviderStat {
+	useMinutes, lo, hi, windowMins := rangeBucketBounds(fromMs, toMs)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]ProviderStat, 0, len(s.byProvider))
+	for id, p := range s.byProvider {
+		src := p.hours
+		if useMinutes {
+			src = p.minutes
+		}
+		agg := sumBucketsBetween(src, lo, hi)
+		st := ProviderStat{
+			ProviderID:   id,
+			ProviderName: p.name,
+			Requests:     agg.Requests,
+			Success:      agg.Success,
+			Failed:       agg.Failed,
+			SuccessRate:  rateOf(agg.Success, agg.Success+agg.Failed),
+			InputTokens:  agg.InputTokens,
+			OutputTokens: agg.OutputTokens,
+			CostUSD:      agg.CostUSD,
+			ModelRounds:  agg.ModelRounds,
+			// Cache ratio derived from exactly the buckets in the window, over the
+			// reporting population — matching ProviderStatsWindow.
+			CacheReadInputTokens:     agg.CacheReadInputTokens,
+			CacheCreationInputTokens: agg.CacheCreationInputTokens,
+			CacheHitRate:             agg.cacheHitRate(),
+			CacheObservedRequests:    agg.CacheObservedRequests,
+			// Live signals, deliberately not windowed.
+			InFlight:     p.inFlight,
+			PeakInFlight: p.peakFlight,
+			FailStreak:   p.curStreak,
+			MaxStreak:    p.maxStreak,
+			LastOk:       p.lastOkMs,
+			LastFail:     p.lastFailMs,
+			LastUsed:     p.lastUsed,
+			Healthy:      p.curStreak < 3,
+		}
+		if agg.Requests > 0 {
+			st.AvgLatencyMs = agg.SumLatencyMs / agg.Requests
+		}
+		if windowMins > 0 {
+			st.RPM = float64(agg.Requests) / windowMins
+			st.TPM = float64(agg.InputTokens+agg.OutputTokens) / windowMins
+		}
+		out = append(out, st)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Requests > out[j].Requests })
+	return out
+}
+
 // ProviderFailureState reports one provider's CURRENT consecutive-failure streak
 // and the timestamp of the most recent failure (UnixMilli, 0 when none).
 //
@@ -1122,6 +1263,12 @@ type ProviderDetail struct {
 	// per-model or per-account breakdowns; live signals (InFlight etc.) are
 	// always current.
 	WindowHours int `json:"windowHours,omitempty"`
+	// WindowFrom/WindowTo echo the effective coverage of a custom [from, to]
+	// window in Unix ms — the rounded-out bucket bounds, not the raw request —
+	// so the UI can label exactly what the numbers cover. Zero for preset and
+	// all-time views.
+	WindowFrom int64 `json:"windowFrom,omitempty"`
+	WindowTo   int64 `json:"windowTo,omitempty"`
 }
 
 // ProviderDetailFor returns the drill-down for one provider. found is false when
@@ -1294,6 +1441,21 @@ func ProviderDetailWindow(id string, hours, minutes int) (ProviderDetail, bool) 
 	// Models/Accounts/Statuses are all-time. The bucket maps do not carry
 	// per-dimension breakdowns, and reconstructing them from the event ring
 	// would be partial for windows longer than the ring covers.
+	fillDetailBreakdownLocked(&d, p)
+	d.Minutes = seriesLocked(p.minutes, nowMinute, minutes, 1)
+	s.mu.Unlock()
+
+	sort.Slice(d.Models, func(i, j int) bool { return d.Models[i].Requests > d.Models[j].Requests })
+	sort.Slice(d.Accounts, func(i, j int) bool { return d.Accounts[i].Requests > d.Accounts[j].Requests })
+	sort.Slice(d.Statuses, func(i, j int) bool { return d.Statuses[i].Count > d.Statuses[j].Count })
+
+	d.Percentiles = percentilesFor(id)
+	return d, true
+}
+
+// fillDetailBreakdownLocked attaches the all-time breakdown (models, accounts,
+// statuses, recent errors) to a detail under construction. Caller holds s.mu.
+func fillDetailBreakdownLocked(d *ProviderDetail, p *providerAgg) {
 	for m, c := range p.byModel {
 		d.Models = append(d.Models, ModelStat{
 			Model:        m,
@@ -1329,7 +1491,87 @@ func ProviderDetailWindow(id string, hours, minutes int) (ProviderDetail, bool) 
 	for i, j := 0, len(d.RecentErrs)-1; i < j; i, j = i+1, j-1 {
 		d.RecentErrs[i], d.RecentErrs[j] = d.RecentErrs[j], d.RecentErrs[i]
 	}
-	d.Minutes = seriesLocked(p.minutes, nowMinute, minutes, 1)
+}
+
+// rangeSeriesLocked materialises the buckets with keys in [lo, hi], oldest
+// first, gaps filled by empty buckets. Caller holds s.mu.
+func rangeSeriesLocked(m map[int64]*Bucket, lo, hi int64) []Bucket {
+	if hi < lo {
+		return []Bucket{}
+	}
+	out := make([]Bucket, 0, hi-lo+1)
+	for k := lo; k <= hi; k++ {
+		if b := m[k]; b != nil {
+			out = append(out, b.derive())
+		} else {
+			out = append(out, Bucket{Minute: k})
+		}
+	}
+	return out
+}
+
+// ProviderDetailRange is ProviderDetailWindow for an arbitrary [fromMs, toMs]
+// window (Unix ms; toMs <= 0 means now), backing the Stats tab's custom range.
+// Granularity and edge rounding follow ProviderStatsRange: minute buckets when
+// the whole window is covered by memory, hourly rollups otherwise with edge
+// buckets counted in full. The sparkline plots the window's own buckets rather
+// than a fixed-width recent slice, and WindowFrom/WindowTo echo the effective
+// rounded-out coverage. Models/Accounts/Statuses stay all-time for the same
+// reason as every other window.
+func ProviderDetailRange(id string, fromMs, toMs int64) (ProviderDetail, bool) {
+	useMinutes, lo, hi, windowMins := rangeBucketBounds(fromMs, toMs)
+	unitMs := int64(3600000)
+	if useMinutes {
+		unitMs = 60000
+	}
+
+	s.mu.Lock()
+	p := s.byProvider[id]
+	if p == nil {
+		s.mu.Unlock()
+		return ProviderDetail{}, false
+	}
+	src := p.hours
+	if useMinutes {
+		src = p.minutes
+	}
+	agg := sumBucketsBetween(src, lo, hi)
+
+	windowed := ProviderStat{
+		ProviderID:               id,
+		ProviderName:             p.name,
+		Requests:                 agg.Requests,
+		Success:                  agg.Success,
+		Failed:                   agg.Failed,
+		SuccessRate:              rateOf(agg.Success, agg.Success+agg.Failed),
+		InputTokens:              agg.InputTokens,
+		OutputTokens:             agg.OutputTokens,
+		CostUSD:                  agg.CostUSD,
+		CacheReadInputTokens:     agg.CacheReadInputTokens,
+		CacheCreationInputTokens: agg.CacheCreationInputTokens,
+		CacheHitRate:             agg.cacheHitRate(),
+		CacheObservedRequests:    agg.CacheObservedRequests,
+		InFlight:                 p.inFlight,
+		PeakInFlight:             p.peakFlight,
+		FailStreak:               p.curStreak,
+		MaxStreak:                p.maxStreak,
+		LastOk:                   p.lastOkMs,
+		LastFail:                 p.lastFailMs,
+		LastUsed:                 p.lastUsed,
+		Healthy:                  p.curStreak < 3,
+	}
+	if agg.Requests > 0 {
+		windowed.AvgLatencyMs = agg.SumLatencyMs / agg.Requests
+	}
+	if windowMins > 0 {
+		// Override RPM/TPM with the window average, matching ProviderDetailWindow.
+		windowed.RPM = float64(agg.Requests) / windowMins
+		windowed.TPM = float64(agg.InputTokens+agg.OutputTokens) / windowMins
+	}
+
+	d := ProviderDetail{ProviderStat: windowed, WindowFrom: lo * unitMs, WindowTo: (hi + 1) * unitMs}
+	fillDetailBreakdownLocked(&d, p)
+	d.Minutes = rangeSeriesLocked(src, lo, hi)
 	s.mu.Unlock()
 
 	sort.Slice(d.Models, func(i, j int) bool { return d.Models[i].Requests > d.Models[j].Requests })
@@ -1432,6 +1674,82 @@ func HistoryFor(id string, hours int) []Bucket {
 		}
 	}
 	return seriesLocked(merged, nowHour, hours, 1)
+}
+
+// HistoryRangeFor returns the buckets covering the arbitrary [fromMs, toMs]
+// window for one provider (an empty id aggregates across all providers),
+// oldest first, with gaps filled by empty buckets. Granularity follows
+// rangeBucketBounds, and the returned unit names it so clients can label the
+// axis. Bucket.Minute carries the raw bucket key in its own unit (epoch
+// minutes or epoch hours), matching HistoryFor.
+func HistoryRangeFor(id string, fromMs, toMs int64) (unit string, buckets []Bucket) {
+	useMinutes, lo, hi, _ := rangeBucketBounds(fromMs, toMs)
+	unit = "hour"
+	if useMinutes {
+		unit = "minute"
+	}
+	if hi < lo {
+		return unit, []Bucket{}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	merged := make(map[int64]*Bucket, hi-lo+1)
+	if id != "" {
+		p := s.byProvider[id]
+		if p == nil {
+			return unit, []Bucket{}
+		}
+		src := p.hours
+		if useMinutes {
+			src = p.minutes
+		}
+		for k, b := range src {
+			if k < lo || k > hi {
+				continue
+			}
+			merged[k] = b
+		}
+	} else {
+		for _, p := range s.byProvider {
+			src := p.hours
+			if useMinutes {
+				src = p.minutes
+			}
+			for k, b := range src {
+				if k < lo || k > hi {
+					continue
+				}
+				t := merged[k]
+				if t == nil {
+					t = &Bucket{Minute: k}
+					merged[k] = t
+				}
+				t.Requests += b.Requests
+				t.Success += b.Success
+				t.Failed += b.Failed
+				t.InputTokens += b.InputTokens
+				t.OutputTokens += b.OutputTokens
+				t.CostUSD += b.CostUSD
+				t.SumLatencyMs += b.SumLatencyMs
+				t.CacheReadInputTokens += b.CacheReadInputTokens
+				t.CacheCreationInputTokens += b.CacheCreationInputTokens
+				t.CacheObservedInputTokens += b.CacheObservedInputTokens
+				t.CacheObservedRequests += b.CacheObservedRequests
+			}
+		}
+	}
+
+	out := make([]Bucket, 0, hi-lo+1)
+	for k := lo; k <= hi; k++ {
+		if b := merged[k]; b != nil {
+			out = append(out, b.derive())
+		} else {
+			out = append(out, Bucket{Minute: k})
+		}
+	}
+	return unit, out
 }
 
 // RouteStat pairs a route's identity with its aggregated counters.
@@ -1684,7 +2002,7 @@ func Reset() {
 	s.overall = counter{}
 	s.byProvider = make(map[string]*providerAgg)
 	s.byRoute = make(map[string]*routeAgg)
-	s.byIP = make(map[string]*counter)
+	s.byIP = make(map[string]*ipAgg)
 	s.buckets = make(map[int64]*Bucket)
 
 	// Re-seed provider entries so names survive the reset (the filter dropdown

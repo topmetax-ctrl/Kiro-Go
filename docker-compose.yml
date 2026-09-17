@@ -10,6 +10,11 @@ services:
       - "9091:9091"
     volumes:
       - ./data:/app/data
+      # Live-edit the admin UI: web/ is served from disk per request (no
+      # go:embed), so bind-mounting it means frontend changes show up after a
+      # browser refresh — no image rebuild, no docker cp needed. Go code still
+      # requires a rebuild (the binary is baked into the image).
+      - ./web:/app/web
       # Bind-mount the host's Kiro IDE SSO cache so the "Inject" button can write
       # kiro-auth-token.json straight to the host. Required for account injection.
       # The host path defaults to the macOS/Linux location (~/.aws/sso/cache); set

@@ -102,6 +102,11 @@
         <div class="brand">
           <img class="brand-icon" src="/admin/icon.png?v=20260724" alt="" />
           <span class="brand-text">Kiro-Go</span>
+          <span class="brand-version" id="versionBadge" aria-label=""
+            data-i18n-aria-label="aria.currentVersion"></span>
+          <span class="brand-status" id="statusBadge" data-i18n-title="status.running" title="">
+            <span class="status-dot"></span>
+          </span>
         </div>
       </div>
       <nav class="header-nav sidebar-nav" aria-label="" data-i18n-aria-label="aria.sections">
@@ -984,10 +989,10 @@
                   <th data-i18n="forward.colTime"></th>
                   <th data-i18n="forward.colModel"></th>
                   <th data-i18n="forward.colProvider"></th>
+                  <th data-i18n="forward.colKey"></th>
                   <th data-i18n="forward.colStatus"></th>
                   <th data-i18n="forward.colIn"></th>
                   <th data-i18n="forward.colOut"></th>
-                  <th data-i18n="forward.colCache"></th>
                   <th data-i18n="forward.colLatency"></th>
                   <th><span class="sr-only" data-i18n="forward.colDetail"></span></th>
                 </tr>
@@ -1010,12 +1015,24 @@
           <div class="card-header">
             <span class="card-title" data-i18n="stats.title"></span>
             <div class="card-actions">
+              <!-- Provider multi-filter: a button opening a checkbox popover,
+                   so a few providers can be compared in isolation. -->
+              <div class="stats-pf" id="statsProviderFilter">
+                <button class="btn btn-outline btn-sm" id="statsPfBtn" type="button"
+                  aria-haspopup="true" aria-expanded="false" data-i18n-aria-label="stats.providerFilterTitle">
+                  <i class="fa-solid fa-filter" aria-hidden="true"></i>
+                  <span class="btn-text" id="statsPfLabel" data-i18n="stats.providerFilterAll"></span>
+                  <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
+                </button>
+                <div class="stats-pf-menu hidden" id="statsPfMenu"></div>
+              </div>
               <select id="statsRangeSelect" class="w-32!" data-i18n-aria-label="stats.rangeLabel">
                 <option value="1" selected data-i18n="stats.range1h"></option>
                 <option value="6" data-i18n="stats.range6h"></option>
                 <option value="24" data-i18n="stats.range24h"></option>
                 <option value="168" data-i18n="stats.range7d"></option>
                 <option value="720" data-i18n="stats.range30d"></option>
+                <option value="custom" data-i18n="stats.rangeCustom"></option>
               </select>
               <button class="btn btn-outline btn-sm" id="statsExportBtn" type="button">
                 <i class="fa-solid fa-download" aria-hidden="true"></i><span class="btn-text"
@@ -1026,6 +1043,19 @@
                   data-i18n="stats.refresh"></span>
               </button>
             </div>
+          </div>
+          <!-- Custom range picker, revealed by the selector's Custom option. The
+               window is frozen: Refresh refetches the same from/to instead of
+               sliding with now, which is what the hour presets do. -->
+          <div class="stats-custom-range hidden" id="statsCustomRange">
+            <label class="text-xs" data-i18n="stats.customFrom" for="statsCustomFrom"></label>
+            <input type="datetime-local" id="statsCustomFrom" class="stats-custom-input">
+            <label class="text-xs" data-i18n="stats.customTo" for="statsCustomTo"></label>
+            <input type="datetime-local" id="statsCustomTo" class="stats-custom-input">
+            <button class="btn btn-outline btn-sm" id="statsCustomApply" type="button"
+              data-i18n="stats.customApply"></button>
+            <span class="text-xs" id="statsCustomError" role="alert"></span>
+            <span class="text-xs muted-text stats-custom-note" data-i18n="stats.customRangeNote"></span>
           </div>
           <p class="muted-text text-xs" data-i18n="stats.intro"></p>
 
@@ -1063,14 +1093,37 @@
             </table>
           </div>
         </div>
+      </div>
 
-        <!-- Top callers by source IP -->
+      <!-- Top callers by source IP: its own tab rather than a second card on
+           the Stats tab, so the leaderboard gets the same toolbar treatment
+           (range filter, text filter, refresh) as every other view. -->
+      <div id="tabTopIps" class="tab-content hidden">
         <div class="card">
           <div class="card-header">
             <span class="card-title" data-i18n="stats.topIpsTitle"></span>
-            <span class="text-xs muted-text" id="statsTopIpsNote"></span>
+            <div class="card-actions">
+              <span class="text-xs muted-text" id="statsTopIpsNote"></span>
+              <button class="btn btn-outline btn-sm" id="topIpsRefreshBtn" type="button">
+                <i class="fa-solid fa-rotate" aria-hidden="true"></i><span class="btn-text"
+                  data-i18n="stats.refresh"></span>
+              </button>
+            </div>
           </div>
           <p class="muted-text text-xs" data-i18n="stats.topIpsIntro"></p>
+          <div class="toolbar">
+            <select id="topIpsRangeSelect" class="w-32!" data-i18n-aria-label="stats.rangeLabel">
+              <option value="" selected data-i18n="forward.allTime"></option>
+              <option value="1" data-i18n="stats.range1h"></option>
+              <option value="6" data-i18n="stats.range6h"></option>
+              <option value="24" data-i18n="stats.range24h"></option>
+              <option value="168" data-i18n="stats.range7d"></option>
+              <option value="720" data-i18n="stats.range30d"></option>
+            </select>
+            <input type="text" id="topIpsFilterIp" class="w-48!" data-i18n-placeholder="stats.topIpsFilter" />
+            <div class="toolbar-spacer"></div>
+            <span class="text-xs muted-text" id="topIpsCount"></span>
+          </div>
           <div class="stats-table-scroll">
             <table class="stats-table" id="topIpsTable">
               <thead>
@@ -1148,8 +1201,6 @@
           </div>
         </div>
       </div>
-    </div>
-
     <!-- Footer -->
     <footer class="app-footer" aria-label="" data-i18n-aria-label="aria.footer">
       <div class="app-footer-inner">
@@ -1159,11 +1210,6 @@
             <div class="footer-copy">
               <div class="footer-title-row">
                 <span class="footer-title">Kiro-Go</span>
-                <span class="footer-version" id="versionBadge" aria-label=""
-                  data-i18n-aria-label="aria.currentVersion"></span>
-                <span class="footer-version-status" id="statusBadge" data-i18n-title="status.running" title="">
-                  <span class="status-dot"></span>
-                </span>
               </div>
 
             </div>
@@ -1186,6 +1232,7 @@
         </div>
       </div>
     </footer>
+    </div>
     </div>
 
     <!-- Floating scroll navigation -->
