@@ -155,9 +155,17 @@ type Event struct {
 	//
 	// SessionSource is a closed low-cardinality label naming the carrier
 	// ("claude-code", "opencode", "generic-affinity", "generic-session",
-	// "claude-metadata", "synthetic-request", "none"); SessionScope is
-	// "conversation" | "request" | "". SessionMapped says whether the provider's
-	// configured session header was actually written.
+	// "claude-metadata", "kiro-managed", "kiro-issued", "synthetic-request",
+	// "none"); SessionScope is "conversation" | "request" | "". SessionMapped says
+	// whether the provider's configured session header was actually written.
+	//
+	// "kiro-issued" and "kiro-managed" are one pair on purpose, and reading them
+	// together is how an operator learns whether managed sessions are doing
+	// anything: "kiro-issued" alone means the gateway offered a token and the
+	// client never sent it back, which is behaviorally identical to
+	// "synthetic-request" — hence its request scope. Only "kiro-managed" is
+	// evidence of cross-turn identity. Labeling a freshly issued token
+	// "conversation" would make this field claim continuity that has not happened.
 	//
 	// The session ID ITSELF is never recorded — not raw, not hashed. It is client
 	// conversation state, and a per-session value would also make an unbounded

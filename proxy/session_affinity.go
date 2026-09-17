@@ -28,6 +28,16 @@ package proxy
 // headers, it may steer session affinity, but it never feeds authentication,
 // billing, or tenant decisions.
 //
+// Kiro-Session is the gateway's own conversation token, for callers that have no
+// conversation identity of their own but can read a response header and send it
+// back. It is a DOWNSTREAM contract (client <-> Kiro-Go) and never an upstream
+// one: an inbound Kiro-Session becomes the canonical identity and reaches the
+// provider through that provider's configured SessionHeader, but the
+// Kiro-Session header itself is never written on an outbound request. It is also
+// the WEAKEST identity, below the strict body fallback, so a client that starts
+// sending a real conversation id is never overridden by a token Kiro-Go handed
+// it earlier.
+//
 // Only carriers whose conversation semantics are established are read. Notably
 // absent, and deliberately so: X-Client-Request-Id (request-level for Claude
 // Code even though some clients overload it with a session), prompt_cache_key
@@ -38,8 +48,19 @@ package proxy
 // Session RESOLUTION never manufactures an id: a request without one resolves
 // to no identity, because giving every request of a conversation a different
 // logical session would destroy the affinity this exists to preserve. Whether a
-// sessionless request may still proceed is a separate, per-provider EGRESS
-// decision — see effectiveSessionForProvider and config.SessionMissingPolicy.
+// sessionless request may still proceed, and under which generated identity, is
+// a separate decision made in exactly one place — see
+// effectiveSessionForProvider, config.ManagedSessionsEnabled and
+// config.SessionMissingPolicy.
+//
+// There are two generated identities and they come from ONE per-request holder,
+// so a single logical request can never mint two different ids: whichever reason
+// asks first materializes the value and the other reason cannot be reached.
+// They differ only in what they claim. A managed issuance (kiro-issued) is
+// offered to the client and may become conversation identity on the next turn; a
+// provider fallback (synthetic-request) is availability only and never leaves the
+// request. Both are request-scoped when generated, because at that moment nobody
+// knows whether the client will ever send the token back.
 
 import (
 	"context"
@@ -70,6 +91,25 @@ const (
 	// spellings in circulation; aggregators read both interchangeably.
 	HeaderSessionID     = "X-Session-Id"
 	HeaderSessionIDBare = "Session-Id"
+	// HeaderKiroSession is the gateway's own managed conversation token, sent on
+	// the response when one is issued and read back on later turns. No "X-"
+	// prefix: RFC 6648 deprecates it for new protocol parameters. It is
+	// deliberately NOT part of sessionHeaderCarriers — that list also drives
+	// egress reconciliation, and this header must never reach an upstream.
+	//
+	// RETENTION IS THE CLIENT'S JOB, and the contract is deliberately one-way:
+	// once a client has been given a token for a conversation it keeps sending
+	// that same value on every later request of that conversation until the
+	// conversation ends or the client starts a new one. A response WITHOUT the
+	// header does not revoke anything — there is no revocation in this protocol.
+	// Absence simply means this turn had nothing to announce, which happens
+	// whenever a turn resolves no session at all: a turn served entirely by the
+	// Kiro account pool never builds an upstream request, so it never reaches
+	// effectiveSessionForProvider and never publishes. A client that mirrored the
+	// last response instead of remembering the token would drop it there and
+	// silently lose affinity, which is why the contract is stated as retention
+	// rather than as an echo of whatever the gateway last said.
+	HeaderKiroSession = "Kiro-Session"
 )
 
 // session sources, for observability only (never logged with the id itself).
@@ -82,7 +122,14 @@ const (
 	sessionSourceGenericAffinity  = "generic-affinity"
 	sessionSourceGenericSession   = "generic-session"
 	sessionSourceSyntheticRequest = "synthetic-request"
-	sessionSourceNone             = "none"
+	// sessionSourceKiroIssued is a managed token Kiro-Go has just minted and
+	// offered to the client. Adoption is NOT proven: it stays request-scoped
+	// until a later turn actually presents it.
+	sessionSourceKiroIssued = "kiro-issued"
+	// sessionSourceKiroManaged is a managed token the client sent back, which is
+	// the only evidence that cross-turn identity exists.
+	sessionSourceKiroManaged = "kiro-managed"
+	sessionSourceNone        = "none"
 )
 
 // sessionScope separates an identity that groups a whole conversation from one
@@ -155,6 +202,12 @@ func sessionSourceHeader(source string) string {
 		return HeaderSessionAffinity
 	case sessionSourceGenericSession:
 		return HeaderSessionID
+	case sessionSourceKiroManaged:
+		// Deliberately no header. Kiro-Session is a downstream contract; echoing
+		// it upstream would tell a provider the gateway's own token is a client
+		// conversation id. The canonical value still reaches the provider through
+		// its configured SessionHeader, which is the only channel it may use.
+		return ""
 	default:
 		return ""
 	}
@@ -162,16 +215,25 @@ func sessionSourceHeader(source string) string {
 
 // clientSessionAffinity resolves the canonical session identity the CLIENT
 // presented. Precedence: the native Claude Code header, the native OpenCode
-// header, the generic affinity/session headers, then the strict body-metadata
-// fallback extracted where the handler parsed the body.
+// header, the generic affinity/session headers, the strict body-metadata
+// fallback extracted where the handler parsed the body, and last a Kiro-Session
+// token the client is echoing back to us.
 //
 // Every header carrier goes through the same bounded validation as the body
 // carrier, so an oversized or control-character-bearing value is not an
 // identity: that carrier is skipped and the next source is tried, exactly as if
 // it had been absent. A duplicate header keeps Go's first-value semantics.
 //
-// Nothing is generated here. A sessionless request resolves to no identity; the
-// per-provider fallback lives in effectiveSessionForProvider.
+// Kiro-Session sits last on purpose. It is the only carrier the gateway itself
+// authored, so any real client identity must be able to supersede it: a client
+// migrating from managed sessions to its own conversation id would otherwise be
+// pinned to a stale token Kiro-Go issued. Being gateway-owned, it is also held to
+// a stricter shape than the opaque generic carriers — exactly the canonical UUID
+// this code issues, nothing else — and a malformed value is simply absent, which
+// lets the managed layer issue a fresh valid one.
+//
+// Nothing is generated here. A sessionless request resolves to no identity; both
+// generated identities live in effectiveSessionForProvider.
 func clientSessionAffinity(r *http.Request) clientSession {
 	for _, c := range sessionHeaderCarriers {
 		if v := sanitizedSessionToken(r.Header.Get(c.Header)); v != "" {
@@ -180,6 +242,9 @@ func clientSessionAffinity(r *http.Request) clientSession {
 	}
 	if v := bodySessionFallback(r.Context()); v != "" {
 		return clientSession{ID: v, Source: sessionSourceClaudeMetadata, Scope: scopeConversation}
+	}
+	if v := strictUUID(r.Header.Get(HeaderKiroSession)); v != "" {
+		return clientSession{ID: v, Source: sessionSourceKiroManaged, Scope: scopeConversation}
 	}
 	return clientSession{Source: sessionSourceNone, Scope: scopeUnknown}
 }
@@ -332,47 +397,111 @@ func validHeaderName(name string) bool {
 	return c != "" && c == textproto.CanonicalMIMEHeaderKey(name)
 }
 
-// requestSyntheticSession is the ONE synthetic identity a single logical
-// inference request may use. It is attached at the request boundary
-// (serveInference) and materialized lazily, so a request that never reaches a
-// provider needing one never mints an id at all.
+// requestGeneratedSession is the ONE generated identity a single logical
+// inference request may use, whichever reason asks for it: a managed issuance
+// offered to the client, or a provider's missing-session fallback. It is
+// attached at the request boundary (serveInference) and materialized lazily, so
+// a request that needs neither never mints an id at all.
+//
+// Deliberately NOT two holders. Two would let one request answer the client with
+// one id and the upstream with another — the client would faithfully echo a token
+// the provider never saw, and the next turn's telemetry would report confirmed
+// cross-turn identity for a conversation that never had any. One holder makes
+// that state unrepresentable rather than merely discouraged.
 //
 // The value is generated exactly once per logical request and reused by every
 // attempt beneath it — key rotation, failover to another target, and every
-// local web-search round — because those are all the same client turn. The lock
-// is request-local by construction: the holder lives in one request's context
+// local web-search round — because those are all the same client turn. The locks
+// are request-local by construction: the holder lives in one request's context
 // and is never shared, so there is no cross-request contention and no global
 // state to scale or evict.
-type requestSyntheticSession struct {
-	once sync.Once
-	id   string
+type requestGeneratedSession struct {
+	mintOnce sync.Once
+	id       string
+
+	// managed records whether managed issuance was enabled for this request,
+	// read once at the boundary so a mid-request config change cannot make one
+	// logical request behave two ways.
+	managed bool
+	// resp is the response header map captured at the boundary, before the
+	// handler runs and therefore before any status line or body byte. Nil for
+	// callers with no response to write to, which disables publication only.
+	resp        http.Header
+	publishOnce sync.Once
 }
 
-// value returns this request's synthetic session id, generating it on first use.
-func (s *requestSyntheticSession) value() string {
+// value returns this request's generated session id, minting it on first use.
+func (s *requestGeneratedSession) value() string {
 	if s == nil {
 		return ""
 	}
-	s.once.Do(func() { s.id = uuid.NewString() })
+	s.mintOnce.Do(func() { s.id = uuid.NewString() })
 	return s.id
 }
 
-type requestSyntheticSessionKey struct{}
-
-// withRequestSyntheticSession attaches an unmaterialized synthetic-session
-// holder to a request. Called once per logical inference request; attaching the
-// holder costs nothing until a provider policy actually asks for the value.
-func withRequestSyntheticSession(r *http.Request) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), requestSyntheticSessionKey{}, &requestSyntheticSession{}))
+// publish announces a managed session to the client exactly once per logical
+// request. Idempotent and race-free by the Once: for any one request the
+// published value is determined before the first call — either the token the
+// client echoed or this holder's own minted id, never both, because an echoed
+// token resolves as a client identity and stops resolution before issuance.
+func (s *requestGeneratedSession) publish(id string) {
+	if s == nil || s.resp == nil || id == "" {
+		return
+	}
+	s.publishOnce.Do(func() { s.resp.Set(HeaderKiroSession, id) })
 }
 
-// requestSyntheticSessionID returns this request's synthetic session id,
-// generating it on first use. Empty when no holder was attached, which keeps
-// non-inference paths (and any caller outside serveInference) from silently
-// gaining a per-attempt identity: no holder means no synthetic fallback.
-func requestSyntheticSessionID(ctx context.Context) string {
-	holder, _ := ctx.Value(requestSyntheticSessionKey{}).(*requestSyntheticSession)
-	return holder.value()
+type requestGeneratedSessionKey struct{}
+
+// withRequestGeneratedSession attaches an unmaterialized generated-session
+// holder to a request. Called once per logical inference request, after
+// authentication: attaching costs nothing until some reason asks for the value,
+// and an unauthenticated request never reaches here, so it is never offered a
+// managed session.
+//
+// resp is the response header map to publish a managed session into; pass nil to
+// disable publication. managed is config.GetManagedSessionsEnabled(), sampled
+// here so the whole request sees one answer.
+func withRequestGeneratedSession(r *http.Request, resp http.Header, managed bool) *http.Request {
+	holder := &requestGeneratedSession{managed: managed, resp: resp}
+	return r.WithContext(context.WithValue(r.Context(), requestGeneratedSessionKey{}, holder))
+}
+
+func requestGeneratedSessionHolder(ctx context.Context) *requestGeneratedSession {
+	holder, _ := ctx.Value(requestGeneratedSessionKey{}).(*requestGeneratedSession)
+	return holder
+}
+
+// requestGeneratedSessionID returns this request's generated session id, minting
+// it on first use. Empty when no holder was attached, which keeps non-inference
+// paths (and any caller outside serveInference) from silently gaining a
+// per-attempt identity: no holder means no generated session at all.
+func requestGeneratedSessionID(ctx context.Context) string {
+	return requestGeneratedSessionHolder(ctx).value()
+}
+
+// issuedManagedSessionID mints this request's managed session and offers it to
+// the client, returning "" when managed issuance is off or unavailable. The
+// response header is set here rather than at the boundary because whether a token
+// may be issued at all is only known after the client's own identity has been
+// resolved — the body-metadata carrier is attached inside the handler, so a
+// request that turns out to own a real session must not have been told about a
+// managed one.
+func issuedManagedSessionID(ctx context.Context) string {
+	holder := requestGeneratedSessionHolder(ctx)
+	if holder == nil || !holder.managed {
+		return ""
+	}
+	id := holder.value()
+	holder.publish(id)
+	return id
+}
+
+// republishManagedSession echoes a client's own managed token back on the
+// response, so a client that adopted the protocol keeps being told the token is
+// still current and does not have to remember it from the first turn alone.
+func republishManagedSession(ctx context.Context, id string) {
+	requestGeneratedSessionHolder(ctx).publish(id)
 }
 
 // effectiveSessionForProvider is the SINGLE place the missing-session question
@@ -380,17 +509,32 @@ func requestSyntheticSessionID(ctx context.Context) string {
 // Letting each call site decide is how the two paths drift apart.
 //
 //	real client identity        -> that identity, conversation-scoped
+//	echoed Kiro-Session         -> that token, conversation-scoped, re-offered
+//	none + managed sessions on  -> this request's one UUID, request-scoped, offered
 //	none + passthrough          -> no identity (existing behavior)
-//	none + synthetic_request    -> this request's one synthetic UUID, request-scoped
+//	none + synthetic_request    -> this request's one UUID, request-scoped
+//
+// Managed issuance is ordered ahead of the provider fallback and returns a
+// present identity, so the fallback is unreachable once a managed token exists.
+// That is what guarantees one generated id per logical request: the two reasons
+// cannot both run, and they share one holder even if they could.
 //
 // The synthetic branch requires a usable SessionHeader: that header is the only
 // channel the generated value can travel in, so without it the policy could only
 // produce an identity nothing carries. That combination is refused at admin
-// write time and warned about here rather than silently doing nothing.
+// write time and warned about here rather than silently doing nothing. Managed
+// issuance has no such requirement — its value has a second channel, the response
+// header, so it is still worth minting for a provider that maps no session.
 func effectiveSessionForProvider(r *http.Request, up config.UpstreamProvider) clientSession {
 	sess := clientSessionAffinity(r)
 	if sess.present() {
+		if sess.Source == sessionSourceKiroManaged {
+			republishManagedSession(r.Context(), sess.ID)
+		}
 		return sess
+	}
+	if id := issuedManagedSessionID(r.Context()); id != "" {
+		return clientSession{ID: id, Source: sessionSourceKiroIssued, Scope: scopeRequest}
 	}
 	if up.SessionMissingPolicyResolved() != config.SessionMissingSyntheticRequest {
 		return sess
@@ -400,7 +544,7 @@ func effectiveSessionForProvider(r *http.Request, up config.UpstreamProvider) cl
 		logger.Warnf("[Forward] provider %s requests a synthetic session but its sessionHeader %q cannot carry one; request stays sessionless", up.Name, up.SessionHeader)
 		return sess
 	}
-	id := requestSyntheticSessionID(r.Context())
+	id := requestGeneratedSessionID(r.Context())
 	if id == "" {
 		return sess
 	}
@@ -430,11 +574,18 @@ func effectiveSessionForProvider(r *http.Request, up config.UpstreamProvider) cl
 //     configured name is warned about once and ignored rather than corrupting
 //     the request.
 //
-// A REQUEST-SCOPED synthetic identity skips step 1 and 2 entirely: it travels
-// only through the provider's own configured header. Writing it into a native
-// header would tell that upstream a real client conversation id had arrived,
-// which is the one thing a synthetic value must never claim. An operator who
-// genuinely wants the native spelling configures SessionHeader as that header.
+// A REQUEST-SCOPED generated identity (a managed issuance or a provider
+// fallback) skips step 1 and 2 entirely: it travels only through the provider's
+// own configured header. Writing it into a native header would tell that upstream
+// a real client conversation id had arrived, which is the one thing a generated
+// value must never claim. An operator who genuinely wants the native spelling
+// configures SessionHeader as that header.
+//
+// A managed token the client echoed is conversation-scoped and so does reach step
+// 1, but Kiro-Session is absent from sessionHeaderCarriers, so the loop finds
+// nothing to reconcile and the token itself never leaves the gateway. That
+// omission is the mechanism, not an oversight: the carrier list drives both
+// ingress and egress, and this is the first carrier where those two sets differ.
 //
 // A request with no effective identity gets nothing: no preserve, no inject.
 func applyUpstreamSessionAffinity(dst *http.Request, src *http.Request, up config.UpstreamProvider) clientSession {

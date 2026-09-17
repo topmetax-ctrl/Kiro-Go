@@ -647,8 +647,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// CORS - 完整的头部支持
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch")
-	w.Header().Set("Access-Control-Expose-Headers", "x-request-id, x-ratelimit-limit-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-requests, x-ratelimit-remaining-tokens, x-ratelimit-reset-requests, x-ratelimit-reset-tokens")
+	// kiro-session appears in both lists on purpose: the gateway writes it on the
+	// response (Expose lets a browser read it) and expects it back on the next
+	// request (Allow lets a browser send it). Omitting either half makes the echo
+	// protocol work everywhere except browsers.
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, anthropic-version, anthropic-beta, x-api-key, x-stainless-os, x-stainless-lang, x-stainless-package-version, x-stainless-runtime, x-stainless-runtime-version, x-stainless-arch, kiro-session")
+	w.Header().Set("Access-Control-Expose-Headers", "x-request-id, x-ratelimit-limit-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-requests, x-ratelimit-remaining-tokens, x-ratelimit-reset-requests, x-ratelimit-reset-tokens, kiro-session")
 
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(204)
@@ -5407,6 +5411,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"host":                 config.GetHost(),
 		"allowOverUsage":       config.GetAllowOverUsage(),
 		"maxPayloadBytes":      config.GetMaxPayloadBytes(),
+		"managedSessions":      config.GetManagedSessionsEnabled(),
 		"publicModelCatalog":   config.GetPublicModelCatalogRaw(),
 		"resolvedModelCatalog": config.GetPublicModelCatalog(),
 	})
@@ -6684,6 +6689,9 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		AllowOverUsage     *bool   `json:"allowOverUsage,omitempty"`
 		MaxPayloadBytes    *int    `json:"maxPayloadBytes,omitempty"`
 		PublicModelCatalog *string `json:"publicModelCatalog,omitempty"`
+		// ManagedSessions is a pointer so a page that does not know the field
+		// cannot silently turn the feature off by omitting it.
+		ManagedSessions *bool `json:"managedSessions,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -6721,6 +6729,16 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	if req.PublicModelCatalog != nil {
 		if err := config.UpdatePublicModelCatalog(*req.PublicModelCatalog); err != nil {
 			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// Read per-request at the inference boundary, so the next request already sees
+	// the new value — no restart or pool reload.
+	if req.ManagedSessions != nil {
+		if err := config.UpdateManagedSessionsEnabled(*req.ManagedSessions); err != nil {
+			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}

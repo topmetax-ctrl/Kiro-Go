@@ -510,6 +510,18 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// ManagedSessionsEnabled makes the gateway issue its own conversation token
+	// (the Kiro-Session header) to authenticated inference requests that present
+	// no conversation identity of their own. It is a DOWNSTREAM protocol: the
+	// token only becomes cross-turn identity when the client echoes it back, so
+	// enabling this cannot by itself produce conversation affinity.
+	//
+	// This is deliberately not a per-provider setting. SessionHeader and
+	// SessionMissingPolicy describe how one upstream is spoken to; this describes
+	// what the gateway offers its own callers. Off by default so deploying a new
+	// binary never changes an existing deployment's session behavior.
+	ManagedSessionsEnabled bool `json:"managedSessionsEnabled,omitempty"`
+
 	// MaxPayloadBytes is the upper bound for the serialized Kiro request body.
 	// Requests above this are truncated (oldest history dropped) before dispatch.
 	// 0 means "use DefaultMaxPayloadBytes". Read per-request, so changes apply
@@ -2089,6 +2101,28 @@ func GetAllowOverUsage() bool {
 		return false
 	}
 	return cfg.AllowOverUsage
+}
+
+// GetManagedSessionsEnabled reports whether the gateway may issue its own
+// Kiro-Session conversation token to sessionless callers. False before Load(),
+// so a request served during startup behaves exactly as with the feature off.
+func GetManagedSessionsEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return false
+	}
+	return cfg.ManagedSessionsEnabled
+}
+
+// UpdateManagedSessionsEnabled sets managed session issuance and persists it.
+// Takes effect on the next request: the flag is read once per request at the
+// inference boundary, so no restart or pool reload is needed.
+func UpdateManagedSessionsEnabled(enabled bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ManagedSessionsEnabled = enabled
+	return Save()
 }
 
 // UpdateAllowOverUsage sets the over-usage setting and persists the change.

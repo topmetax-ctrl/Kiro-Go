@@ -2122,6 +2122,7 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
+    if ($('managedSessions')) $('managedSessions').checked = d.managedSessions || false;
     $('maxPayloadBytes').value = String(d.maxPayloadBytes || 2000000);
     if ($('publicModelCatalog')) $('publicModelCatalog').value = d.publicModelCatalog || '';
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadMemoryConfig(), loadWebSearchConfig(), loadApiKeys(), loadUpstreams(), loadSecurityConfig(), loadKiroGoModels()]);
@@ -2335,6 +2336,13 @@
     const maxPayloadBytes = parseInt($('maxPayloadBytes').value, 10);
     await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage, maxPayloadBytes }) });
     toast(t('settings.overUsageSaved'), 'success');
+  }
+  async function saveManagedSessionsConfig() {
+    const managedSessions = $('managedSessions').checked;
+    const res = await api('/settings', { method: 'POST', body: JSON.stringify({ managedSessions }) });
+    const d = await res.json().catch(() => ({}));
+    if (res.ok && d.success !== false) toast(t('settings.managedSessionsSaved'), 'success');
+    else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
   async function changePassword() {
     const np = $('newPassword').value;
@@ -10925,6 +10933,7 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+    $('saveManagedSessionsBtn').addEventListener('click', saveManagedSessionsConfig);
     const saveModelCatalogBtn = $('saveModelCatalogBtn');
     if (saveModelCatalogBtn) saveModelCatalogBtn.addEventListener('click', saveModelCatalogConfig);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);

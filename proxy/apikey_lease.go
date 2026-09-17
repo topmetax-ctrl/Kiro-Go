@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"kiro-go/apikey"
+	"kiro-go/config"
 	"kiro-go/logger"
 	"net/http"
 	"sync"
@@ -46,11 +47,18 @@ func (h *Handler) serveInference(
 		return
 	}
 	// This is the logical request boundary, shared by all three inference
-	// endpoints, so it is where the one synthetic session identity a request may
-	// fall back on is attached. Attaching is free: the value is generated only if
-	// some provider's missing-session policy actually asks for it, and then
-	// exactly once for every attempt, failover and tool round beneath this call.
-	ar = withRequestSyntheticSession(ar)
+	// endpoints, so it is where the one generated session identity a request may
+	// use is attached. Attaching is free: the value is minted only if managed
+	// issuance or some provider's missing-session policy actually asks for it, and
+	// then exactly once for every attempt, failover and tool round beneath this
+	// call.
+	//
+	// w.Header() is captured here so a managed session can be published before the
+	// handler runs — leaseResponseWriter does not override Header(), so this is the
+	// same map every writer beneath sees, and no status line or body byte has been
+	// written yet. Being after authenticate() is also the auth boundary: a request
+	// that failed authentication returned above and is never offered a token.
+	ar = withRequestGeneratedSession(ar, w.Header(), config.GetManagedSessionsEnabled())
 	ar = h.bindAPIKeyLease(ar, endpoint)
 	w = wrapLeaseWriter(w, ar.Context())
 	defer h.settleAPIKeyLease(ar.Context())

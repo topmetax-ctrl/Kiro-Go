@@ -74,7 +74,7 @@ func forwardWithHolder(t *testing.T, clientModel, subPath string, stream bool, h
 		r.Header.Set(k, v)
 	}
 	r = r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, ""))
-	r = withRequestSyntheticSession(r)
+	r = withRequestGeneratedSession(r, nil, false)
 	h := &Handler{}
 	if !h.tryForwardUpstream(r, rec, []byte(body), clientModel, stream, subPath, subPath == "/messages", "") {
 		t.Fatal("expected route to match and forward")
@@ -218,7 +218,7 @@ func TestForwardGenericCarrierBeatsBodyMetadata(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
 	r.Header.Set(HeaderSessionAffinity, "from-header")
 	r = r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, ""))
-	r = withRequestSyntheticSession(r)
+	r = withRequestGeneratedSession(r, nil, false)
 	h := &Handler{}
 	h.handleClaudeMessagesInternal(rec, r)
 	if rec.Code != 200 {
@@ -581,7 +581,7 @@ func TestSyntheticSessionDistinctPerConcurrentRequest(t *testing.T) {
 			body := `{"model":"m","messages":[]}`
 			r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
 			r = r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, ""))
-			r = withRequestSyntheticSession(r)
+			r = withRequestGeneratedSession(r, nil, false)
 			h := &Handler{}
 			h.tryForwardUpstream(r, rec, []byte(body), "m", false, "/messages", true, "")
 		}()
@@ -606,22 +606,22 @@ func TestSyntheticSessionDistinctPerConcurrentRequest(t *testing.T) {
 // The holder generates its value once and only once, however many consumers ask.
 func TestRequestSyntheticSessionIsStableAndLazy(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-	if got := requestSyntheticSessionID(r.Context()); got != "" {
+	if got := requestGeneratedSessionID(r.Context()); got != "" {
 		t.Errorf("no holder attached should yield %q, got %q", "", got)
 	}
-	r = withRequestSyntheticSession(r)
-	first := requestSyntheticSessionID(r.Context())
+	r = withRequestGeneratedSession(r, nil, false)
+	first := requestGeneratedSessionID(r.Context())
 	if !canonicalUUID(first) {
 		t.Fatalf("synthetic id = %q, want a canonical UUID", first)
 	}
 	for i := 0; i < 5; i++ {
-		if got := requestSyntheticSessionID(r.Context()); got != first {
+		if got := requestGeneratedSessionID(r.Context()); got != first {
 			t.Fatalf("call %d returned %q, want the stable %q", i, got, first)
 		}
 	}
 	// A second request gets its own identity.
-	other := withRequestSyntheticSession(httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
-	if second := requestSyntheticSessionID(other.Context()); second == first {
+	other := withRequestGeneratedSession(httptest.NewRequest(http.MethodPost, "/v1/messages", nil), nil, false)
+	if second := requestGeneratedSessionID(other.Context()); second == first {
 		t.Error("two requests share one synthetic identity; each must get its own")
 	}
 }
@@ -635,7 +635,7 @@ func TestServeInferenceAttachesSyntheticHolder(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	h.serveInference(rec, r, "claude",
 		func(w http.ResponseWriter, r *http.Request) *http.Request { return r },
-		func(w http.ResponseWriter, r *http.Request) { got = requestSyntheticSessionID(r.Context()) },
+		func(w http.ResponseWriter, r *http.Request) { got = requestGeneratedSessionID(r.Context()) },
 	)
 	if !canonicalUUID(got) {
 		t.Errorf("serveInference handler saw synthetic id %q, want a canonical UUID", got)
@@ -755,7 +755,7 @@ func TestForwardLocalWebSearchSyntheticSessionStableAcrossRounds(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
 	r = r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, ""))
-	r = withRequestSyntheticSession(r)
+	r = withRequestGeneratedSession(r, nil, false)
 
 	h := &Handler{}
 	h.handleClaudeMessagesInternal(rec, r)
@@ -806,8 +806,8 @@ func TestProbeAndRequestSyntheticIdentitiesAreDistinct(t *testing.T) {
 	if canonicalUUID(probe) {
 		t.Error("probe id must not be a bare UUID: probe traffic stays recognizable upstream")
 	}
-	r := withRequestSyntheticSession(httptest.NewRequest(http.MethodPost, "/v1/messages", nil))
-	reqID := requestSyntheticSessionID(r.Context())
+	r := withRequestGeneratedSession(httptest.NewRequest(http.MethodPost, "/v1/messages", nil), nil, false)
+	reqID := requestGeneratedSessionID(r.Context())
 	if strings.HasPrefix(reqID, ProbeSessionPrefix) {
 		t.Errorf("request synthetic id %q carries the probe prefix; policies must not cross over", reqID)
 	}
@@ -917,7 +917,7 @@ func TestSameSessionFromDifferentAPIKeysIsNotNamespaced(t *testing.T) {
 		r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
 		r.Header.Set(HeaderClaudeCodeSession, "shared-session")
 		r = r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, key))
-		r = withRequestSyntheticSession(r)
+		r = withRequestGeneratedSession(r, nil, false)
 		h := &Handler{}
 		if !h.tryForwardUpstream(r, rec, []byte(body), "m", false, "/messages", true, "") {
 			t.Fatal("expected forward")
