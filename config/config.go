@@ -2493,12 +2493,93 @@ func (p UpstreamProvider) SessionMissingPolicyResolved() SessionMissingPolicy {
 	return ParseSessionMissingPolicy(p.SessionMissingPolicy)
 }
 
+// isTokenByte reports whether b may appear in an HTTP header field-name:
+// the RFC 7230 tchar set — ALPHA / DIGIT / "!#$%&'*+-.^_`|~".
+func isTokenByte(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		return true
+	}
+	switch b {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	}
+	return false
+}
+
+// ValidSessionHeaderName reports whether name is a well-formed HTTP header
+// field-name (every byte a tchar, nothing else). This is a real token check —
+// deliberately NOT textproto.CanonicalMIMEHeaderKey, which returns an invalid
+// name unchanged, making it a validator that accepts spaces, colons and CRLF.
+func ValidSessionHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if !isTokenByte(name[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// reservedOutboundHeaders names the upstream request headers this gateway
+// owns. Transport-owned fields must never be overwritten from provider
+// config, and Authorization / X-Api-Key are the upstream credentials the
+// gateway itself writes from the connection — a session identity colliding
+// with one would replace real credentials with a conversation token.
+// Deliberately small: only headers something in this repo actually writes.
+var reservedOutboundHeaders = []string{
+	// Upstream credentials, set from the connection config.
+	"Authorization",
+	"X-Api-Key",
+	"Proxy-Authorization",
+	// Transport-owned, managed by net/http and the gateway's request build.
+	"Host",
+	"Content-Length",
+	"Content-Type",
+	"Transfer-Encoding",
+	"Connection",
+	"Upgrade",
+	"TE",
+	"Trailer",
+	// Set by the gateway itself on every forwarded request.
+	"Accept",
+	"Anthropic-Version",
+	// The gateway's own managed token, ingress-only by design: it belongs to
+	// the client conversation, never to the upstream wire.
+	"Kiro-Session",
+}
+
+// SessionHeaderReserved reports whether name collides with a header the
+// gateway owns on upstream requests (case-insensitive, per RFC 9110 §5.1).
+func SessionHeaderReserved(name string) bool {
+	for _, r := range reservedOutboundHeaders {
+		if strings.EqualFold(name, r) {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidateSessionPolicy reports why this provider's session configuration
-// cannot be honored, or nil when it is coherent. Generating an identity the
-// provider has no header to carry it in would be a silent no-op, so the admin
-// write path refuses that combination instead of storing a policy that does
-// nothing.
+// cannot be honored, or nil when it is coherent. A sessionHeader that no
+// upstream request could carry — malformed, or colliding with a header this
+// gateway writes itself — is refused here so the admin write path fails fast;
+// the relay additionally treats such a name as absent (defense in depth for a
+// hand-edited config loaded past this check). Generating an identity the
+// provider has no header to carry it in would be a silent no-op, so the
+// synthetic-policy combination is refused instead of storing a policy that
+// does nothing.
 func (p UpstreamProvider) ValidateSessionPolicy() error {
+	if h := strings.TrimSpace(p.SessionHeader); h != "" {
+		if !ValidSessionHeaderName(h) {
+			return fmt.Errorf("provider %q: sessionHeader %q is not a valid HTTP header name", p.Name, h)
+		}
+		if SessionHeaderReserved(h) {
+			return fmt.Errorf("provider %q: sessionHeader %q is reserved (gateway-owned) and cannot carry a session", p.Name, h)
+		}
+	}
 	if p.SessionMissingPolicyResolved() != SessionMissingSyntheticRequest {
 		return nil
 	}

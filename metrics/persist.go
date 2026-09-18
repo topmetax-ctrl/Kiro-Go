@@ -6,17 +6,33 @@ import (
 	"time"
 )
 
+// cacheStatsVersion is the semantics version of the persisted cache-ratio
+// accumulators. v2 folds only COMPLETE observations into the hit-ratio
+// population: a reported cache-read figure (explicit zero included) AND a
+// known, positive input total. v1 files folded partial observations — a read
+// with an unknown input total inflated the ratio, a write-only event diluted
+// it — and raw events are memory-only, so v1 sums cannot be recomputed from
+// history. Load therefore resets exactly the three affected accumulators of a
+// file from any other version and keeps every other counter (see
+// resetStaleCacheRatioSums). Cache-creation totals fold identically in both
+// versions and are kept.
+const cacheStatsVersion = 2
+
 // persistedState is the subset of metrics written to disk: the aggregate
 // counters that should survive a restart, plus the per-provider hourly rollups
 // that back the long-term trend charts. The event ring buffer and the
 // per-minute time series are intentionally in-memory only — they are realtime
 // views that start fresh each run, keeping the on-disk file small.
 type persistedState struct {
-	Overall    persistedCounter             `json:"overall"`
-	ByProvider map[string]persistedProvider `json:"byProvider"`
-	ByRoute    map[string]persistedRoute    `json:"byRoute"`
-	ByIP       map[string]persistedIP       `json:"byIp,omitempty"`
-	ToolStats  map[string]persistedToolAgg  `json:"toolStats,omitempty"`
+	// CacheStatsVersion identifies the semantics of the persisted cache-ratio
+	// sums; files written before the field existed are v1 (zero) and get
+	// their ratio accumulators reset on load.
+	CacheStatsVersion int                          `json:"cacheStatsVersion"`
+	Overall           persistedCounter             `json:"overall"`
+	ByProvider        map[string]persistedProvider `json:"byProvider"`
+	ByRoute           map[string]persistedRoute    `json:"byRoute"`
+	ByIP              map[string]persistedIP       `json:"byIp,omitempty"`
+	ToolStats         map[string]persistedToolAgg  `json:"toolStats,omitempty"`
 }
 
 // persistedIP is one source IP's saved state: the lifetime counters plus the
@@ -46,7 +62,9 @@ type persistedCounter struct {
 	ModelRounds int64 `json:"modelRounds,omitempty"`
 	// Cache telemetry sums, additive the same way: a pre-cache file loads with
 	// zero observable requests, which the cache-hit rate reads as "unknown"
-	// rather than a misleading 0%.
+	// rather than a misleading 0%. The ratio triple (read/observed-input/
+	// observed-requests) is semantics-versioned via cacheStatsVersion: a file
+	// from any other version has exactly those three fields reset on load.
 	CacheReadInputTokens     int64 `json:"cacheReadInputTokens,omitempty"`
 	CacheCreationInputTokens int64 `json:"cacheCreationInputTokens,omitempty"`
 	CacheObservedInputTokens int64 `json:"cacheObservedInputTokens,omitempty"`
@@ -181,6 +199,51 @@ func fromPersistedCounter(p persistedCounter) counter {
 	return c
 }
 
+// resetStaleCacheRatioSums zeroes the cache-hit-ratio accumulators of a stats
+// file written under different cache-telemetry semantics. The reset is
+// deliberately narrow — only the three fields that define the ratio population
+// move, because a numerator and denominator computed under different rules must
+// never be displayed as one accurate percentage. Requests, outcomes, latency,
+// TTFB, token totals, cost, cache-creation totals (folded identically in every
+// version), hourly rollups and every non-cache dimension are kept. Tool stats
+// are an unrelated metric (tool-invocation cache hits) and are not touched.
+func resetStaleCacheRatioSums(st *persistedState) {
+	zeroCounter := func(c *persistedCounter) {
+		c.CacheReadInputTokens = 0
+		c.CacheObservedInputTokens = 0
+		c.CacheObservedRequests = 0
+	}
+	zeroBucket := func(b *persistedBucket) {
+		b.CacheReadInputTokens = 0
+		b.CacheObservedInputTokens = 0
+		b.CacheObservedRequests = 0
+	}
+	zeroCounter(&st.Overall)
+	for id, p := range st.ByProvider {
+		zeroCounter(&p.persistedCounter)
+		for m, c := range p.ByModel {
+			zeroCounter(&c)
+			p.ByModel[m] = c
+		}
+		for aid, a := range p.ByAccount {
+			zeroCounter(&a.persistedCounter)
+			p.ByAccount[aid] = a
+		}
+		for i := range p.Hours {
+			zeroBucket(&p.Hours[i])
+		}
+		st.ByProvider[id] = p
+	}
+	for id, r := range st.ByRoute {
+		zeroCounter(&r.persistedCounter)
+		st.ByRoute[id] = r
+	}
+	for ip, c := range st.ByIP {
+		zeroCounter(&c.persistedCounter)
+		st.ByIP[ip] = c
+	}
+}
+
 // statusKey/parseStatusKey convert the int status map to string keys, because
 // JSON object keys must be strings.
 func statusKey(code int) string {
@@ -218,10 +281,11 @@ func Save(path string) error {
 	s.mu.Lock()
 	cutoffHour := time.Now().UnixMilli()/3600000 - hourWindowHours
 	st := persistedState{
-		Overall:    toPersistedCounter(s.overall),
-		ByProvider: make(map[string]persistedProvider, len(s.byProvider)),
-		ByRoute:    make(map[string]persistedRoute, len(s.byRoute)),
-		ByIP:       make(map[string]persistedIP, len(s.byIP)),
+		CacheStatsVersion: cacheStatsVersion,
+		Overall:           toPersistedCounter(s.overall),
+		ByProvider:        make(map[string]persistedProvider, len(s.byProvider)),
+		ByRoute:           make(map[string]persistedRoute, len(s.byRoute)),
+		ByIP:              make(map[string]persistedIP, len(s.byIP)),
 	}
 	for ip, c := range s.byIP {
 		pi := persistedIP{persistedCounter: toPersistedCounter(c.counter)}
@@ -378,6 +442,14 @@ func Load(path string) error {
 	var st persistedState
 	if err := json.Unmarshal(data, &st); err != nil {
 		return err
+	}
+	if st.CacheStatsVersion != cacheStatsVersion {
+		// A file from any other cache-telemetry semantics (v1 files carry no
+		// version field): its ratio sums folded a different population and
+		// cannot be recomputed, so they must not be mixed with v2 sums and
+		// presented as one accurate ratio. Reset exactly the affected
+		// accumulators; every other counter survives untouched.
+		resetStaleCacheRatioSums(&st)
 	}
 
 	cutoffHour := time.Now().UnixMilli()/3600000 - hourWindowHours

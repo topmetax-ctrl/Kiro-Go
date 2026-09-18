@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1107,5 +1108,154 @@ func TestProviderDetailRangeScopesAndEchoesWindow(t *testing.T) {
 	}
 	if total != 2 {
 		t.Fatalf("detail models total = %d, want 2 (breakdown stays all-time)", total)
+	}
+}
+
+// Partial cache telemetry must not distort the hit ratio in either direction:
+// a read with an unknown input total joins neither numerator nor denominator
+// (no phantom inflation), and a write-only event stays out of the read-ratio
+// population entirely (no dilution toward 0%).
+func TestCacheAggregationPartialTelemetryExcluded(t *testing.T) {
+	reset(t)
+	// F4: read=500 reported, input total NOT reported. Under a population that
+	// counts any cache field, this would inflate 0/1000 = 0% into 500/1000.
+	e := ev("p1", true, 200, 100)
+	e.Usage = &EventUsage{
+		CacheReadInputTokens: ptrOf(500),
+		Source:               UsageSourceUpstream,
+	}
+	Record(e)
+	// F5: cache write reported, cache read absent — an unknown read is not a
+	// zero read; the event cannot join the read-ratio population.
+	Record(usageEvent(1000, 10, nil, ptrOf(200)))
+
+	o := Overall()
+	if o.CacheObservedRequests != 0 {
+		t.Fatalf("observed = %d, want 0 (no complete observation)", o.CacheObservedRequests)
+	}
+	if o.CacheReadInputTokens != 0 {
+		t.Fatalf("reads = %d, want 0 (unknown-input read excluded)", o.CacheReadInputTokens)
+	}
+	if o.CacheCreationInputTokens != 200 {
+		t.Fatalf("creations = %d, want 200 (raw total still folds)", o.CacheCreationInputTokens)
+	}
+	if o.CacheHitRate != -1 {
+		t.Fatalf("hit rate = %v, want -1 (unknown, never a fake 0%%)", o.CacheHitRate)
+	}
+
+	// A complete observation still folds normally.
+	Record(usageEvent(1000, 10, ptrOf(400), nil))
+	o = Overall()
+	if o.CacheObservedRequests != 1 || o.CacheReadInputTokens != 400 {
+		t.Fatalf("after complete event: observed=%d reads=%d, want 1/400", o.CacheObservedRequests, o.CacheReadInputTokens)
+	}
+	if want := 400.0 * 100 / 1000.0; o.CacheHitRate < want-0.001 || o.CacheHitRate > want+0.001 {
+		t.Fatalf("hit rate = %v, want ~%v", o.CacheHitRate, want)
+	}
+}
+
+func TestLoadUnrecognizedCacheStatsVersionResetsRatioSums(t *testing.T) {
+	reset(t)
+	// A v1 file: its ratio sums folded partial observations (a read with an
+	// unknown input total joined the numerator; a write-only event diluted the
+	// denominator), and raw events are memory-only, so the sums cannot be
+	// recomputed. Load must reset exactly the ratio accumulators — v1 and v2
+	// fold cache-creation totals identically, so creation stays — while every
+	// other counter survives the cutover.
+	hour := nowMs()/3600000 - 1
+	v1 := fmt.Sprintf(`{"overall":{"requests":10,"success":9,"failed":1,"totalLatencyMs":10000,
+		"lastUsed":123,"inputTokens":5000,"outputTokens":900,"costUsd":1.5,
+		"cacheReadInputTokens":800,"cacheCreationInputTokens":40,"cacheObservedInputTokens":1000,"cacheObservedRequests":3},
+	"byProvider":{"p1":{"requests":10,"success":9,"failed":1,"totalLatencyMs":10000,"lastUsed":123,"name":"P1",
+		"cacheReadInputTokens":800,"cacheCreationInputTokens":40,"cacheObservedInputTokens":1000,"cacheObservedRequests":3,
+		"byModel":{"m1":{"requests":4,"lastUsed":123,"cacheReadInputTokens":300,"cacheObservedInputTokens":400,"cacheObservedRequests":1}},
+		"byAccount":{"a1":{"requests":2,"lastUsed":123,"label":"acc","cacheReadInputTokens":100,"cacheObservedInputTokens":200,"cacheObservedRequests":1}},
+		"hours":[{"h":%d,"r":3,"s":3,"cr":250,"cc":15,"ci":300,"cq":1}]}},
+	"byRoute":{"rt":{"requests":1,"lastUsed":123,"clientModel":"cm","targetModel":"tm","providerId":"p1",
+		"cacheReadInputTokens":50,"cacheObservedInputTokens":60,"cacheObservedRequests":1}},
+	"byIp":{"10.0.0.1":{"requests":1,"lastUsed":123,"cacheReadInputTokens":10,"cacheObservedInputTokens":10,"cacheObservedRequests":1}}}`, hour)
+	path := filepath.Join(t.TempDir(), "v1.json")
+	if err := os.WriteFile(path, []byte(v1), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Load(path); err != nil {
+		t.Fatalf("load v1: %v", err)
+	}
+
+	o := Overall()
+	if o.Requests != 10 || o.Success != 9 || o.InputTokens != 5000 || o.OutputTokens != 900 || o.CostUSD != 1.5 {
+		t.Fatalf("non-cache counters must survive the cutover: %+v", o)
+	}
+	if o.CacheCreationInputTokens != 40 {
+		t.Fatalf("cache-creation totals fold identically in v1/v2 and must be kept, got %d", o.CacheCreationInputTokens)
+	}
+	if o.CacheReadInputTokens != 0 || o.CacheObservedRequests != 0 || o.CacheHitRate != -1 {
+		t.Fatalf("stale ratio sums must reset to unknown, got read=%d obs=%d rate=%v",
+			o.CacheReadInputTokens, o.CacheObservedRequests, o.CacheHitRate)
+	}
+
+	ps := ProviderStats()
+	if len(ps) != 1 || ps[0].Requests != 10 || ps[0].CacheReadInputTokens != 0 || ps[0].CacheHitRate != -1 {
+		t.Fatalf("provider ratio not reset: %+v", ps)
+	}
+	p := s.byProvider["p1"]
+	if p.byModel["m1"].cacheReadInputTokens != 0 || p.byModel["m1"].cacheObservedRequests != 0 || p.byModel["m1"].requests != 4 {
+		t.Fatalf("byModel ratio not reset: %+v", p.byModel["m1"])
+	}
+	if a := p.byAccount["a1"]; a.counter.cacheReadInputTokens != 0 || a.counter.cacheObservedRequests != 0 || a.counter.requests != 2 {
+		t.Fatalf("byAccount ratio not reset: %+v", a.counter)
+	}
+	if r := s.byRoute["rt"]; r.counter.cacheReadInputTokens != 0 || r.counter.cacheObservedRequests != 0 || r.counter.requests != 1 {
+		t.Fatalf("byRoute ratio not reset: %+v", r.counter)
+	}
+	if ip := s.byIP["10.0.0.1"]; ip.counter.cacheReadInputTokens != 0 || ip.counter.cacheObservedRequests != 0 || ip.counter.requests != 1 {
+		t.Fatalf("byIP ratio not reset: %+v", ip.counter)
+	}
+	if len(p.hours) != 1 {
+		t.Fatalf("hour rollup missing after load: %d buckets", len(p.hours))
+	}
+	for _, b := range p.hours {
+		if b.CacheReadInputTokens != 0 || b.CacheObservedInputTokens != 0 || b.CacheObservedRequests != 0 {
+			t.Fatalf("hour bucket ratio not reset: %+v", b)
+		}
+		if b.CacheCreationInputTokens != 15 {
+			t.Fatalf("bucket cache-creation total must be kept, got %d", b.CacheCreationInputTokens)
+		}
+	}
+	w := ProviderStatsWindow(24)
+	if len(w) != 1 || w[0].CacheHitRate != -1 {
+		t.Fatalf("windowed cache must read unknown after cutover: %+v", w)
+	}
+}
+
+func TestSaveWritesCurrentCacheStatsVersionAndRoundTrips(t *testing.T) {
+	reset(t)
+	Record(usageEvent(1000, 10, ptrOf(800), ptrOf(40)))
+	path := filepath.Join(t.TempDir(), "cur.json")
+	if err := Save(path); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk map[string]any
+	if err := json.Unmarshal(data, &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := onDisk["cacheStatsVersion"].(float64); !ok || int(v) != cacheStatsVersion {
+		t.Fatalf("cacheStatsVersion missing or wrong on disk: %v", onDisk["cacheStatsVersion"])
+	}
+
+	s = newStore()
+	if err := Load(path); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	o := Overall()
+	if o.CacheReadInputTokens != 800 || o.CacheCreationInputTokens != 40 || o.CacheObservedRequests != 1 {
+		t.Fatalf("current-version cache sums must survive a restart: %+v", o)
+	}
+	if o.CacheHitRate < 79.99 || o.CacheHitRate > 80.01 {
+		t.Fatalf("reloaded hit rate = %v, want 80", o.CacheHitRate)
 	}
 }

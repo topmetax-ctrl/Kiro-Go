@@ -66,7 +66,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/textproto"
 	"strings"
 	"sync"
 
@@ -334,15 +333,39 @@ func sessionIDFromJSONUserID(raw string) string {
 	return sanitizedSessionToken(envelope.SessionID)
 }
 
-// sessionIDFromNativeUserID reads the trailing _session_<uuid> of Claude
-// Code's native user_id envelope; any other trailing shape yields "".
+// sessionIDFromNativeUserID reads the session id out of Claude Code's native
+// user_id envelope, "user_<hex>_account_<uuid>_session_<uuid>". The whole
+// shape is required — both UUIDs strict, the user_ prefix present — because a
+// bare trailing "_session_<uuid>" anchor would also extract identities from
+// unrelated strings that merely end that way ("<other>_session_<uuid>"), which
+// the envelope never produces. Any other shape yields "": a sessionless
+// request stays sessionless rather than gaining an invented identity.
+// Aggregators that resolve sessions themselves write the JSON envelope, which
+// sessionIDFromJSONUserID handles separately.
 func sessionIDFromNativeUserID(raw string) string {
-	const marker = "_session_"
-	i := strings.LastIndex(raw, marker)
+	const sessionMarker = "_session_"
+	i := strings.LastIndex(raw, sessionMarker)
 	if i < 0 {
 		return ""
 	}
-	return strictUUID(raw[i+len(marker):])
+	sid := strictUUID(raw[i+len(sessionMarker):])
+	if sid == "" {
+		return ""
+	}
+	const accountMarker = "_account_"
+	j := strings.LastIndex(raw[:i], accountMarker)
+	if j <= len("user_") {
+		// No account segment, or none after the required "user_" prefix
+		// (which would leave an empty middle).
+		return ""
+	}
+	if !strings.HasPrefix(raw, "user_") {
+		return ""
+	}
+	if strictUUID(raw[j+len(accountMarker):i]) == "" {
+		return ""
+	}
+	return sid
 }
 
 // sanitizedSessionToken accepts a bounded, whitespace-free session token and
@@ -389,12 +412,13 @@ func isHexDigit(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
-// validHeaderName reports whether name is a well-formed MIME header key after
-// canonicalization, so a mistyped provider sessionHeader cannot produce a
-// malformed upstream request.
+// validHeaderName reports whether name is a well-formed HTTP header
+// field-name. Delegates to the config package's real token check — NOT
+// textproto.CanonicalMIMEHeaderKey, which returns an invalid name unchanged
+// (space, colon, CR/LF, tab) and would therefore accept exactly the names a
+// validator must reject.
 func validHeaderName(name string) bool {
-	c := textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(name))
-	return c != "" && c == textproto.CanonicalMIMEHeaderKey(name)
+	return config.ValidSessionHeaderName(name)
 }
 
 // requestGeneratedSession is the ONE generated identity a single logical
@@ -540,7 +564,7 @@ func effectiveSessionForProvider(r *http.Request, up config.UpstreamProvider) cl
 		return sess
 	}
 	name := strings.TrimSpace(up.SessionHeader)
-	if name == "" || !validHeaderName(name) {
+	if name == "" || !usableSessionHeaderName(name) {
 		logger.Warnf("[Forward] provider %s requests a synthetic session but its sessionHeader %q cannot carry one; request stays sessionless", up.Name, up.SessionHeader)
 		return sess
 	}
@@ -634,17 +658,26 @@ func applyClientSessionAffinity(dst *http.Request, sess clientSession, up config
 	applyProviderSessionMapping(dst, sess, up)
 }
 
+// usableSessionHeaderName reports whether a configured sessionHeader may carry
+// a session identity upstream: well-formed, and not one of the headers this
+// gateway writes itself (credentials, transport, its own token). A reserved
+// name would otherwise let a session id overwrite the upstream Authorization
+// or corrupt the transport framing — treated exactly like a malformed name.
+func usableSessionHeaderName(name string) bool {
+	return validHeaderName(name) && !config.SessionHeaderReserved(name)
+}
+
 // applyProviderSessionMapping writes the provider-configured session header,
 // if any, with the canonical value — the EXACT effective id for this request,
-// never one regenerated per attempt. An invalid configured name is warned about
-// and skipped rather than corrupting the upstream request.
+// never one regenerated per attempt. An invalid or reserved configured name is
+// warned about and skipped rather than corrupting the upstream request.
 func applyProviderSessionMapping(dst *http.Request, sess clientSession, up config.UpstreamProvider) {
 	name := strings.TrimSpace(up.SessionHeader)
 	if name == "" || !sess.present() {
 		return
 	}
-	if !validHeaderName(name) {
-		logger.Warnf("[Forward] provider %s has an invalid sessionHeader %q; session mapping skipped", up.Name, up.SessionHeader)
+	if !usableSessionHeaderName(name) {
+		logger.Warnf("[Forward] provider %s has an invalid or reserved sessionHeader %q; session mapping skipped", up.Name, up.SessionHeader)
 		return
 	}
 	dst.Header.Set(name, sess.ID)
@@ -657,7 +690,7 @@ func applyProviderSessionMapping(dst *http.Request, sess clientSession, up confi
 // writes nothing).
 func sessionMappedUpstream(sess clientSession, up config.UpstreamProvider) bool {
 	name := strings.TrimSpace(up.SessionHeader)
-	return sess.present() && name != "" && validHeaderName(name)
+	return sess.present() && name != "" && usableSessionHeaderName(name)
 }
 
 // logSessionAffinity records the session-affinity metadata for one upstream
@@ -711,7 +744,7 @@ func applyProbeSessionAffinityInto(dst map[string]string, probeID string, up con
 		return
 	}
 	dst[HeaderClaudeCodeSession] = probeID
-	if name := strings.TrimSpace(up.SessionHeader); name != "" && validHeaderName(name) {
+	if name := strings.TrimSpace(up.SessionHeader); name != "" && usableSessionHeaderName(name) {
 		dst[name] = probeID
 	}
 }

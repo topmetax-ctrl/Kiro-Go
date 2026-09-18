@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -240,5 +241,91 @@ func TestAccountAllowOverageMigration(t *testing.T) {
 		if _, ok := a["allowOverage"]; ok {
 			t.Fatalf("expected allowOverage to be omitted from persisted file, got %+v", a)
 		}
+	}
+}
+
+// A configured sessionHeader becomes an upstream request header, so its name
+// must be a real RFC token and must not collide with a header this gateway
+// writes itself. textproto.CanonicalMIMEHeaderKey is NOT a validator — it
+// returns invalid names unchanged — so these cases pin the real semantics.
+func TestValidSessionHeaderName(t *testing.T) {
+	valid := []string{
+		"X-Opencode-Session",
+		"x-session-affinity", // lowercase is a valid token; net/http canonicalizes on write
+		"Kiro-Session",
+		"X-Session_Affinity.v2",
+	}
+	invalid := []string{
+		"",
+		"Bad Header",
+		"Bad:Header",
+		"Bad\r\nHeader",
+		"Bad\nHeader",
+		"Bad\tHeader",
+		"Bad/Header",
+		"Bad(1)",
+		"kéy",
+	}
+	for _, name := range valid {
+		if !ValidSessionHeaderName(name) {
+			t.Errorf("ValidSessionHeaderName(%q) = false, want true", name)
+		}
+	}
+	for _, name := range invalid {
+		if ValidSessionHeaderName(name) {
+			t.Errorf("ValidSessionHeaderName(%q) = true, want false", name)
+		}
+	}
+}
+
+func TestSessionHeaderReserved(t *testing.T) {
+	reserved := []string{
+		"Authorization",
+		"authorization", // case-insensitive per RFC 9110 field-name semantics
+		"AUTHORIZATION",
+		"X-API-KEY",
+		"Proxy-Authorization",
+		"Host",
+		"Content-Length",
+		"Transfer-Encoding",
+		"Kiro-Session",
+	}
+	free := []string{
+		"X-Opencode-Session",
+		"X-Claude-Code-Session-Id",
+		"X-My-Session",
+	}
+	for _, name := range reserved {
+		if !SessionHeaderReserved(name) {
+			t.Errorf("SessionHeaderReserved(%q) = false, want true", name)
+		}
+	}
+	for _, name := range free {
+		if SessionHeaderReserved(name) {
+			t.Errorf("SessionHeaderReserved(%q) = true, want false", name)
+		}
+	}
+}
+
+func TestValidateSessionPolicyHeaderChecks(t *testing.T) {
+	ok := UpstreamProvider{Name: "p", SessionHeader: "X-Opencode-Session", SessionMissingPolicy: SessionMissingPolicyRaw + ":synthetic_request"}
+	if err := ok.ValidateSessionPolicy(); err != nil {
+		t.Fatalf("valid header rejected: %v", err)
+	}
+	reserved := UpstreamProvider{Name: "p", SessionHeader: "Authorization"}
+	err := reserved.ValidateSessionPolicy()
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("reserved header: err = %v, want reserved rejection", err)
+	}
+	malformed := UpstreamProvider{Name: "p", SessionHeader: "Bad Header"}
+	err = malformed.ValidateSessionPolicy()
+	if err == nil || !strings.Contains(err.Error(), "not a valid") {
+		t.Fatalf("malformed header: err = %v, want invalid rejection", err)
+	}
+	// A malformed name is refused even without the synthetic policy — the
+	// header is unusable in any policy.
+	err = UpstreamProvider{Name: "p", SessionHeader: "Bad\r\nHeader"}.ValidateSessionPolicy()
+	if err == nil {
+		t.Fatal("malformed header without synthetic policy must still be rejected")
 	}
 }

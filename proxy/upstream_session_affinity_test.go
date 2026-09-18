@@ -865,3 +865,92 @@ func TestForwardBodyMetadataRequestScoped(t *testing.T) {
 		t.Errorf("upstream saw sessions %v, want exactly %v", got, want)
 	}
 }
+
+// The native envelope parser requires the FULL documented shape — a bare
+// trailing _session_<uuid> anchor would also extract from unrelated strings
+// that merely end that way.
+func TestNativeUserIDRejectsLookalikeSuffixes(t *testing.T) {
+	const valid = "11111111-2222-4333-8444-555555555555"
+	const account = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"full native envelope still parses",
+			"user_" + strings.Repeat("b", 64) + "_account_" + account + "_session_" + valid, valid},
+		{"lookalike suffix without envelope", "unrelated_customer_session_" + valid, ""},
+		{"session marker without account", "user_" + strings.Repeat("b", 64) + "_session_" + valid, ""},
+		{"account shape without user prefix", "x_account_" + account + "_session_" + valid, ""},
+		{"account segment not a uuid", "user_abc_account_notauuid_session_" + valid, ""},
+	}
+	for _, tc := range cases {
+		if got := metadataSessionID(tc.raw); got != tc.want {
+			t.Errorf("%s: metadataSessionID = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A sessionHeader colliding with a gateway-owned outbound header must never be
+// written: Authorization carries the upstream credential, and the mapping runs
+// after credentials are set on the request.
+func TestProviderSessionMappingSkipsUnusableHeaders(t *testing.T) {
+	sess := clientSession{ID: "sess-1", Source: sessionSourceClaudeCode, Scope: scopeConversation}
+	newReq := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+		r.Header.Set("Authorization", "Bearer real-upstream-credential")
+		return r
+	}
+
+	mapped := config.UpstreamProvider{Name: "p", SessionHeader: "X-Opencode-Session"}
+	r := newReq()
+	applyProviderSessionMapping(r, sess, mapped)
+	if got := r.Header.Get("X-Opencode-Session"); got != "sess-1" {
+		t.Fatalf("valid header not mapped: got %q", got)
+	}
+	if !sessionMappedUpstream(sess, mapped) {
+		t.Fatal("valid header: sessionMappedUpstream = false, want true")
+	}
+
+	for _, name := range []string{"Authorization", "authorization", "X-Api-Key", "Kiro-Session", "Host", "Content-Length", "Bad Header", "Bad\r\nHeader"} {
+		up := config.UpstreamProvider{Name: "p", SessionHeader: name}
+		r := newReq()
+		applyProviderSessionMapping(r, sess, up)
+		if got := r.Header.Get("Authorization"); got != "Bearer real-upstream-credential" {
+			t.Errorf("%q: upstream credential clobbered to %q", name, got)
+		}
+		if r.Header.Get("Bad\r\nHeader") != "" {
+			t.Errorf("%q: malformed name written anyway", name)
+		}
+		if sessionMappedUpstream(sess, up) {
+			t.Errorf("%q: sessionMappedUpstream = true, want false", name)
+		}
+	}
+
+	// The probe map follows the same rule: reserved names stay out.
+	probe := map[string]string{}
+	applyProbeSessionAffinityInto(probe, "probe-1", config.UpstreamProvider{Name: "p", SessionHeader: "Authorization"})
+	if _, ok := probe["Authorization"]; ok {
+		t.Fatal("probe wrote into reserved Authorization")
+	}
+	probe = map[string]string{}
+	applyProbeSessionAffinityInto(probe, "probe-1", mapped)
+	if probe["X-Opencode-Session"] != "probe-1" {
+		t.Fatalf("probe did not map valid header: %v", probe)
+	}
+}
+
+// The synthetic-eligibility gate treats reserved names like malformed ones:
+// no synthetic id is minted for a header that could not carry it.
+func TestUsableSessionHeaderName(t *testing.T) {
+	for _, name := range []string{"X-Opencode-Session", "x-session"} {
+		if !usableSessionHeaderName(name) {
+			t.Errorf("usableSessionHeaderName(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"", "Authorization", "Kiro-Session", "Bad Header", "Bad\tHeader"} {
+		if usableSessionHeaderName(name) {
+			t.Errorf("usableSessionHeaderName(%q) = true, want false", name)
+		}
+	}
+}

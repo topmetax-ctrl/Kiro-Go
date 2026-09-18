@@ -193,35 +193,38 @@ type cacheAgg struct {
 	cacheReadInputTokens     int64 // sum of reported cache-read tokens
 	cacheCreationInputTokens int64 // sum of reported cache-creation tokens
 	// cacheObservedInputTokens is the input-total sum over exactly the events
-	// that reported cache telemetry — the weighted ratio's denominator. It is
-	// deliberately separate from the unbounded inputTokens sum, which counts
-	// every event.
+	// folded into the numerator — those that reported a positive cache-read
+	// figure AND a known input total. It is deliberately separate from the
+	// unbounded inputTokens sum, which counts every event.
 	cacheObservedInputTokens int64
-	cacheObservedRequests    int64 // events that reported cache telemetry
+	cacheObservedRequests    int64 // events folded into the ratio (read + input both known)
 }
 
-// addUsage folds ev.Usage into the cache aggregates. Only events that actually
-// reported a cache breakdown advance the observability counters, so the
-// cache-hit ratio below is computed over the population that can support it.
-// An event reporting a cache breakdown but no input total joins the population
-// with a zero denominator contribution — it cannot distort the ratio, only the
-// coverage count.
+// addUsage folds ev.Usage into the cache aggregates. The hit-ratio population
+// is exactly the events with COMPLETE observations: a REPORTED cache-read
+// figure (explicit zero included — it is a real observation, not a gap) AND a
+// known, positive input total. Anything less is excluded rather than partially
+// folded — a read with an unknown input total would join the numerator while
+// contributing nothing to the denominator, inflating the ratio, and a
+// write-only event (read not reported) would dilute it with a denominator the
+// numerator never saw. Missing telemetry must never distort the ratio in
+// either direction. Cache-creation tokens are a raw total with no ratio, so
+// they fold whenever reported.
 func (a *cacheAgg) addUsage(ev Event) {
 	u := ev.Usage
 	if u == nil {
 		return
 	}
-	if u.CacheReadInputTokens == nil && u.CacheCreationInputTokens == nil {
-		return
-	}
-	if u.CacheReadInputTokens != nil && *u.CacheReadInputTokens > 0 {
-		a.cacheReadInputTokens += *u.CacheReadInputTokens
+	if u.CacheReadInputTokens != nil && u.InputTokens != nil && *u.InputTokens > 0 {
+		if *u.CacheReadInputTokens > 0 {
+			a.cacheReadInputTokens += *u.CacheReadInputTokens
+		}
+		a.cacheObservedInputTokens += *u.InputTokens
+		a.cacheObservedRequests++
 	}
 	if u.CacheCreationInputTokens != nil && *u.CacheCreationInputTokens > 0 {
 		a.cacheCreationInputTokens += *u.CacheCreationInputTokens
 	}
-	a.cacheObservedInputTokens += ev.InputTokens
-	a.cacheObservedRequests++
 }
 
 // hitRate returns the token-weighted cache-hit share (0..100) over the
