@@ -162,6 +162,7 @@
     renderVersionBadge();
     renderAccounts();
     renderPromptRules();
+    renderTokenOpt();
     renderUpstreams();
     renderModelRoutes();
     buildApiAddrOptions();
@@ -2125,7 +2126,7 @@
     if ($('managedSessions')) $('managedSessions').checked = d.managedSessions || false;
     $('maxPayloadBytes').value = String(d.maxPayloadBytes || 2000000);
     if ($('publicModelCatalog')) $('publicModelCatalog').value = d.publicModelCatalog || '';
-    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadMemoryConfig(), loadWebSearchConfig(), loadApiKeys(), loadUpstreams(), loadSecurityConfig(), loadKiroGoModels()]);
+    await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadTokenOpt(true), loadMemoryConfig(), loadWebSearchConfig(), loadApiKeys(), loadUpstreams(), loadSecurityConfig(), loadKiroGoModels()]);
     refreshCustomSelects();
   }
   async function loadThinkingConfig() {
@@ -8367,6 +8368,282 @@
     if (d.success) toast(t('settings.promptFilterSaved'), 'success');
     else toast(t('common.saveFailed') + ': ' + (d.error || ''), 'error');
   }
+  // ---- Token Optimization ------------------------------------------------
+  // Saved settings and runtime state are shown separately on purpose: saving
+  // "Headroom, on" does not make Headroom reachable, and the panel must never
+  // present one as the other. Everything dynamic goes through escapeHtml.
+  let tokenOptState = null; // last GET /token-optimization payload
+  const tokenOptRadios = (name) => qsa('input[name="' + name + '"]');
+  const tokenOptValue = (name) => {
+    const el = document.querySelector('input[name="' + name + '"]:checked');
+    return el ? el.value : '';
+  };
+  function tokenOptSelect(name, value) {
+    tokenOptRadios(name).forEach(el => { el.checked = el.value === value; });
+  }
+  function tokenOptBytes(n) {
+    n = Number(n) || 0;
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+    if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+    return n + ' B';
+  }
+  function tokenOptBadge(id, cls, text) {
+    const el = $(id);
+    if (!el) return;
+    el.className = 'badge ' + cls;
+    el.textContent = text;
+  }
+  function tokenOptBadgeHtml(cls, text) {
+    return '<span class="badge ' + cls + '">' + escapeHtml(text) + '</span>';
+  }
+  function setTokenOptError(msg) {
+    const el = $('tokenOptError');
+    el.textContent = msg || '';
+    el.classList.toggle('hidden', !msg);
+  }
+
+  async function loadTokenOpt(probe) {
+    const res = await api('/token-optimization' + (probe ? '?probe=1' : ''));
+    if (!res.ok) return;
+    tokenOptState = await res.json();
+    renderTokenOptForm(tokenOptState.settings);
+    renderTokenOpt();
+  }
+  // Status only: leaves whatever the operator has typed into the form alone.
+  async function refreshTokenOptRuntime() {
+    const res = await api('/token-optimization?probe=1');
+    if (!res.ok) return;
+    tokenOptState = await res.json();
+    renderTokenOpt();
+  }
+
+  function renderTokenOptForm(s) {
+    tokenOptSelect('tokenOptMode', s.mode);
+    tokenOptSelect('tokenOptInput', s.inputCompression);
+    tokenOptSelect('tokenOptCaveman', s.caveman);
+    tokenOptSelect('tokenOptPonytail', s.ponytail);
+    tokenOptSelect('tokenOptHeadroomMode', s.headroom.mode);
+    $('tokenOptHeadroomUrl').value = s.headroom.baseUrl || '';
+    // The token is never returned; an empty field means "keep the stored one".
+    $('tokenOptHeadroomKey').value = '';
+    $('tokenOptHeadroomClearKey').checked = false;
+    $('tokenOptHeadroomClearKey').closest('label').classList.toggle('hidden', !s.headroom.apiKeySet);
+    $('tokenOptHeadroomTimeout').value = String(s.headroom.timeoutMs);
+    $('tokenOptHeadroomMinBytes').value = String(s.headroom.minBytes);
+    $('tokenOptRtkUrl').value = s.rtk.proxyUrl || '';
+    $('tokenOptHeadroomResult').textContent = '';
+    $('tokenOptRtkResult').textContent = '';
+    setTokenOptError('');
+    updateTokenOptPanels();
+  }
+
+  // Which panels and hints show depends on the CURRENT selection, saved or not.
+  function updateTokenOptPanels() {
+    const input = tokenOptValue('tokenOptInput');
+    $('tokenOptHeadroomPanel').classList.toggle('hidden', input !== 'headroom');
+    $('tokenOptRtkPanel').classList.toggle('hidden', input !== 'rtk');
+    $('tokenOptModeHint').textContent = t('tokenOpt.modeHint.' + (tokenOptValue('tokenOptMode') || 'off'));
+    $('tokenOptHeadroomModeHint').textContent = t('tokenOpt.headroom.modeHint.' + (tokenOptValue('tokenOptHeadroomMode') || 'cache'));
+  }
+
+  function tokenOptCheckLine(rep) {
+    if (!rep) return escapeHtml(t('tokenOpt.rt.never'));
+    const parts = [new Date(rep.checkedAt).toLocaleTimeString()];
+    if (rep.reachable) parts.push(rep.latencyMs + ' ms');
+    return escapeHtml(parts.join(' · '));
+  }
+
+  function renderTokenOpt() {
+    if (!tokenOptState) return;
+    const rt = tokenOptState.runtime;
+    const saved = tokenOptState.settings;
+    updateTokenOptPanels();
+    const keyEl = $('tokenOptHeadroomKey');
+    keyEl.placeholder = saved.headroom.apiKeyMasked || t('tokenOpt.apiKeyPlaceholder');
+
+    // --- Headroom ---
+    const hs = rt.headroom;
+    const hClass = { disabled: 'badge-muted', unconfigured: 'badge-warning', unverified: 'badge-warning', connected: 'badge-success', disconnected: 'badge-error' }[hs.state] || 'badge-muted';
+    tokenOptBadge('tokenOptHeadroomBadge', hClass, t('tokenOpt.state.' + hs.state));
+    const activeBadge = hs.active ? tokenOptBadgeHtml('badge-success', t('tokenOpt.state.active'))
+      : hs.observing ? tokenOptBadgeHtml('badge-info', t('tokenOpt.state.observing'))
+      : tokenOptBadgeHtml('badge-muted', t('tokenOpt.state.inactive'));
+    let hRows = '<dt>' + escapeHtml(t('tokenOpt.rt.compression')) + '</dt><dd>' + activeBadge + '</dd>';
+    hRows += '<dt>' + escapeHtml(t('tokenOpt.rt.circuit')) + '</dt><dd>' + escapeHtml(t('tokenOpt.rt.circuit.' + hs.circuit)) + '</dd>';
+    const lc = hs.lastCheck;
+    hRows += '<dt>' + escapeHtml(t('tokenOpt.rt.lastCheck')) + '</dt><dd>' + tokenOptCheckLine(lc) +
+      (lc && lc.compressOk ? ' ' + tokenOptBadgeHtml('badge-success', t('tokenOpt.rt.compressOk')) : '') +
+      (lc && lc.error ? ' <span class="tokenopt-result is-bad">' + escapeHtml(lc.error) + '</span>' : '') + '</dd>';
+    if (lc && lc.version) {
+      const tested = lc.compat === 'tested';
+      hRows += '<dt>' + escapeHtml(t('tokenOpt.rt.version')) + '</dt><dd><span class="font-mono">' + escapeHtml(lc.version) + '</span> ' +
+        tokenOptBadgeHtml(tested ? 'badge-success' : 'badge-warning', tested ? t('tokenOpt.rt.versionTested') : t('tokenOpt.rt.versionUntested', hs.testedVersion)) + '</dd>';
+    }
+    hRows += '<dt>' + escapeHtml(t('tokenOpt.rt.memo')) + '</dt><dd>' + escapeHtml(String(hs.memoEntries)) + ' (' + escapeHtml(tokenOptBytes(hs.memoBytes)) + ')</dd>';
+    $('tokenOptHeadroomStatus').innerHTML = hRows;
+
+    // --- RTK: never "active"; it has no gateway-level mode ---
+    const rs = rt.rtk;
+    const rClass = { client_side: 'badge-muted', unverified: 'badge-warning', connected: 'badge-success', disconnected: 'badge-error' }[rs.state] || 'badge-muted';
+    const rKey = { client_side: 'clientSide', unverified: 'unverified', connected: 'connected', disconnected: 'disconnected' }[rs.state] || 'clientSide';
+    tokenOptBadge('tokenOptRtkBadge', rClass, t('tokenOpt.state.' + rKey));
+    let rRows = '<dt>' + escapeHtml(t('tokenOpt.rt.gatewayLevel')) + '</dt><dd>' + tokenOptBadgeHtml('badge-muted', t('tokenOpt.rt.no')) + '</dd>';
+    rRows += '<dt>' + escapeHtml(t('tokenOpt.rt.routed')) + '</dt><dd>' +
+      (rs.routedProviders && rs.routedProviders.length ? rs.routedProviders.map(n => '<span class="font-mono">' + escapeHtml(n) + '</span>').join(', ') : escapeHtml(t('tokenOpt.rt.none'))) + '</dd>';
+    if (rs.proxyUrl) {
+      rRows += '<dt>' + escapeHtml(t('tokenOpt.rt.lastCheck')) + '</dt><dd>' + tokenOptCheckLine(rs.lastCheck) +
+        (rs.lastCheck && rs.lastCheck.error ? ' <span class="tokenopt-result is-bad">' + escapeHtml(rs.lastCheck.error) + '</span>' : '') + '</dd>';
+    }
+    $('tokenOptRtkStatus').innerHTML = rRows;
+
+    // --- Caveman / Ponytail: observe mode cannot simulate a prompt ---
+    const behaviorBadge = (id, b) => {
+      if (saved.mode === 'observe' && b.level !== 'off') return tokenOptBadge(id, 'badge-muted', t('tokenOpt.state.notObservable'));
+      const cls = { active: 'badge-success', inactive: 'badge-muted', unavailable: 'badge-error' }[b.state] || 'badge-muted';
+      tokenOptBadge(id, cls, t('tokenOpt.state.' + b.state));
+    };
+    behaviorBadge('tokenOptCavemanBadge', rt.caveman);
+    behaviorBadge('tokenOptPonytailBadge', rt.ponytail);
+
+    $('tokenOptRuntime').innerHTML = tokenOptRuntimeHtml(rt);
+  }
+
+  function tokenOptRuntimeHtml(rt) {
+    const row = (k, v) => '<dt>' + escapeHtml(k) + '</dt><dd>' + v + '</dd>';
+    const yes = (ok) => tokenOptBadgeHtml(ok ? 'badge-success' : 'badge-muted', ok ? '✓' : '–');
+    let h = '';
+    if (!rt.assetsVerified) {
+      h += '<div class="tokenopt-error" role="alert">' + escapeHtml(t('tokenOpt.rt.assetsBad', rt.assetsError || '')) + '</div>';
+    }
+    h += '<dl class="tokenopt-kv">';
+    h += row(t('tokenOpt.rt.protocols'), ['claude', 'openai', 'responses'].map(p => {
+      const c = rt.protocols[p] || {};
+      return '<span>' + escapeHtml(t('tokenOpt.rt.protocol.' + p)) + ' ' + escapeHtml(t('tokenOpt.rt.compression')) + yes(c.headroom) + ' ' + escapeHtml(t('tokenOpt.rt.prompts')) + yes(c.behavior) + '</span>';
+    }).join('<br>'));
+    h += row(t('tokenOpt.rt.protected', ''), rt.exactBytesTools.map(n => '<span class="font-mono">' + escapeHtml(n) + '</span>').join(', '));
+    h += row(t('tokenOpt.rt.asset'), (rt.assets || []).map(a =>
+      '<span><a href="' + escapeAttr(a.repo) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(a.title) + '</a> <span class="font-mono">' + escapeHtml(a.tag) + '</span> · ' + escapeHtml(a.license) + '</span>').join('<br>'));
+    h += '</dl>';
+
+    // Metrics
+    const m = rt.metrics;
+    const per = {};
+    (m.counters || []).forEach(c => {
+      const e = per[c.engine] || (per[c.engine] = { applied: 0, skipped: 0, error: 0, observed: 0, reasons: [] });
+      e[c.outcome] = (e[c.outcome] || 0) + c.count;
+      if (c.reason && c.outcome !== 'applied') e.reasons.push(c.reason + ' ' + c.count);
+    });
+    h += '<div class="tokenopt-sub">' + escapeHtml(t('tokenOpt.rt.metrics')) + '</div><dl class="tokenopt-kv">';
+    Object.keys(per).sort().forEach(name => {
+      const e = per[name];
+      h += row(name, escapeHtml(t('tokenOpt.rt.applied') + ' ' + e.applied + ' · ' + t('tokenOpt.rt.skipped') + ' ' + e.skipped + ' · ' + t('tokenOpt.rt.errors') + ' ' + e.error) +
+        (e.observed ? escapeHtml(' · ' + t('tokenOpt.state.observing') + ' ' + e.observed) : '') +
+        (e.reasons.length ? ' <span class="tokenopt-result font-mono">' + escapeHtml(e.reasons.join(', ')) + '</span>' : ''));
+    });
+    const saving = m.bytesBefore > 0 ? ' (−' + Math.round((1 - m.bytesAfter / m.bytesBefore) * 100) + '%)' : '';
+    h += row(t('tokenOpt.rt.replaced'), escapeHtml(String(m.replaced)));
+    h += row(t('tokenOpt.rt.bytes'), escapeHtml(tokenOptBytes(m.bytesBefore) + ' → ' + tokenOptBytes(m.bytesAfter) + saving));
+    h += row(t('tokenOpt.rt.estTokens'), escapeHtml(String(m.estTokensSaved)));
+    h += row(t('tokenOpt.rt.engineTokens'), escapeHtml(String(m.engineTokensSaved)));
+    if (m.observedBytesSaved > 0) h += row(t('tokenOpt.rt.observed'), escapeHtml(tokenOptBytes(m.observedBytesSaved)));
+    h += row(t('tokenOpt.rt.latency'), escapeHtml(m.avgDurationMs.toFixed(0) + ' / ' + m.maxDurationMs + ' ms'));
+    if (m.phantomSavings > 0) h += row(t('tokenOpt.rt.phantom'), escapeHtml(String(m.phantomSavings)));
+    h += '</dl><small>' + escapeHtml(t('tokenOpt.rt.provenance')) + '</small>';
+
+    // Recent decisions
+    const recent = m.recent || [];
+    h += '<details class="tokenopt-recent"><summary>' + escapeHtml(t('tokenOpt.rt.recent')) + ' (' + recent.length + ')</summary>';
+    h += recent.length ? '<ul>' + recent.map(ev =>
+      '<li><span class="font-mono">' + escapeHtml(new Date(ev.time).toLocaleTimeString()) + ' ' + escapeHtml(ev.protocol) + ' ' + escapeHtml(ev.engine) + ' ' + escapeHtml(ev.outcome + (ev.reason ? ':' + ev.reason : '')) + '</span>' +
+      (ev.replaced ? ' · ' + escapeHtml(String(ev.replaced)) + ' · ' + escapeHtml(tokenOptBytes(ev.bytesBefore) + ' → ' + tokenOptBytes(ev.bytesAfter)) : '') + '</li>').join('') + '</ul>'
+      : '<div>' + escapeHtml(t('tokenOpt.rt.noEvents')) + '</div>';
+    return h + '</details>';
+  }
+
+  async function saveTokenOpt() {
+    const body = {
+      mode: tokenOptValue('tokenOptMode'),
+      inputCompression: tokenOptValue('tokenOptInput'),
+      caveman: tokenOptValue('tokenOptCaveman'),
+      ponytail: tokenOptValue('tokenOptPonytail'),
+      headroom: {
+        baseUrl: $('tokenOptHeadroomUrl').value.trim(),
+        timeoutMs: parseInt($('tokenOptHeadroomTimeout').value, 10) || 0,
+        minBytes: parseInt($('tokenOptHeadroomMinBytes').value, 10) || 0,
+        mode: tokenOptValue('tokenOptHeadroomMode'),
+      },
+      rtk: { proxyUrl: $('tokenOptRtkUrl').value.trim() },
+    };
+    // Only send the token when a new one was typed (empty = keep) or removal was asked for.
+    const key = $('tokenOptHeadroomKey').value.trim();
+    if (key) body.headroom.apiKey = key;
+    if ($('tokenOptHeadroomClearKey').checked) body.headroom.clearApiKey = true;
+    setTokenOptError('');
+    const res = await api('/token-optimization', { method: 'POST', body: JSON.stringify(body) });
+    const d = await res.json().catch(() => ({}));
+    if (res.ok && d.success) {
+      toast(t('tokenOpt.saved'), 'success');
+      loadTokenOpt(true);
+    } else {
+      const msg = (d.field ? d.field + ': ' : '') + (d.error || res.status);
+      setTokenOptError(msg);
+      toast(t('tokenOpt.saveFailed') + ': ' + msg, 'error');
+    }
+  }
+
+  // Tests the values currently in the form, saved or not.
+  async function testTokenOpt(target) {
+    const rtk = target === 'rtk';
+    const out = $(rtk ? 'tokenOptRtkResult' : 'tokenOptHeadroomResult');
+    const btn = $(rtk ? 'tokenOptRtkTestBtn' : 'tokenOptHeadroomTestBtn');
+    out.className = 'tokenopt-result';
+    out.textContent = t('tokenOpt.testing');
+    btn.disabled = true;
+    try {
+      let body;
+      if (rtk) {
+        body = { target, rtk: { proxyUrl: $('tokenOptRtkUrl').value.trim() } };
+      } else {
+        body = { target, headroom: { baseUrl: $('tokenOptHeadroomUrl').value.trim(), timeoutMs: parseInt($('tokenOptHeadroomTimeout').value, 10) || 0 } };
+        const key = $('tokenOptHeadroomKey').value.trim();
+        if (key) body.headroom.apiKey = key;
+      }
+      const res = await api('/token-optimization/test', { method: 'POST', body: JSON.stringify(body) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        out.classList.add('is-bad');
+        out.textContent = (d.field ? d.field + ': ' : '') + (d.error || res.status);
+        return;
+      }
+      const r = d.report;
+      const ok = r.reachable && (rtk || r.compressOk);
+      out.classList.add(ok ? 'is-ok' : 'is-bad');
+      out.textContent = ok ? t('tokenOpt.state.connected') + ' · ' + r.latencyMs + ' ms' : (r.error || t('tokenOpt.state.disconnected'));
+      tokenOptState = d.state;
+      renderTokenOpt(); // status only: the operator's unsaved edits stay as typed
+    } catch (e) {
+      out.classList.add('is-bad');
+      out.textContent = String(e && e.message || e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function bindTokenOptEvents() {
+    $('saveTokenOptBtn').addEventListener('click', saveTokenOpt);
+    $('resetTokenOptBtn').addEventListener('click', () => {
+      if (!tokenOptState) return;
+      renderTokenOptForm(tokenOptState.settings);
+      renderTokenOpt();
+      toast(t('tokenOpt.resetDone'), 'primary');
+    });
+    $('refreshTokenOptBtn').addEventListener('click', refreshTokenOptRuntime);
+    $('tokenOptHeadroomTestBtn').addEventListener('click', () => testTokenOpt('headroom'));
+    $('tokenOptRtkTestBtn').addEventListener('click', () => testTokenOpt('rtk'));
+    ['tokenOptMode', 'tokenOptInput', 'tokenOptHeadroomMode'].forEach(name =>
+      tokenOptRadios(name).forEach(el => el.addEventListener('change', updateTokenOptPanels)));
+  }
+
   async function loadMemoryConfig() {
     const res = await api('/memory/config');
     const d = await res.json();
@@ -11263,6 +11540,7 @@
     bindSettingsEvents();
     bindPromptFilterEvents();
     bindMemoryEvents();
+    bindTokenOptEvents();
     bindModalEvents();
     bindDetailEvents();
     bindTestEvents();

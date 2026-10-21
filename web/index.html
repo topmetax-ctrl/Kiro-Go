@@ -541,6 +541,132 @@
           </div>
         </div>
 
+        <!-- Token Optimization -->
+        <div class="card" id="tokenOptCard">
+          <div class="card-header"><span class="card-title" data-i18n="tokenOpt.title"></span></div>
+          <small class="help-block" data-i18n="tokenOpt.intro"></small>
+          <div id="tokenOptError" class="tokenopt-error hidden" role="alert"></div>
+
+          <!-- 1. Engine mode -->
+          <div class="form-group mt-2">
+            <label class="font-semibold pb-2 block" id="tokenOptModeLabel" data-i18n="tokenOpt.group.mode"></label>
+            <div class="seg" role="radiogroup" aria-labelledby="tokenOptModeLabel">
+              <label class="seg-item"><input type="radio" name="tokenOptMode" value="off" /><span data-i18n="tokenOpt.mode.off"></span></label>
+              <label class="seg-item"><input type="radio" name="tokenOptMode" value="observe" /><span data-i18n="tokenOpt.mode.observe"></span></label>
+              <label class="seg-item"><input type="radio" name="tokenOptMode" value="on" /><span data-i18n="tokenOpt.mode.on"></span></label>
+            </div>
+            <small id="tokenOptModeHint"></small>
+          </div>
+
+          <!-- 2. Input compression -->
+          <div class="form-group">
+            <label class="font-semibold pb-2 block" id="tokenOptInputLabel" data-i18n="tokenOpt.group.input"></label>
+            <div class="seg" role="radiogroup" aria-labelledby="tokenOptInputLabel">
+              <label class="seg-item"><input type="radio" name="tokenOptInput" value="none" /><span data-i18n="tokenOpt.input.none"></span></label>
+              <label class="seg-item"><input type="radio" name="tokenOptInput" value="rtk" /><span data-i18n="tokenOpt.input.rtk"></span></label>
+              <label class="seg-item"><input type="radio" name="tokenOptInput" value="headroom" /><span data-i18n="tokenOpt.input.headroom"></span></label>
+              <label class="seg-item"><input type="radio" name="tokenOptInput" value="auto" disabled /><span data-i18n="tokenOpt.input.auto"></span></label>
+            </div>
+            <small data-i18n="tokenOpt.autoUnavailable"></small>
+
+            <div class="tokenopt-panel hidden" id="tokenOptHeadroomPanel">
+              <div class="tokenopt-panel-title"><span data-i18n="tokenOpt.headroom.title"></span><span class="badge" id="tokenOptHeadroomBadge"></span></div>
+              <small class="help-block" data-i18n="tokenOpt.headroom.intro"></small>
+              <div class="form-group">
+                <label for="tokenOptHeadroomUrl" data-i18n="tokenOpt.headroom.baseUrl"></label>
+                <input type="text" id="tokenOptHeadroomUrl" class="font-mono" placeholder="http://127.0.0.1:8787" autocomplete="off" spellcheck="false" />
+                <small data-i18n="tokenOpt.headroom.baseUrlHint"></small>
+              </div>
+              <div class="form-group">
+                <label for="tokenOptHeadroomKey" data-i18n="tokenOpt.headroom.apiKey"></label>
+                <input type="password" id="tokenOptHeadroomKey" data-i18n-placeholder="tokenOpt.apiKeyPlaceholder" autocomplete="off" />
+                <small data-i18n="tokenOpt.headroom.apiKeyHint"></small>
+                <label class="flex items-center gap-2 mt-2"><input type="checkbox" id="tokenOptHeadroomClearKey" /><span data-i18n="tokenOpt.headroom.clearKey"></span></label>
+              </div>
+              <div class="tokenopt-row">
+                <div class="form-group">
+                  <label for="tokenOptHeadroomTimeout" data-i18n="tokenOpt.headroom.timeout"></label>
+                  <input type="number" id="tokenOptHeadroomTimeout" min="200" max="30000" step="100" />
+                  <small data-i18n="tokenOpt.headroom.timeoutHint"></small>
+                </div>
+                <div class="form-group">
+                  <label for="tokenOptHeadroomMinBytes" data-i18n="tokenOpt.headroom.minBytes"></label>
+                  <input type="number" id="tokenOptHeadroomMinBytes" min="256" max="1048576" step="256" />
+                  <small data-i18n="tokenOpt.headroom.minBytesHint"></small>
+                </div>
+              </div>
+              <div class="form-group">
+                <label id="tokenOptHeadroomModeLabel" data-i18n="tokenOpt.headroom.mode"></label>
+            <div class="seg" role="radiogroup" aria-labelledby="tokenOptHeadroomModeLabel">
+              <label class="seg-item"><input type="radio" name="tokenOptHeadroomMode" value="cache" /><span data-i18n="tokenOpt.headroom.mode.cache"></span></label>
+              <label class="seg-item"><input type="radio" name="tokenOptHeadroomMode" value="token" /><span data-i18n="tokenOpt.headroom.mode.token"></span></label>
+            </div>
+                <small id="tokenOptHeadroomModeHint"></small>
+              </div>
+              <div class="tokenopt-actions">
+                <button type="button" class="btn btn-outline btn-sm" id="tokenOptHeadroomTestBtn" data-i18n="tokenOpt.test"></button>
+                <span class="tokenopt-result" id="tokenOptHeadroomResult" role="status" aria-live="polite"></span>
+              </div>
+              <dl class="tokenopt-kv" id="tokenOptHeadroomStatus"></dl>
+            </div>
+
+            <div class="tokenopt-panel hidden" id="tokenOptRtkPanel">
+              <div class="tokenopt-panel-title"><span data-i18n="tokenOpt.rtk.title"></span><span class="badge" id="tokenOptRtkBadge"></span></div>
+              <small class="help-block" data-i18n="tokenOpt.rtk.intro"></small>
+              <small class="help-block" data-i18n="tokenOpt.rtk.install"></small>
+              <div class="form-group">
+                <label for="tokenOptRtkUrl" data-i18n="tokenOpt.rtk.proxyUrl"></label>
+                <input type="text" id="tokenOptRtkUrl" class="font-mono" placeholder="http://127.0.0.1:8081" autocomplete="off" spellcheck="false" />
+                <small data-i18n="tokenOpt.rtk.proxyUrlHint"></small>
+              </div>
+              <div class="tokenopt-actions">
+                <button type="button" class="btn btn-outline btn-sm" id="tokenOptRtkTestBtn" data-i18n="tokenOpt.test"></button>
+                <span class="tokenopt-result" id="tokenOptRtkResult" role="status" aria-live="polite"></span>
+              </div>
+              <dl class="tokenopt-kv" id="tokenOptRtkStatus"></dl>
+            </div>
+          </div>
+
+          <!-- 3. Output & coding behavior -->
+          <div class="form-group">
+            <label class="font-semibold pb-2 block" data-i18n="tokenOpt.group.behavior"></label>
+            <div class="tokenopt-behavior">
+              <div>
+                <div class="tokenopt-behavior-head"><span class="font-semibold" id="tokenOptCavemanLabel" data-i18n="tokenOpt.behavior.caveman"></span><span class="badge" id="tokenOptCavemanBadge"></span></div>
+            <div class="seg" role="radiogroup" aria-labelledby="tokenOptCavemanLabel">
+              <label class="seg-item"><input type="radio" name="tokenOptCaveman" value="off" /><span data-i18n="tokenOpt.style.off"></span></label>
+              <label class="seg-item"><input type="radio" name="tokenOptCaveman" value="caveman" /><span data-i18n="tokenOpt.style.caveman"></span></label>
+              <label class="seg-item"><input type="radio" name="tokenOptCaveman" value="ultracave" /><span data-i18n="tokenOpt.style.ultracave"></span></label>
+            </div>
+                <small data-i18n="tokenOpt.behavior.cavemanHint"></small>
+              </div>
+              <div>
+                <div class="tokenopt-behavior-head"><span class="font-semibold" id="tokenOptPonytailLabel" data-i18n="tokenOpt.behavior.ponytail"></span><span class="badge" id="tokenOptPonytailBadge"></span></div>
+            <div class="seg" role="radiogroup" aria-labelledby="tokenOptPonytailLabel">
+              <label class="seg-item"><input type="radio" name="tokenOptPonytail" value="off" /><span data-i18n="tokenOpt.level.off"></span></label>
+              <label class="seg-item"><input type="radio" name="tokenOptPonytail" value="lite" /><span data-i18n="tokenOpt.level.lite"></span></label>
+              <label class="seg-item"><input type="radio" name="tokenOptPonytail" value="full" /><span data-i18n="tokenOpt.level.full"></span></label>
+              <label class="seg-item"><input type="radio" name="tokenOptPonytail" value="ultra" /><span data-i18n="tokenOpt.level.ultra"></span></label>
+            </div>
+                <small data-i18n="tokenOpt.behavior.ponytailHint"></small>
+              </div>
+              <small data-i18n="tokenOpt.behavior.note"></small>
+            </div>
+          </div>
+
+          <!-- Runtime status -->
+          <div class="form-group">
+            <label class="font-semibold pb-2 block" data-i18n="tokenOpt.group.runtime"></label>
+            <div id="tokenOptRuntime"></div>
+          </div>
+
+          <div class="flex gap-2">
+            <button type="button" class="btn btn-primary" id="saveTokenOptBtn" data-i18n="tokenOpt.save"></button>
+            <button type="button" class="btn btn-outline" id="resetTokenOptBtn" data-i18n="tokenOpt.reset"></button>
+            <button type="button" class="btn btn-outline" id="refreshTokenOptBtn" data-i18n="tokenOpt.refresh"></button>
+          </div>
+        </div>
+
         <!-- Memory sidecar (Mem0) -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="memory.title"></span></div>
