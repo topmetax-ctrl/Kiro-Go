@@ -1,0 +1,428 @@
+{
+ "sessions": {
+  "shared": "96b672cd",
+  "other": "e1fd955c"
+ },
+ "results": [
+  {
+   "label": "A-cache-1",
+   "session": "96b672cd",
+   "t_start": 1789715549.602178,
+   "status": 200,
+   "raw": {
+    "id": "dccbc288-d661-4ffa-897d-dda28cacb49f",
+    "object": "chat.completion",
+    "created": 1789715550,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "P_A_ACK",
+       "reasoning_content": "We need answer exactly P_A_ACK. Need comply."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 15835,
+     "completion_tokens": 17,
+     "total_tokens": 15852,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 15835,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 12
+     }
+    },
+    "cost": "0"
+   },
+   "text": "P_A_ACK",
+   "input": 15835,
+   "output": 17,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 15835,
+    "completion_tokens": 17,
+    "total_tokens": 15852,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 15835,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 12
+    }
+   },
+   "resp_id": "dccbc288-d661-4ffa-897d-dda28cacb49f",
+   "latency": 2.078,
+   "t_end": 1789715551.679799,
+   "prefix": "P_A"
+  },
+  {
+   "label": "B-cache-1",
+   "session": "96b672cd",
+   "t_start": 1789715553.6849432,
+   "status": 200,
+   "raw": {
+    "id": "12c994e6-4e1e-4600-be3a-077079bf7012",
+    "object": "chat.completion",
+    "created": 1789715554,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "P_B_ACK",
+       "reasoning_content": "We need answer exactly token P_B_ACK and nothing else. Need comply."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 15818,
+     "completion_tokens": 21,
+     "total_tokens": 15839,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 15818,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 16
+     }
+    },
+    "cost": "0"
+   },
+   "text": "P_B_ACK",
+   "input": 15818,
+   "output": 21,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 15818,
+    "completion_tokens": 21,
+    "total_tokens": 15839,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 15818,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 16
+    }
+   },
+   "resp_id": "12c994e6-4e1e-4600-be3a-077079bf7012",
+   "latency": 1.791,
+   "t_end": 1789715555.4763,
+   "prefix": "P_B"
+  },
+  {
+   "label": "A-cache-2",
+   "session": "96b672cd",
+   "t_start": 1789715557.479424,
+   "status": 200,
+   "raw": {
+    "id": "0870fcc0-c848-47cb-b224-5c1bd8ee526e",
+    "object": "chat.completion",
+    "created": 1789715558,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "length",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "",
+       "reasoning_content": "The user wants exactly the token P_A_ACK and nothing else. But wait \u2014 this is a huge specification with rules. The instruction at the end says \"Reply with exactly the token P_A_ACK and nothing else.\" So I should just output P_A_ACK.\n\nBut let me consider if"
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 15835,
+     "completion_tokens": 60,
+     "total_tokens": 15895,
+     "prompt_cache_hit_tokens": 15616,
+     "prompt_cache_miss_tokens": 219,
+     "prompt_tokens_details": {
+      "cached_tokens": 15616
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 60
+     }
+    },
+    "cost": "0"
+   },
+   "text": "",
+   "input": 15835,
+   "output": 60,
+   "cache_read": 15616,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 15835,
+    "completion_tokens": 60,
+    "total_tokens": 15895,
+    "prompt_cache_hit_tokens": 15616,
+    "prompt_cache_miss_tokens": 219,
+    "prompt_tokens_details": {
+     "cached_tokens": 15616
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 60
+    }
+   },
+   "resp_id": "0870fcc0-c848-47cb-b224-5c1bd8ee526e",
+   "latency": 2.674,
+   "t_end": 1789715560.153402,
+   "prefix": "P_A"
+  },
+  {
+   "label": "B-cache-2",
+   "session": "96b672cd",
+   "t_start": 1789715562.157881,
+   "status": 200,
+   "raw": {
+    "id": "24cc56e6-1c38-4f9a-8660-110a7735a564",
+    "object": "chat.completion",
+    "created": 1789715563,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "P_B_ACK",
+       "reasoning_content": "The user wants exactly \"P_B_ACK\" and nothing else."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 15818,
+     "completion_tokens": 19,
+     "total_tokens": 15837,
+     "prompt_cache_hit_tokens": 15616,
+     "prompt_cache_miss_tokens": 202,
+     "prompt_tokens_details": {
+      "cached_tokens": 15616
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 14
+     }
+    },
+    "cost": "0"
+   },
+   "text": "P_B_ACK",
+   "input": 15818,
+   "output": 19,
+   "cache_read": 15616,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 15818,
+    "completion_tokens": 19,
+    "total_tokens": 15837,
+    "prompt_cache_hit_tokens": 15616,
+    "prompt_cache_miss_tokens": 202,
+    "prompt_tokens_details": {
+     "cached_tokens": 15616
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 14
+    }
+   },
+   "resp_id": "24cc56e6-1c38-4f9a-8660-110a7735a564",
+   "latency": 1.918,
+   "t_end": 1789715564.0757911,
+   "prefix": "P_B"
+  },
+  {
+   "label": "C-unrelated",
+   "session": "96b672cd",
+   "t_start": 1789715566.0780249,
+   "status": 200,
+   "raw": {
+    "id": "a7608c59-635e-4ebe-b76e-3f78df53e361",
+    "object": "chat.completion",
+    "created": 1789715567,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "P_C_ACK",
+       "reasoning_content": "We need answer user asks \"Reply with exactly the token P_C_ACK and nothing else.\" Need output exactly P_C_ACK. Ensure no punctuation."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 15844,
+     "completion_tokens": 36,
+     "total_tokens": 15880,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 15844,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 31
+     }
+    },
+    "cost": "0"
+   },
+   "text": "P_C_ACK",
+   "input": 15844,
+   "output": 36,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 15844,
+    "completion_tokens": 36,
+    "total_tokens": 15880,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 15844,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 31
+    }
+   },
+   "resp_id": "a7608c59-635e-4ebe-b76e-3f78df53e361",
+   "latency": 2.571,
+   "t_end": 1789715568.6487849,
+   "prefix": "P_C"
+  },
+  {
+   "label": "A-diff-sess",
+   "session": "e1fd955c",
+   "t_start": 1789715570.651136,
+   "status": 200,
+   "raw": {
+    "id": "b4f69eba-d54e-4bda-bd57-82bbaa74f068",
+    "object": "chat.completion",
+    "created": 1789715571,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "P_A_ACK",
+       "reasoning_content": "We need answer exactly token P_A_ACK nothing else. Need comply."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 15835,
+     "completion_tokens": 20,
+     "total_tokens": 15855,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 15835,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 15
+     }
+    },
+    "cost": "0"
+   },
+   "text": "P_A_ACK",
+   "input": 15835,
+   "output": 20,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 15835,
+    "completion_tokens": 20,
+    "total_tokens": 15855,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 15835,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 15
+    }
+   },
+   "resp_id": "b4f69eba-d54e-4bda-bd57-82bbaa74f068",
+   "latency": 2.012,
+   "t_end": 1789715572.6626701,
+   "prefix": "P_A"
+  },
+  {
+   "label": "A-diff-sess-2",
+   "session": "e1fd955c",
+   "t_start": 1789715574.667833,
+   "status": 200,
+   "raw": {
+    "id": "ca6fa9ea-36c0-469b-9fcd-fbcaa0f18880",
+    "object": "chat.completion",
+    "created": 1789715576,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "P_A_ACK",
+       "reasoning_content": "We need answer exactly P_A_ACK. Need comply. No analysis in final. Just token."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 15835,
+     "completion_tokens": 25,
+     "total_tokens": 15860,
+     "prompt_cache_hit_tokens": 15616,
+     "prompt_cache_miss_tokens": 219,
+     "prompt_tokens_details": {
+      "cached_tokens": 15616
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 20
+     }
+    },
+    "cost": "0"
+   },
+   "text": "P_A_ACK",
+   "input": 15835,
+   "output": 25,
+   "cache_read": 15616,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 15835,
+    "completion_tokens": 25,
+    "total_tokens": 15860,
+    "prompt_cache_hit_tokens": 15616,
+    "prompt_cache_miss_tokens": 219,
+    "prompt_tokens_details": {
+     "cached_tokens": 15616
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 20
+    }
+   },
+   "resp_id": "ca6fa9ea-36c0-469b-9fcd-fbcaa0f18880",
+   "latency": 2.03,
+   "t_end": 1789715576.698292,
+   "prefix": "P_A"
+  }
+ ]
+}

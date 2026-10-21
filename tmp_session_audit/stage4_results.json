@@ -1,0 +1,242 @@
+{
+ "seq": [
+  {
+   "label": "dup-seq-1",
+   "session": "0f2a9f3d",
+   "t_start": 1789715629.6304681,
+   "status": 200,
+   "raw": {
+    "id": "4922578c-40b6-4050-8ac0-bc38c002f6b3",
+    "object": "chat.completion",
+    "created": 1789715630,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "DUP_MARKER_DWADJ20A",
+       "reasoning_content": "We need answer exact secret marker and nothing else. User asks return exact secret marker. We have system says \"Secret marker: DUP_MARKER_DWADJ20A.\" Need output that only."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 61,
+     "completion_tokens": 54,
+     "total_tokens": 115,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 61,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 42
+     }
+    },
+    "cost": "0"
+   },
+   "text": "DUP_MARKER_DWADJ20A",
+   "input": 61,
+   "output": 54,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 61,
+    "completion_tokens": 54,
+    "total_tokens": 115,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 61,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 42
+    }
+   },
+   "resp_id": "4922578c-40b6-4050-8ac0-bc38c002f6b3",
+   "latency": 1.795,
+   "t_end": 1789715631.425051
+  },
+  {
+   "label": "dup-seq-2",
+   "session": "0f2a9f3d",
+   "t_start": 1789715631.425201,
+   "status": 200,
+   "raw": {
+    "id": "20a71d4a-223b-4b99-a5c4-ee884c1a24ad",
+    "object": "chat.completion",
+    "created": 1789715632,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "DUP_MARKER_DWADJ20A",
+       "reasoning_content": "We need answer exact secret marker and nothing else. User asks return exact secret marker. System says secret marker: DUP_MARKER_DWADJ20A. Need only that."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 61,
+     "completion_tokens": 50,
+     "total_tokens": 111,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 61,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 38
+     }
+    },
+    "cost": "0"
+   },
+   "text": "DUP_MARKER_DWADJ20A",
+   "input": 61,
+   "output": 50,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 61,
+    "completion_tokens": 50,
+    "total_tokens": 111,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 61,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 38
+    }
+   },
+   "resp_id": "20a71d4a-223b-4b99-a5c4-ee884c1a24ad",
+   "latency": 1.754,
+   "t_end": 1789715633.179702
+  }
+ ],
+ "par": [
+  {
+   "label": "dup-par-1",
+   "session": "0f2a9f3d",
+   "t_start": 1789715633.1840389,
+   "status": 200,
+   "raw": {
+    "id": "54b326bc-5ca6-4c10-bdf3-6d484a026460",
+    "object": "chat.completion",
+    "created": 1789715634,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "DUP_MARKER_DWADJ20A",
+       "reasoning_content": "We need answer exact secret marker and nothing else. Need obey. Marker given: DUP_MARKER_DWADJ20A. Need output only that."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 61,
+     "completion_tokens": 45,
+     "total_tokens": 106,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 61,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 33
+     }
+    },
+    "cost": "0"
+   },
+   "text": "DUP_MARKER_DWADJ20A",
+   "input": 61,
+   "output": 45,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 61,
+    "completion_tokens": 45,
+    "total_tokens": 106,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 61,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 33
+    }
+   },
+   "resp_id": "54b326bc-5ca6-4c10-bdf3-6d484a026460",
+   "latency": 1.814,
+   "t_end": 1789715634.998008
+  },
+  {
+   "label": "dup-par-2",
+   "session": "0f2a9f3d",
+   "t_start": 1789715633.1843588,
+   "status": 200,
+   "raw": {
+    "id": "748d3091-4777-4910-9d20-c41af889b4a3",
+    "object": "chat.completion",
+    "created": 1789715634,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "DUP_MARKER_DWADJ20A",
+       "reasoning_content": "We need answer user asks secret marker and nothing else. Need comply? System says secret marker: DUP_MARKER_DWADJ20A. We must return exact secret marker and nothing else. So final only that."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 61,
+     "completion_tokens": 58,
+     "total_tokens": 119,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 61,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 46
+     }
+    },
+    "cost": "0"
+   },
+   "text": "DUP_MARKER_DWADJ20A",
+   "input": 61,
+   "output": 58,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 61,
+    "completion_tokens": 58,
+    "total_tokens": 119,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 61,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 46
+    }
+   },
+   "resp_id": "748d3091-4777-4910-9d20-c41af889b4a3",
+   "latency": 1.935,
+   "t_end": 1789715635.11928
+  }
+ ]
+}

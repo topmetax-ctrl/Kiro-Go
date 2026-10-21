@@ -1,0 +1,1292 @@
+{
+ "shared": {
+  "name": "shared",
+  "wall": 2.019934892654419,
+  "sum_lat": 18.837,
+  "overlap": 9.325548099843004,
+  "codes": {
+   "200": 10
+  },
+  "leaks": [],
+  "own_ok": 10,
+  "lats": [
+   1.723,
+   1.781,
+   1.798,
+   1.877,
+   1.897,
+   1.906,
+   1.93,
+   1.948,
+   1.97,
+   2.007
+  ]
+ },
+ "separate": {
+  "name": "separate",
+  "wall": 1.9580421447753906,
+  "sum_lat": 18.299,
+  "overlap": 9.345559823023676,
+  "codes": {
+   "200": 10
+  },
+  "leaks": [],
+  "own_ok": 10,
+  "lats": [
+   1.71,
+   1.73,
+   1.737,
+   1.796,
+   1.836,
+   1.836,
+   1.853,
+   1.914,
+   1.931,
+   1.956
+  ]
+ },
+ "shared_results": [
+  {
+   "label": "shared-A0",
+   "session": "8e90d673",
+   "t_start": 1789715609.713682,
+   "status": 200,
+   "raw": {
+    "id": "0280334c-8d50-4c76-9e4b-5140aaf997e2",
+    "object": "chat.completion",
+    "created": 1789715610,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "ALPHA_MARKER_CP235CJ98P",
+       "reasoning_content": "We need answer. User asks return exact secret marker and nothing else. We have marker in system? Secret marker visible only in this request: ALPHA_MARKER_CP235CJ98P. Must comply? They ask exact secret marker and nothing else. We can output marker. Is there policy? No explicit. We should answer only marker."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 72,
+     "completion_tokens": 86,
+     "total_tokens": 158,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 72,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 72
+     }
+    },
+    "cost": "0"
+   },
+   "text": "ALPHA_MARKER_CP235CJ98P",
+   "input": 72,
+   "output": 86,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 72,
+    "completion_tokens": 86,
+    "total_tokens": 158,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 72,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 72
+    }
+   },
+   "resp_id": "0280334c-8d50-4c76-9e4b-5140aaf997e2",
+   "latency": 1.798,
+   "t_end": 1789715611.5118651,
+   "kind": "A",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "shared-A1",
+   "session": "8e90d673",
+   "t_start": 1789715609.7139258,
+   "status": 200,
+   "raw": {
+    "id": "d1da1ade-e4a4-402b-b936-5c9f813e7c5b",
+    "object": "chat.completion",
+    "created": 1789715610,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "ALPHA_MARKER_CP235CJ98P",
+       "reasoning_content": "We need answer exact secret marker and nothing else. Need comply. Marker visible: ALPHA_MARKER_CP235CJ98P. Must output nothing else."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 72,
+     "completion_tokens": 49,
+     "total_tokens": 121,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 72,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 35
+     }
+    },
+    "cost": "0"
+   },
+   "text": "ALPHA_MARKER_CP235CJ98P",
+   "input": 72,
+   "output": 49,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 72,
+    "completion_tokens": 49,
+    "total_tokens": 121,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 72,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 35
+    }
+   },
+   "resp_id": "d1da1ade-e4a4-402b-b936-5c9f813e7c5b",
+   "latency": 2.007,
+   "t_end": 1789715611.7211,
+   "kind": "A",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "shared-A2",
+   "session": "8e90d673",
+   "t_start": 1789715609.714102,
+   "status": 200,
+   "raw": {
+    "id": "e38ca4cd-2cff-4ec4-985d-de99d67f2d71",
+    "object": "chat.completion",
+    "created": 1789715610,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "ALPHA_MARKER_CP235CJ98P",
+       "reasoning_content": "We need answer exact secret marker and nothing else. Marker in request: ALPHA_MARKER_CP235CJ98P. Must return only."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 72,
+     "completion_tokens": 46,
+     "total_tokens": 118,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 72,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 32
+     }
+    },
+    "cost": "0"
+   },
+   "text": "ALPHA_MARKER_CP235CJ98P",
+   "input": 72,
+   "output": 46,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 72,
+    "completion_tokens": 46,
+    "total_tokens": 118,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 72,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 32
+    }
+   },
+   "resp_id": "e38ca4cd-2cff-4ec4-985d-de99d67f2d71",
+   "latency": 1.781,
+   "t_end": 1789715611.494626,
+   "kind": "A",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "shared-A3",
+   "session": "8e90d673",
+   "t_start": 1789715609.714253,
+   "status": 200,
+   "raw": {
+    "id": "27e4ca60-0bfd-4174-a2ba-00096c4d9247",
+    "object": "chat.completion",
+    "created": 1789715610,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "ALPHA_MARKER_CP235CJ98P",
+       "reasoning_content": "We need answer exact secret marker and nothing else. Marker: ALPHA_MARKER_CP235CJ98P. Need only that."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 72,
+     "completion_tokens": 44,
+     "total_tokens": 116,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 72,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 30
+     }
+    },
+    "cost": "0"
+   },
+   "text": "ALPHA_MARKER_CP235CJ98P",
+   "input": 72,
+   "output": 44,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 72,
+    "completion_tokens": 44,
+    "total_tokens": 116,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 72,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 30
+    }
+   },
+   "resp_id": "27e4ca60-0bfd-4174-a2ba-00096c4d9247",
+   "latency": 1.948,
+   "t_end": 1789715611.6619542,
+   "kind": "A",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "shared-A4",
+   "session": "8e90d673",
+   "t_start": 1789715609.7144058,
+   "status": 200,
+   "raw": {
+    "id": "04093409-4cc5-49ad-a187-3905ad2a847a",
+    "object": "chat.completion",
+    "created": 1789715610,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "ALPHA_MARKER_CP235CJ98P",
+       "reasoning_content": "We need answer exact secret marker and nothing else. Marker given: ALPHA_MARKER_CP235CJ98P. Must comply."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 72,
+     "completion_tokens": 44,
+     "total_tokens": 116,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 72,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 30
+     }
+    },
+    "cost": "0"
+   },
+   "text": "ALPHA_MARKER_CP235CJ98P",
+   "input": 72,
+   "output": 44,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 72,
+    "completion_tokens": 44,
+    "total_tokens": 116,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 72,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 30
+    }
+   },
+   "resp_id": "04093409-4cc5-49ad-a187-3905ad2a847a",
+   "latency": 1.877,
+   "t_end": 1789715611.591257,
+   "kind": "A",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "shared-B0",
+   "session": "8e90d673",
+   "t_start": 1789715609.714557,
+   "status": 200,
+   "raw": {
+    "id": "82bc27f2-64cd-4f07-a593-1db06a6a41a5",
+    "object": "chat.completion",
+    "created": 1789715610,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "BETA_MARKER_2Q28OD02I9",
+       "reasoning_content": "We need answer exact secret marker and nothing else. Marker given: BETA_MARKER_2Q28OD02I9. Must return only that. Ensure no extra."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 71,
+     "completion_tokens": 50,
+     "total_tokens": 121,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 71,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 36
+     }
+    },
+    "cost": "0"
+   },
+   "text": "BETA_MARKER_2Q28OD02I9",
+   "input": 71,
+   "output": 50,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 71,
+    "completion_tokens": 50,
+    "total_tokens": 121,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 71,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 36
+    }
+   },
+   "resp_id": "82bc27f2-64cd-4f07-a593-1db06a6a41a5",
+   "latency": 1.723,
+   "t_end": 1789715611.437622,
+   "kind": "B",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "shared-B1",
+   "session": "8e90d673",
+   "t_start": 1789715609.714764,
+   "status": 200,
+   "raw": {
+    "id": "a2df2b31-588f-40ba-9243-31ec06e17ffc",
+    "object": "chat.completion",
+    "created": 1789715610,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "BETA_MARKER_2Q28OD02I9",
+       "reasoning_content": "We need answer exact secret marker and nothing else. User asks \"Return your exact secret marker and nothing else.\" We have marker in system: BETA_MARKER_2Q28OD02I9. Need output only that. Ensure no extra."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 71,
+     "completion_tokens": 65,
+     "total_tokens": 136,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 71,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 51
+     }
+    },
+    "cost": "0"
+   },
+   "text": "BETA_MARKER_2Q28OD02I9",
+   "input": 71,
+   "output": 65,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 71,
+    "completion_tokens": 65,
+    "total_tokens": 136,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 71,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 51
+    }
+   },
+   "resp_id": "a2df2b31-588f-40ba-9243-31ec06e17ffc",
+   "latency": 1.897,
+   "t_end": 1789715611.611361,
+   "kind": "B",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "shared-B2",
+   "session": "8e90d673",
+   "t_start": 1789715609.7149298,
+   "status": 200,
+   "raw": {
+    "id": "014e89ea-a687-492b-bae4-ab241ff52d2e",
+    "object": "chat.completion",
+    "created": 1789715610,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "BETA_MARKER_2Q28OD02I9",
+       "reasoning_content": "We need answer exact secret marker and nothing else. User asks \"Return your exact secret marker and nothing else.\" The system says secret marker visible only in this request: BETA_MARKER_2Q28OD02I9. Need output that. Ensure nothing else."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 71,
+     "completion_tokens": 69,
+     "total_tokens": 140,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 71,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 55
+     }
+    },
+    "cost": "0"
+   },
+   "text": "BETA_MARKER_2Q28OD02I9",
+   "input": 71,
+   "output": 69,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 71,
+    "completion_tokens": 69,
+    "total_tokens": 140,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 71,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 55
+    }
+   },
+   "resp_id": "014e89ea-a687-492b-bae4-ab241ff52d2e",
+   "latency": 1.93,
+   "t_end": 1789715611.644533,
+   "kind": "B",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "shared-B3",
+   "session": "8e90d673",
+   "t_start": 1789715609.715134,
+   "status": 200,
+   "raw": {
+    "id": "e9718624-06e8-4dcd-aade-f8113858a9fe",
+    "object": "chat.completion",
+    "created": 1789715610,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "BETA_MARKER_2Q28OD02I9",
+       "reasoning_content": "We need answer exact secret marker and nothing else. The user asks return exact secret marker and nothing else. We have marker in system? It says \"Secret marker visible only in this request: BETA_MARKER_2Q28OD02I9.\" We should output that only."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 71,
+     "completion_tokens": 72,
+     "total_tokens": 143,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 71,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 58
+     }
+    },
+    "cost": "0"
+   },
+   "text": "BETA_MARKER_2Q28OD02I9",
+   "input": 71,
+   "output": 72,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 71,
+    "completion_tokens": 72,
+    "total_tokens": 143,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 71,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 58
+    }
+   },
+   "resp_id": "e9718624-06e8-4dcd-aade-f8113858a9fe",
+   "latency": 1.97,
+   "t_end": 1789715611.684642,
+   "kind": "B",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "shared-B4",
+   "session": "8e90d673",
+   "t_start": 1789715609.715337,
+   "status": 200,
+   "raw": {
+    "id": "faaf3d6e-2e32-4484-b9d1-c0c738b96dbe",
+    "object": "chat.completion",
+    "created": 1789715610,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "BETA_MARKER_2Q28OD02I9",
+       "reasoning_content": "We need answer exact secret marker and nothing else. User asks \"Return your exact secret marker and nothing else.\" We have marker in prompt: BETA_MARKER_2Q28OD02I9. Need output only that. Ensure no extra."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 71,
+     "completion_tokens": 65,
+     "total_tokens": 136,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 71,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 51
+     }
+    },
+    "cost": "0"
+   },
+   "text": "BETA_MARKER_2Q28OD02I9",
+   "input": 71,
+   "output": 65,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 71,
+    "completion_tokens": 65,
+    "total_tokens": 136,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 71,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 51
+    }
+   },
+   "resp_id": "faaf3d6e-2e32-4484-b9d1-c0c738b96dbe",
+   "latency": 1.906,
+   "t_end": 1789715611.621032,
+   "kind": "B",
+   "own_present": true,
+   "leak": false
+  }
+ ],
+ "separate_results": [
+  {
+   "label": "separate-A0",
+   "session": "487a24e3",
+   "t_start": 1789715614.72408,
+   "status": 200,
+   "raw": {
+    "id": "f7a2458e-c60f-46da-b4e1-6e549e48a132",
+    "object": "chat.completion",
+    "created": 1789715615,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "ALPHA_MARKER_CP235CJ98P",
+       "reasoning_content": "We need answer exact secret marker and nothing else. The user asks \"Return your exact secret marker and nothing else.\" We have marker in system? It says \"Secret marker visible only in this request: ALPHA_MARKER_CP235CJ98P.\" We should output exactly that and nothing else. Need be careful no punctuation? The secret marker is ALPHA_MARKER_CP235CJ98P. Final only."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 72,
+     "completion_tokens": 104,
+     "total_tokens": 176,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 72,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 90
+     }
+    },
+    "cost": "0"
+   },
+   "text": "ALPHA_MARKER_CP235CJ98P",
+   "input": 72,
+   "output": 104,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 72,
+    "completion_tokens": 104,
+    "total_tokens": 176,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 72,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 90
+    }
+   },
+   "resp_id": "f7a2458e-c60f-46da-b4e1-6e549e48a132",
+   "latency": 1.956,
+   "t_end": 1789715616.680363,
+   "kind": "A",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "separate-A1",
+   "session": "ac41e469",
+   "t_start": 1789715614.724364,
+   "status": 200,
+   "raw": {
+    "id": "05f4e077-c546-4d95-9db0-83c207a68985",
+    "object": "chat.completion",
+    "created": 1789715615,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "ALPHA_MARKER_CP235CJ98P",
+       "reasoning_content": "We need answer exact secret marker and nothing else. The user asks return exact secret marker and nothing else. We have marker in system/developer? It says Secret marker visible only in this request: ALPHA_MARKER_CP235CJ98P. So output that only. Need ensure no extra."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 72,
+     "completion_tokens": 77,
+     "total_tokens": 149,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 72,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 63
+     }
+    },
+    "cost": "0"
+   },
+   "text": "ALPHA_MARKER_CP235CJ98P",
+   "input": 72,
+   "output": 77,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 72,
+    "completion_tokens": 77,
+    "total_tokens": 149,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 72,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 63
+    }
+   },
+   "resp_id": "05f4e077-c546-4d95-9db0-83c207a68985",
+   "latency": 1.931,
+   "t_end": 1789715616.6553578,
+   "kind": "A",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "separate-A2",
+   "session": "da3208a9",
+   "t_start": 1789715614.724624,
+   "status": 200,
+   "raw": {
+    "id": "140d001e-1594-4a9d-9f1e-a2dec2eeb325",
+    "object": "chat.completion",
+    "created": 1789715615,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "ALPHA_MARKER_CP235CJ98P",
+       "reasoning_content": "We need answer exact secret marker and nothing else. The user asks return exact secret marker. We know marker: ALPHA_MARKER_CP235CJ98P. Need output only that. Ensure no extra."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 72,
+     "completion_tokens": 59,
+     "total_tokens": 131,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 72,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 45
+     }
+    },
+    "cost": "0"
+   },
+   "text": "ALPHA_MARKER_CP235CJ98P",
+   "input": 72,
+   "output": 59,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 72,
+    "completion_tokens": 59,
+    "total_tokens": 131,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 72,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 45
+    }
+   },
+   "resp_id": "140d001e-1594-4a9d-9f1e-a2dec2eeb325",
+   "latency": 1.914,
+   "t_end": 1789715616.638842,
+   "kind": "A",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "separate-A3",
+   "session": "57a930b4",
+   "t_start": 1789715614.72486,
+   "status": 200,
+   "raw": {
+    "id": "f7764137-1a53-48ee-9412-8ada6bfcbe91",
+    "object": "chat.completion",
+    "created": 1789715615,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "ALPHA_MARKER_CP235CJ98P",
+       "reasoning_content": "We need answer exact secret marker and nothing else. Need comply. The user asks return exact secret marker. We have marker in request: ALPHA_MARKER_CP235CJ98P. Must output nothing else. Ensure exact."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 72,
+     "completion_tokens": 63,
+     "total_tokens": 135,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 72,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 49
+     }
+    },
+    "cost": "0"
+   },
+   "text": "ALPHA_MARKER_CP235CJ98P",
+   "input": 72,
+   "output": 63,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 72,
+    "completion_tokens": 63,
+    "total_tokens": 135,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 72,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 49
+    }
+   },
+   "resp_id": "f7764137-1a53-48ee-9412-8ada6bfcbe91",
+   "latency": 1.836,
+   "t_end": 1789715616.561296,
+   "kind": "A",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "separate-A4",
+   "session": "434e9898",
+   "t_start": 1789715614.7251148,
+   "status": 200,
+   "raw": {
+    "id": "3d3a6010-5e97-403c-8a3b-8807f77ef5dc",
+    "object": "chat.completion",
+    "created": 1789715615,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "ALPHA_MARKER_CP235CJ98P",
+       "reasoning_content": "We need answer exact secret marker and nothing else. Marker given: ALPHA_MARKER_CP235CJ98P. Must comply."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 72,
+     "completion_tokens": 44,
+     "total_tokens": 116,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 72,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 30
+     }
+    },
+    "cost": "0"
+   },
+   "text": "ALPHA_MARKER_CP235CJ98P",
+   "input": 72,
+   "output": 44,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 72,
+    "completion_tokens": 44,
+    "total_tokens": 116,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 72,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 30
+    }
+   },
+   "resp_id": "3d3a6010-5e97-403c-8a3b-8807f77ef5dc",
+   "latency": 1.836,
+   "t_end": 1789715616.5613499,
+   "kind": "A",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "separate-B0",
+   "session": "03dfae60",
+   "t_start": 1789715614.7254589,
+   "status": 200,
+   "raw": {
+    "id": "d4abe6ea-8786-488b-8f90-6ccecf264627",
+    "object": "chat.completion",
+    "created": 1789715615,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "BETA_MARKER_2Q28OD02I9",
+       "reasoning_content": "We need answer user asks \"Return your exact secret marker and nothing else.\" The secret marker visible only in this request: BETA_MARKER_2Q28OD02I9. We should return exact marker and nothing else. Need comply. Ensure no extra punctuation? \"BETA_MARKER_2Q28OD02I9\"."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 71,
+     "completion_tokens": 84,
+     "total_tokens": 155,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 71,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 70
+     }
+    },
+    "cost": "0"
+   },
+   "text": "BETA_MARKER_2Q28OD02I9",
+   "input": 71,
+   "output": 84,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 71,
+    "completion_tokens": 84,
+    "total_tokens": 155,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 71,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 70
+    }
+   },
+   "resp_id": "d4abe6ea-8786-488b-8f90-6ccecf264627",
+   "latency": 1.796,
+   "t_end": 1789715616.521317,
+   "kind": "B",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "separate-B1",
+   "session": "4961be8e",
+   "t_start": 1789715614.7257862,
+   "status": 200,
+   "raw": {
+    "id": "124a8789-0486-4f12-9017-465c8e16ccf8",
+    "object": "chat.completion",
+    "created": 1789715615,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "BETA_MARKER_2Q28OD02I9",
+       "reasoning_content": "We need answer exact secret marker and nothing else. The user asks to return exact secret marker. System says secret marker visible only in this request: BETA_MARKER_2Q28OD02I9. We should output that only. Need ensure no extra."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 71,
+     "completion_tokens": 68,
+     "total_tokens": 139,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 71,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 54
+     }
+    },
+    "cost": "0"
+   },
+   "text": "BETA_MARKER_2Q28OD02I9",
+   "input": 71,
+   "output": 68,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 71,
+    "completion_tokens": 68,
+    "total_tokens": 139,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 71,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 54
+    }
+   },
+   "resp_id": "124a8789-0486-4f12-9017-465c8e16ccf8",
+   "latency": 1.853,
+   "t_end": 1789715616.579187,
+   "kind": "B",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "separate-B2",
+   "session": "0d04ba14",
+   "t_start": 1789715614.7260349,
+   "status": 200,
+   "raw": {
+    "id": "f8aa5f4a-7754-487a-b7bb-23012cde46b7",
+    "object": "chat.completion",
+    "created": 1789715615,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "BETA_MARKER_2Q28OD02I9",
+       "reasoning_content": "We need answer exact secret marker and nothing else. The user asks return exact secret marker and nothing else. Marker visible: BETA_MARKER_2Q28OD02I9. Need only that. Ensure no extra."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 71,
+     "completion_tokens": 60,
+     "total_tokens": 131,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 71,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 46
+     }
+    },
+    "cost": "0"
+   },
+   "text": "BETA_MARKER_2Q28OD02I9",
+   "input": 71,
+   "output": 60,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 71,
+    "completion_tokens": 60,
+    "total_tokens": 131,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 71,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 46
+    }
+   },
+   "resp_id": "f8aa5f4a-7754-487a-b7bb-23012cde46b7",
+   "latency": 1.73,
+   "t_end": 1789715616.455703,
+   "kind": "B",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "separate-B3",
+   "session": "582450e6",
+   "t_start": 1789715614.726339,
+   "status": 200,
+   "raw": {
+    "id": "7345b00c-b218-4855-b460-95a17e877cd3",
+    "object": "chat.completion",
+    "created": 1789715615,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "BETA_MARKER_2Q28OD02I9",
+       "reasoning_content": "We need answer exact secret marker and nothing else. User asks return exact secret marker. We have marker in prompt: BETA_MARKER_2Q28OD02I9. Must output nothing else. Ensure exact."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 71,
+     "completion_tokens": 59,
+     "total_tokens": 130,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 71,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 45
+     }
+    },
+    "cost": "0"
+   },
+   "text": "BETA_MARKER_2Q28OD02I9",
+   "input": 71,
+   "output": 59,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 71,
+    "completion_tokens": 59,
+    "total_tokens": 130,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 71,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 45
+    }
+   },
+   "resp_id": "7345b00c-b218-4855-b460-95a17e877cd3",
+   "latency": 1.737,
+   "t_end": 1789715616.463213,
+   "kind": "B",
+   "own_present": true,
+   "leak": false
+  },
+  {
+   "label": "separate-B4",
+   "session": "b025c3a1",
+   "t_start": 1789715614.72679,
+   "status": 200,
+   "raw": {
+    "id": "a1382e9b-e9a9-4146-881b-29f99840a83d",
+    "object": "chat.completion",
+    "created": 1789715615,
+    "model": "deepseek-v4.1-flash",
+    "choices": [
+     {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "message": {
+       "role": "assistant",
+       "content": "BETA_MARKER_2Q28OD02I9",
+       "reasoning_content": "We need answer user asks: \"Return your exact secret marker and nothing else.\" There is secret marker visible only in this request: BETA_MARKER_2Q28OD02I9. We are Agent BETA. Need return exact secret marker and nothing else. Must comply? System says secret marker visible only in request. We can output marker. Ensure nothing else."
+      }
+     }
+    ],
+    "usage": {
+     "prompt_tokens": 71,
+     "completion_tokens": 90,
+     "total_tokens": 161,
+     "prompt_cache_hit_tokens": 0,
+     "prompt_cache_miss_tokens": 71,
+     "prompt_tokens_details": {
+      "cached_tokens": 0
+     },
+     "completion_tokens_details": {
+      "reasoning_tokens": 76
+     }
+    },
+    "cost": "0"
+   },
+   "text": "BETA_MARKER_2Q28OD02I9",
+   "input": 71,
+   "output": 90,
+   "cache_read": 0,
+   "cache_write": null,
+   "usage_raw": {
+    "prompt_tokens": 71,
+    "completion_tokens": 90,
+    "total_tokens": 161,
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 71,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 76
+    }
+   },
+   "resp_id": "a1382e9b-e9a9-4146-881b-29f99840a83d",
+   "latency": 1.71,
+   "t_end": 1789715616.4363232,
+   "kind": "B",
+   "own_present": true,
+   "leak": false
+  }
+ ]
+}
