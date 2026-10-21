@@ -8,6 +8,7 @@ import (
 	"kiro-go/apikey"
 	"kiro-go/config"
 	"kiro-go/providererr"
+	"kiro-go/tokenopt"
 	"net/http"
 	"strings"
 	"time"
@@ -39,9 +40,22 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	clientModel := req.Model
 	noteAPIKeyMeta(r.Context(), "responses", clientModel, "", req.Stream)
 
+	// Token Optimization. A relayed request and a Kiro-native one carry different
+	// representations (raw items vs assembled chat messages), so input compression
+	// runs once per fork rather than once up front: here for the relayed body, below
+	// for the assembled messages. Only a model with a forward route takes this one.
+	run := h.tokenOptBegin()
+	fwdBody := body
+	if route, targets := config.ResolveRoute(req.Model); route != nil && len(targets) > 0 {
+		if res := run.input(r.Context(), tokenopt.ProtocolResponses, body, req.Model); res.Changed {
+			fwdBody = res.Body
+		}
+	}
+	fwdBody, kiroBehavior := run.applyBehavior(tokenopt.ProtocolResponses, req.Model, fwdBody)
+
 	// Forward to an external upstream when the client model matches an enabled
 	// route. Uses the raw client body (passthrough), bypassing the Kiro pool.
-	if h.tryForwardUpstream(r, w, body, req.Model, req.Stream, "/responses", false, "") {
+	if h.tryForwardUpstream(r, w, fwdBody, req.Model, req.Stream, "/responses", false, "") {
 		return
 	}
 	if h.rejectUnconfiguredModel(w, req.Model, false) {
@@ -116,11 +130,17 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Kiro-native fork: compress the assembled history (stored turns plus this
+	// input). Stored responses keep the client's original text; only what is sent
+	// upstream is shortened, and the memo keeps old turns byte-identical.
+	finalMessages = run.compressOpenAIMessages(r.Context(), finalMessages, req.Model)
+
 	openaiReq := &OpenAIRequest{
 		Model:    req.Model,
 		Messages: finalMessages,
 		Stream:   req.Stream,
 		Tools:    req.Tools,
+		behavior: kiroBehavior,
 	}
 	if req.Temperature != nil {
 		openaiReq.Temperature = *req.Temperature
@@ -135,7 +155,7 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	applyOpenAIModelNameEffort(openaiReq, nameEffort)
 	noteAPIKeyMeta(r.Context(), "responses", clientModel, actualModel, req.Stream)
 
-	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq)
+	estimatedInputTokens := estimateOpenAIRequestInputTokens(openaiReq) + behaviorTokens(openaiReq.behavior)
 	kiroPayload := OpenAIToKiro(openaiReq, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())

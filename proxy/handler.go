@@ -17,6 +17,7 @@ import (
 	"kiro-go/pool"
 	"kiro-go/providererr"
 	"kiro-go/search"
+	"kiro-go/tokenopt"
 	"net"
 	"net/http"
 	"net/url"
@@ -123,6 +124,12 @@ type Handler struct {
 	microsoftFlowMu       sync.Mutex
 	microsoftCanceled     map[string]time.Time
 	microsoftDiscoveries  map[string]*microsoftProfileDiscovery
+
+	// tokenOptMgr is the Token Optimization integration layer, built on first use
+	// (see tokenopt_integration.go) so tests that construct &Handler{} and installs
+	// that never enable the feature pay nothing.
+	tokenOptOnce sync.Once
+	tokenOptMgr  *tokenopt.Manager
 }
 
 type microsoftProfileSelection struct {
@@ -999,6 +1006,20 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 		h.sendClaudeError(w, 400, "invalid_request_error", msg)
 		return
 	}
+	// Token Optimization, input compression: may replace large tool results in the
+	// body, keeping the envelope (ids, order, unknown fields) exactly as the client
+	// wrote it. Done once, before the forward/Kiro fork, so both paths see the same
+	// request; req is re-read from the new body so the two stay consistent. Any
+	// problem leaves the original untouched.
+	run := h.tokenOptBegin()
+	if res := run.input(r.Context(), tokenopt.ProtocolClaude, body, req.Model); res.Changed {
+		var optimized ClaudeRequest
+		if err := json.Unmarshal(res.Body, &optimized); err == nil && validateClaudeRequestShape(&optimized) == "" {
+			body, req = res.Body, optimized
+		} else {
+			logger.Warnf("[TokenOpt] optimized request did not re-parse cleanly; using the original")
+		}
+	}
 	// Session-identity fallback: aggregators that rebuild requests drop the
 	// session headers but relay the same Claude Code identity inside
 	// metadata.user_id. Extract it ONCE here — the body is already parsed —
@@ -1031,6 +1052,13 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 			}
 		}
 	}
+
+	// Token Optimization, Caveman/Ponytail: append the official prompt text. After
+	// the memory step above on purpose: that step re-marshals the whole request from
+	// req, which would discard a system prompt added to body before it. The relayed
+	// body and the Kiro-native request get separate copies (see applyBehavior), so a
+	// request that is relayed and then falls through to the pool is never doubled.
+	body, req.behavior = run.applyBehavior(tokenopt.ProtocolClaude, req.Model, body)
 
 	// Capability-aware forwarding for web_search: resolve the model route
 	// and the provider's web_search execution strategy BEFORE the forwarding
@@ -1106,7 +1134,7 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	noteAPIKeyMeta(r.Context(), "claude", clientModel, req.Model, req.Stream)
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
-	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)
+	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq) + behaviorTokens(req.behavior)
 	cacheProfile := h.promptCache.BuildClaudeProfile(effectiveReq, estimatedInputTokens)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
@@ -1902,6 +1930,7 @@ func (h *Handler) Shutdown() {
 		if h.tokenManager != nil {
 			h.tokenManager.FlushPending()
 		}
+		h.closeTokenOpt()
 		close(h.stopRefresh)
 		close(h.stopStatsSaver)
 		if h.stopKeyRetention != nil {
@@ -2529,6 +2558,17 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		h.sendOpenAIError(w, 400, "invalid_request_error", msg)
 		return
 	}
+	// Token Optimization: see handleClaudeMessagesInternal.
+	run := h.tokenOptBegin()
+	if res := run.input(r.Context(), tokenopt.ProtocolOpenAI, body, req.Model); res.Changed {
+		var optimized OpenAIRequest
+		if err := json.Unmarshal(res.Body, &optimized); err == nil && validateOpenAIRequestShape(&optimized) == "" {
+			body, req = res.Body, optimized
+		} else {
+			logger.Warnf("[TokenOpt] optimized request did not re-parse cleanly; using the original")
+		}
+	}
+	body, req.behavior = run.applyBehavior(tokenopt.ProtocolOpenAI, req.Model, body)
 	clientModel := req.Model
 	noteAPIKeyMeta(r.Context(), "openai", clientModel, "", req.Stream)
 
@@ -2551,7 +2591,7 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	req.Model = actualModel
 	applyOpenAIModelNameEffort(&req, nameEffort)
 	noteAPIKeyMeta(r.Context(), "openai", clientModel, req.Model, req.Stream)
-	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
+	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req) + behaviorTokens(req.behavior)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
@@ -3439,6 +3479,12 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetWebSearchConfig(w, r)
 	case path == "/websearch" && r.Method == "POST":
 		h.apiUpdateWebSearchConfig(w, r)
+	case path == "/token-optimization" && r.Method == "GET":
+		h.apiGetTokenOptimization(w, r)
+	case path == "/token-optimization" && r.Method == "POST":
+		h.apiUpdateTokenOptimization(w, r)
+	case path == "/token-optimization/test" && r.Method == "POST":
+		h.apiTestTokenOptimization(w, r)
 	case path == "/tool-stats" && r.Method == "GET":
 		h.apiGetToolStats(w, r)
 	case path == "/memory/search" && r.Method == "GET":

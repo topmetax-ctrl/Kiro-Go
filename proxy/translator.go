@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"kiro-go/config"
+	"kiro-go/tokenopt"
 	"os"
 	"regexp"
 	"strings"
@@ -198,6 +199,13 @@ type ClaudeRequest struct {
 	// identity from the forwarded body, and lets session_affinity.go read it
 	// as the last-resort identity carrier.
 	Metadata *ClaudeRequestMetadata `json:"metadata,omitempty"`
+
+	// behavior is the official Caveman/Ponytail block to append to the system
+	// prompt on the Kiro-native path. The handler sets it; it is unexported, so it
+	// is never serialized and never reaches a relayed body. It is appended after the
+	// prompt filters because FilterClaudeCode replaces the whole system prompt, which
+	// would drop anything added to req.System first.
+	behavior tokenopt.Behavior
 }
 
 // ClaudeRequestMetadata mirrors the Anthropic request metadata object. Only
@@ -321,6 +329,11 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 
 	// 提取系统提示
 	systemPrompt := buildClaudeSystemPrompt(req.System, effort)
+	// The conversation id is derived from the prompt as the client and the filters
+	// left it, so switching an optimization on or off never forks an existing
+	// conversation. The behavior block is appended only after that.
+	identityPrompt := systemPrompt
+	systemPrompt = appendBehaviorPrompt(systemPrompt, req.behavior)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -431,7 +444,7 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
+	payload.ConversationState.ConversationID = buildConversationID(modelID, identityPrompt, firstClaudeConversationAnchor(req.Messages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
@@ -1340,6 +1353,9 @@ type OpenAIRequest struct {
 	// ReasoningEffort is the OpenAI-format spelling of the reasoning-depth
 	// control. Accepts the same level names as Anthropic's output_config.effort.
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+
+	// behavior: see ClaudeRequest.behavior.
+	behavior tokenopt.Behavior
 }
 
 type OpenAIMessage struct {
@@ -1461,6 +1477,9 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	if effort := resolveEffortForPayload(thinking, openAIRequestEffort(req)); effort != EffortUnset {
 		systemPrompt = thinkingModePromptForEffort(effort) + "\n\n" + systemPrompt
 	}
+	// See ClaudeToKiro: identity first, behavior block after.
+	identityPrompt := systemPrompt
+	systemPrompt = appendBehaviorPrompt(systemPrompt, req.behavior)
 
 	// 构建历史消息
 	history := make([]KiroHistoryMessage, 0)
@@ -1597,7 +1616,7 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ConversationState.ChatTriggerType = "MANUAL"
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
+	payload.ConversationState.ConversationID = buildConversationID(modelID, identityPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,
