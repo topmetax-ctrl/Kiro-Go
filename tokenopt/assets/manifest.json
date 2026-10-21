@@ -1,0 +1,46 @@
+{
+  "_comment": "Provenance for vendored upstream assets. Files under this directory are byte-identical copies; sha256 is verified at startup and in tests. To update: copy the new upstream file, re-pin tag + commit, recompute sha256, and re-run the golden tests in prompts_test.go.",
+  "assets": [
+    {
+      "id": "caveman.caveman",
+      "title": "Caveman: always-on activation rule",
+      "repo": "https://github.com/JuliusBrussee/caveman",
+      "tag": "v4.0.1",
+      "commit": "d262ab3882952a59312ff3537cd86d894523c5ab",
+      "upstreamPath": "src/rules/caveman-activate.md",
+      "file": "caveman/caveman-activate.md",
+      "bytes": 1314,
+      "sha256": "ef99681346ed2ff1932e1264fb5cdf1b5bb8ba54d62f7f205eebbd9973979802",
+      "license": "Apache-2.0",
+      "licenseFile": "caveman/LICENSE",
+      "noticeFile": "caveman/NOTICE"
+    },
+    {
+      "id": "caveman.ultracave",
+      "title": "Caveman: ultracave skill",
+      "repo": "https://github.com/JuliusBrussee/caveman",
+      "tag": "v4.0.1",
+      "commit": "d262ab3882952a59312ff3537cd86d894523c5ab",
+      "upstreamPath": "skills/ultracave/SKILL.md",
+      "file": "caveman/ultracave-SKILL.md",
+      "bytes": 2513,
+      "sha256": "a8da5b0b3501b853e1b98f2ae09fe8dc9c0edf481b1d3fa9529f8557011c1ef8",
+      "license": "Apache-2.0",
+      "licenseFile": "caveman/LICENSE",
+      "noticeFile": "caveman/NOTICE"
+    },
+    {
+      "id": "ponytail.skill",
+      "title": "Ponytail: skill (lite / full / ultra)",
+      "repo": "https://github.com/DietrichGebert/ponytail",
+      "tag": "v5.3.2",
+      "commit": "16352ac229eb08a9598dcae48fe9f2b342567d86",
+      "upstreamPath": "skills/ponytail/SKILL.md",
+      "file": "ponytail/SKILL.md",
+      "bytes": 3496,
+      "sha256": "9badd22a32e19cb884e46dfa8d3aae82bb81dfa5484105b8b4f0262df823a509",
+      "license": "MIT",
+      "licenseFile": "ponytail/LICENSE"
+    }
+  ]
+}
