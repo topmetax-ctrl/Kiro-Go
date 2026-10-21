@@ -18,6 +18,7 @@ Nếu dự án này hữu ích với bạn, một Star sẽ rất có ý nghĩa.
 - Nhiều cách xác thực: AWS Builder ID, IAM Identity Center (Enterprise SSO), Microsoft Enterprise SSO, SSO Token, cache cục bộ, credentials JSON, Kiro API Key
 - Theo dõi mức dùng, nhập/xuất tài khoản, đa ngôn ngữ (CN / EN / VI)
 - Hỗ trợ cấu hình proxy ra ngoài (SOCKS5 / HTTP)
+- Tối ưu token tùy chọn (mặc định tắt): nén đầu vào bằng Headroom, prompt Caveman / Ponytail, hướng dẫn RTK. Xem [docs/token-optimization.md](docs/token-optimization.md)
 
 ## Bắt đầu nhanh
 

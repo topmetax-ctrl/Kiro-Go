@@ -18,6 +18,7 @@ If this project helps you, a Star would mean a lot.
 - Multiple auth: AWS Builder ID, IAM Identity Center (Enterprise SSO), Microsoft Enterprise SSO, SSO Token, local cache, credentials JSON, Kiro API Key
 - Usage tracking, account import/export, i18n (CN / EN / VI)
 - Support configuring outbound proxy (SOCKS5 / HTTP)
+- Optional token optimization (off by default): Headroom input compression, Caveman / Ponytail prompts, RTK guidance. See [docs/token-optimization.md](docs/token-optimization.md)
 
 ## Quick Start
 
