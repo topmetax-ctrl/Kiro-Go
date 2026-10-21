@@ -576,6 +576,12 @@ type Config struct {
 	// a dedicated admin API; it does NOT inject memory into the LLM request path.
 	Memory MemoryConfig `json:"memory,omitempty"`
 
+	// TokenOptimization configures the optional integration layer over external
+	// token-saving engines and official prompt assets (see token_optimization.go).
+	// Omitted from the file while untouched, so existing installs keep an
+	// identical config and unchanged inference behavior.
+	TokenOptimization TokenOptimizationConfig `json:"tokenOptimization,omitzero"`
+
 	// LogLevel controls verbosity of application logs.
 	// Accepted values: "debug", "info", "warn", "error". Defaults to "info".
 	// Can be overridden by the LOG_LEVEL environment variable.
