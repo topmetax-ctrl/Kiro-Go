@@ -25,6 +25,8 @@ without them serialize exactly as before.
 | `cache.prefix` | `"k:digest"` checkpoints; the digest covers tools, system and the first `k` messages. The newest 4 are always listed, plus one every 16 (wider for very long conversations, at most 24), plus the boundary after every message that carries a breakpoint. |
 | `cache.marks` | The breakpoint signature: `t<i>` tool, `s<i>` system block, `m<i>` message, suffixed `:<ttl>` and `@<scope>` when the body names them (`s0:1h@global`). |
 | `cache.policy` | Token Optimization settings in force: `off`, `observe`, or `on+headroom-cache+caveman`. |
+| `cache.sess`, `cache.parent` | Keyed digests of the session id and of the parent session id in the body's `metadata.user_id`, scoped to the API key. A child's `parent` equals its parent's `sess`. Omitted when the body names none. See [Session fingerprints](#session-fingerprints). |
+| `cache.signals` | What the request carried that could classify it (parent session, subagent marker, agent header, probe, title helper, extended-TTL beta), each `present`, `absent` or `not-observable`. See [Classification signals](#classification-signals). |
 
 Only Claude-shaped routes (`/v1/messages`) are traced.
 
@@ -54,7 +56,8 @@ Truncated (96-bit) HMAC-SHA256. The key is derived from the api-key pepper
 (`apiKeyPepper` in `config.json`, or `KIRO_APIKEY_PEPPER`) by a fixed label, so it
 survives restarts and is not the pepper itself. A digest equals another only when
 the content is identical; it reveals nothing else. No prompt text, source code,
-tool arguments, session id or credential is stored.
+tool arguments or credential is stored, and a session id appears only as the
+separate keyed digest described under [Session fingerprints](#session-fingerprints).
 
 Rotating the pepper (which also invalidates stored API-key hashes) makes digests
 recorded before and after it incomparable. An install with no pepper creates one
@@ -70,6 +73,10 @@ tools     = D(tools JSON)          system = D(system JSON)         (markers remo
 msg_i     = D(message i JSON)                                     (markers removed)
 prefix(k) = HMAC-SHA256(key, tools ‖ system ‖ msg_1 ‖ … ‖ msg_k)   (the full 32-byte sums)
 conv      = msg_1                  settings = D(model, thinking, output_config, tool_choice)
+
+sessKey   = HMAC-SHA256(pepper, "kiro-go/cache-trace/session/v1")
+S(p, id)  = first 12 bytes of HMAC-SHA256(sessKey, be64(len(p)) ‖ p ‖ be64(len(id)) ‖ id)
+sess      = S(principal, session_id)       parent = S(principal, parent_session_id)
 ```
 
 Every digest is the first 12 bytes of its value, hex encoded. Parts are the raw
@@ -90,23 +97,28 @@ lists share with equal digests bounds where.
 About 9 ms and 2 MB of allocation per 1.8 MB body (Intel i5-8500B), computed in
 parallel with the upstream call, so a request waits for it only if the upstream
 answers faster than the hash. The goroutine always finishes (no I/O, no locks)
-and holds nothing once the event is built. An event gains 300 to 1100 bytes (up
-to 3000 messages; at most 44 prefix checkpoints and 16 marks).
+and holds nothing once the event is built. An event gains up to about 1350 bytes
+(3000 messages, at most 44 prefix checkpoints and 16 marks, a session and its
+parent, every signal; 570 bytes for a 3-message request). Reading the signals
+parses `metadata`, `output_config` and `system`, and the one message of a
+probe-shaped request; only a title-only output schema makes it read every message.
+The benchmark body (300 messages, a short system prompt) cost 9.0 ms before and
+after, with 0.8 KB and 13 more allocations.
 
-The event ring holds `metrics.EventRingCapacity` = 12000 events, about 1.7 KB
-each with a trace: roughly 20 MB when full, about two days of the traffic this
+The event ring holds `metrics.EventRingCapacity` = 12000 events, about 1.9 KB
+each with a trace: roughly 23 MB when full, about two days of the traffic this
 gateway has seen. The JSON export covers the whole ring.
 
 ### Switching it off
 
 `"cacheTrace": false` in `config.json`, then restart. Events then carry no
-`cache` object; the TTL split and `upstreamModel` are plain response telemetry
-and stay.
+`cache` object, so no digests, session fingerprints or signals; the TTL split and
+`upstreamModel` are plain response telemetry and stay.
 
 ## Classifying rewrites
 
 ```
-python3 scripts/classify_cache_rewrites.py events.json [--min-write 100000]
+python3 scripts/classify_cache_rewrites.py events.json [--min-write 100000] [--sessions]
 ```
 
 `events.json` is the output of `/admin/api/forward-events/export?format=json`
@@ -137,6 +149,113 @@ message, so a marker that moves along with the history is not a change.
 Events recorded before this feature have no digests and no TTL split. For those
 the previous request is a guess from sizes, labels that depend on it say
 `heuristic`, and `prefix_changed` and `scope_changed` cannot be reached.
+
+A snapshot kept by `scripts/cache_audit_store.py` (below) is read the same way.
+
+`--sessions` adds a table of the sessions in the events, by digest: requests,
+tokens written, the TTL tiers they wrote, the `parentSession` values they carried,
+and the parent each names with whether that parent's own events are in the file
+(`in events`) or not (`outside`). That is how to tell a child session from a main
+one. It needs events recorded with session digests.
+
+## Classification signals
+
+`cache.signals` records facts that a gateway further upstream may use to classify
+a request, for instance to decide how long its cache lives. They are what this
+gateway **observed**, not what that gateway decided: the event says nothing about
+whether anyone acted on a signal, and a signal this gateway does not forward is
+still recorded as seen.
+
+| Field | Read from | Present when |
+|---|---|---|
+| `userId` | body `metadata.user_id` | not a signal; its shape: `json` (the envelope gateways write), `native` (`user_<hex>_account_<uuid>_session_<uuid>`), `invalid` (present, neither, or over 4096 bytes), `none` |
+| `parentSession` | body `metadata.user_id` | it names `parent_session_id`: the JSON envelope has the key, an object-form `user_id` has it, or the text holds `"parent_session_id"` |
+| `subagentMarker` | body `system` | `system[0].text` (or a string `system`) holds `cc_is_subagent=true` |
+| `agentHeader` | client request headers | `X-Claude-Code-Agent-Id` or `X-Claude-Code-Parent-Agent-Id` was sent. **Never forwarded**: this gateway's header allow-list leaves them out, so the next hop cannot see them |
+| `probe` | body | one token allowed, no tools, one short user message such as `quota`, `test`, `.`, `probe` |
+| `titleHelper` | body | the request asks for a session title: a system prompt holding the instruction, or a title-only output schema |
+| `extendedTtlBeta` | `Anthropic-Beta` as forwarded | it lists `extended-cache-ttl-2025-04-11` |
+
+A breakpoint that asks for `ttl: "1h"` is already in `cache.marks` (`m5:1h`).
+
+**The three values.** `present`: the signal was in the data checked. `absent`: the
+data was checked in full, in a form that can carry the signal, and it is not
+there. `not-observable`: this gateway cannot tell. That is the case for
+`parentSession` when `userId` is `native`, `none` or `invalid` (those forms cannot
+carry a parent, so only the JSON envelope can show there is none), and for the two
+header fields when the client's headers were not available. Do not read
+`not-observable` as `false`.
+
+To ask whether CLIProxyAPI v8.0.8 would have treated a request as a subagent from
+what it was sent, use `parentSession = present` or `subagentMarker = present`;
+`agentHeader` cannot reach it. That version also keeps a subagent's `1h` marker
+when `extendedTtlBeta = present` or a mark says `:1h`, and strips the TTL of a
+probe or title helper.
+
+The body-derived rules follow that version's `claude_diagnostics.go`. They were
+run against it over 1598 generated bodies: `parentSession`, `subagentMarker`,
+`agentHeader` and the `1h` request agreed on every one, and `probe` and
+`titleHelper` on every one except two inputs the Messages API rejects (a
+`max_tokens` sent as the string `"1"`, and messages with the role `system`),
+which are read as not a probe and not a helper. Requests with no message are not
+traced at all.
+
+## Session fingerprints
+
+`cache.sess` and `cache.parent` exist to answer one question: is this
+conversation a child of another? A child's body names its parent in
+`parent_session_id`; the parent's own events carry that id as their session.
+Digesting both with one key, one framing and one scope makes them equal exactly
+when they are the same session of the same API key, so the link can be read from
+events that hold no session id.
+
+- Key and scheme: see [Digests](#digests). The session key is a separate
+  derivation from the content key, so a session digest never equals a content
+  digest of the same bytes.
+- Scope: the API key id goes into every digest. One session id sent through two
+  keys gives two unrelated digests, so a digest cannot tie one person's sessions
+  to another's. Requests with no API key share the scope `""`.
+- Normalisation: an id in canonical UUID form is lower-cased first; any other id
+  is used as sent. Both digests pass through the same function.
+- Source: the body's `metadata.user_id` only, parsed by the same rules as session
+  affinity (the JSON envelope's `session_id`; the native form's UUID). The
+  session headers are not consulted, so a request whose body carries no usable
+  `user_id` has no `sess`, even when a header named a session. Omitted means
+  unknown; no id is ever made up.
+- A stable digest is a pseudonym, not anonymity. It cannot be reversed to the id,
+  but it links one session's events to each other (that is its use). Treat an
+  export that holds it as private data: see the store below.
+
+## Durable audit store
+
+The ring is memory only. `scripts/cache_audit_store.py` keeps what the analysis
+needs outside the repository, in `~/.kiro-go-audit/` by default:
+
+```
+KIRO_GO_ADMIN_PASSWORD=... python3 scripts/cache_audit_store.py save --url http://127.0.0.1:8080
+python3 scripts/cache_audit_store.py save --source events.json     # an export you already have
+python3 scripts/cache_audit_store.py prune [--dry-run]
+```
+
+`save` writes one snapshot, `exports/audit-<UTC time>.json`, then prunes. It keeps
+an allowlist of fields: time, model, status, latency, TTFB, token usage including
+the 5m/1h split, the `cache` object (digests, marks, signals, `sess`, `parent`)
+and the session source and scope. It drops the API key name and id, the client
+address, the connection name and id, the request id, the provider and route ids,
+the error text, and any field it does not know. A credential label is replaced by
+a token that is only comparable inside that snapshot, so `scope_changed` still
+works. A snapshot is an export to the classifier.
+
+- Directory 0700, files 0600, whatever the caller's umask. A directory inside a
+  git work tree, or one that is not empty and not a store, is refused.
+- Retention: snapshots older than 30 days are deleted, then the oldest until the
+  store is under 400 MB. A snapshot younger than 48 hours is never deleted, so an
+  audit window that is still running keeps its data; if the cap cannot be met
+  without it, `prune` says so and exits 2.
+- Pruning runs at the end of every `save`. Nothing schedules `save`: run it once a
+  day, and before a container recreate, which empties the ring. Snapshots overlap
+  (the ring holds about two days) and are self-contained on purpose.
+- The admin password comes from `KIRO_GO_ADMIN_PASSWORD`, never from an argument.
 
 ## In the dashboard
 
@@ -190,11 +309,14 @@ All of these are additive; existing fields are unchanged.
 Every label describes the body **this gateway sent**.
 
 - **The final upstream body.** In the deployed chain a CLIProxyAPI hop sits in
-  between. Its Claude executor (v7.2.144 source; the deployed v8.0.8 was not
-  diffed) can rewrite `cache_control` for non-native clients (inject
-  breakpoints, upgrade a marker with no `ttl` to `1h` for OAuth credentials, cap
-  at four, repair TTL order) and adds `context_management` with `keep: "all"`,
-  which clears nothing. A digest that stays equal proves the client side was
+  between. Its Claude executor can rewrite `cache_control`. For the TTL rules
+  the source was read at the deployed tag, v8.0.8: a marker with no `ttl` is
+  upgraded to `1h` for OAuth credentials, except on a subagent, probe or title
+  helper (see [Classification signals](#classification-signals)), whose TTL is
+  stripped unless it asked for `1h`. The other rewrites (inject breakpoints, cap
+  at four, repair TTL order) and the `context_management` it adds with
+  `keep: "all"`, which clears nothing, are from v7.2.144 and were not checked
+  against v8.0.8. A digest that stays equal proves the client side was
   stable. When it stays equal, the gap is inside the TTL and the cache still
   missed, the cause is downstream of this gateway; the classifier says exactly
   that and leaves the label `unknown`. The response-side TTL split is the
@@ -214,7 +336,8 @@ Every label describes the body **this gateway sent**.
 ## Operating notes
 
 - The event ring is in memory only. A container recreate empties it: export
-  first (`/admin/api/forward-events/export?format=json`).
+  first (`/admin/api/forward-events/export?format=json`), or `save` a snapshot to
+  the audit store.
 - Before analysing a window, check that the oldest exported event is older than
   the window's start; if not, the ring overwrote part of it.
 - Roll back by deploying the previous image. Events recorded by the new build
