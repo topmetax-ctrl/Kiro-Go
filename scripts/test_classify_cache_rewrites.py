@@ -147,6 +147,30 @@ class ClassifyTest(unittest.TestCase):
         self.assertIn("compaction?", got[0][1])
 
 
+class ConcurrentBranchTest(unittest.TestCase):
+    """Two requests that fork from one history overlap: neither could read the other's write."""
+
+    def later(self, first_marks, branch_marks, first_ttfb, branch_end):
+        first = trace("c", 6, ["3:a3", "4:a4", "5:x5", "6:x6"], marks=first_marks)
+        branch = trace("c", 6, ["3:a3", "4:a4", "5:y5", "6:y6"], marks=branch_marks)
+        got = verdicts([ev(1040, lat=40, ttfb=first_ttfb, tot=210000, cr=0, cc=210000, trace=first),
+                        ev(branch_end, lat=20, ttfb=2, tot=210000, cr=0, cc=210000, trace=branch)])
+        return next(v for v in got.values() if v.row.end == branch_end)
+
+    def test_branches_sharing_a_breakpoint_entry_are_concurrent(self):
+        got = self.later(["m3", "m5"], ["m3"], first_ttfb=20, branch_end=1033)
+        self.assertEqual((got.label, got.confidence), ("concurrent_write", "confirmed"))
+        self.assertIn("same history up to message 4", got.evidence)
+
+    def test_branches_with_no_shared_entry_are_not_concurrent(self):
+        got = self.later(["m5"], ["m3"], first_ttfb=20, branch_end=1033)
+        self.assertNotEqual(got.label, "concurrent_write")
+
+    def test_a_start_after_the_first_byte_is_not_concurrent(self):
+        got = self.later(["m3", "m5"], ["m3"], first_ttfb=2, branch_end=1043)
+        self.assertNotEqual(got.label, "concurrent_write")
+
+
 class ConfidenceTest(unittest.TestCase):
     """How well the evidence supports a verdict, apart from which verdict it is."""
 

@@ -116,7 +116,7 @@ confidence:
 
 | Label | Evidence required |
 |---|---|
-| `concurrent_write` | An earlier-started request for the identical prompt (same `conv`, `settings` and full-prefix digest) had not produced a response byte when this one started. |
+| `concurrent_write` | An earlier-started request of the same conversation (same `conv` and `settings`) that asked to cache a prefix this request also contains had not produced a response byte when this one started, so that entry was not readable yet. The two prompts may differ after the shared prefix (a branch); the evidence names where. |
 | `expired` | The previous request of the conversation ended more than 3600 s earlier (no tier lives longer), or it wrote the 5m tier and ended more than 300 s earlier. |
 | `prefix_changed` | The history no longer extends the previous request's, and expiry is excluded (gap within 300 s, or the previous write was the 1h tier). Names the changed parts and the message window. |
 | `scope_changed` | The previous request was served by a different credential (needs a per-request credential; see below). |

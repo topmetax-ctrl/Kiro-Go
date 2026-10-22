@@ -8,8 +8,8 @@ most likely cause, using only evidence the events carry:
   expired           the conversation was idle longer than the cache lives
   prefix_changed    the prompt no longer extends the previous request's prompt
   scope_changed     the previous request was served by a different credential
-  concurrent_write  an identical request started first and had not yet begun
-                    its response, so its cache entry was not readable yet
+  concurrent_write  a request sharing this one's history started first and had not
+                    yet begun its response, so its cache entry was not readable yet
   unknown           the evidence does not decide
 
 Each verdict also carries how well the evidence supports it:
@@ -186,14 +186,25 @@ def compaction_followup(r, rows):
     return None
 
 
+def shared_boundary(r, e):
+    """Largest message count at which r lists a prefix digest that e asked to cache, or None.
+
+    That is the entry r would have read had e's write been readable already, so it
+    is what makes two requests one prompt even when their last messages differ.
+    """
+    mine = set(r.trace.get("prefix") or [])
+    ks = [int(p.split(":", 1)[0]) for p in e.entries & mine]
+    return max(ks) if ks else None
+
+
 def find_twin(r, rows, min_write):
-    """An earlier-started request for the same prompt that had no response yet."""
+    """An earlier-started request that wrote what r wrote and had no response yet."""
     for e in rows[max(0, r.i - 300) : r.i + 300]:
         if e.i == r.i or e.cc < min_write * 0.5 or not (e.start < r.start < e.first_byte):
             continue
         if r.trace and e.trace:
             same = (r.trace.get("conv") == e.trace.get("conv") and r.trace.get("settings") == e.trace.get("settings")
-                    and r.full_prefix and r.full_prefix == e.full_prefix)
+                    and shared_boundary(r, e) is not None)
         else:
             same = abs(e.tot - r.tot) <= TWIN_TOLERANCE * r.tot
         if same:
@@ -277,7 +288,12 @@ def decide(r, rows, has_successor, min_write):
     twin = find_twin(r, rows, min_write)
     if twin:
         digests = bool(r.trace and twin.trace)
-        how = "identical prompt digest" if digests else "size within %.1f%%" % (TWIN_TOLERANCE * 100)
+        if not digests:
+            how = "size within %.1f%%" % (TWIN_TOLERANCE * 100)
+        elif r.full_prefix and r.full_prefix in twin.entries:
+            how = "identical prompt digest"
+        else:
+            how = "same history up to message %d, then the prompts differ" % shared_boundary(r, twin)
         return ("concurrent_write", CONFIRMED if digests else LIKELY,
                 "request #%d started %.1fs earlier and sent no response for another %.1fs (%s)"
                 % (twin.i, r.start - twin.start, twin.first_byte - r.start, how), "")
