@@ -171,6 +171,7 @@
     renderStatsTable();
     renderStatsCompare();
     renderStatsTrend(statsTrendLast.buckets, statsTrendLast.unit, statsTrendLast.minuteSinceMs);
+    renderFwdWindowChip();
     // The callers leaderboard caches its rows for the IP text filter, so it
     // re-renders from cache on a language switch like the other tables.
     renderTopIps();
@@ -8388,8 +8389,11 @@
     // The range is expressed as a lower bound resolved at request time, not a
     // stored timestamp, so paging and live refreshes always mean "the last N
     // hours from now" rather than from whenever the filter was picked.
-    const sinceMs = fwdFilterSinceMs();
+    const sinceMs = fwdWindow ? fwdWindow.since : fwdFilterSinceMs();
     if (sinceMs) params.set('since', String(sinceMs));
+    if (fwdWindow && fwdWindow.until) params.set('until', String(fwdWindow.until));
+    const minWrite = fwdFilterMinCacheWrite();
+    if (minWrite) params.set('minCacheWrite', String(minWrite));
     try {
       const res = await api('/forward-events?' + params.toString());
       if (!res.ok) throw new Error('http ' + res.status);
@@ -8833,13 +8837,63 @@
     return Date.now() - Math.round(hours * 3600 * 1000);
   }
 
+  // fwdWindow is an exact time window set by a drill-down from a chart or a
+  // table (not by the range select): {since, until, label}. While set it replaces
+  // the range select, and shows as a removable chip so the view is never
+  // silently narrowed.
+  let fwdWindow = null;
+
+  // fwdFilterMinCacheWrite is the Activity "cache write at least" filter in tokens.
+  function fwdFilterMinCacheWrite() {
+    const sel = $('fwdFilterCache');
+    const n = sel ? parseInt(sel.value, 10) : 0;
+    return n > 0 ? n : 0;
+  }
+
   function fwdFilterActive() {
     const prov = $('fwdFilterProvider') ? $('fwdFilterProvider').value : '';
     const status = $('fwdFilterStatus') ? $('fwdFilterStatus').value : '';
     const model = $('fwdFilterModel') ? $('fwdFilterModel').value.trim() : '';
     // A range counts as an active filter: live events must not be prepended
-    // when the view is scoped, or a row outside the window would slip in.
-    return !!(prov || status || model || fwdFilterSinceMs());
+    // when the view is scoped, or a row outside the window would slip in. The
+    // same goes for a drill-down window and the cache-write filter.
+    return !!(prov || status || model || fwdFilterSinceMs() || fwdWindow || fwdFilterMinCacheWrite());
+  }
+
+  function renderFwdWindowChip() {
+    const el = $('fwdFilterWindow');
+    if (!el) return;
+    el.innerHTML = fwdWindow
+      ? scopeTag('range', t('forward.windowChip', fwdWindow.label), t('forward.windowChipHint')) +
+        '<button type="button" class="btn btn-outline btn-sm" data-fwd-window-clear aria-label="' +
+        escapeAttr(t('forward.windowClear')) + '"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>'
+      : '';
+  }
+
+  // openActivityWindow opens Activity narrowed to the requests behind a chart bar
+  // or a table row: an exact time window, optionally one provider and a minimum
+  // cache write. Everything else is reset so the result is exactly that slice.
+  function openActivityWindow(o) {
+    const setSel = (id, value) => {
+      const sel = $(id);
+      if (!sel) return;
+      sel.value = value;
+      if (typeof syncCustomSelect === 'function') syncCustomSelect(sel);
+    };
+    setSel('fwdFilterProvider', o.providerId || '');
+    setSel('fwdFilterStatus', '');
+    setSel('fwdFilterRange', '');
+    // The select offers fixed sizes; a drill-down picks the largest one that does
+    // not hide any request it came from.
+    const minWrite = o.minCacheWrite || 0;
+    const opts = [100000, 10000, 1000, 1].filter(v => v <= minWrite);
+    setSel('fwdFilterCache', opts.length ? String(opts[0]) : '');
+    if ($('fwdFilterModel')) $('fwdFilterModel').value = '';
+    fwdWindow = { since: o.since, until: o.until, label: o.label };
+    renderFwdWindowChip();
+    // Navigating runs the activity view's enter hook, which resets the offset and
+    // fetches with the filters just set.
+    navigate('forwarding/activity');
   }
 
   function closeForwardStream() {
@@ -8887,7 +8941,23 @@
     const status = $('fwdFilterStatus');
     if (status) status.addEventListener('change', () => { fwdEventsOffset = 0; loadForwardEvents(); });
     const range = $('fwdFilterRange');
-    if (range) range.addEventListener('change', () => { fwdEventsOffset = 0; loadForwardEvents(); });
+    if (range) range.addEventListener('change', () => {
+      // Picking a range is choosing a different window than a drill-down's.
+      fwdWindow = null;
+      renderFwdWindowChip();
+      fwdEventsOffset = 0;
+      loadForwardEvents();
+    });
+    const cacheSel = $('fwdFilterCache');
+    if (cacheSel) cacheSel.addEventListener('change', () => { fwdEventsOffset = 0; loadForwardEvents(); });
+    const winChip = $('fwdFilterWindow');
+    if (winChip) winChip.addEventListener('click', e => {
+      if (!e.target.closest('[data-fwd-window-clear]')) return;
+      fwdWindow = null;
+      renderFwdWindowChip();
+      fwdEventsOffset = 0;
+      loadForwardEvents();
+    });
     const model = $('fwdFilterModel');
     if (model) model.addEventListener('input', () => {
       clearTimeout(fwdModelSearchTimer);

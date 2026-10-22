@@ -1123,6 +1123,14 @@
               <option value="720" data-i18n="stats.range30d"></option>
             </select>
             <input type="text" id="fwdFilterModel" class="w-48!" data-i18n-placeholder="forward.filterModel" />
+            <select id="fwdFilterCache" class="w-48!" data-i18n-aria-label="forward.filterCache">
+              <option value="" data-i18n="forward.cacheAny"></option>
+              <option value="1" data-i18n="forward.cacheAnyWrite"></option>
+              <option value="1000" data-i18n="forward.cacheWrite1k"></option>
+              <option value="10000" data-i18n="forward.cacheWrite10k"></option>
+              <option value="100000" data-i18n="forward.cacheWrite100k"></option>
+            </select>
+            <span class="scope-line" id="fwdFilterWindow"></span>
             <div class="toolbar-spacer"></div>
             <span class="scope-line" id="fwdEventsScope"></span>
             <span class="text-xs muted-text" id="fwdEventsCount"></span>
