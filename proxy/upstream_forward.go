@@ -334,7 +334,7 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 	// cacheTrace resolves the request's cache evidence (see cache_trace.go). It
 	// starts hashing now and is read only when the event is recorded, so the
 	// digests cost the upstream call no time.
-	cacheTrace := h.startCacheTrace(payload, isClaudeRoute)
+	cacheTrace := h.startCacheTrace(r, payload, isClaudeRoute, apiKeyID)
 
 	// recordMetric is called once, at the end of the attempt (after the body/stream
 	// finishes), so LatencyMs reflects the full relay — not just time-to-headers.

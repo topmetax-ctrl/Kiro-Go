@@ -114,7 +114,7 @@ func TestStartCacheTraceNeverReadStillFinishes(t *testing.T) {
 	h := &Handler{}
 	body := []byte(strings.Replace(claudeBody, "%STREAM%", "false", 1))
 	for i := 0; i < 50; i++ {
-		h.startCacheTrace(body, true) // reader dropped unread
+		h.startCacheTrace(nil, body, true, "") // reader dropped unread
 	}
 	waitUntil(t, "unread traces to finish", func() bool { return goroutinesIn("startCacheTrace") == 0 })
 }
@@ -134,7 +134,7 @@ func TestCacheTraceReaderDoesNotRetainTheBody(t *testing.T) {
 	freed := make(chan struct{})
 	runtime.SetFinalizer(&buf[0], func(*byte) { close(freed) })
 
-	read := h.startCacheTrace(buf, true)
+	read := h.startCacheTrace(nil, buf, true, "")
 	if tr := read(); tr == nil || tr.Msgs != 1 {
 		t.Fatalf("no trace for a valid body: %+v", tr)
 	}
@@ -162,7 +162,7 @@ func TestCacheTraceDigestsSurviveARestart(t *testing.T) {
 		if err := config.Init(path); err != nil {
 			t.Fatalf("config.Init: %v", err)
 		}
-		tr := (&Handler{}).startCacheTrace(body, true)()
+		tr := (&Handler{}).startCacheTrace(nil, body, true, "")()
 		if tr == nil {
 			t.Fatal("no trace")
 		}
@@ -189,7 +189,7 @@ func TestStartCacheTraceIsSafeUnderLoad(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if h.startCacheTrace(body, true)() == nil {
+			if h.startCacheTrace(nil, body, true, "")() == nil {
 				t.Error("nil trace under load")
 			}
 		}()

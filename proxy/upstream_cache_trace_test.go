@@ -273,7 +273,7 @@ func TestForwardTraceCoversFailuresAndSkipsOtherDialects(t *testing.T) {
 
 	// A route that is not Claude-shaped has no prompt cache semantics to trace.
 	h := &Handler{}
-	if got := h.startCacheTrace([]byte(claudeBody), false)(); got != nil {
+	if got := h.startCacheTrace(nil, []byte(claudeBody), false, "")(); got != nil {
 		t.Fatalf("non-Claude route traced: %+v", got)
 	}
 }
@@ -288,7 +288,7 @@ func TestStartCacheTraceIsSafeConcurrently(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			read := h.startCacheTrace(body, true)
+			read := h.startCacheTrace(nil, body, true, "")
 			results[i] = read()
 			if read() != results[i] {
 				t.Errorf("reader must be idempotent")

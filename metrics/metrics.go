@@ -177,9 +177,12 @@ type Event struct {
 	// evidence of cross-turn identity. Labeling a freshly issued token
 	// "conversation" would make this field claim continuity that has not happened.
 	//
-	// The session ID ITSELF is never recorded — not raw, not hashed. It is client
-	// conversation state, and a per-session value would also make an unbounded
-	// metric dimension out of something these three labels already answer.
+	// The session ID ITSELF is never recorded raw, and these three labels never
+	// carry it. A per-session value would make an unbounded metric dimension out
+	// of something these labels already answer, so no counter or series is keyed
+	// on one. The one exception is CacheTrace.Sess/Parent: a keyed digest of the
+	// body's session id, scoped to the API key, held only on the event ring so a
+	// child session can be tied to its parent when a cache write is explained.
 	SessionSource string `json:"sessionSource,omitempty"`
 	SessionScope  string `json:"sessionScope,omitempty"`
 	SessionMapped bool   `json:"sessionMapped,omitempty"`
@@ -234,6 +237,57 @@ type CacheTrace struct {
 	// Policy labels the Token Optimization settings in force, since they change
 	// what the prompt contains.
 	Policy string `json:"policy,omitempty"`
+	// Sess and Parent are keyed digests of the session id and the parent session
+	// id the body's metadata.user_id names. Both are scoped to the API key and
+	// hashed the same way, so a child's Parent equals its parent's Sess when, and
+	// only when, both came through one key. Omitted when the body names none or
+	// it could not be parsed: unknown, never a made-up id.
+	Sess   string `json:"sess,omitempty"`
+	Parent string `json:"parent,omitempty"`
+	// Signals is what the request carried that could classify it, as enums.
+	Signals *CacheSignals `json:"signals,omitempty"`
+}
+
+// Values of a CacheSignals field. present: the signal was in the data checked.
+// absent: the data was checked in full, in a form that can carry the signal, and
+// it is not there. not-observable: this gateway cannot tell (the form cannot
+// carry it, it could not be parsed, or the data was not available).
+const (
+	SignalPresent       = "present"
+	SignalAbsent        = "absent"
+	SignalNotObservable = "not-observable"
+)
+
+// CacheSignals records facts about a request that a gateway further upstream
+// may use to classify it, for instance to decide how long its cache lives. They
+// are what this gateway observed, not what that gateway decided: a signal this
+// gateway does not forward is recorded as seen, and the event says nothing about
+// whether anyone downstream acted on it. Every field is an enum; no header,
+// metadata or prompt text is copied.
+//
+// Where each is read: UserID, ParentSession, SubagentMarker, Probe and
+// TitleHelper from the body sent upstream; AgentHeader from the client's request
+// headers (it is never forwarded); ExtendedTTLBeta from the Anthropic-Beta value
+// as forwarded.
+type CacheSignals struct {
+	// UserID is the shape of metadata.user_id: "json" (the envelope gateways
+	// write, which can carry a parent session), "native" (Claude Code's own
+	// user_<hex>_account_<uuid>_session_<uuid>, which cannot), "invalid" (present
+	// but neither) or "none". Empty when it was not read.
+	UserID string `json:"userId,omitempty"`
+	// ParentSession: metadata.user_id names a parent_session_id.
+	ParentSession string `json:"parentSession"`
+	// SubagentMarker: system[0] (or a string system) holds "cc_is_subagent=true".
+	SubagentMarker string `json:"subagentMarker"`
+	// AgentHeader: the client sent X-Claude-Code-Agent-Id or
+	// X-Claude-Code-Parent-Agent-Id.
+	AgentHeader string `json:"agentHeader"`
+	// Probe: a one-token request of the shape a client uses to test a key.
+	Probe string `json:"probe"`
+	// TitleHelper: a request that asks for a session title.
+	TitleHelper string `json:"titleHelper"`
+	// ExtendedTTLBeta: Anthropic-Beta lists extended-cache-ttl-2025-04-11.
+	ExtendedTTLBeta string `json:"extendedTtlBeta"`
 }
 
 // eventModelRounds is the number of model rounds an Event represents. Unset (0)

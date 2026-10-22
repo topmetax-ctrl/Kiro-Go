@@ -96,3 +96,55 @@ func TestRingKeepsTheNewestCapacityEvents(t *testing.T) {
 		t.Fatalf("newest/oldest = %d/%d, want %d/%d", got[0].TimeMs, got[len(got)-1].TimeMs, EventRingCapacity+extra, extra+1)
 	}
 }
+
+// A trace that names no session and carries no signals must serialize as it did
+// before they existed: an export read by an older consumer sees no new keys.
+func TestTraceWithoutSessionFieldsKeepsItsShape(t *testing.T) {
+	raw, err := json.Marshal(Event{TimeMs: 1, Cache: &CacheTrace{Conv: "aaaaaaaaaaaa", Msgs: 2, Policy: "off"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"sess"`, `"parent"`, `"signals"`} {
+		if strings.Contains(string(raw), key) {
+			t.Fatalf("unused field %s appears in %s", key, raw)
+		}
+	}
+}
+
+// An export written before the signals existed still loads, and its trace has
+// none: absent from the data is nil here, never a made-up "absent".
+func TestEventFromAnOlderExportStillLoads(t *testing.T) {
+	var ev Event
+	old := `{"time":1,"status":200,"cache":{"conv":"aaaaaaaaaaaa","msgs":3,"prefix":["3:bbbbbbbbbbbb"],"marks":["m2"],"policy":"off"}}`
+	if err := json.Unmarshal([]byte(old), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.Cache == nil || ev.Cache.Msgs != 3 || ev.Cache.Signals != nil || ev.Cache.Sess != "" || ev.Cache.Parent != "" {
+		t.Fatalf("older event loaded as %+v", ev.Cache)
+	}
+}
+
+func TestTraceSignalsRoundTrip(t *testing.T) {
+	want := &CacheTrace{
+		Conv: "aaaaaaaaaaaa", Msgs: 3, Sess: "bbbbbbbbbbbbbbbbbbbbbbbb", Parent: "cccccccccccccccccccccccc",
+		Signals: &CacheSignals{
+			UserID: "json", ParentSession: SignalPresent, SubagentMarker: SignalAbsent, AgentHeader: SignalNotObservable,
+			Probe: SignalAbsent, TitleHelper: SignalAbsent, ExtendedTTLBeta: SignalPresent,
+		},
+	}
+	raw, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got CacheTrace
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Sess != want.Sess || got.Parent != want.Parent || got.Signals == nil || *got.Signals != *want.Signals {
+		t.Fatalf("round trip lost data: %s", raw)
+	}
+	// Not-observable and absent are different things on the wire.
+	if !strings.Contains(string(raw), `"agentHeader":"not-observable"`) || !strings.Contains(string(raw), `"subagentMarker":"absent"`) {
+		t.Fatalf("tri-state not spelled out: %s", raw)
+	}
+}

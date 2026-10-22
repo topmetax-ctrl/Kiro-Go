@@ -57,7 +57,8 @@ const domain = "kiro-go/cache-trace/v1"
 // Tracer computes cache traces under one key. The zero value and a nil *Tracer
 // are valid and produce no traces. It is safe for concurrent use.
 type Tracer struct {
-	key []byte
+	key     []byte
+	sessKey []byte
 }
 
 // New derives a Tracer from a long-lived secret. The tracing key is a keyed
@@ -67,27 +68,43 @@ func New(secret []byte) *Tracer {
 	if len(secret) == 0 {
 		return nil
 	}
-	m := hmac.New(sha256.New, secret)
-	m.Write([]byte(domain))
-	return &Tracer{key: m.Sum(nil)}
+	derive := func(label string) []byte {
+		m := hmac.New(sha256.New, secret)
+		m.Write([]byte(label))
+		return m.Sum(nil)
+	}
+	return &Tracer{key: derive(domain), sessKey: derive(sessionDomain)}
 }
 
-// Trace digests a Messages request body. policy labels the Token Optimization
-// settings in force and is recorded as given. It returns nil when the body is
-// not a Messages request with at least one message.
+// messagesRequest is the part of a Messages body the trace reads. Fields it only
+// hashes or inspects stay raw, so nothing is re-encoded.
+type messagesRequest struct {
+	Model        json.RawMessage   `json:"model"`
+	Tools        json.RawMessage   `json:"tools"`
+	System       json.RawMessage   `json:"system"`
+	Messages     []json.RawMessage `json:"messages"`
+	Thinking     json.RawMessage   `json:"thinking"`
+	OutputConfig json.RawMessage   `json:"output_config"`
+	ToolChoice   json.RawMessage   `json:"tool_choice"`
+	MaxTokens    json.RawMessage   `json:"max_tokens"`
+	Metadata     json.RawMessage   `json:"metadata"`
+}
+
+// Trace digests a Messages request body with nothing known about the request
+// beyond it: see TraceFor.
 func (t *Tracer) Trace(body []byte, policy string) *metrics.CacheTrace {
+	return t.TraceFor(body, policy, Request{})
+}
+
+// TraceFor digests a Messages request body. policy labels the Token Optimization
+// settings in force and is recorded as given. in adds what the gateway knows
+// about the request apart from its body. It returns nil when the body is not a
+// Messages request with at least one message.
+func (t *Tracer) TraceFor(body []byte, policy string, in Request) *metrics.CacheTrace {
 	if t == nil || len(t.key) == 0 {
 		return nil
 	}
-	var req struct {
-		Model        json.RawMessage   `json:"model"`
-		Tools        json.RawMessage   `json:"tools"`
-		System       json.RawMessage   `json:"system"`
-		Messages     []json.RawMessage `json:"messages"`
-		Thinking     json.RawMessage   `json:"thinking"`
-		OutputConfig json.RawMessage   `json:"output_config"`
-		ToolChoice   json.RawMessage   `json:"tool_choice"`
-	}
+	var req messagesRequest
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Messages) == 0 {
 		return nil
 	}
@@ -105,6 +122,10 @@ func (t *Tracer) Trace(body []byte, policy string) *metrics.CacheTrace {
 	if len(req.System) > 0 {
 		tr.System = short(systemSum)
 	}
+	var id Identity
+	tr.Signals, id = signalsOf(&req, in)
+	tr.Sess = t.sessionDigest(in.Principal, id.Session)
+	tr.Parent = t.sessionDigest(in.Principal, id.ParentSession)
 
 	// The prefix chain folds tools, system and each message digest in order, so a
 	// checkpoint at k covers exactly what the upstream hashes for a breakpoint

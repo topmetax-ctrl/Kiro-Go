@@ -332,19 +332,27 @@ func BenchmarkTraceLargeBody(b *testing.B) {
 	}
 }
 
-// A trace is stored on every forward event of a 5000-entry ring, so its size
-// must stay bounded however long the conversation gets.
+// A trace is stored on every forward event of the ring, so its size must stay
+// bounded however long the conversation gets. The worst case names both a
+// session and its parent and has every signal set.
 func TestTraceSizeIsBounded(t *testing.T) {
+	full := Request{
+		Principal: "key-1",
+		Ingress:   &Ingress{AgentID: true, Beta: extendedTTLBeta},
+		Identify: func(json.RawMessage) Identity {
+			return Identity{Shape: "json", Parent: metrics.SignalPresent, Session: "child", ParentSession: "parent"}
+		},
+	}
 	for _, n := range []int{3, 60, 400, 3000} {
-		tr := testTracer.Trace(body(t, turns(n), n-1, func(r map[string]any) {
+		tr := testTracer.TraceFor(body(t, turns(n), n-1, func(r map[string]any) {
 			r["system"].([]any)[0].(map[string]any)["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h"}
-		}), "on+headroom-cache+ultracave+ponytail-full")
+		}), "on+headroom-cache+ultracave+ponytail-full", full)
 		raw, err := json.Marshal(tr)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Logf("n=%d: %d bytes", n, len(raw))
-		if len(raw) > 1200 {
+		if len(raw) > 1500 {
 			t.Fatalf("n=%d: trace is %d bytes", n, len(raw))
 		}
 	}
