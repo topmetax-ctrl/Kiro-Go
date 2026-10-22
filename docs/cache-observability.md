@@ -138,6 +138,49 @@ Events recorded before this feature have no digests and no TTL split. For those
 the previous request is a guess from sizes, labels that depend on it say
 `heuristic`, and `prefix_changed` and `scope_changed` cannot be reached.
 
+## In the dashboard
+
+Forwarding → Stats has a **Cache analytics** card, and Forwarding → Activity can
+filter on it. Both read the event ring, because only events carry the 5m/1h
+split; neither changes a request.
+
+The card follows the Stats range selector and provider filter and shows, for
+requests whose upstream reported cache usage:
+
+- **Cache reuse**: cache read ÷ input, token-weighted, over the requests that
+  reported a read figure (a write-only report never dilutes it).
+- **Cache writes**, split by the upstream's own TTL tier (`5m`, `1h`) and a
+  separate "no tier" part when the upstream sent no split. A tier is never
+  guessed.
+- **Uncached input** (`max(0, input − read − write)` per request) and **large
+  writes** (a single write of at least 100k tokens, the default of `bigWrite`).
+- A stacked chart (writes by TTL tier, or the input as read / write / uncached
+  shares) and the ten largest writes. A bar or a listed write opens Activity on
+  exactly those requests (an exact time window plus `minCacheWrite`).
+
+Left out, and counted in the card: **Kiro pool** requests (their cache figures
+are synthesised for the client, not reported by an upstream), requests whose
+usage is **estimated**, and successful requests with **no cache figure** or no
+input total. The card does not say why a write happened; for that, export the
+events and run the classifier below.
+
+Every window is labelled with where its data starts. The event log begins at
+process start, or at the oldest event once the ring has wrapped (`retention.eventLogSinceMs`);
+the per-minute charts begin at the later of process start and the two-hour
+window they are pruned to (`retention.minuteSinceMs`). Time before that is
+drawn as "no data", not as zero requests.
+
+### API
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /admin/api/forward-cache-series?hours=N` or `from=&to=` (ms) | Buckets of `read`, `write`, `write5m`, `write1h`, `writeUntiered`, `uncached`, `readInput`, `bigWrites`, `maxWrite`; `totals`; `topWrites` (10, with provider, model, request id and tier split); `eligible` and `excluded` (`pool`, `estimated`, `notReported`); `coverageFrom`; `retention`. Optional `provider=a,b` and `bigWrite=tokens`. Bucket width follows the window (1 min up to 1 h, 5 min up to 6 h, 15 min up to 24 h, then 1 h; windows are capped at 30 days). |
+| `GET /admin/api/forward-events?minCacheWrite=N` | Only events whose upstream reported a cache write of at least `N` tokens. Combine with `since`/`until`/`provider`. |
+| `GET /admin/api/forward-stats` | Gains `retention`: `eventRingCapacity`, `eventRingSize`, `eventRingOldestMs`, `memorySinceMs`, `minuteSinceMs`, `eventLogSinceMs`. |
+| `GET /admin/api/forward-history` | Gains `minuteSinceMs`. |
+
+All of these are additive; existing fields are unchanged.
+
 ## What it cannot see
 
 Every label describes the body **this gateway sent**.
