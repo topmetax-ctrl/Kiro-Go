@@ -564,3 +564,27 @@ func TestExportForwardEventsCoversTheWholeRing(t *testing.T) {
 		t.Fatalf("total/exported = %d/%d, want %d/%d", out.Total, out.Exported, n, n)
 	}
 }
+
+// retention tells the dashboard how far back the memory-only views reach, so a
+// percentile or per-minute chart can be labeled "since <time>" instead of
+// passing for a longer window.
+func TestForwardStatsCarriesRetention(t *testing.T) {
+	metrics.Reset()
+	initStatsConfig(t)
+	metrics.Record(metrics.Event{ProviderID: "up-1", ProviderName: "p", Ok: true, Status: 200, TimeMs: 1234})
+
+	out := getJSON(t, &Handler{}, "/admin/api/forward-stats")
+	ret, ok := out["retention"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("retention missing: %v", out)
+	}
+	if ret["eventRingSize"].(float64) != 1 || ret["eventRingOldestMs"].(float64) != 1234 {
+		t.Fatalf("ring coverage wrong: %+v", ret)
+	}
+	if ret["eventRingCapacity"].(float64) != float64(metrics.EventRingCapacity) {
+		t.Fatalf("capacity wrong: %+v", ret)
+	}
+	if ret["memorySinceMs"].(float64) <= 0 {
+		t.Fatalf("memorySinceMs unset: %+v", ret)
+	}
+}

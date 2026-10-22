@@ -6258,8 +6258,10 @@ func windowQuery(r *http.Request) (fromMs, toMs int64, ok bool, err error) {
 
 // An `hours` query restricts the per-provider figures to that window, which is
 // what the Stats tab's range selector sends; a `from`/`to` pair carries the
-// custom range instead. overall/percentiles stay all-time: they feed the
-// Forwarding tab's KPI cards, which are not range-scoped.
+// custom range instead. overall stays all-time: it feeds the Forwarding tab's
+// KPI cards, which are not range-scoped. percentiles come from the in-memory
+// event ring (successful requests since the last restart), and retention says
+// how far back that ring and the per-minute series actually reach.
 func (h *Handler) apiGetForwardStats(w http.ResponseWriter, r *http.Request) {
 	minutes := 60
 	if v := strings.TrimSpace(r.URL.Query().Get("minutes")); v != "" {
@@ -6295,6 +6297,7 @@ func (h *Handler) apiGetForwardStats(w http.ResponseWriter, r *http.Request) {
 		"routes":      metrics.RouteStats(),
 		"timeseries":  metrics.TimeSeries(minutes),
 		"percentiles": metrics.LatencyPercentiles(),
+		"retention":   metrics.Retention(),
 		"windowHours": windowHours,
 		"windowFrom":  windowFrom,
 		"windowTo":    windowTo,

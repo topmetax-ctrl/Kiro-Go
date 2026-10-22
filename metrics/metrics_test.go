@@ -1259,3 +1259,53 @@ func TestSaveWritesCurrentCacheStatsVersionAndRoundTrips(t *testing.T) {
 		t.Fatalf("reloaded hit rate = %v, want 80", o.CacheHitRate)
 	}
 }
+
+func TestRetentionReportsRingCoverage(t *testing.T) {
+	reset(t)
+	r := Retention()
+	if r.EventRingCapacity != EventRingCapacity || r.EventRingSize != 0 || r.EventRingOldestMs != 0 {
+		t.Fatalf("empty store: %+v", r)
+	}
+	if r.MemorySinceMs <= 0 || r.MemorySinceMs > nowMs() {
+		t.Fatalf("memorySince = %d, want a past/present timestamp", r.MemorySinceMs)
+	}
+
+	// Callers may stamp TimeMs themselves, so the oldest event is the minimum
+	// timestamp, not the first slot.
+	late, early := ev("p1", true, 200, 5), ev("p1", true, 200, 5)
+	late.TimeMs, early.TimeMs = 5_000, 2_000
+	Record(late)
+	Record(early)
+	r = Retention()
+	if r.EventRingSize != 2 || r.EventRingOldestMs != 2_000 {
+		t.Fatalf("two events: %+v", r)
+	}
+}
+
+func TestRetentionWrappedRingAndReset(t *testing.T) {
+	reset(t)
+	for i := 0; i < EventRingCapacity+10; i++ {
+		e := ev("p1", true, 200, 1)
+		e.TimeMs = int64(1_000 + i)
+		Record(e)
+	}
+	r := Retention()
+	if r.EventRingSize != EventRingCapacity {
+		t.Fatalf("size = %d, want %d", r.EventRingSize, EventRingCapacity)
+	}
+	// The 10 oldest were overwritten, so the oldest survivor is event #10.
+	if r.EventRingOldestMs != 1_010 {
+		t.Fatalf("oldest = %d, want 1010", r.EventRingOldestMs)
+	}
+
+	before := r.MemorySinceMs
+	time.Sleep(2 * time.Millisecond)
+	Reset()
+	r = Retention()
+	if r.EventRingSize != 0 || r.EventRingOldestMs != 0 {
+		t.Fatalf("after reset: %+v", r)
+	}
+	if r.MemorySinceMs <= before {
+		t.Fatalf("memorySince did not advance on reset: %d -> %d", before, r.MemorySinceMs)
+	}
+}

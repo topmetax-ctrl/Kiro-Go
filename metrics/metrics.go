@@ -602,6 +602,10 @@ type store struct {
 	byIP        map[string]*ipAgg
 	buckets     map[int64]*Bucket
 	subscribers map[chan Event]struct{}
+	// sinceMs is when the in-memory views (event ring, per-minute buckets)
+	// started collecting: process start, or the last Reset. Everything memory-only
+	// is empty before it, which is not the same as "no traffic".
+	sinceMs int64
 }
 
 var s = newStore()
@@ -614,6 +618,7 @@ func newStore() *store {
 		byIP:        make(map[string]*ipAgg),
 		buckets:     make(map[int64]*Bucket),
 		subscribers: make(map[chan Event]struct{}),
+		sinceMs:     time.Now().UnixMilli(),
 	}
 }
 
@@ -2059,6 +2064,46 @@ func percentilesFor(providerID string) Percentiles {
 	return Percentiles{P50: pick(0.50), P95: pick(0.95), P99: pick(0.99), Count: len(lat)}
 }
 
+// RetentionStat says how much history the memory-only views cover, so a client
+// can label a figure "since 11:03" instead of implying a longer window. The
+// lifetime counters and hourly rollups are persisted and not described here.
+type RetentionStat struct {
+	// EventRingCapacity is the most events the log keeps; EventRingSize is how
+	// many it holds now.
+	EventRingCapacity int `json:"eventRingCapacity"`
+	EventRingSize     int `json:"eventRingSize"`
+	// EventRingOldestMs is the time of the oldest retained event, 0 when empty.
+	EventRingOldestMs int64 `json:"eventRingOldestMs"`
+	// MemorySinceMs is when the event ring and per-minute buckets began
+	// collecting (process start or last reset). Minutes before it have no data,
+	// as opposed to zero requests.
+	MemorySinceMs int64 `json:"memorySinceMs"`
+}
+
+// Retention reports the current coverage of the memory-only views.
+func Retention() RetentionStat {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	size := s.next
+	if s.full {
+		size = EventRingCapacity
+	}
+	var oldest int64
+	for i := 0; i < size; i++ {
+		// Callers may stamp TimeMs themselves, so ring order is not a promise of
+		// time order; scan for the true minimum (bounded by the ring capacity).
+		if t := s.ring[i].TimeMs; oldest == 0 || t < oldest {
+			oldest = t
+		}
+	}
+	return RetentionStat{
+		EventRingCapacity: EventRingCapacity,
+		EventRingSize:     size,
+		EventRingOldestMs: oldest,
+		MemorySinceMs:     s.sinceMs,
+	}
+}
+
 // ProviderNames returns id -> display name for every provider with recorded
 // traffic, so the UI can label filters without a separate config lookup.
 func ProviderNames() map[string]string {
@@ -2094,6 +2139,7 @@ func Reset() {
 	s.byRoute = make(map[string]*routeAgg)
 	s.byIP = make(map[string]*ipAgg)
 	s.buckets = make(map[int64]*Bucket)
+	s.sinceMs = time.Now().UnixMilli()
 
 	// Re-seed provider entries so names survive the reset (the filter dropdown
 	// would otherwise empty until traffic resumes) and in-flight stays balanced.
