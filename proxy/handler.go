@@ -6567,6 +6567,11 @@ func (h *Handler) apiGetForwardCacheSeries(w http.ResponseWriter, r *http.Reques
 	if n, err := strconv.Atoi(strings.TrimSpace(q.Get("hours"))); err == nil && n > 0 {
 		hours = n
 	}
+	// The window is capped at 30 days anyway; clamping here keeps hours*3.6e6
+	// from overflowing for a hostile value.
+	if hours > 24*30 {
+		hours = 24 * 30
+	}
 	fromMs, toMs, hasWindow, err := windowQuery(r)
 	if err != nil {
 		w.WriteHeader(400)
@@ -6687,17 +6692,32 @@ func eventFilterFromQuery(q url.Values, offset, limit int) metrics.EventFilter {
 	if n, err := strconv.Atoi(strings.TrimSpace(q.Get("code"))); err == nil {
 		code = n
 	}
+	// provider is one id, or several comma separated (the cache analytics
+	// drill-down can span a selection of providers).
+	var providerID string
+	var providerIDs []string
+	for _, id := range strings.Split(q.Get("provider"), ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			providerIDs = append(providerIDs, id)
+		}
+	}
+	if len(providerIDs) == 1 {
+		providerID, providerIDs = providerIDs[0], nil
+	}
 	return metrics.EventFilter{
-		ProviderID: strings.TrimSpace(q.Get("provider")),
-		AccountID:  strings.TrimSpace(q.Get("account")),
-		Status:     strings.TrimSpace(q.Get("status")),
-		StatusCode: code,
-		Model:      strings.TrimSpace(q.Get("model")),
-		SinceMs:    atoi64(q.Get("since")),
-		UntilMs:    atoi64(q.Get("until")),
+		ProviderID:  providerID,
+		ProviderIDs: providerIDs,
+		AccountID:   strings.TrimSpace(q.Get("account")),
+		Status:      strings.TrimSpace(q.Get("status")),
+		StatusCode:  code,
+		Model:       strings.TrimSpace(q.Get("model")),
+		SinceMs:     atoi64(q.Get("since")),
+		UntilMs:     atoi64(q.Get("until")),
 		// minCacheWrite narrows the log to requests that wrote at least this many
 		// tokens to the upstream cache; the cache analytics drill-down uses it.
 		MinCacheWrite: atoi64(q.Get("minCacheWrite")),
+		// cacheEligible keeps the requests a cache chart counts, whatever they wrote.
+		CacheEligible: q.Get("cacheEligible") == "1",
 		Offset:        offset,
 		Limit:         limit,
 	}

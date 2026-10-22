@@ -70,8 +70,10 @@ type CacheWrite struct {
 	Model        string `json:"model,omitempty"`
 	RequestID    string `json:"requestId,omitempty"`
 	Input        int64  `json:"input"`
-	Read         int64  `json:"read"`
-	Write        int64  `json:"write"`
+	// Read is nil when the upstream reported no cache-read figure, so a
+	// write-only report is not shown as a 0% hit.
+	Read  *int64 `json:"read,omitempty"`
+	Write int64  `json:"write"`
 	// Write5m and Write1h are nil when the upstream sent no tier split.
 	Write5m *int64 `json:"write5m,omitempty"`
 	Write1h *int64 `json:"write1h,omitempty"`
@@ -120,6 +122,16 @@ func cacheBucketWidth(spanMs int64) int64 {
 	default:
 		return time.Hour.Milliseconds()
 	}
+}
+
+// cacheEligibleParts is cacheEventParts for an event the cache analytics may
+// count at all: not Kiro-pool traffic and not estimated usage, whose cache
+// figures are not reported by an upstream.
+func cacheEligibleParts(ev Event) (parts CacheBucket, readReported bool, ok bool) {
+	if ev.ProviderID == KiroPoolID || (ev.Usage != nil && ev.Usage.Source == UsageSourceEstimated) {
+		return CacheBucket{}, false, false
+	}
+	return cacheEventParts(ev)
 }
 
 // cacheEventParts reads the cache accounting of one event. ok is false when the
@@ -186,7 +198,9 @@ func CacheSeries(fromMs, toMs int64, providerIDs []string, bigWriteMin int64) Ca
 	if toMs < fromMs {
 		toMs = fromMs
 	}
-	if toMs-fromMs > maxCacheWindow.Milliseconds() {
+	// Compared as fromMs < toMs-max, never toMs-fromMs, which overflows for a
+	// hostile fromMs.
+	if fromMs < toMs-maxCacheWindow.Milliseconds() {
 		fromMs = toMs - maxCacheWindow.Milliseconds()
 	}
 	width := cacheBucketWidth(toMs - fromMs)
@@ -204,8 +218,8 @@ func CacheSeries(fromMs, toMs int64, providerIDs []string, bigWriteMin int64) Ca
 	s.mu.Lock()
 	all := s.snapshotEventsLocked()
 	res.CoverageFromMs = s.sinceMs
-	if s.full {
-		res.CoverageFromMs = ringOldestLocked()
+	if oldest := ringOldestLocked(); s.wrapped && oldest > 0 {
+		res.CoverageFromMs = oldest
 	}
 	s.mu.Unlock()
 
@@ -232,7 +246,7 @@ func CacheSeries(fromMs, toMs int64, providerIDs []string, bigWriteMin int64) Ca
 			res.Excluded.Estimated++
 			continue
 		}
-		parts, _, ok := cacheEventParts(ev)
+		parts, readReported, ok := cacheEligibleParts(ev)
 		if !ok {
 			// Only a request that succeeded was expected to report; a failure with
 			// no usage is not a reporting gap.
@@ -251,8 +265,12 @@ func CacheSeries(fromMs, toMs int64, providerIDs []string, bigWriteMin int64) Ca
 			w := CacheWrite{
 				TimeMs: ev.TimeMs, ProviderID: ev.ProviderID, ProviderName: ev.ProviderName,
 				Model: ev.TargetModel, RequestID: ev.RequestID,
-				Input: parts.Input, Read: parts.Read, Write: parts.Write,
+				Input: parts.Input, Write: parts.Write,
 				Write5m: ev.Usage.CacheCreation5mTokens, Write1h: ev.Usage.CacheCreation1hTokens,
+			}
+			if readReported {
+				read := parts.Read
+				w.Read = &read
 			}
 			if w.Model == "" {
 				w.Model = ev.ClientModel

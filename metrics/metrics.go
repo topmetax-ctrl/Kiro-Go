@@ -592,10 +592,15 @@ func (b Bucket) derive() Bucket {
 }
 
 type store struct {
-	mu          sync.Mutex
-	ring        []Event
-	next        int
-	full        bool
+	mu   sync.Mutex
+	ring []Event
+	next int
+	full bool
+	// wrapped records that the ring has overwritten events at some point, so
+	// history before the oldest survivor is gone for good. full cannot say this:
+	// ResetProvider rebuilds the ring and may leave it with room, but the
+	// overwritten events do not come back. Only Reset clears it.
+	wrapped     bool
 	overall     counter
 	byProvider  map[string]*providerAgg
 	byRoute     map[string]*routeAgg
@@ -677,6 +682,7 @@ func Record(ev Event) {
 	s.next = (s.next + 1) % EventRingCapacity
 	if s.next == 0 {
 		s.full = true
+		s.wrapped = true
 	}
 
 	s.overall.add(ev)
@@ -1893,15 +1899,20 @@ func RouteStats() []RouteStat {
 // status when non-zero.
 type EventFilter struct {
 	ProviderID string
-	AccountID  string
-	Status     string
-	StatusCode int
-	Model      string
-	SinceMs    int64
-	UntilMs    int64
-	// MinCacheWrite keeps only events whose upstream reported a cache write of at
-	// least this many tokens (0 = no filter). Events with no usage, or no
-	// reported cache write, never match.
+	// ProviderIDs narrows to any of several providers (used with ProviderID empty).
+	ProviderIDs []string
+	AccountID   string
+	Status      string
+	StatusCode  int
+	Model       string
+	SinceMs     int64
+	UntilMs     int64
+	// CacheEligible keeps only the requests the cache analytics counts: usage the
+	// upstream reported (not estimated, not the Kiro pool) with a cache figure
+	// and an input total. MinCacheWrite additionally keeps those that wrote at
+	// least that many tokens (0 = no minimum). Both therefore select exactly the
+	// population a cache chart bar was drawn from.
+	CacheEligible bool
 	MinCacheWrite int64
 	Offset        int
 	Limit         int
@@ -1910,6 +1921,18 @@ type EventFilter struct {
 func (f EventFilter) matches(e Event, model string) bool {
 	if f.ProviderID != "" && e.ProviderID != f.ProviderID {
 		return false
+	}
+	if len(f.ProviderIDs) > 0 {
+		in := false
+		for _, id := range f.ProviderIDs {
+			if e.ProviderID == id {
+				in = true
+				break
+			}
+		}
+		if !in {
+			return false
+		}
 	}
 	if f.AccountID != "" && e.AccountID != f.AccountID {
 		return false
@@ -1939,9 +1962,9 @@ func (f EventFilter) matches(e Event, model string) bool {
 	if f.UntilMs != 0 && e.TimeMs > f.UntilMs {
 		return false
 	}
-	if f.MinCacheWrite > 0 {
-		u := e.Usage
-		if u == nil || u.CacheCreationInputTokens == nil || *u.CacheCreationInputTokens < f.MinCacheWrite {
+	if f.CacheEligible || f.MinCacheWrite > 0 {
+		parts, _, ok := cacheEligibleParts(e)
+		if !ok || parts.Write < f.MinCacheWrite {
 			return false
 		}
 	}
@@ -2126,7 +2149,7 @@ func Retention() RetentionStat {
 	}
 	oldest := ringOldestLocked()
 	logSince := s.sinceMs
-	if s.full {
+	if s.wrapped && oldest > 0 {
 		logSince = oldest
 	}
 	return RetentionStat{
@@ -2169,6 +2192,7 @@ func Reset() {
 	s.ring = make([]Event, EventRingCapacity)
 	s.next = 0
 	s.full = false
+	s.wrapped = false
 	s.overall = counter{}
 	s.byProvider = make(map[string]*providerAgg)
 	s.byRoute = make(map[string]*routeAgg)
