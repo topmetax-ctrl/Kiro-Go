@@ -6779,53 +6779,72 @@
     return canonical != null ? '0' : '—';
   }
 
-  // fwdInCell renders the merged IN cell. Without cache telemetry it is the
-  // plain tri-state input total (unchanged). With cache, it stacks the real
-  // TOTAL input (the actual context footprint of the request) above the ACTIVE
-  // input in green with a bolt — the tokens actually processed this turn, i.e.
-  // everything except the cheap cache-read hits (fresh input PLUS cache writes,
-  // which were freshly processed and billed at a premium). Once a cache read is
-  // involved the total reads as the superseded gross figure and is struck
-  // through, like an old price above the one that replaced it; with only a
-  // cache write (priming, read=0) total and active coincide, so the total
-  // stays plain. A cache write adds a small "+Nk write" marker so a
-  // cache-priming request reads as heavy at a glance; the full read/write/hit
-  // breakdown is in the tooltip and the detail panel. "Active", never
-  // "fresh": it includes the cache writes.
-  function fwdInCell(e) {
-    const prefix = fwdUsageSourcePrefix(e);
+  // fwdCacheParts splits a request's input into the three things the cache can
+  // have done with it: served it (read), stored it (write), or neither
+  // (uncached). total is null when the upstream gave no input total, in which
+  // case no remainder can be derived. When the upstream reported only one of
+  // read/write, the remainder mixes the unreported part with uncached input, so
+  // it is flagged as such instead of being called "uncached".
+  function fwdCacheParts(e) {
     const u = e.usage;
     const read = u ? u.cacheReadInputTokens : null;
     const create = u ? u.cacheCreationInputTokens : null;
-    if (read == null && create == null) {
-      return '<span>' + escapeHtml(prefix + fwdTokenCell(e, 'inputTokens')) + '</span>';
-    }
-    const total = (u && u.inputTokens != null) ? u.inputTokens : e.inputTokens;
+    const total = (u && u.inputTokens != null) ? u.inputTokens : (e.inputTokens || null);
     const r = read || 0;
     const w = create || 0;
-    // Active = total minus cache-read hits (reused, not reprocessed). Cache
-    // writes stay INSIDE active — they were processed this turn. So a priming
-    // request (big write, no read) stays heavy; a cache hit (big read) drops to
-    // near its uncached size, which is exactly the "how heavy is this?" signal.
-    const active = Math.max(0, (total || 0) - r);
-    // Uncached = brand-new tokens, neither read from nor written to cache.
-    const uncached = Math.max(0, (total || 0) - r - w);
-    const hit = total > 0 ? Math.round(r * 100 / total) : null;
-    let tip = t('forward.usageTotalInput') + ' ' + fwdFmtTokens(total) +
-      '\n' + t('forward.usageActiveInput') + ' ' + fwdFmtTokens(active);
-    if (read != null) tip += '\n' + t('forward.usageCacheRead') + ' ' + fwdFmtTokens(r);
-    if (create != null) tip += '\n' + t('forward.usageCacheWrite') + ' ' + fwdFmtTokens(w);
-    tip += '\n' + t('forward.usageUncached') + ' ' + fwdFmtTokens(uncached);
-    if (hit != null) tip += '\n' + t('forward.usageCacheHit') + ' ' + hit + '%';
-    const writeTag = w > 0
-      ? '<span class="fwd-in-write" title="' + escapeAttr(t('forward.usageCacheWrite') + ' ' + fwdFmtTokens(w)) + '">+' +
-          escapeHtml(fwdFmtTokens(w)) + ' ' + escapeHtml(t('forward.usageWriteShort')) + '</span>'
-      : '';
+    const rest = total == null ? null : Math.max(0, total - r - w);
+    return {
+      read, create, total, r, w, rest,
+      restIsUncached: read != null && create != null,
+      // Tokens processed this turn: everything except cache-read hits.
+      active: total == null ? null : Math.max(0, total - r),
+      hit: total > 0 && read != null ? Math.round(r * 100 / total) : null
+    };
+  }
+
+  // fwdCacheBar draws the proportions of a request's input as a thin stacked bar.
+  // Colour is never the only signal: the bar is an image with a text label, and
+  // the same figures are printed beside it.
+  function fwdCacheBar(c) {
+    const base = Math.max(c.total || 0, c.r + c.w);
+    if (!base) return '';
+    const seg = (cls, n) => n > 0
+      ? '<i class="cache-seg cache-seg--' + cls + '" style="flex-grow:' + n + '"></i>' : '';
+    const named = [];
+    if (c.read != null) named.push(t('forward.usageCacheRead') + ' ' + fwdFmtTokens(c.r));
+    if (c.create != null) named.push(t('forward.usageCacheWrite') + ' ' + fwdFmtTokens(c.w));
+    if (c.rest != null) named.push(t(c.restIsUncached ? 'forward.usageUncached' : 'forward.usageOther') + ' ' + fwdFmtTokens(c.rest));
+    const label = named.join(', ');
+    return '<span class="cache-bar" role="img" aria-label="' + escapeAttr(label) + '">' +
+      seg('read', c.r) + seg('write', c.w) + seg(c.restIsUncached ? 'uncached' : 'other', c.rest || 0) + '</span>';
+  }
+
+  // fwdInCell renders the IN cell. Without cache telemetry it is the plain
+  // tri-state input total. With cache, the total input (the request's real
+  // context size) is the primary figure, followed by a bar and a line saying how
+  // much of it was served from cache, written to cache, or neither. The tooltip
+  // defines each term, including "active input" (total minus cache reads: what
+  // was actually processed this turn), which is also in the detail panel.
+  function fwdInCell(e) {
+    const prefix = fwdUsageSourcePrefix(e);
+    const c = fwdCacheParts(e);
+    if (c.read == null && c.create == null) {
+      return '<span>' + escapeHtml(prefix + fwdTokenCell(e, 'inputTokens')) + '</span>';
+    }
+    const bits = [];
+    if (c.read != null) bits.push(fwdFmtTokens(c.r) + ' ' + t('forward.usageCachedShort'));
+    if (c.create != null && c.w > 0) bits.push(fwdFmtTokens(c.w) + ' ' + t('forward.usageWriteShort'));
+    if (c.rest) bits.push(fwdFmtTokens(c.rest) + ' ' + t(c.restIsUncached ? 'forward.usageUncachedShort' : 'forward.usageOtherShort'));
+    let tip = t('forward.usageTotalInput') + ' ' + fwdFmtTokens(c.total);
+    if (c.read != null) tip += '\n' + t('forward.usageCacheRead') + ' ' + fwdFmtTokens(c.r);
+    if (c.create != null) tip += '\n' + t('forward.usageCacheWrite') + ' ' + fwdFmtTokens(c.w);
+    if (c.rest != null) tip += '\n' + t(c.restIsUncached ? 'forward.usageUncached' : 'forward.usageOther') + ' ' + fwdFmtTokens(c.rest);
+    if (c.hit != null) tip += '\n' + t('forward.usageCacheHit') + ' ' + c.hit + '%';
+    if (c.active != null) tip += '\n\n' + t('forward.usageActiveInput') + ' ' + fwdFmtTokens(c.active) + ' — ' + t('forward.usageActiveHint');
     return '<span class="fwd-in-merged" title="' + escapeAttr(tip) + '">' +
-      '<span class="fwd-in-total' + (r > 0 ? ' fwd-in-total-old' : '') + '">' +
-        escapeHtml(prefix + fwdFmtTokens(total)) + '</span>' +
-      '<span class="fwd-in-active"><i class="fa-solid fa-bolt" aria-hidden="true"></i>' + escapeHtml(fwdFmtTokens(active)) + '</span>' +
-      writeTag +
+      '<span class="fwd-in-head"><span class="fwd-in-total">' + escapeHtml(prefix + fwdFmtTokens(c.total)) + '</span>' +
+        fwdCacheBar(c) + '</span>' +
+      (bits.length ? '<span class="fwd-in-split">' + escapeHtml(bits.join(' · ')) + '</span>' : '') +
       '</span>';
   }
 

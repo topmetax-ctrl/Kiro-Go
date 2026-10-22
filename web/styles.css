@@ -3287,38 +3287,54 @@ img.brand-icon {
 .scope-line + .fwd-stats-grid {
   margin-top: 0.5rem;
 }
-/* Merged IN cell: the real total input footprint above the active input
-   (processed this turn) in green with a bolt. With a cache read the total is
-   the superseded gross figure and reads struck-through, like an old price;
-   with only a cache write (read=0) it coincides with active and stays plain. */
+/* IN cell: total input first, then a bar and a line splitting it into cache
+   read / cache write / uncached. The bar colors are all >= 3:1 on the row
+   background in both themes; the line and the aria-label carry the same
+   numbers, so color is never the only cue. */
 .fwd-in-merged {
   display: inline-flex;
   flex-direction: column;
-  line-height: 1.15;
+  gap: 0.15rem;
+  line-height: 1.2;
 }
-.fwd-in-total {
-  color: var(--muted-foreground, #9aa3b2);
-  font-size: 0.9em;
-}
-.fwd-in-total-old {
-  text-decoration: line-through;
-  opacity: 0.6;
-}
-.fwd-in-active {
+.fwd-in-head {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  color: var(--success, #16a34a);
+  gap: 0.5rem;
+}
+.fwd-in-total {
+  color: var(--foreground);
   font-weight: 600;
 }
-.fwd-in-active .fa-bolt {
-  font-size: 0.85em;
-}
-/* Cache-write marker: signals a request that is priming the cache. */
-.fwd-in-write {
-  font-size: 0.8em;
-  color: var(--warning, #d97706);
+.fwd-in-split {
+  color: var(--muted-foreground);
+  font-size: 0.72rem;
   white-space: nowrap;
+}
+.cache-bar {
+  display: inline-flex;
+  gap: 1px;
+  width: 4rem;
+  height: 0.35rem;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--muted);
+}
+.cache-seg {
+  display: block;
+  flex-basis: 0;
+  flex-shrink: 1;
+  min-width: 2px;
+}
+.cache-seg--read {
+  background: var(--success);
+}
+.cache-seg--write {
+  background: var(--info);
+}
+.cache-seg--uncached,
+.cache-seg--other {
+  background: var(--muted-foreground);
 }
 /* API key label: keep long names from stretching the column. */
 .fwd-key {
