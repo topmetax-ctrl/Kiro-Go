@@ -1234,6 +1234,28 @@
             <div id="statsTrendNote" class="muted-text text-xs"></div>
           </div>
 
+          <div class="fwd-chart-card" id="cacheCard" style="margin-top:0.75rem;">
+            <div class="flex items-center justify-between" style="flex-wrap:wrap;gap:0.5rem;">
+              <span class="text-xs font-semibold" data-i18n="cache.title"></span>
+              <span class="scope-line" id="cacheScope"></span>
+            </div>
+            <p class="muted-text text-xs" data-i18n="cache.intro"></p>
+            <div class="pd-tiles" id="cacheTiles"></div>
+            <div class="flex items-center justify-between" style="flex-wrap:wrap;gap:0.5rem;margin-top:0.75rem;">
+              <span class="text-xs font-semibold" id="cacheChartTitle"></span>
+              <div class="seg" role="radiogroup" data-i18n-aria-label="cache.viewLabel">
+                <label class="seg-item"><input type="radio" name="cacheView" value="writes" checked /><span data-i18n="cache.viewWrites"></span></label>
+                <label class="seg-item"><input type="radio" name="cacheView" value="share" /><span data-i18n="cache.viewShare"></span></label>
+              </div>
+            </div>
+            <div id="cacheChart" class="fwd-chart"></div>
+            <div id="cacheNotes" class="muted-text text-xs"></div>
+            <div class="pd-section">
+              <div class="pd-section-title" data-i18n="cache.topWritesTitle"></div>
+              <div id="cacheTopWrites"></div>
+            </div>
+          </div>
+
           <div class="stats-table-scroll">
             <table class="stats-table" id="statsTable">
               <thead>

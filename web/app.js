@@ -171,6 +171,7 @@
     renderStatsTable();
     renderStatsCompare();
     renderStatsTrend(statsTrendLast.buckets, statsTrendLast.unit, statsTrendLast.minuteSinceMs);
+    renderCacheAnalytics();
     renderFwdWindowChip();
     // The callers leaderboard caches its rows for the IP text filter, so it
     // re-renders from cache on a language switch like the other tables.
@@ -7964,6 +7965,172 @@
     }
   }
 
+  // ===== Cache analytics (Stats tab) =====
+  // Cache read, write by TTL tier and uncached input over time, from the event
+  // log: only events carry the 5m/1h split. Figures cover the selected range and
+  // provider filter, but only back to where the event log starts (the card says
+  // where). Kiro-pool traffic and estimated usage are left out because their
+  // cache figures are not measured by an upstream; the card says how many.
+  // It reports what happened; it does not judge why a miss happened.
+
+  let cacheSeriesLast = null;
+  let cacheView = 'writes';
+  let cacheSeriesSeq = 0;
+
+  async function loadCacheSeries() {
+    const card = $('cacheCard');
+    if (!card) return;
+    const seq = ++cacheSeriesSeq;
+    // The range this request asks for, captured now so the card's tag names the
+    // data that comes back even if the selector moves meanwhile.
+    const label = statsRangeLabel();
+    const params = new URLSearchParams(statsRangeParams());
+    if (statsSelectedProviders.size) params.set('provider', Array.from(statsSelectedProviders).join(','));
+    let d = null;
+    try {
+      const res = await api('/forward-cache-series?' + params.toString());
+      if (!res.ok) throw new Error('http ' + res.status);
+      d = await res.json();
+      d.rangeLabel = label;
+    } catch (e) { d = null; }
+    // An answer for an older range or filter must not replace a newer one.
+    if (seq !== cacheSeriesSeq) return;
+    cacheSeriesLast = d;
+    renderCacheAnalytics();
+  }
+
+  function cacheSegments(view) {
+    if (view === 'share') {
+      return [
+        fwdSeg('read', t('forward.usageCacheRead'), 'bc-read', b => b.read),
+        fwdSeg('write', t('forward.usageCacheWrite'), 'bc-write', b => b.write),
+        fwdSeg('unc', t('forward.usageUncached'), 'bc-unc', b => b.uncached)
+      ];
+    }
+    return [
+      fwdSeg('w5m', t('cache.seg5m'), 'bc-w5m', b => b.write5m),
+      fwdSeg('w1h', t('cache.seg1h'), 'bc-w1h', b => b.write1h),
+      fwdSeg('wun', t('cache.segUntiered'), 'bc-wun', b => b.writeUntiered)
+    ];
+  }
+
+  // cacheOpenWindow drills into Activity for a time slice, restricted to the
+  // providers selected on this tab when exactly one is.
+  function cacheOpenWindow(since, until, minCacheWrite) {
+    const only = statsSelectedProviders.size === 1 ? Array.from(statsSelectedProviders)[0] : '';
+    openActivityWindow({
+      providerId: only, since, until, minCacheWrite,
+      label: fwdFmtSince(since) + (until > since ? ' – ' + new Date(until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '')
+    });
+  }
+
+  function renderCacheAnalytics() {
+    const card = $('cacheCard');
+    if (!card) return;
+    const d = cacheSeriesLast;
+    const set = (id, html) => { const el = $(id); if (el) el.innerHTML = html; };
+    const cap = forwardStats.retention && forwardStats.retention.eventRingCapacity
+      ? formatNum(forwardStats.retention.eventRingCapacity) : '—';
+    set('cacheScope', (d && d.rangeLabel ? scopeRangeTag(d.rangeLabel) : '') + (d && d.coverageFrom
+      ? scopeTag('log', t('scope.log', fwdFmtSince(d.coverageFrom)), t('scope.logHint', cap)) : ''));
+    if (!d) {
+      set('cacheTiles', '');
+      set('cacheChart', '<div class="muted-text text-xs" style="padding:1rem 0;">' + escapeHtml(t('stats.loadFailed')) + '</div>');
+      set('cacheNotes', '');
+      set('cacheTopWrites', '');
+      return;
+    }
+    const tot = d.totals || {};
+    const ex = d.excluded || {};
+    const tok = fwdFmtTokens;
+
+    // Notes first: they explain an empty card as much as a full one.
+    const notes = [];
+    const left = [];
+    if (ex.pool) left.push(t('cache.exclPool', formatNum(ex.pool)));
+    if (ex.estimated) left.push(t('cache.exclEstimated', formatNum(ex.estimated)));
+    if (ex.notReported) left.push(t('cache.exclNotReported', formatNum(ex.notReported)));
+    notes.push(t('cache.noteCounted', formatNum(d.eligible || 0)) + (left.length ? ' ' + t('cache.noteLeftOut', left.join(' · ')) : ''));
+    if (d.coverageFrom && d.coverageFrom > d.from + d.bucketMs) notes.push(t('cache.noteCoverage', fwdFmtSince(d.coverageFrom)));
+    notes.push(t('cache.noteNoVerdict'));
+    set('cacheNotes', notes.map(n => '<p>' + escapeHtml(n) + '</p>').join(''));
+
+    if (!d.eligible) {
+      set('cacheTiles', '');
+      set('cacheChart', '<div class="muted-text text-xs" style="padding:1rem 0;">' + escapeHtml(t('cache.empty')) + '</div>');
+      set('cacheTopWrites', '');
+      return;
+    }
+
+    const reuse = tot.readInput > 0 ? tot.read * 100 / tot.readInput : -1;
+    const tierParts = [t('cache.tier5m', tok(tot.write5m || 0)), t('cache.tier1h', tok(tot.write1h || 0))];
+    if (tot.writeUntiered) tierParts.push(t('cache.tierUntiered', tok(tot.writeUntiered)));
+    set('cacheTiles',
+      metricTile(t('cache.tileReuse'), fwdFmtPct(reuse), tot.readInput > 0 ? t('cache.tileReuseSub', tok(tot.read), tok(tot.readInput)) : '') +
+      metricTile(t('cache.tileWrites'), tok(tot.write || 0), tierParts.join(' · ')) +
+      metricTile(t('cache.tileUncached'), tok(tot.uncached || 0), tot.input > 0 ? t('cache.tileUncachedSub', (tot.uncached * 100 / tot.input).toFixed(1)) : '') +
+      metricTile(t('cache.tileBig'), formatNum(tot.bigWrites || 0), t('cache.tileBigSub', tok(d.bigWriteMin), tok(tot.maxWrite || 0))));
+
+    const title = $('cacheChartTitle');
+    if (title) title.textContent = t(cacheView === 'share' ? 'cache.chartShare' : 'cache.chartWrites');
+    const normalize = cacheView === 'share';
+    fwdBarChart($('cacheChart'), {
+      buckets: d.buckets || [],
+      startOf: b => b.startMs,
+      bucketMs: d.bucketMs,
+      segments: cacheSegments(cacheView),
+      yFormat: tok,
+      unitLabel: t(normalize ? 'cache.unitShare' : 'cache.unitTokens', fwdFmtBucketWidth(d.bucketMs)),
+      normalize,
+      noDataBefore: d.coverageFrom,
+      emptyText: t('cache.empty'),
+      summary: t('cache.summaryChart', formatNum(d.eligible), tok(tot.write || 0)),
+      tipFormat: tok,
+      tipExtra: b => '<div class="bc-tip-row">' + escapeHtml(t('cache.tipRequests', formatNum(b.requests || 0), tok(b.read || 0))) + '</div>',
+      onSelect: b => {
+        // A bar with no write has nothing to open in the writes view.
+        if (cacheView === 'writes' && !b.write) return;
+        cacheOpenWindow(b.startMs, b.startMs + d.bucketMs - 1, cacheView === 'writes' ? 1 : 0);
+      }
+    });
+
+    const rows = (d.topWrites || []);
+    set('cacheTopWrites', rows.length
+      ? '<div class="pd-table-scroll"><table class="pd-table"><thead><tr>' +
+          '<th>' + escapeHtml(t('forward.colTime')) + '</th>' +
+          '<th>' + escapeHtml(t('forward.colProvider')) + '</th>' +
+          '<th>' + escapeHtml(t('forward.colModel')) + '</th>' +
+          '<th>' + escapeHtml(t('forward.usageCacheWrite')) + '</th>' +
+          '<th>' + escapeHtml(t('forward.usageCacheRead')) + '</th>' +
+          '<th>' + escapeHtml(t('forward.usageCacheHit')) + '</th>' +
+          '<th><span class="sr-only">' + escapeHtml(t('forward.colDetail')) + '</span></th>' +
+          '</tr></thead><tbody>' +
+          rows.map((w, i) => {
+            const tier = ' <span class="muted-text">' + escapeHtml(fwdTierSplit(w.write5m, w.write1h) || t('forward.detailCacheTierUnknown')) + '</span>';
+            return '<tr>' +
+              '<td class="font-mono">' + escapeHtml(fwdFmtWhen(w.time)) + '</td>' +
+              '<td>' + escapeHtml(w.providerName || fwdProviderNames[w.providerId] || w.providerId || '—') + '</td>' +
+              '<td class="font-mono">' + escapeHtml(w.model || '—') + '</td>' +
+              '<td class="font-mono">' + escapeHtml(tok(w.write)) + tier + '</td>' +
+              '<td class="font-mono">' + escapeHtml(tok(w.read)) + '</td>' +
+              '<td class="font-mono">' + escapeHtml(w.input > 0 ? Math.round(w.read * 100 / w.input) + '%' : '—') + '</td>' +
+              '<td><button type="button" class="btn btn-outline btn-sm" data-cache-open="' + i + '">' + escapeHtml(t('cache.openRequest')) + '</button></td>' +
+              '</tr>';
+          }).join('') + '</tbody></table></div>'
+      : '<div class="muted-text text-xs">' + escapeHtml(t('cache.noWrites')) + '</div>');
+  }
+
+  // fwdFmtBucketWidth names a bucket width for the axis unit ("1 min", "15 min", "1 h").
+  function fwdFmtBucketWidth(ms) {
+    return ms >= 3600000 ? (ms / 3600000) + ' h' : (ms / 60000) + ' min';
+  }
+
+  // loadStatsCharts refreshes everything on the Stats tab that is drawn over time.
+  function loadStatsCharts() {
+    loadStatsHistory();
+    loadCacheSeries();
+  }
+
   // loadStatsHistory fetches the trend for the selected range and provider
   // filter. One selected provider (or none) is a single request — the endpoint
   // already scopes by id. Several selected providers fetch one series each and
@@ -8115,7 +8282,7 @@
   function openStats() {
     loadForwardStats();
     loadStatsWindow();
-    loadStatsHistory();
+    loadStatsCharts();
   }
 
   // ===== Provider multi-filter (Stats tab) =====
@@ -8154,7 +8321,7 @@
     updateStatsPfLabel();
     renderStatsTable();
     renderStatsCompare();
-    loadStatsHistory();
+    loadStatsCharts();
   }
 
   function updateStatsPfLabel() {
@@ -8220,7 +8387,7 @@
     if (errEl) errEl.textContent = '';
     statsCustomRange = { from: fromMs, to: toMs };
     loadStatsWindow();
-    loadStatsHistory();
+    loadStatsCharts();
   }
 
   function bindStatsEvents() {
@@ -8278,10 +8445,22 @@
         hideStatsCustomRange();
         statsHistoryHours = parseInt(range.value, 10) || 24;
         loadStatsWindow();
-        loadStatsHistory();
+        loadStatsCharts();
       });
     }
 
+    qsa('input[name="cacheView"]').forEach(r => r.addEventListener('change', () => {
+      cacheView = r.value;
+      renderCacheAnalytics();
+    }));
+    const topWrites = $('cacheTopWrites');
+    if (topWrites) topWrites.addEventListener('click', e => {
+      const btn = e.target.closest('[data-cache-open]');
+      const w = btn && cacheSeriesLast && (cacheSeriesLast.topWrites || [])[parseInt(btn.dataset.cacheOpen, 10)];
+      if (!w) return;
+      // The event's own millisecond timestamp, with its provider: exactly that request.
+      openActivityWindow({ providerId: w.providerId, since: w.time, until: w.time, minCacheWrite: 1, label: fwdFmtWhen(w.time) });
+    });
     qsa('input[name="statsTrendMetric"]').forEach(r => r.addEventListener('change', () => {
       statsTrendMetric = r.value;
       renderStatsTrend(statsTrendLast.buckets, statsTrendLast.unit, statsTrendLast.minuteSinceMs);

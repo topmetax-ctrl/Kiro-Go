@@ -5320,6 +5320,12 @@ body.modal-open .scroll-nav {
   fill: var(--bc);
 }
 .bc-ok { --bc: var(--success); }
+.bc-read { --bc: var(--success); }
+.bc-write,
+.bc-w5m { --bc: var(--info); }
+.bc-w1h { --bc: var(--brand-purple); }
+.bc-wun,
+.bc-unc { --bc: var(--muted-foreground); }
 .bc-fail { --bc: var(--destructive); }
 .bc-cancel { --bc: var(--muted-foreground); }
 .bc-in { --bc: var(--info); }
