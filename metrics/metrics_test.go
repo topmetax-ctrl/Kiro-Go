@@ -1318,3 +1318,24 @@ func TestRetentionWrappedRingAndReset(t *testing.T) {
 		t.Fatalf("memorySince did not advance on reset: %d -> %d", before, r.MemorySinceMs)
 	}
 }
+
+// The per-minute buckets are pruned to a rolling window, so a process that has
+// been up for days still only covers the last two hours of minutes; claiming
+// coverage since process start would present pruned minutes as zero requests.
+func TestMinuteSinceIsBoundedByTheRollingWindow(t *testing.T) {
+	reset(t)
+	now := nowMs()
+	if got := MinuteSince(); got != s.sinceMs {
+		t.Fatalf("fresh store: %d, want collection start %d", got, s.sinceMs)
+	}
+	s.sinceMs = now - 72*60*60*1000 // up for three days
+	floor := now - int64(bucketWindowMins)*60_000
+	got := MinuteSince()
+	if got < floor-1000 || got > floor+1000 {
+		t.Fatalf("long-running store: %d, want about now-window %d", got, floor)
+	}
+	r := Retention()
+	if r.MemorySinceMs != s.sinceMs || r.MinuteSinceMs < floor-1000 {
+		t.Fatalf("retention: %+v", r)
+	}
+}

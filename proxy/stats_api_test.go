@@ -591,12 +591,13 @@ func TestForwardStatsCarriesRetention(t *testing.T) {
 	}
 }
 
-// Every history shape reports when the memory-only series began, so a chart can
-// tell minutes with no data (before a restart) from minutes with zero requests.
-func TestForwardHistoryReportsMemorySince(t *testing.T) {
+// Every history shape reports how far back the per-minute series can answer, so
+// a chart can tell minutes with no data (before a restart) from minutes with
+// zero requests.
+func TestForwardHistoryReportsMinuteSince(t *testing.T) {
 	metrics.Reset()
 	initStatsConfig(t)
-	since := metrics.MemorySince()
+	since := metrics.MinuteSince()
 	now := time.Now().UnixMilli()
 	for _, target := range []string{
 		"/admin/api/forward-history?hours=1",
@@ -604,9 +605,9 @@ func TestForwardHistoryReportsMemorySince(t *testing.T) {
 		fmt.Sprintf("/admin/api/forward-history?from=%d&to=%d", now-30*60*1000, now),
 	} {
 		out := getJSON(t, &Handler{}, target)
-		got, ok := out["memorySinceMs"].(float64)
+		got, ok := out["minuteSinceMs"].(float64)
 		if !ok || int64(got) != since {
-			t.Fatalf("%s: memorySinceMs = %v, want %d", target, out["memorySinceMs"], since)
+			t.Fatalf("%s: minuteSinceMs = %v, want %d", target, out["minuteSinceMs"], since)
 		}
 	}
 }

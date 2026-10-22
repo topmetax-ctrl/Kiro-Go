@@ -2085,9 +2085,12 @@ type RetentionStat struct {
 	// EventRingOldestMs is the time of the oldest retained event, 0 when empty.
 	EventRingOldestMs int64 `json:"eventRingOldestMs"`
 	// MemorySinceMs is when the event ring and per-minute buckets began
-	// collecting (process start or last reset). Minutes before it have no data,
-	// as opposed to zero requests.
+	// collecting (process start or last reset).
 	MemorySinceMs int64 `json:"memorySinceMs"`
+	// MinuteSinceMs is how far back the per-minute series can answer: the later
+	// of MemorySinceMs and the rolling two-hour window it is pruned to. Minutes
+	// before it have no data, as opposed to zero requests.
+	MinuteSinceMs int64 `json:"minuteSinceMs"`
 	// EventLogSinceMs is the earliest moment the event log can answer for: the
 	// oldest retained event once the ring has wrapped (older ones were
 	// overwritten), otherwise when collection began — a quiet start is covered,
@@ -2095,13 +2098,22 @@ type RetentionStat struct {
 	EventLogSinceMs int64 `json:"eventLogSinceMs"`
 }
 
-// MemorySince is when the memory-only views began collecting. It is the cheap
-// subset of Retention for callers that only need to tell "no data yet" from
-// "no requests" on a per-minute series.
-func MemorySince() int64 {
+// MinuteSince is the earliest minute the per-minute series can answer for. The
+// buckets are memory only and pruned after bucketWindowMins, so coverage starts
+// at the later of when collection began and that rolling window; minutes before
+// it have no data, which is not the same as zero requests.
+func MinuteSince() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.sinceMs
+	return s.minuteSinceLocked(time.Now().UnixMilli())
+}
+
+func (s *store) minuteSinceLocked(nowMs int64) int64 {
+	since := s.sinceMs
+	if floor := nowMs - int64(bucketWindowMins)*60_000; floor > since {
+		since = floor
+	}
+	return since
 }
 
 // Retention reports the current coverage of the memory-only views.
@@ -2122,6 +2134,7 @@ func Retention() RetentionStat {
 		EventRingSize:     size,
 		EventRingOldestMs: oldest,
 		MemorySinceMs:     s.sinceMs,
+		MinuteSinceMs:     s.minuteSinceLocked(time.Now().UnixMilli()),
 		EventLogSinceMs:   logSince,
 	}
 }

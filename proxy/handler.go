@@ -6504,8 +6504,9 @@ func (h *Handler) apiGetProviderDetail(w http.ResponseWriter, r *http.Request) {
 // range, whose granularity (minute vs hour) the metrics layer picks by how
 // much of the window the per-minute memory actually covers.
 //
-// memorySinceMs says when the memory-only series began collecting. Minute
-// buckets before it have no data, which a chart must not draw as zero requests.
+// minuteSinceMs says how far back the per-minute series can answer (collection
+// start, or the two-hour window it is pruned to). Minute buckets before it have
+// no data, which a chart must not draw as zero requests.
 func (h *Handler) apiGetForwardHistory(w http.ResponseWriter, r *http.Request) {
 	hours := 24
 	if v := strings.TrimSpace(r.URL.Query().Get("hours")); v != "" {
@@ -6527,7 +6528,7 @@ func (h *Handler) apiGetForwardHistory(w http.ResponseWriter, r *http.Request) {
 			"to":            toMs,
 			"unit":          unit,
 			"buckets":       buckets,
-			"memorySinceMs": metrics.MemorySince(),
+			"minuteSinceMs": metrics.MinuteSince(),
 		})
 		return
 	}
@@ -6538,7 +6539,7 @@ func (h *Handler) apiGetForwardHistory(w http.ResponseWriter, r *http.Request) {
 			"hours":         hours,
 			"unit":          "minute",
 			"buckets":       metrics.MinuteHistoryFor(id, 60),
-			"memorySinceMs": metrics.MemorySince(),
+			"minuteSinceMs": metrics.MinuteSince(),
 		})
 		return
 	}
@@ -6547,7 +6548,7 @@ func (h *Handler) apiGetForwardHistory(w http.ResponseWriter, r *http.Request) {
 		"hours":         hours,
 		"unit":          "hour",
 		"buckets":       metrics.HistoryFor(id, hours),
-		"memorySinceMs": metrics.MemorySince(),
+		"minuteSinceMs": metrics.MinuteSince(),
 	})
 }
 
