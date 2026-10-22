@@ -170,7 +170,7 @@
     renderLogs(logsCache);
     renderStatsTable();
     renderStatsCompare();
-    renderStatsTrend(statsTrendLast.buckets, statsTrendLast.unit);
+    renderStatsTrend(statsTrendLast.buckets, statsTrendLast.unit, statsTrendLast.minuteSinceMs);
     // The callers leaderboard caches its rows for the IP text filter, so it
     // re-renders from cache on a language switch like the other tables.
     renderTopIps();
@@ -6533,32 +6533,263 @@
   // Last chart payload, kept so a language switch can redraw the text built in JS.
   let fwdChartLast = null;
 
-  // Hand-rolled SVG bar chart (zero external deps): one bar per minute, success
-  // stacked below failed, height scaled to the busiest minute.
+  // ===== Bar charts =====
+  // One renderer behind the Forwarding request chart, the Stats trend and the
+  // cache analytics: stacked bars over time with a y scale, x ticks, a legend, a
+  // tooltip and an explicit "no data" band. fwdStackBars (the geometry) is also
+  // what the provider sparkline draws with, minus the chrome.
+
+  let fwdChartSeq = 0;
+
+  // fwdSeg describes one stacked segment. tone is the CSS class that colours both
+  // the bar and its legend swatch; value reads the segment off a bucket.
+  function fwdSeg(key, label, tone, value) {
+    return { key, label, tone, cls: 'bc-seg ' + tone, value };
+  }
+
+  // fwdStackBars returns the SVG rects of stacked bars: one column per bucket in
+  // a w x h box, segments stacked from the baseline up in segment order.
+  // normalize scales every column to the full height (shares, not totals).
+  // A non-zero segment is never thinner than minSeg, so a single failure stays
+  // visible next to a bar of hundreds.
+  function fwdStackBars(buckets, segs, o) {
+    const w = o.w, h = o.h, minSeg = o.minSeg || 0;
+    const n = buckets.length;
+    if (!n) return '';
+    const bw = w / n;
+    let out = '';
+    buckets.forEach((b, i) => {
+      if (o.skip && o.skip(i)) return;
+      const vals = segs.map(s => Math.max(0, Number(s.value(b)) || 0));
+      const total = vals.reduce((a, v) => a + v, 0);
+      if (!total) return;
+      const denom = o.normalize ? total : o.max;
+      let y = h;
+      segs.forEach((s, k) => {
+        if (!vals[k]) return;
+        const sh = Math.max(vals[k] / denom * h, minSeg);
+        y = Math.max(0, y - sh);
+        out += '<rect class="' + s.cls + '" x="' + (i * bw).toFixed(2) + '" y="' + y.toFixed(2) +
+          '" width="' + (bw * 0.8).toFixed(2) + '" height="' + sh.toFixed(2) + '"></rect>';
+      });
+    });
+    return out;
+  }
+
+  // fwdFmtTick labels a time on the x axis: just the clock for a window of a day
+  // or less, with the date once it spans more.
+  function fwdFmtTick(ms, spanMs) {
+    const d = new Date(ms);
+    const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (spanMs < 36 * 3600000) return time;
+    return d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ' ' + time;
+  }
+
+  // fwdBarChart draws stacked bars into host.
+  //   buckets, startOf(b) -> ms, bucketMs   the series and its resolution
+  //   segments                              [fwdSeg(...)] stacked bottom to top
+  //   yFormat, unitLabel                    y scale text and what one bar counts
+  //   normalize                             every bar as a share of its own total
+  //   noDataBefore                          ms; earlier buckets have no data (a
+  //                                         restart), which is not zero requests
+  //   tipExtra(b) -> html, onSelect(b, i)   extra tooltip lines; click/Enter handler
+  //   summary, emptyText                    accessible description; text when empty
+  // Zero inside the covered span is drawn as an empty column on the baseline;
+  // the span before coverage is hatched and the tooltip says why.
+  function fwdBarChart(host, o) {
+    if (!host) return;
+    const buckets = o.buckets || [];
+    const n = buckets.length;
+    const segs = o.segments;
+    const totals = buckets.map(b => segs.reduce((a, s) => a + Math.max(0, Number(s.value(b)) || 0), 0));
+    const sum = totals.reduce((a, v) => a + v, 0);
+    host._bc = null;
+    if (!n || !sum) {
+      host.innerHTML = '<div class="muted-text text-xs" style="padding:1rem 0;">' + escapeHtml(o.emptyText) + '</div>';
+      return;
+    }
+    // Buckets that end before coverage began carry no data at all.
+    let blind = 0;
+    if (o.noDataBefore) while (blind < n && o.startOf(buckets[blind]) + o.bucketMs <= o.noDataBefore) blind++;
+    const max = o.normalize ? 100 : Math.max(...totals);
+    const pct = x => (x * 100 / n).toFixed(3) + '%';
+    const spanMs = n * o.bucketMs;
+
+    const ticks = [0, 0.25, 0.5, 0.75, 1].map(f => {
+      const i = Math.min(n - 1, Math.round(f * (n - 1)));
+      return '<span>' + escapeHtml(fwdFmtTick(o.startOf(buckets[i]), spanMs)) + '</span>';
+    }).join('');
+
+    const used = segs.filter(s => buckets.some((b, i) => i >= blind && (Number(s.value(b)) || 0) > 0));
+    const legend = used.map(s => '<span class="bc-legend-item"><i class="bc-swatch ' + s.tone + '" aria-hidden="true"></i>' +
+      escapeHtml(s.label) + '</span>').join('') +
+      (blind ? '<span class="bc-legend-item"><i class="bc-swatch bc-swatch--nodata" aria-hidden="true"></i>' +
+        escapeHtml(t('chart.noDataBand', fwdFmtTick(o.noDataBefore, spanMs))) + '</span>' : '');
+
+    host.innerHTML =
+      '<div class="bc">' +
+        '<div class="bc-unit">' + escapeHtml(o.unitLabel) + '</div>' +
+        '<div class="bc-y"><span>' + escapeHtml(o.normalize ? '100%' : o.yFormat(max)) + '</span><span>' +
+          escapeHtml(o.normalize ? '0%' : o.yFormat(0)) + '</span></div>' +
+        '<div class="bc-plot" tabindex="0" role="group" aria-roledescription="chart" aria-label="' +
+          escapeAttr(o.summary + ' ' + t('chart.keysHint')) + '">' +
+          (blind ? '<div class="bc-nodata" style="width:' + pct(blind) + '"></div>' : '') +
+          '<div class="bc-base" style="left:' + pct(blind) + '"></div>' +
+          '<div class="bc-hover" style="width:' + pct(1) + '" hidden></div>' +
+          '<svg class="bc-svg" viewBox="0 0 100 40" preserveAspectRatio="none" aria-hidden="true">' +
+            fwdStackBars(buckets, segs, { w: 100, h: 40, max, normalize: !!o.normalize, minSeg: 0.8, skip: i => i < blind }) +
+          '</svg>' +
+          '<div class="bc-tip" role="tooltip" hidden></div>' +
+        '</div>' +
+        '<div class="bc-x">' + ticks + '</div>' +
+        '<div class="bc-legend">' + legend + '</div>' +
+        '<div class="sr-only" aria-live="polite"></div>' +
+      '</div>';
+    host._bc = { o, buckets, n, blind, spanMs, active: -1 };
+    fwdBarChartBind(host);
+  }
+
+  // fwdBarChartTip is the tooltip body for one bucket: its time range, then each
+  // segment's value, or the reason there is no data.
+  function fwdBarChartTip(host, i) {
+    const c = host._bc, o = c.o, b = c.buckets[i];
+    const start = o.startOf(b);
+    const end = start + o.bucketMs;
+    const head = fwdFmtTick(start, c.spanMs) + ' – ' + new Date(end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (i < c.blind) {
+      return { html: '<strong>' + escapeHtml(head) + '</strong><div>' + escapeHtml(t('chart.noDataTip', fwdFmtTick(o.noDataBefore, c.spanMs))) + '</div>', text: head + '. ' + t('chart.noDataTip', fwdFmtTick(o.noDataBefore, c.spanMs)) };
+    }
+    const vals = o.segments.map(s => ({ s, v: Math.max(0, Number(s.value(b)) || 0) }));
+    const total = vals.reduce((a, x) => a + x.v, 0);
+    const fmt = o.tipFormat || o.yFormat;
+    const lines = vals.map(x => '<div class="bc-tip-row"><i class="bc-swatch ' + x.s.tone + '" aria-hidden="true"></i>' +
+      escapeHtml(x.s.label) + ' <b>' + escapeHtml(fmt(x.v)) + '</b>' +
+      (o.normalize && total ? ' <span class="muted-text">(' + Math.round(x.v * 100 / total) + '%)</span>' : '') + '</div>').join('');
+    const extra = o.tipExtra ? o.tipExtra(b) : '';
+    const hint = o.onSelect ? '<div class="bc-tip-hint">' + escapeHtml(t('chart.clickHint')) + '</div>' : '';
+    const text = head + '. ' + vals.map(x => x.s.label + ' ' + fmt(x.v)).join(', ');
+    return { html: '<strong>' + escapeHtml(head) + '</strong>' + lines + extra + hint, text };
+  }
+
+  // fwdBarChartShow highlights bucket i and shows its tooltip, kept inside the plot.
+  function fwdBarChartShow(host, i) {
+    const c = host._bc;
+    if (!c) return;
+    const plot = host.querySelector('.bc-plot');
+    const tip = host.querySelector('.bc-tip');
+    const hover = host.querySelector('.bc-hover');
+    if (!plot || !tip || !hover) return;
+    c.active = i;
+    const body = fwdBarChartTip(host, i);
+    tip.innerHTML = body.html;
+    tip.hidden = false;
+    hover.hidden = false;
+    hover.style.left = (i * 100 / c.n).toFixed(3) + '%';
+    const plotW = plot.clientWidth;
+    const tipW = tip.offsetWidth;
+    const center = (i + 0.5) * plotW / c.n;
+    tip.style.left = Math.max(0, Math.min(plotW - tipW, center - tipW / 2)) + 'px';
+    const live = host.querySelector('[aria-live]');
+    if (live) live.textContent = body.text;
+  }
+
+  function fwdBarChartHide(host) {
+    const c = host._bc;
+    if (c) c.active = -1;
+    const tip = host.querySelector('.bc-tip');
+    const hover = host.querySelector('.bc-hover');
+    if (tip) tip.hidden = true;
+    if (hover) hover.hidden = true;
+  }
+
+  // fwdBarChartBind attaches the interaction once per host. Handlers are
+  // delegated and read the host's current chart, so re-rendering the chart (every
+  // refresh replaces its innerHTML) never needs to rebind.
+  function fwdBarChartBind(host) {
+    if (host._bcBound) return;
+    host._bcBound = true;
+    const indexAt = e => {
+      const plot = e.target.closest && e.target.closest('.bc-plot');
+      const c = host._bc;
+      if (!plot || !c) return -1;
+      const r = plot.getBoundingClientRect();
+      return Math.max(0, Math.min(c.n - 1, Math.floor((e.clientX - r.left) / r.width * c.n)));
+    };
+    const select = i => {
+      const c = host._bc;
+      if (!c || i < 0 || i < c.blind || !c.o.onSelect) return;
+      c.o.onSelect(c.buckets[i], i);
+    };
+    host.addEventListener('pointermove', e => {
+      const i = indexAt(e);
+      if (i < 0) fwdBarChartHide(host); else fwdBarChartShow(host, i);
+    });
+    host.addEventListener('pointerleave', () => fwdBarChartHide(host));
+    host.addEventListener('click', e => select(indexAt(e)));
+    host.addEventListener('focusout', e => {
+      if (e.target.closest && e.target.closest('.bc-plot')) fwdBarChartHide(host);
+    });
+    host.addEventListener('keydown', e => {
+      const c = host._bc;
+      if (!c || !e.target.closest || !e.target.closest('.bc-plot')) return;
+      let i = c.active < 0 ? c.n - 1 : c.active;
+      if (e.key === 'ArrowLeft') i = Math.max(0, i - 1);
+      else if (e.key === 'ArrowRight') i = Math.min(c.n - 1, i + 1);
+      else if (e.key === 'Home') i = 0;
+      else if (e.key === 'End') i = c.n - 1;
+      else if (e.key === 'Escape') { fwdBarChartHide(host); return; }
+      else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(c.active < 0 ? c.n - 1 : c.active); return; }
+      else return;
+      e.preventDefault();
+      fwdBarChartShow(host, i);
+    });
+    host.addEventListener('focusin', e => {
+      const c = host._bc;
+      if (c && c.active < 0 && e.target.closest && e.target.closest('.bc-plot') && e.target.matches(':focus-visible')) fwdBarChartShow(host, c.n - 1);
+    });
+  }
+
+  // Segment sets shared by the request-count charts.
+  function fwdRequestSegments() {
+    return [
+      fwdSeg('ok', t('chart.segOk'), 'bc-ok', b => b.success != null ? b.success : (b.requests || 0) - (b.failed || 0)),
+      fwdSeg('failed', t('chart.segFailed'), 'bc-fail', b => b.failed || 0),
+      // Canceled requests count in neither success nor failed; named so the
+      // columns still add up to the request total.
+      fwdSeg('canceled', t('chart.segCanceled'), 'bc-cancel', b => Math.max(0, (b.requests || 0) - (b.success || 0) - (b.failed || 0)))
+    ];
+  }
+
+  // fwdBucketTipExtra adds tokens and average latency to a request-count tooltip.
+  function fwdBucketTipExtra(b) {
+    let h = '';
+    const tokens = (b.inputTokens || 0) + (b.outputTokens || 0);
+    if (tokens) h += '<div class="bc-tip-row">' + escapeHtml(t('chart.tipTokens', formatNum(tokens))) + '</div>';
+    if (b.requests && b.avgLatencyMs) h += '<div class="bc-tip-row">' + escapeHtml(t('chart.tipLatency', fwdFmtLatency(b.avgLatencyMs))) + '</div>';
+    return h;
+  }
+
+  // renderForwardChart draws the Forwarding tab's request chart (the last 60
+  // minutes, one bar per minute) and the latency percentiles beside it.
   function renderForwardChart(series, pct) {
     fwdChartLast = { series: series, pct: pct };
     const host = $('fwdChart');
     if (host) {
-      if (!series.length) {
-        host.innerHTML = '<div class="muted-text text-xs" style="padding:1rem 0;">' + escapeHtml(t('forward.noData')) + '</div>';
-      } else {
-        const w = 100, h = 40, n = series.length;
-        const bw = w / n;
-        const max = Math.max(1, ...series.map(b => b.requests || 0));
-        let bars = '';
-        series.forEach((b, i) => {
-          const x = (i * bw).toFixed(2);
-          const total = b.requests || 0;
-          if (!total) return;
-          const th = (total / max) * h;
-          const fh = ((b.failed || 0) / max) * h;
-          const sh = th - fh;
-          const bwFill = (bw * 0.8).toFixed(2);
-          if (sh > 0) bars += '<rect x="' + x + '" y="' + (h - th).toFixed(2) + '" width="' + bwFill + '" height="' + sh.toFixed(2) + '" fill="#22c55e"></rect>';
-          if (fh > 0) bars += '<rect x="' + x + '" y="' + (h - fh).toFixed(2) + '" width="' + bwFill + '" height="' + fh.toFixed(2) + '" fill="#ef4444"></rect>';
-        });
-        host.innerHTML = '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" style="width:100%;height:60px;">' + bars + '</svg>';
-      }
+      const r = forwardStats.retention;
+      const failed = series.reduce((n, b) => n + (b.failed || 0), 0);
+      const reqs = series.reduce((n, b) => n + (b.requests || 0), 0);
+      fwdBarChart(host, {
+        buckets: series,
+        startOf: b => b.minute * 60000,
+        bucketMs: 60000,
+        segments: fwdRequestSegments(),
+        yFormat: formatNum,
+        unitLabel: t('chart.unitReqMin'),
+        noDataBefore: r ? r.minuteSinceMs : 0,
+        emptyText: t('forward.noData'),
+        summary: t('chart.summaryRequests', formatNum(reqs), formatNum(failed)),
+        tipExtra: fwdBucketTipExtra
+      });
     }
     const pctEl = $('fwdPercentiles');
     if (pctEl) {
@@ -6887,25 +7118,17 @@
     return 'fwd-badge--err';
   }
 
-  // sparkline draws a compact SVG bar chart of per-minute buckets, matching the
-  // main forwarding chart's stacked success/failure encoding.
+  // sparkline draws a compact bar chart of per-minute buckets: the same geometry
+  // as the full charts, without axes or tooltip.
   function sparkline(buckets) {
     if (!buckets || !buckets.length) return '';
-    const w = 100, h = 24, n = buckets.length, bw = w / n;
     const max = Math.max(1, ...buckets.map(b => b.requests || 0));
-    let bars = '';
-    buckets.forEach((b, i) => {
-      const total = b.requests || 0;
-      if (!total) return;
-      const th = (total / max) * h;
-      const fh = ((b.failed || 0) / max) * h;
-      const sh = th - fh;
-      const x = (i * bw).toFixed(2);
-      const fw = (bw * 0.8).toFixed(2);
-      if (sh > 0) bars += '<rect x="' + x + '" y="' + (h - th).toFixed(2) + '" width="' + fw + '" height="' + sh.toFixed(2) + '" class="spark-ok"></rect>';
-      if (fh > 0) bars += '<rect x="' + x + '" y="' + (h - fh).toFixed(2) + '" width="' + fw + '" height="' + fh.toFixed(2) + '" class="spark-err"></rect>';
-    });
-    return '<svg class="provider-spark" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none">' + bars + '</svg>';
+    const segs = [
+      { cls: 'spark-err', value: b => b.failed || 0 },
+      { cls: 'spark-ok', value: b => Math.max(0, (b.requests || 0) - (b.failed || 0)) }
+    ];
+    return '<svg class="provider-spark" viewBox="0 0 100 24" preserveAspectRatio="none">' +
+      fwdStackBars(buckets, segs, { w: 100, h: 24, max }) + '</svg>';
   }
 
   function metricTile(label, value, sub) {
@@ -7257,7 +7480,7 @@
   let statsHistoryHours = 1;
   // Last trend payload, kept so a language switch can re-render the chart
   // heading and note (both are built in JS, not via data-i18n).
-  let statsTrendLast = { buckets: [], unit: 'hour' };
+  let statsTrendLast = { buckets: [], unit: 'hour', minuteSinceMs: 0 };
 
   // Callers-by-IP tab state. The fetched leaderboard is cached so the IP text
   // filter re-renders client-side without refetching; 0 means all-time.
@@ -7661,47 +7884,79 @@
     });
   }
 
+  // statsTrendMetric is what the trend plots: requests (success / failed /
+  // canceled), tokens (input / output) or the average latency of each bucket.
+  // Every one is a figure the buckets already carry; there is no per-bucket p95.
+  let statsTrendMetric = 'requests';
+
+  function statsTrendConfig(unit) {
+    const perUnit = unit === 'minute';
+    if (statsTrendMetric === 'tokens') {
+      return {
+        segments: [
+          fwdSeg('in', t('chart.segInput'), 'bc-in', b => b.inputTokens || 0),
+          fwdSeg('out', t('chart.segOutput'), 'bc-out', b => b.outputTokens || 0)
+        ],
+        yFormat: formatNum,
+        unitLabel: t(perUnit ? 'chart.unitTokensMin' : 'chart.unitTokensHour')
+      };
+    }
+    if (statsTrendMetric === 'latency') {
+      return {
+        segments: [fwdSeg('lat', t('chart.segLatency'), 'bc-lat', b => (b.requests ? b.avgLatencyMs : 0) || 0)],
+        yFormat: fwdFmtLatency,
+        unitLabel: t(perUnit ? 'chart.unitLatencyMin' : 'chart.unitLatencyHour')
+      };
+    }
+    return {
+      segments: fwdRequestSegments(),
+      yFormat: formatNum,
+      unitLabel: t(perUnit ? 'chart.unitReqMin' : 'chart.unitReqHour'),
+      tipExtra: fwdBucketTipExtra
+    };
+  }
+
   // renderStatsTrend draws the history chart. The bucket unit follows the
   // selected range (per-minute for the 1-hour view, hourly beyond that), so the
-  // heading names the unit rather than assuming hours.
-  function renderStatsTrend(buckets, unit) {
-    statsTrendLast = { buckets: buckets || [], unit: unit };
+  // heading names the unit rather than assuming hours. minuteSinceMs marks where
+  // the per-minute memory began: minutes before it are drawn as "no data", never
+  // as zero requests.
+  function renderStatsTrend(buckets, unit, minuteSinceMs) {
+    statsTrendLast = { buckets: buckets || [], unit: unit, minuteSinceMs: minuteSinceMs || 0 };
     const host = $('statsTrendChart');
     const isMinute = unit === 'minute';
     const title = $('statsTrendTitle');
     if (title) title.textContent = t(isMinute ? 'stats.trendTitleMinute' : 'stats.trendTitle');
     const note = $('statsTrendNote');
-    // Per-minute buckets live only in memory, so say so instead of letting an
-    // empty 1-hour chart read as "no traffic" after a restart.
-    if (note) note.textContent = isMinute ? t('stats.trendMinuteNote') : '';
+    // Per-minute buckets live only in memory, so say when they begin instead of
+    // letting an empty 1-hour chart read as "no traffic" after a restart.
+    if (note) {
+      note.textContent = !isMinute ? '' : (minuteSinceMs
+        ? t('stats.trendMinuteNoteSince', fwdFmtSince(minuteSinceMs))
+        : t('stats.trendMinuteNote'));
+    }
     if (!host) return;
     const series = buckets || [];
     const total = series.reduce((n, b) => n + (b.requests || 0), 0);
-    if (!total) {
-      host.innerHTML = '<div class="muted-text text-xs" style="padding:1rem 0;">' +
-        escapeHtml(t('forward.noData')) + '</div>';
-    } else {
-      const w = 100, h = 40, n = series.length, bw = w / n;
-      const max = Math.max(1, ...series.map(b => b.requests || 0));
-      let bars = '';
-      series.forEach((b, i) => {
-        const reqs = b.requests || 0;
-        if (!reqs) return;
-        const th = (reqs / max) * h;
-        const fh = ((b.failed || 0) / max) * h;
-        const sh = th - fh;
-        const x = (i * bw).toFixed(2);
-        const fw = (bw * 0.8).toFixed(2);
-        if (sh > 0) bars += '<rect x="' + x + '" y="' + (h - th).toFixed(2) + '" width="' + fw + '" height="' + sh.toFixed(2) + '" class="spark-ok"></rect>';
-        if (fh > 0) bars += '<rect x="' + x + '" y="' + (h - fh).toFixed(2) + '" width="' + fw + '" height="' + fh.toFixed(2) + '" class="spark-err"></rect>';
-      });
-      host.innerHTML = '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" style="width:100%;height:60px;">' + bars + '</svg>';
-    }
+    const failed = series.reduce((n, b) => n + (b.failed || 0), 0);
+    const tokens = series.reduce((n, b) => n + (b.inputTokens || 0) + (b.outputTokens || 0), 0);
+    const cfg = statsTrendConfig(unit);
+    fwdBarChart(host, {
+      buckets: series,
+      startOf: b => b.minute * (isMinute ? 60000 : 3600000),
+      bucketMs: isMinute ? 60000 : 3600000,
+      segments: cfg.segments,
+      yFormat: cfg.yFormat,
+      unitLabel: cfg.unitLabel,
+      tipExtra: cfg.tipExtra,
+      // Only the per-minute series is memory-only; hourly rollups are persisted.
+      noDataBefore: isMinute ? minuteSinceMs : 0,
+      emptyText: t('forward.noData'),
+      summary: t('chart.summaryRequests', formatNum(total), formatNum(failed))
+    });
 
     const summary = $('statsTrendSummary');
     if (summary) {
-      const failed = series.reduce((n, b) => n + (b.failed || 0), 0);
-      const tokens = series.reduce((n, b) => n + (b.inputTokens || 0) + (b.outputTokens || 0), 0);
       summary.textContent = total
         ? t('stats.trendSummary', formatNum(total), formatNum(failed), formatNum(tokens))
         : '';
@@ -7722,7 +7977,7 @@
         const res = await api('/forward-history?' + params.toString());
         if (!res.ok) throw new Error('http ' + res.status);
         const d = await res.json();
-        renderStatsTrend(d.buckets || [], d.unit);
+        renderStatsTrend(d.buckets || [], d.unit, d.minuteSinceMs);
         return;
       }
       const responses = await Promise.all(ids.map(id => {
@@ -7734,9 +7989,9 @@
         });
       }));
       const unit = responses[0] ? responses[0].unit : 'hour';
-      renderStatsTrend(mergeHistoryBuckets(responses), unit);
+      renderStatsTrend(mergeHistoryBuckets(responses), unit, responses[0] ? responses[0].minuteSinceMs : 0);
     } catch (e) {
-      renderStatsTrend([], !statsCustomRange && statsHistoryHours <= 1 ? 'minute' : 'hour');
+      renderStatsTrend([], !statsCustomRange && statsHistoryHours <= 1 ? 'minute' : 'hour', 0);
     }
   }
 
@@ -7748,35 +8003,25 @@
     const byKey = new Map();
     responses.forEach(r => (r.buckets || []).forEach(b => {
       const key = b.minute || 0;
-      const t = byKey.get(key);
-      if (t) {
-        t.requests += b.requests || 0;
-        t.success += b.success || 0;
-        t.failed += b.failed || 0;
-        t.inputTokens += b.inputTokens || 0;
-        t.outputTokens += b.outputTokens || 0;
-        t.costUsd += b.costUsd || 0;
-      } else {
-        byKey.set(key, {
-          minute: key,
-          requests: b.requests || 0,
-          success: b.success || 0,
-          failed: b.failed || 0,
-          inputTokens: b.inputTokens || 0,
-          outputTokens: b.outputTokens || 0,
-          costUsd: b.costUsd || 0
-        });
+      let t = byKey.get(key);
+      if (!t) {
+        t = { minute: key, requests: 0, success: 0, failed: 0, inputTokens: 0, outputTokens: 0, costUsd: 0, latencySum: 0 };
+        byKey.set(key, t);
       }
+      t.requests += b.requests || 0;
+      t.success += b.success || 0;
+      t.failed += b.failed || 0;
+      t.inputTokens += b.inputTokens || 0;
+      t.outputTokens += b.outputTokens || 0;
+      t.costUsd += b.costUsd || 0;
+      // Each bucket carries only its average; weighting by requests recovers the
+      // merged average without needing the per-request sums.
+      t.latencySum += (b.avgLatencyMs || 0) * (b.requests || 0);
     }));
-    return Array.from(byKey.values()).sort((a, b) => a.minute - b.minute);
+    return Array.from(byKey.values())
+      .map(b => Object.assign(b, { avgLatencyMs: b.requests ? Math.round(b.latencySum / b.requests) : 0 }))
+      .sort((a, b) => a.minute - b.minute);
   }
-
-  // loadStatsWindow refetches the per-provider figures scoped to the selected
-  // range and re-renders the two surfaces that read them. On failure the window
-  // copy is dropped so the tab falls back to all-time rather than freezing on a
-  // stale range.
-  // statsRangeParams renders the active Stats-tab range as query params: the
-  // custom window's from/to when one is applied, otherwise the preset's hours.
   function statsRangeParams() {
     if (statsCustomRange) {
       return { from: String(statsCustomRange.from), to: String(statsCustomRange.to) };
@@ -8035,6 +8280,11 @@
         loadStatsHistory();
       });
     }
+
+    qsa('input[name="statsTrendMetric"]').forEach(r => r.addEventListener('change', () => {
+      statsTrendMetric = r.value;
+      renderStatsTrend(statsTrendLast.buckets, statsTrendLast.unit, statsTrendLast.minuteSinceMs);
+    }));
 
     // Provider multi-filter: the menu is rebuilt on open (so it lists newly
     // configured providers); checkbox changes and the reset re-filter without

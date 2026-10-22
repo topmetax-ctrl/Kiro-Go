@@ -5188,6 +5188,144 @@ body.modal-open .scroll-nav {
   fill: var(--destructive, #ef4444);
 }
 
+/* Bar charts: Forwarding request chart, Stats trend, cache analytics. Axis text
+   and legend are --muted-foreground (7:1+); every bar color is >= 3:1 on the card
+   in both themes. The "no data" band is hatched and also named in the legend and
+   the tooltip, so it never relies on the pattern alone. */
+.bc {
+  display: grid;
+  grid-template-columns: 3.4rem minmax(0, 1fr);
+  column-gap: 0.4rem;
+  row-gap: 0.25rem;
+}
+.bc-unit {
+  grid-column: 2;
+  font-size: 0.7rem;
+  color: var(--muted-foreground);
+}
+.bc-y {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: flex-end;
+  height: 6rem;
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted-foreground);
+}
+.bc-plot {
+  position: relative;
+  height: 6rem;
+  border-left: 1px solid var(--border);
+}
+.bc-plot:focus-visible {
+  outline: 2px solid var(--foreground);
+  outline-offset: 2px;
+}
+.bc-svg {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.bc-base {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: var(--muted-foreground);
+}
+.bc-nodata {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: repeating-linear-gradient(
+    45deg,
+    transparent 0 5px,
+    color-mix(in srgb, var(--muted-foreground) 40%, transparent) 5px 6px
+  );
+}
+.bc-hover {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  pointer-events: none;
+}
+.bc-hover[hidden],
+.bc-tip[hidden] {
+  display: none;
+}
+.bc-tip {
+  position: absolute;
+  z-index: 5;
+  top: -0.25rem;
+  transform: translateY(-100%);
+  min-width: 9rem;
+  max-width: 16rem;
+  padding: 0.4rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  font-size: 0.74rem;
+  line-height: 1.4;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+}
+.bc-tip-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.bc-tip-hint {
+  margin-top: 0.25rem;
+  color: var(--muted-foreground);
+}
+.bc-x {
+  grid-column: 2;
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: var(--muted-foreground);
+}
+.bc-legend {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 1rem;
+  font-size: 0.72rem;
+  color: var(--muted-foreground);
+}
+.bc-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.bc-swatch {
+  display: inline-block;
+  flex: none;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 2px;
+  background: var(--bc);
+}
+.bc-swatch--nodata {
+  background: repeating-linear-gradient(45deg, transparent 0 2px, var(--muted-foreground) 2px 3px);
+  border: 1px solid var(--muted-foreground);
+}
+.bc-seg {
+  fill: var(--bc);
+}
+.bc-ok { --bc: var(--success); }
+.bc-fail { --bc: var(--destructive); }
+.bc-cancel { --bc: var(--muted-foreground); }
+.bc-in { --bc: var(--info); }
+.bc-out { --bc: var(--brand-purple); }
+.bc-lat { --bc: var(--info); }
+
 /* Stats tab: at-a-glance provider comparison */
 .stats-compare {
   margin-top: 1rem;

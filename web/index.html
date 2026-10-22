@@ -1215,6 +1215,11 @@
               <!-- Title is set from JS because it names the bucket unit, which
                    depends on the selected range (minutes vs hours). -->
               <span class="text-xs font-semibold" id="statsTrendTitle"></span>
+              <div class="seg" role="radiogroup" data-i18n-aria-label="chart.metricLabel" id="statsTrendMetric">
+                <label class="seg-item"><input type="radio" name="statsTrendMetric" value="requests" checked /><span data-i18n="chart.metricRequests"></span></label>
+                <label class="seg-item"><input type="radio" name="statsTrendMetric" value="tokens" /><span data-i18n="chart.metricTokens"></span></label>
+                <label class="seg-item"><input type="radio" name="statsTrendMetric" value="latency" /><span data-i18n="chart.metricLatency"></span></label>
+              </div>
               <span class="text-xs muted-text font-mono" id="statsTrendSummary"></span>
             </div>
             <div id="statsTrendChart" class="fwd-chart"></div>
