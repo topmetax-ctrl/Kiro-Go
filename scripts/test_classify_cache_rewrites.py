@@ -262,5 +262,56 @@ class CacheKeyTest(unittest.TestCase):
         self.assertIn("downstream", got.hint)
 
 
+class SessionLinksTest(unittest.TestCase):
+    """A child names its parent's session digest; the two meet only inside one key."""
+
+    def traced(self, sess, parent=None, flag="absent", **kw):
+        t = trace("c-" + sess, 4, ["1:a1", "4:a4"], sess=sess, signals={"parentSession": flag})
+        if parent:
+            t["parent"] = parent
+        return ev(kw.pop("end"), trace=t, **kw)
+
+    def groups(self, items):
+        rows, _ = cl.build(items)
+        return cl.session_links(rows)
+
+    def test_a_child_points_at_a_parent_that_is_in_the_events(self):
+        g = self.groups([self.traced("main", end=1000, tot=10, cc=500, cc5=500, cc1=0),
+                         self.traced("kid", parent="main", flag="present", end=1100, tot=10, cc=300, cc5=0, cc1=300),
+                         self.traced("kid", parent="main", flag="present", end=1200, tot=10, cc=0)])
+        self.assertEqual(set(g), {"main", "kid"})
+        self.assertEqual(g["kid"]["n"], 2)
+        self.assertEqual(g["kid"]["cc"], 300)
+        self.assertEqual(g["kid"]["parents_known"], {"main"})
+        self.assertEqual(dict(g["kid"]["tiers"]), {"1h": 1})
+        self.assertEqual(dict(g["kid"]["flags"]), {"present": 2})
+        self.assertEqual(g["main"]["parents"], set())
+        self.assertEqual(dict(g["main"]["flags"]), {"absent": 1})
+
+    def test_a_parent_outside_the_events_is_not_claimed(self):
+        g = self.groups([self.traced("kid", parent="gone", flag="present", end=1000, tot=10, cc=1)])
+        self.assertEqual(g["kid"]["parents"], {"gone"})
+        self.assertEqual(g["kid"]["parents_known"], set())
+
+    def test_events_without_session_digests_form_no_group(self):
+        self.assertEqual(self.groups([ev(1000, tot=10, cc=1), ev(1100, tot=10, cc=1, trace=P4)]), {})
+
+    def test_the_report_names_the_state_of_each_parent(self):
+        import io
+        from contextlib import redirect_stdout
+        g = self.groups([self.traced("main", end=1000, tot=10, cc=5), self.traced("kid", parent="main", flag="present", end=1100, tot=10, cc=9),
+                         self.traced("orphan", parent="elsewhere", flag="present", end=1200, tot=10, cc=1)])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cl.print_sessions(g)
+        text = out.getvalue()
+        self.assertIn("main(in events)", text)
+        self.assertIn("elsewher(outside)", text)  # digests print as their first 8 characters
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cl.print_sessions({})
+        self.assertIn("no session digests", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

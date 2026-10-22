@@ -32,7 +32,11 @@ Events recorded before cache tracing existed carry no prompt digests and no TTL
 split; for those the previous request is a heuristic guess, and every label that
 rests on it is marked "heuristic". See docs/cache-observability.md.
 
-usage: classify_cache_rewrites.py EVENTS.json [--min-write N] [--model M] [--json]
+With --sessions it also lists each session (by its keyed digest) with the parent
+it names and whether that parent is among the events: the way to tell a child
+session from a main one. Events recorded before session digests have none.
+
+usage: classify_cache_rewrites.py EVENTS.json [--min-write N] [--model M] [--json] [--sessions]
 """
 
 import argparse
@@ -335,6 +339,47 @@ def decide(r, rows, has_successor, min_write):
     return "unknown", UNKNOWN, "%sprevious request #%d ended %.0fs earlier; tier %s" % (rel, p.i, gap, tier or "unknown"), hint
 
 
+def session_links(rows):
+    """Per session digest: its requests, what they wrote, the parent it names.
+
+    Only the digests are compared, and they are scoped to one API key, so a
+    parent shows as "in events" only when it came through the same key.
+    """
+    groups = {}
+    for r in rows:
+        t = r.trace or {}
+        sess = t.get("sess")
+        if not sess:
+            continue
+        g = groups.setdefault(sess, {"n": 0, "cc": 0, "convs": set(), "parents": set(),
+                                     "flags": collections.Counter(), "tiers": collections.Counter()})
+        g["n"] += 1
+        g["cc"] += r.cc
+        g["convs"].add(t.get("conv"))
+        if t.get("parent"):
+            g["parents"].add(t["parent"])
+        g["flags"][(t.get("signals") or {}).get("parentSession", "unrecorded")] += 1
+        tier = own_tier(r)
+        if tier:
+            g["tiers"][tier] += 1
+    for g in groups.values():
+        g["parents_known"] = {p for p in g["parents"] if p in groups}
+    return groups
+
+
+def print_sessions(groups):
+    if not groups:
+        print("\nno session digests: these events predate them, or the requests named no session")
+        return
+    print("\nsession   requests  convs  written    ttl tiers        parentSession flags           parent")
+    for sess, g in sorted(groups.items(), key=lambda kv: -kv[1]["cc"]):
+        parents = ",".join("%s(%s)" % (p[:8], "in events" if p in groups else "outside") for p in sorted(g["parents"])) or "-"
+        print("%-9s %8d %6d %8d    %-16s %-27s %s" % (
+            sess[:8], g["n"], len(g["convs"]), g["cc"],
+            ",".join("%s:%d" % kv for kv in sorted(g["tiers"].items())) or "-",
+            ",".join("%s:%d" % kv for kv in sorted(g["flags"].items())), parents))
+
+
 def run(rows, min_write):
     has_successor = link_by_arithmetic(rows)
     return [classify(r, rows, has_successor, min_write) for r in rows if r.cc >= min_write]
@@ -346,6 +391,7 @@ def main(argv=None):
     ap.add_argument("--min-write", type=int, default=100000, help="cache_creation tokens that make a rewrite")
     ap.add_argument("--model", help="target model (default: the most common one)")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--sessions", action="store_true", help="also list sessions and the parents they name")
     args = ap.parse_args(argv)
     rows, model = load(args.events, args.model)
     result = run(rows, args.min_write)
@@ -365,6 +411,8 @@ def main(argv=None):
     print("\nlabel              confidence  rewrites  tokens written")
     for (label, confidence), (n, cc) in sorted(tally.items(), key=lambda kv: -kv[1][1]):
         print("%-18s %-10s %9d  %14d" % (label, confidence, n, cc))
+    if args.sessions:
+        print_sessions(session_links(rows))
     print("\nVerdicts describe the body this gateway sent, not the one a gateway further upstream finally forwarded.")
     return 0
 
