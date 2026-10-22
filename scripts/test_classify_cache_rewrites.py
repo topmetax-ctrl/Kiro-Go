@@ -24,9 +24,13 @@ def trace(conv, msgs, prefix, **parts):
     return {"conv": conv, "msgs": msgs, "prefix": prefix, **parts}
 
 
-def labels(items):
+def verdicts(items):
     rows, _ = cl.build(items)
-    return {r.i: (label, evidence, hint) for r, label, evidence, hint in cl.run(rows, MIN)}
+    return {v.row.i: v for v in cl.run(rows, MIN)}
+
+
+def labels(items):
+    return {i: (v.label, v.evidence, v.hint) for i, v in verdicts(items).items()}
 
 
 # A conversation of 4 messages, then a request extending it to 6.
@@ -141,6 +145,97 @@ class ClassifyTest(unittest.TestCase):
     def test_compaction_followup_is_reported(self):
         got = labels([ev(1000, tot=300000, cr=13800, cc=286200), ev(1020, lat=5, tot=60000, cr=13800, cc=46200)])
         self.assertIn("compaction?", got[0][1])
+
+
+class ConfidenceTest(unittest.TestCase):
+    """How well the evidence supports a verdict, apart from which verdict it is."""
+
+    def test_expiry_on_a_digest_chain_is_confirmed(self):
+        v = verdicts([ev(1000, tot=200000, cr=190000, cc=10000, trace=P4),
+                      ev(5100, tot=210000, cr=13800, cc=196200, trace=R6)])[1]
+        self.assertEqual((v.label, v.confidence), ("expired", "confirmed"))
+
+    def test_expiry_on_a_size_guessed_predecessor_is_only_likely(self):
+        v = verdicts([ev(1000, tot=200000, cr=190000, cc=10000), ev(9000, tot=205000, cr=0, cc=205000)])[1]
+        self.assertEqual((v.label, v.confidence), ("expired", "likely"))
+
+    def test_five_minute_expiry_from_the_upstream_split_is_confirmed(self):
+        v = verdicts([ev(1000, tot=200000, cr=100, cc=199900, cc5=199900, cc1=0, trace=P4),
+                      ev(1500, tot=210000, cr=13800, cc=196200, trace=R6)])[1]
+        self.assertEqual((v.label, v.confidence), ("expired", "confirmed"))
+
+    def test_concurrency_needs_a_digest_to_be_confirmed(self):
+        twin = ev(1030, lat=30, ttfb=20, tot=210000, cr=13800, cc=196200, trace=R6)
+        late = ev(1035, lat=20, ttfb=2, tot=210000, cr=13800, cc=196200, trace=R6)
+        self.assertEqual(verdicts([twin, late])[1].confidence, "confirmed")
+        twin, late = ev(1030, lat=30, ttfb=20, tot=210000, cr=13800, cc=196200), ev(1035, lat=20, ttfb=2, tot=210000, cr=13800, cc=196200)
+        v = verdicts([twin, late])[1]
+        self.assertEqual((v.label, v.confidence), ("concurrent_write", "likely"))
+
+    def test_different_settings_are_not_the_same_request(self):
+        a = trace("c", 6, ["5:a5", "6:a6"], settings="g1")
+        b = trace("c", 6, ["5:a5", "6:a6"], settings="g2")
+        twin = ev(1030, lat=30, ttfb=20, tot=210000, cr=13800, cc=196200, trace=a)
+        late = ev(1035, lat=20, ttfb=2, tot=210000, cr=13800, cc=196200, trace=b)
+        self.assertNotEqual(verdicts([twin, late])[1].label, "concurrent_write")
+
+    def test_changed_history_is_confirmed(self):
+        v = verdicts([ev(1000, tot=200000, cr=190000, cc=10000, trace=P4),
+                      ev(1100, tot=210000, cr=13800, cc=196200, trace=R6_BROKEN)])[1]
+        self.assertEqual((v.label, v.confidence), ("prefix_changed", "confirmed"))
+
+    def test_a_credential_change_is_never_more_than_likely(self):
+        a = ev(1000, tot=200000, cr=190000, cc=10000, trace=P4)
+        a["accountLabel"] = "acct-1"
+        b = ev(1060, tot=210000, cr=13800, cc=196200, trace=R6)
+        b["accountLabel"] = "acct-2"
+        v = verdicts([a, b])[1]
+        self.assertEqual((v.label, v.confidence), ("scope_changed", "likely"))
+
+    def test_unknown_stays_unknown(self):
+        v = verdicts([ev(1000, tot=200000, cr=0, cc=200000)])[0]
+        self.assertEqual((v.label, v.confidence), ("unknown", "unknown"))
+
+    def test_intact_history_inside_ttl_points_downstream(self):
+        v = verdicts([ev(1000, tot=200000, cr=100, cc=199900, cc5=0, cc1=199900, trace=P4),
+                      ev(1060, tot=210000, cr=13800, cc=196200, trace=R6)])[1]
+        self.assertEqual((v.label, v.confidence), ("unknown", "unknown"))
+        self.assertIn("downstream", v.hint)
+
+
+class CacheKeyTest(unittest.TestCase):
+    """Equal prompt digests are not equal cache entries: breakpoints and tier count too."""
+
+    def pair(self, prev_marks, now_marks, prev_cc=(0, 199900), now_cc=(None, None)):
+        p = trace("c", 4, ["1:a1", "2:a2", "3:a3", "4:a4"], marks=prev_marks)
+        r = trace("c", 6, ["3:a3", "4:a4", "5:a5", "6:a6"], marks=now_marks)
+        return verdicts([ev(1000, tot=200000, cr=100, cc=199900, cc5=prev_cc[0], cc1=prev_cc[1], trace=p),
+                         ev(1060, tot=210000, cr=13800, cc=196200, cc5=now_cc[0], cc1=now_cc[1], trace=r)])[1]
+
+    def test_a_marker_that_moves_with_the_history_is_the_same_layout(self):
+        self.assertNotIn("breakpoints changed", self.pair(["s0:1h@global", "m3:1h"], ["s0:1h@global", "m5:1h"]).evidence)
+
+    def test_a_changed_ttl_or_scope_or_count_is_reported(self):
+        for now in (["s0:1h@global", "m5"], ["s0:1h", "m5:1h"], ["m5:1h"]):
+            self.assertIn("breakpoints changed", self.pair(["s0:1h@global", "m3:1h"], now).evidence, now)
+
+    def test_a_changed_distance_from_the_newest_message_is_reported(self):
+        self.assertIn("breakpoints changed", self.pair(["m3"], ["m3"]).evidence)
+
+    def test_a_changed_tier_is_reported(self):
+        v = self.pair(["m3:1h"], ["m5:1h"], prev_cc=(0, 199900), now_cc=(196200, 0))
+        self.assertIn("TTL tier changed 1h -> 5m", v.evidence)
+
+    def test_the_breakpoint_entry_links_requests_the_whole_prompt_does_not(self):
+        # The previous request cached up to message 2, but ends at 4. The next one
+        # lists the digest at 2 and not the one at 4, so only the breakpoint entry
+        # connects them.
+        p = trace("c", 4, ["1:a1", "2:a2", "3:a3", "4:a4"], marks=["m1"])
+        r = trace("c", 6, ["2:a2", "3:y3", "4:y4", "5:y5", "6:y6"])
+        got = verdicts([ev(1000, tot=200000, cr=100, cc=199900, cc5=0, cc1=199900, trace=p),
+                        ev(1060, tot=210000, cr=13800, cc=196200, trace=r)])[1]
+        self.assertEqual(got.label, "unknown")
+        self.assertIn("downstream", got.hint)
 
 
 if __name__ == "__main__":
