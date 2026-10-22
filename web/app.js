@@ -178,6 +178,8 @@
     // Inline stats and any expanded detail panels are innerHTML-built, so they
     // need an explicit re-render to pick up the new locale.
     renderProviderInlineStats();
+    renderScopeTags();
+    if (fwdChartLast) renderForwardChart(fwdChartLast.series, fwdChartLast.pct);
     // The nav hints, the sheet and the palette all render labels through t(),
     // so they need the same nudge as the other innerHTML-built surfaces.
     syncShortcutUi();
@@ -3171,6 +3173,9 @@
   function renderUpstreams() {
     renderProviders();
     renderModelRoutes();
+    // Fresh cards start with an empty stat line, and the first stats load can
+    // land before they exist; fill it from the stats already in memory.
+    renderProviderInlineStats();
   }
 
   // providerCard renders one provider row. Hidden providers get the same markup —
@@ -6456,7 +6461,7 @@
   }
 
   // ===== Forwarding dashboard =====
-  let forwardStats = { overall: {}, providers: [], routes: [] };
+  let forwardStats = { overall: {}, providers: [], routes: [], retention: null };
   // Range-scoped copy of providers for the Stats tab. forwardStats stays
   // all-time because the Forwarding tab's inline stats and provider filter
   // depend on it; null means "no window loaded yet, fall back to all-time".
@@ -6498,11 +6503,15 @@
       forwardStats = {
         overall: d.overall || {},
         providers: Array.isArray(d.providers) ? d.providers : [],
-        routes: Array.isArray(d.routes) ? d.routes : []
+        routes: Array.isArray(d.routes) ? d.routes : [],
+        // How far back the memory-only views (event log, per-minute series)
+        // reach; absent from an older server, in which case labels say "since restart".
+        retention: d.retention || null
       };
       forwardStats.providers.forEach(p => { fwdProviderNames[p.providerId] = p.providerName || p.providerId; });
       // The filter badge counts against the provider universe, which just changed.
       updateStatsPfLabel();
+      renderScopeTags();
       renderForwardStatCards(d);
       renderForwardChart(d.timeseries || [], d.percentiles || {});
       populateForwardProviderFilter();
@@ -6521,9 +6530,13 @@
     if ($('fwdStatLatency')) $('fwdStatLatency').textContent = fwdFmtLatency(o.avgLatencyMs || 0);
   }
 
+  // Last chart payload, kept so a language switch can redraw the text built in JS.
+  let fwdChartLast = null;
+
   // Hand-rolled SVG bar chart (zero external deps): one bar per minute, success
   // stacked below failed, height scaled to the busiest minute.
   function renderForwardChart(series, pct) {
+    fwdChartLast = { series: series, pct: pct };
     const host = $('fwdChart');
     if (host) {
       if (!series.length) {
@@ -6549,11 +6562,13 @@
     }
     const pctEl = $('fwdPercentiles');
     if (pctEl) {
-      if (pct && pct.count) {
-        pctEl.textContent = 'p50 ' + fwdFmtLatency(pct.p50) + ' · p95 ' + fwdFmtLatency(pct.p95) + ' · p99 ' + fwdFmtLatency(pct.p99);
-      } else {
-        pctEl.textContent = '';
-      }
+      // Percentiles come from the in-memory event log, not the all-time counters
+      // the KPI cards use, so the line carries its own scope.
+      setHtmlIfChanged(pctEl, pct && pct.count
+        ? scopeMemoryTag('recent') + ' ' +
+          escapeHtml('p50 ' + fwdFmtLatency(pct.p50) + ' · p95 ' + fwdFmtLatency(pct.p95) + ' · p99 ' + fwdFmtLatency(pct.p99) +
+            ' · ' + t('scope.pctN', formatNum(pct.count)))
+        : '');
     }
   }
 
@@ -6575,12 +6590,13 @@
     forwardStats.providers.forEach(p => { byId[p.providerId] = p; });
     qsa('#upstreamsList [data-fwd-inline-for]').forEach(el => {
       const p = byId[el.dataset.fwdInlineFor];
-      if (!p || !p.requests) { el.textContent = ''; return; }
+      if (!p || !p.requests) { setHtmlIfChanged(el, ''); return; }
       let line = t('forward.inlineStat', String(p.requests), String(p.success), String(p.failed), fwdFmtLatency(p.avgLatencyMs));
       const tokens = (p.inputTokens || 0) + (p.outputTokens || 0);
       if (tokens) line += ' · ' + t('stats.inlineTokens', formatNum(tokens));
       if (p.rpm) line += ' · ' + t('stats.inlineRpm', fwdFmtRate(p.rpm));
-      el.textContent = line;
+      // These are lifetime counters, unlike the range-scoped Stats rows.
+      setHtmlIfChanged(el, scopeAllTimeTag() + ' ' + escapeHtml(line));
     });
   }
 
@@ -6634,6 +6650,109 @@
   function fwdFmtWhen(ms) {
     if (!ms) return '—';
     return new Date(ms).toLocaleString();
+  }
+
+  // fwdFmtSince renders the start of a window as a clock time, adding the date
+  // only when it is not today, so "since 11:03" stays short on the common case.
+  function fwdFmtSince(ms) {
+    if (!ms) return '';
+    const d = new Date(ms);
+    const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (d.toDateString() === new Date().toDateString()) return time;
+    return d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ' ' + time;
+  }
+
+  // ---- Scope tags ----
+  // Every aggregate on these screens covers one of four windows, and mixing them
+  // silently is how a 111-request row ends up beside a 29.8K-request panel:
+  //   range  the range selected on the Stats tab (server-side window)
+  //   all    lifetime counters, saved to disk, survive restarts
+  //   recent figures computed from the in-memory event log (latency percentiles)
+  //   log    the event log itself
+  //   mem    the per-minute series (charts, ranges up to two hours)
+  // recent, log and mem are memory-only and emptied by a restart, so their tags
+  // carry the time they actually start from.
+  const SCOPE_ICON = {
+    range: 'fa-regular fa-clock',
+    all: 'fa-solid fa-infinity',
+    recent: 'fa-solid fa-hourglass-half',
+    log: 'fa-solid fa-hourglass-half',
+    mem: 'fa-solid fa-hourglass-half'
+  };
+
+  // The hint is a mouse tooltip and also read out by screen readers; sighted
+  // keyboard and touch users get the same caveats in the visible notes beside
+  // each chart, which is why the tags themselves are not tab stops.
+  function scopeTag(kind, text, hint) {
+    return '<span class="scope-tag scope-tag--' + kind + '"' +
+      (hint ? ' title="' + escapeAttr(hint) + '"' : '') + '>' +
+      '<i class="' + SCOPE_ICON[kind] + '" aria-hidden="true"></i>' + escapeHtml(text) +
+      (hint ? '<span class="sr-only"> — ' + escapeHtml(hint) + '</span>' : '') + '</span>';
+  }
+
+  // setHtmlIfChanged skips the write when the markup is the same as last time.
+  // These mounts refresh every couple of seconds under live traffic, and
+  // replacing their children would dismiss a tooltip someone is reading.
+  function setHtmlIfChanged(el, html) {
+    if (!el || el._html === html) return;
+    el._html = html;
+    el.innerHTML = html;
+  }
+
+  function scopeRangeTag(label) {
+    return scopeTag('range', t('scope.range', label), t('scope.rangeHint'));
+  }
+
+  function scopeAllTimeTag() {
+    return scopeTag('all', t('scope.allTime'), t('scope.allTimeHint'));
+  }
+
+  // scopeMemoryTag covers the memory-only windows (kind recent, log or mem). The
+  // ring and the per-minute series start empty on every restart, so the tag
+  // names the moment coverage begins instead of implying history it does not hold.
+  function scopeMemoryTag(kind) {
+    const r = forwardStats.retention;
+    const cap = r && r.eventRingCapacity ? formatNum(r.eventRingCapacity) : '—';
+    // The per-minute series is pruned to a rolling window, so it can start later
+    // than the event log; each memory-only view reports its own start.
+    const from = r ? (kind === 'mem' ? r.minuteSinceMs : r.eventLogSinceMs) : 0;
+    const since = fwdFmtSince(from);
+    const text = since ? t('scope.' + kind, since) : t('scope.' + kind + 'NoTime');
+    return scopeTag(kind, text, t('scope.' + kind + 'Hint', cap));
+  }
+
+  // statsRangeLabel names the Stats tab's current range for tags and badges.
+  function statsRangeLabel() {
+    return statsCustomRange ? fmtRangeLabel(statsCustomRange.from, statsCustomRange.to) : rangeLabel(statsHistoryHours);
+  }
+
+  // statsRangeInMemory: ranges that reach back less than two hours are served
+  // from the per-minute memory (a preset of 1-2 h, or a custom window that
+  // starts inside it), the same rule the server uses to pick minute buckets.
+  function statsRangeInMemory() {
+    return statsCustomRange
+      ? statsCustomRange.from >= Date.now() - 120 * 60000
+      : statsHistoryHours * 60 <= 120;
+  }
+
+  // statsWindowScope is the scope of the data behind the Stats table, recorded
+  // when a response lands (null = the rows are the all-time fallback). The tag
+  // reads this, not the live selector, so it can never describe a different
+  // range than the rows beside it.
+  let statsWindowScope = null;
+
+  // renderScopeTags fills the scope tags that depend on live state (retention,
+  // the loaded range) or on the language, so it runs after each stats load and
+  // on a language switch.
+  function renderScopeTags() {
+    const set = (id, html) => setHtmlIfChanged($(id), html);
+    set('fwdKpiScope', scopeAllTimeTag());
+    set('fwdChartScope', scopeMemoryTag('mem'));
+    set('fwdEventsScope', scopeMemoryTag('log'));
+    const sc = statsWindowScope;
+    set('statsScopeLine', sc
+      ? scopeRangeTag(sc.label) + (sc.inMemory ? scopeMemoryTag('mem') : '')
+      : scopeAllTimeTag());
   }
 
   // fwdFmtTokens renders one token count compactly for a table cell. null or
@@ -6778,6 +6897,19 @@
       '</div>';
   }
 
+  // pdRecentSince is when the in-memory event log begins, which bounds the
+  // percentile sample.
+  function pdRecentSince() {
+    const r = forwardStats.retention;
+    return r ? fwdFmtSince(r.eventLogSinceMs) : '';
+  }
+  // pctRecentNote says what population a percentile sub-line covers: the
+  // successful requests still in the event log, not the tile's range.
+  function pctRecentNote(count) {
+    const since = pdRecentSince();
+    return since ? t('scope.pctRecent', formatNum(count), since) : t('scope.pctRecentNoTime', formatNum(count));
+  }
+
   function pdSection(title, inner) {
     if (!inner) return '';
     return '<div class="pd-section">' +
@@ -6835,7 +6967,10 @@
       metricTile(t('stats.tileRpm'), fwdFmtRate(d.rpm),
         t('stats.tileTpm', fwdFmtRate(d.tpm))) +
       metricTile(t('stats.tileLatency'), fwdFmtLatency(d.avgLatencyMs || 0),
-        pct.count ? 'p50 ' + fwdFmtLatency(pct.p50) + ' · p95 ' + fwdFmtLatency(pct.p95) + ' · p99 ' + fwdFmtLatency(pct.p99) : '') +
+        // The average follows the panel's scope; percentiles are always the recent
+        // in-memory sample, so the sub-line says so.
+        pct.count ? 'p50 ' + fwdFmtLatency(pct.p50) + ' · p95 ' + fwdFmtLatency(pct.p95) + ' · p99 ' + fwdFmtLatency(pct.p99) +
+          '\n' + pctRecentNote(pct.count) : '') +
       metricTile(t('stats.tileTtfb'), d.avgTtfbMs ? fwdFmtLatency(d.avgTtfbMs) : '—',
         d.tokensPerSec ? t('stats.tileTokensPerSec', fwdFmtRate(d.tokensPerSec)) : '') +
       metricTile(t('stats.tileConcurrency'), String(d.inFlight || 0),
@@ -6859,12 +6994,13 @@
     const wLabel = d.windowFrom
       ? fmtRangeLabel(d.windowFrom, d.windowTo)
       : rangeLabel(wh);
-    const windowBadge = wLabel
-      ? '<div class="pd-range-badge"><i class="fa-regular fa-clock" aria-hidden="true"></i>' +
-          escapeHtml(wLabel) +
-          '<span class="pd-range-alltime-note">' +
-          escapeHtml(t('stats.detailAllTimeNote')) + '</span></div>'
-      : '';
+    // Both surfaces say what their headline numbers cover: the selected range
+    // on the Stats row, all-time on the Forwarding card.
+    const ranged = !!wLabel;
+    const windowBadge = '<div class="pd-range-badge">' +
+      (ranged ? scopeRangeTag(wLabel) : scopeAllTimeTag()) +
+      (ranged ? '<span class="pd-range-alltime-note">' + escapeHtml(t('stats.detailAllTimeNote')) + '</span>' : '') +
+      '</div>';
 
     let html = windowBadge + '<div class="pd-tiles">' + tiles + '</div>';
 
@@ -6872,7 +7008,7 @@
     if (spark) html += pdSection(t('stats.sectionActivity'), spark);
 
     if (d.statuses && d.statuses.length) {
-      const sTitle = wh ? t('stats.sectionAllTime', t('stats.sectionStatus')) : t('stats.sectionStatus');
+      const sTitle = ranged ? t('stats.sectionAllTime', t('stats.sectionStatus')) : t('stats.sectionStatus');
       html += pdSection(sTitle,
         '<div class="pd-badges">' + d.statuses.map(s =>
           '<span class="fwd-badge ' + statusClass(s.status) + '">' +
@@ -6881,7 +7017,7 @@
     }
 
     if (d.models && d.models.length) {
-      const mTitle = wh ? t('stats.sectionAllTime', t('stats.sectionModels')) : t('stats.sectionModels');
+      const mTitle = ranged ? t('stats.sectionAllTime', t('stats.sectionModels')) : t('stats.sectionModels');
       html += pdSection(mTitle,
         '<div class="pd-table-scroll"><table class="pd-table"><thead><tr>' +
         '<th>' + escapeHtml(t('stats.colModel')) + '</th>' +
@@ -6901,7 +7037,7 @@
     }
 
     if (d.accounts && d.accounts.length) {
-      const aTitle = wh ? t('stats.sectionAllTime', t('stats.sectionAccounts')) : t('stats.sectionAccounts');
+      const aTitle = ranged ? t('stats.sectionAllTime', t('stats.sectionAccounts')) : t('stats.sectionAccounts');
       html += pdSection(aTitle,
         '<div class="pd-table-scroll"><table class="pd-table"><thead><tr>' +
         '<th>' + escapeHtml(t('stats.colAccount')) + '</th>' +
@@ -7629,16 +7765,28 @@
     return { hours: String(statsHistoryHours) };
   }
 
+  let statsWindowSeq = 0;
+
   async function loadStatsWindow() {
+    const seq = ++statsWindowSeq;
+    // What this request asks for, captured now: the scope tag must describe the
+    // data that comes back, even if the selector moves while it is in flight.
+    const scope = { label: statsRangeLabel(), inMemory: statsRangeInMemory() };
+    let providers = null;
     try {
       const params = new URLSearchParams(statsRangeParams());
       const res = await api('/forward-stats?' + params.toString());
       if (!res.ok) throw new Error('http ' + res.status);
       const d = await res.json();
-      statsWindowProviders = Array.isArray(d.providers) ? d.providers : null;
+      providers = Array.isArray(d.providers) ? d.providers : null;
     } catch (e) {
-      statsWindowProviders = null;
+      providers = null;
     }
+    // A newer request owns the table now.
+    if (seq !== statsWindowSeq) return;
+    statsWindowProviders = providers;
+    statsWindowScope = providers ? scope : null;
+    renderScopeTags();
     renderStatsTable();
     renderStatsCompare();
     refreshOpenProviderDetails('stats');

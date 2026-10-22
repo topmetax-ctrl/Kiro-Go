@@ -3255,6 +3255,38 @@ img.brand-icon {
   white-space: normal;
   word-break: break-all;
 }
+/* Scope tags: every aggregate says which window it covers (selected range,
+   all-time counters, or the memory-only views that restart empties). Text is
+   --muted-foreground on --muted (7:1 in both themes); the icon is decoration. */
+.scope-line {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.5rem;
+}
+.scope-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.05rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--muted);
+  color: var(--muted-foreground);
+  font-size: 0.68rem;
+  font-weight: 500;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.scope-tag i {
+  font-size: 0.9em;
+}
+.scope-tag--range {
+  color: var(--foreground);
+}
+.scope-line + .fwd-stats-grid {
+  margin-top: 0.5rem;
+}
 /* Merged IN cell: the real total input footprint above the active input
    (processed this turn) in green with a bolt. With a cache read the total is
    the superseded gross figure and reads struck-through, like an old price;
@@ -4947,6 +4979,7 @@ body.modal-open .scroll-nav {
   overflow-wrap: anywhere;
 }
 .pd-tile-sub {
+  white-space: pre-line;
   font-size: 0.7rem;
   color: var(--muted-foreground);
   margin-top: 0.1rem;

@@ -1056,6 +1056,10 @@
           </div>
           <p class="muted-text text-xs" data-i18n="forward.intro"></p>
 
+          <div class="scope-line">
+            <span id="fwdKpiScope"></span>
+            <span class="text-xs muted-text" data-i18n="forward.kpiScopeNote"></span>
+          </div>
           <div class="fwd-stats-grid">
             <div class="stat-card">
               <div class="stat-card-title" data-i18n="forward.statRequests"></div>
@@ -1090,6 +1094,7 @@
           <div class="fwd-chart-card">
             <div class="flex items-center justify-between" style="flex-wrap:wrap;gap:0.5rem;">
               <span class="text-xs font-semibold" data-i18n="forward.chartTitle"></span>
+              <span class="scope-line" id="fwdChartScope"></span>
               <span class="text-xs muted-text font-mono" id="fwdPercentiles"></span>
             </div>
             <div id="fwdChart" class="fwd-chart"></div>
@@ -1119,6 +1124,7 @@
             </select>
             <input type="text" id="fwdFilterModel" class="w-48!" data-i18n-placeholder="forward.filterModel" />
             <div class="toolbar-spacer"></div>
+            <span class="scope-line" id="fwdEventsScope"></span>
             <span class="text-xs muted-text" id="fwdEventsCount"></span>
           </div>
           <div class="fwd-events-scroll">
@@ -1201,6 +1207,7 @@
           <!-- At-a-glance comparison: champion cards plus normalised bars, so an
                operator can rank providers without reading the numeric table. -->
           <div id="statsCompare" class="stats-compare"></div>
+          <div class="scope-line" id="statsScopeLine"></div>
           <p class="muted-text text-xs" data-i18n="stats.windowNote"></p>
 
           <div class="fwd-chart-card">
