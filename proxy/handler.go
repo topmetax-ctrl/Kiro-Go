@@ -6501,6 +6501,9 @@ func (h *Handler) apiGetProviderDetail(w http.ResponseWriter, r *http.Request) {
 // response reports which unit was used. A from/to pair carries the custom
 // range, whose granularity (minute vs hour) the metrics layer picks by how
 // much of the window the per-minute memory actually covers.
+//
+// memorySinceMs says when the memory-only series began collecting. Minute
+// buckets before it have no data, which a chart must not draw as zero requests.
 func (h *Handler) apiGetForwardHistory(w http.ResponseWriter, r *http.Request) {
 	hours := 24
 	if v := strings.TrimSpace(r.URL.Query().Get("hours")); v != "" {
@@ -6517,29 +6520,32 @@ func (h *Handler) apiGetForwardHistory(w http.ResponseWriter, r *http.Request) {
 	} else if hasWindow {
 		unit, buckets := metrics.HistoryRangeFor(id, fromMs, toMs)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"providerId": id,
-			"from":       fromMs,
-			"to":         toMs,
-			"unit":       unit,
-			"buckets":    buckets,
+			"providerId":    id,
+			"from":          fromMs,
+			"to":            toMs,
+			"unit":          unit,
+			"buckets":       buckets,
+			"memorySinceMs": metrics.MemorySince(),
 		})
 		return
 	}
 
 	if hours <= 1 {
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"providerId": id,
-			"hours":      hours,
-			"unit":       "minute",
-			"buckets":    metrics.MinuteHistoryFor(id, 60),
+			"providerId":    id,
+			"hours":         hours,
+			"unit":          "minute",
+			"buckets":       metrics.MinuteHistoryFor(id, 60),
+			"memorySinceMs": metrics.MemorySince(),
 		})
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"providerId": id,
-		"hours":      hours,
-		"unit":       "hour",
-		"buckets":    metrics.HistoryFor(id, hours),
+		"providerId":    id,
+		"hours":         hours,
+		"unit":          "hour",
+		"buckets":       metrics.HistoryFor(id, hours),
+		"memorySinceMs": metrics.MemorySince(),
 	})
 }
 

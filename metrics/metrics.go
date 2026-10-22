@@ -2080,6 +2080,15 @@ type RetentionStat struct {
 	MemorySinceMs int64 `json:"memorySinceMs"`
 }
 
+// MemorySince is when the memory-only views began collecting. It is the cheap
+// subset of Retention for callers that only need to tell "no data yet" from
+// "no requests" on a per-minute series.
+func MemorySince() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sinceMs
+}
+
 // Retention reports the current coverage of the memory-only views.
 func Retention() RetentionStat {
 	s.mu.Lock()
