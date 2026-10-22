@@ -6703,7 +6703,7 @@
       escapeHtml(x.s.label) + ' <b>' + escapeHtml(show(x)) + '</b>' +
       (o.normalize && total ? ' <span class="muted-text">(' + Math.round(x.v * 100 / total) + '%)</span>' : '') + '</div>').join('');
     const extra = o.tipExtra ? o.tipExtra(b) : '';
-    const hint = o.onSelect ? '<div class="bc-tip-hint">' + escapeHtml(t('chart.clickHint')) + '</div>' : '';
+    const hint = o.onSelect && (!o.selectable || o.selectable(b)) ? '<div class="bc-tip-hint">' + escapeHtml(t('chart.clickHint')) + '</div>' : '';
     const text = head + '. ' + vals.map(x => x.s.label + ' ' + show(x)).join(', ');
     return { html: '<strong>' + escapeHtml(head) + '</strong>' + lines + extra + hint, text };
   }
@@ -6758,6 +6758,7 @@
     const select = i => {
       const c = host._bc;
       if (!c || i < 0 || i < c.blind || !c.o.onSelect) return;
+      if (c.o.selectable && !c.o.selectable(c.buckets[i])) return;
       c.o.onSelect(c.buckets[i], i);
     };
     host.addEventListener('pointermove', e => {
@@ -7026,9 +7027,17 @@
     return scopeTag(kind, text, t('scope.' + kind + 'Hint', cap));
   }
 
-  // statsRangeLabel names the Stats tab's current range for tags and badges.
-  function statsRangeLabel() {
-    return statsCustomRange ? fmtRangeLabel(statsCustomRange.from, statsCustomRange.to) : rangeLabel(statsHistoryHours);
+  // A range is captured as data ({custom, hours}) and turned into text only when
+  // it is drawn, so a language switch re-labels it instead of leaving the words
+  // it was captured in.
+  function statsRangeSnapshot() {
+    return {
+      custom: statsCustomRange ? { from: statsCustomRange.from, to: statsCustomRange.to } : null,
+      hours: statsHistoryHours
+    };
+  }
+  function statsRangeLabelOf(r) {
+    return r.custom ? fmtRangeLabel(r.custom.from, r.custom.to) : rangeLabel(r.hours);
   }
 
   // statsRangeInMemory: ranges that reach back less than two hours are served
@@ -7056,7 +7065,7 @@
     set('fwdEventsScope', scopeMemoryTag('log'));
     const sc = statsWindowScope;
     set('statsScopeLine', sc
-      ? scopeRangeTag(sc.label) + (sc.inMemory ? scopeMemoryTag('mem') : '')
+      ? scopeRangeTag(statsRangeLabelOf(sc.range)) + (sc.inMemory ? scopeMemoryTag('mem') : '')
       : scopeAllTimeTag());
   }
 
@@ -8064,7 +8073,7 @@
     const seq = ++cacheSeriesSeq;
     // The range this request asks for, captured now so the card's tag names the
     // data that comes back even if the selector moves meanwhile.
-    const label = statsRangeLabel();
+    const range = statsRangeSnapshot();
     const params = new URLSearchParams(statsRangeParams());
     if (statsSelectedProviders.size) params.set('provider', Array.from(statsSelectedProviders).join(','));
     let d = null;
@@ -8072,12 +8081,22 @@
       const res = await api('/forward-cache-series?' + params.toString());
       if (!res.ok) throw new Error('http ' + res.status);
       d = await res.json();
-      d.rangeLabel = label;
+      d.range = range;
     } catch (e) { d = null; }
     // An answer for an older range or filter must not replace a newer one.
     if (seq !== cacheSeriesSeq) return;
     cacheSeriesLast = d;
     renderCacheAnalytics();
+  }
+
+  // fwdChartMessage replaces a chart with a plain message and forgets its last
+  // drawing: otherwise an identical redraw later would be skipped as "unchanged"
+  // and the message would stay.
+  function fwdChartMessage(host, text) {
+    if (!host) return;
+    host._bcSig = null;
+    host._bc = null;
+    host.innerHTML = '<div class="muted-text text-xs" style="padding:1rem 0;">' + escapeHtml(text) + '</div>';
   }
 
   function cacheSegments(view) {
@@ -8095,12 +8114,18 @@
     ];
   }
 
-  // cacheOpenWindow drills into Activity for a time slice, restricted to the
-  // providers selected on this tab when exactly one is.
-  function cacheOpenWindow(since, until, minCacheWrite) {
-    const only = statsSelectedProviders.size === 1 ? Array.from(statsSelectedProviders)[0] : '';
+  // cacheOpenWindow drills into Activity for the requests behind a bar: the same
+  // time slice (clamped to the range the chart was drawn for), the providers
+  // selected on this tab, and the same population (requests with upstream cache
+  // usage, or those that wrote to the cache) so the list matches the bar.
+  function cacheOpenWindow(since, until, population) {
+    const d = cacheSeriesLast;
+    if (d) { since = Math.max(since, d.from); until = Math.min(until, d.to); }
     openActivityWindow({
-      providerId: only, since, until, minCacheWrite,
+      providerIds: Array.from(statsSelectedProviders),
+      since, until,
+      minCacheWrite: population === 'writes' ? 1 : 0,
+      cacheEligible: population !== 'writes',
       label: fwdFmtSince(since) + (until > since ? ' – ' + new Date(until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '')
     });
   }
@@ -8110,13 +8135,13 @@
     if (!card) return;
     const d = cacheSeriesLast;
     const set = (id, html) => { const el = $(id); if (el) el.innerHTML = html; };
-    const cap = forwardStats.retention && forwardStats.retention.eventRingCapacity
-      ? formatNum(forwardStats.retention.eventRingCapacity) : '—';
-    set('cacheScope', (d && d.rangeLabel ? scopeRangeTag(d.rangeLabel) : '') + (d && d.coverageFrom
+    const ret = (d && d.retention) || forwardStats.retention;
+    const cap = ret && ret.eventRingCapacity ? formatNum(ret.eventRingCapacity) : '—';
+    set('cacheScope', (d && d.range ? scopeRangeTag(statsRangeLabelOf(d.range)) : '') + (d && d.coverageFrom
       ? scopeTag('log', t('scope.log', fwdFmtSince(d.coverageFrom)), t('scope.logHint', cap)) : ''));
     if (!d) {
       set('cacheTiles', '');
-      set('cacheChart', '<div class="muted-text text-xs" style="padding:1rem 0;">' + escapeHtml(t('stats.loadFailed')) + '</div>');
+      fwdChartMessage($('cacheChart'), t('stats.loadFailed'));
       set('cacheNotes', '');
       set('cacheTopWrites', '');
       return;
@@ -8138,7 +8163,7 @@
 
     if (!d.eligible) {
       set('cacheTiles', '');
-      set('cacheChart', '<div class="muted-text text-xs" style="padding:1rem 0;">' + escapeHtml(t('cache.empty')) + '</div>');
+      fwdChartMessage($('cacheChart'), t('cache.empty'));
       set('cacheTopWrites', '');
       return;
     }
@@ -8164,15 +8189,14 @@
       unitLabel: t(normalize ? 'cache.unitShare' : 'cache.unitTokens', fwdFmtBucketWidth(d.bucketMs)),
       normalize,
       noDataBefore: d.coverageFrom,
-      emptyText: t('cache.empty'),
+      // With requests counted but nothing written, say so rather than "no requests".
+      emptyText: t(normalize ? 'cache.empty' : 'cache.noWrites'),
       summary: t('cache.summaryChart', formatNum(d.eligible), tok(tot.write || 0)),
       tipFormat: tok,
       tipExtra: b => '<div class="bc-tip-row">' + escapeHtml(t('cache.tipRequests', formatNum(b.requests || 0), tok(b.read || 0))) + '</div>',
-      onSelect: b => {
-        // A bar with no write has nothing to open in the writes view.
-        if (cacheView === 'writes' && !b.write) return;
-        cacheOpenWindow(b.startMs, b.startMs + d.bucketMs - 1, cacheView === 'writes' ? 1 : 0);
-      }
+      // A bar with no write has nothing to open in the writes view.
+      selectable: b => cacheView !== 'writes' || b.write > 0,
+      onSelect: b => cacheOpenWindow(b.startMs, b.startMs + d.bucketMs - 1, cacheView === 'writes' ? 'writes' : 'eligible')
     });
 
     const rows = (d.topWrites || []);
@@ -8193,8 +8217,8 @@
               '<td>' + escapeHtml(w.providerName || fwdProviderNames[w.providerId] || w.providerId || '—') + '</td>' +
               '<td class="font-mono">' + escapeHtml(w.model || '—') + '</td>' +
               '<td class="font-mono">' + escapeHtml(tok(w.write)) + tier + '</td>' +
-              '<td class="font-mono">' + escapeHtml(tok(w.read)) + '</td>' +
-              '<td class="font-mono">' + escapeHtml(w.input > 0 ? Math.round(w.read * 100 / w.input) + '%' : '—') + '</td>' +
+              '<td class="font-mono">' + escapeHtml(w.read == null ? '—' : tok(w.read)) + '</td>' +
+              '<td class="font-mono">' + escapeHtml(w.read == null || !(w.input > 0) ? '—' : Math.round(w.read * 100 / w.input) + '%') + '</td>' +
               '<td><button type="button" class="btn btn-outline btn-sm" data-cache-open="' + i + '">' + escapeHtml(t('cache.openRequest')) + '</button></td>' +
               '</tr>';
           }).join('') + '</tbody></table></div>'
@@ -8290,7 +8314,7 @@
     const seq = ++statsWindowSeq;
     // What this request asks for, captured now: the scope tag must describe the
     // data that comes back, even if the selector moves while it is in flight.
-    const scope = { label: statsRangeLabel(), inMemory: statsRangeInMemory() };
+    const scope = { range: statsRangeSnapshot(), inMemory: statsRangeInMemory() };
     let providers = null;
     try {
       const params = new URLSearchParams(statsRangeParams());
@@ -8551,7 +8575,7 @@
       const w = btn && cacheSeriesLast && (cacheSeriesLast.topWrites || [])[parseInt(btn.dataset.cacheOpen, 10)];
       if (!w) return;
       // The event's own millisecond timestamp, with its provider: exactly that request.
-      openActivityWindow({ providerId: w.providerId, since: w.time, until: w.time, minCacheWrite: 1, label: fwdFmtWhen(w.time) });
+      openActivityWindow({ providerIds: [w.providerId], since: w.time, until: w.time, minCacheWrite: 1, label: fwdFmtWhen(w.time) });
     });
     qsa('input[name="statsTrendMetric"]').forEach(r => r.addEventListener('change', () => {
       statsTrendMetric = r.value;
@@ -8665,6 +8689,9 @@
     if (fwdWindow && fwdWindow.until) params.set('until', String(fwdWindow.until));
     const minWrite = fwdFilterMinCacheWrite();
     if (minWrite) params.set('minCacheWrite', String(minWrite));
+    else if (fwdFilterCacheEligible()) params.set('cacheEligible', '1');
+    // A multi-provider drill-down overrides the (single-valued) provider select.
+    if (fwdWindow && fwdWindow.providers && fwdWindow.providers.length) params.set('provider', fwdWindow.providers.join(','));
     try {
       const res = await api('/forward-events?' + params.toString());
       if (!res.ok) throw new Error('http ' + res.status);
@@ -9121,6 +9148,12 @@
     return n > 0 ? n : 0;
   }
 
+  // fwdFilterCacheEligible: only the requests the cache analytics counts.
+  function fwdFilterCacheEligible() {
+    const sel = $('fwdFilterCache');
+    return !!sel && sel.value === 'elig';
+  }
+
   function fwdFilterActive() {
     const prov = $('fwdFilterProvider') ? $('fwdFilterProvider').value : '';
     const status = $('fwdFilterStatus') ? $('fwdFilterStatus').value : '';
@@ -9128,14 +9161,23 @@
     // A range counts as an active filter: live events must not be prepended
     // when the view is scoped, or a row outside the window would slip in. The
     // same goes for a drill-down window and the cache-write filter.
-    return !!(prov || status || model || fwdFilterSinceMs() || fwdWindow || fwdFilterMinCacheWrite());
+    return !!(prov || status || model || fwdFilterSinceMs() || fwdWindow || fwdFilterMinCacheWrite() || fwdFilterCacheEligible());
   }
 
   function renderFwdWindowChip() {
     const el = $('fwdFilterWindow');
+    // The window replaces the range select, so the select is switched off while
+    // it is set rather than left showing a range that does not apply.
+    const range = $('fwdFilterRange');
+    if (range) {
+      range.disabled = !!fwdWindow;
+      if (typeof syncCustomSelect === 'function') syncCustomSelect(range);
+    }
     if (!el) return;
     el.innerHTML = fwdWindow
-      ? scopeTag('range', t('forward.windowChip', fwdWindow.label), t('forward.windowChipHint')) +
+      ? scopeTag('range', t('forward.windowChip', fwdWindow.label) +
+          (fwdWindow.providers && fwdWindow.providers.length ? ' · ' + t('forward.windowProviders', String(fwdWindow.providers.length)) : ''),
+          t('forward.windowChipHint')) +
         '<button type="button" class="btn btn-outline btn-sm" data-fwd-window-clear aria-label="' +
         escapeAttr(t('forward.windowClear')) + '"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>'
       : '';
@@ -9151,16 +9193,20 @@
       sel.value = value;
       if (typeof syncCustomSelect === 'function') syncCustomSelect(sel);
     };
-    setSel('fwdFilterProvider', o.providerId || '');
+    // The provider select takes one id. A selection of several is carried by the
+    // window itself (and named on its chip) so the list is not widened to all.
+    const providers = (o.providerIds || []).filter(Boolean);
+    setSel('fwdFilterProvider', providers.length === 1 ? providers[0] : '');
     setSel('fwdFilterStatus', '');
     setSel('fwdFilterRange', '');
     // The select offers fixed sizes; a drill-down picks the largest one that does
-    // not hide any request it came from.
+    // not hide any request it came from. Without a write minimum it asks for the
+    // requests the cache chart counted.
     const minWrite = o.minCacheWrite || 0;
     const opts = [100000, 10000, 1000, 1].filter(v => v <= minWrite);
-    setSel('fwdFilterCache', opts.length ? String(opts[0]) : '');
+    setSel('fwdFilterCache', opts.length ? String(opts[0]) : (o.cacheEligible ? 'elig' : ''));
     if ($('fwdFilterModel')) $('fwdFilterModel').value = '';
-    fwdWindow = { since: o.since, until: o.until, label: o.label };
+    fwdWindow = { since: o.since, until: o.until, label: o.label, providers: providers.length > 1 ? providers : [] };
     renderFwdWindowChip();
     // Navigating runs the activity view's enter hook, which resets the offset and
     // fetches with the filters just set.

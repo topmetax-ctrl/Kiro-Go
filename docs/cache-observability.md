@@ -156,7 +156,10 @@ requests whose upstream reported cache usage:
   writes** (a single write of at least 100k tokens, the default of `bigWrite`).
 - A stacked chart (writes by TTL tier, or the input as read / write / uncached
   shares) and the ten largest writes. A bar or a listed write opens Activity on
-  exactly those requests (an exact time window plus `minCacheWrite`).
+  the requests it was drawn from: the bar's time slice (clamped to the chosen
+  range), the selected providers, and the same population (`cacheEligible` for
+  the share view, `minCacheWrite=1` for the writes view). While such a window is
+  set, Activity shows it as a chip and switches its range select off.
 
 Left out, and counted in the card: **Kiro pool** requests (their cache figures
 are synthesised for the client, not reported by an upstream), requests whose
@@ -165,7 +168,8 @@ input total. The card does not say why a write happened; for that, export the
 events and run the classifier below.
 
 Every window is labelled with where its data starts. The event log begins at
-process start, or at the oldest event once the ring has wrapped (`retention.eventLogSinceMs`);
+process start, or at the oldest event once the ring has wrapped at any point
+(`retention.eventLogSinceMs`; a per-provider stats reset does not undo that);
 the per-minute charts begin at the later of process start and the two-hour
 window they are pruned to (`retention.minuteSinceMs`). Time before that is
 drawn as "no data", not as zero requests.
@@ -174,8 +178,8 @@ drawn as "no data", not as zero requests.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /admin/api/forward-cache-series?hours=N` or `from=&to=` (ms) | Buckets of `read`, `write`, `write5m`, `write1h`, `writeUntiered`, `uncached`, `readInput`, `bigWrites`, `maxWrite`; `totals`; `topWrites` (10, with provider, model, request id and tier split); `eligible` and `excluded` (`pool`, `estimated`, `notReported`); `coverageFrom`; `retention`. Optional `provider=a,b` and `bigWrite=tokens`. Bucket width follows the window (1 min up to 1 h, 5 min up to 6 h, 15 min up to 24 h, then 1 h; windows are capped at 30 days). |
-| `GET /admin/api/forward-events?minCacheWrite=N` | Only events whose upstream reported a cache write of at least `N` tokens. Combine with `since`/`until`/`provider`. |
+| `GET /admin/api/forward-cache-series?hours=N` or `from=&to=` (ms) | Buckets of `read`, `write`, `write5m`, `write1h`, `writeUntiered`, `uncached`, `readInput`, `bigWrites`, `maxWrite`; `totals`; `topWrites` (10, with provider, model, request id and tier split; `read` is omitted when the upstream reported no read figure); `eligible` and `excluded` (`pool`, `estimated`, `notReported`); `coverageFrom`; `retention`. Optional `provider=a,b` and `bigWrite=tokens`. Bucket width follows the window (1 min up to 1 h, 5 min up to 6 h, 15 min up to 24 h, then 1 h; windows, and `hours`, are capped at 30 days). |
+| `GET /admin/api/forward-events?cacheEligible=1` and `minCacheWrite=N` | The population a cache chart counts: usage the upstream reported (not estimated, not the Kiro pool) with a cache figure and an input total. `minCacheWrite` additionally requires a cache write of at least `N` tokens (and implies `cacheEligible`). `provider` accepts a comma separated list; combine with `since`/`until`. |
 | `GET /admin/api/forward-stats` | Gains `retention`: `eventRingCapacity`, `eventRingSize`, `eventRingOldestMs`, `memorySinceMs`, `minuteSinceMs`, `eventLogSinceMs`. |
 | `GET /admin/api/forward-history` | Gains `minuteSinceMs`. |
 
