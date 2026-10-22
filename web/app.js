@@ -6982,7 +6982,7 @@
         d.failStreak ? t('stats.tileStreak', String(d.failStreak)) : '') +
       metricTile(t('stats.tileTokens'), formatNum((d.inputTokens || 0) + (d.outputTokens || 0)),
         t('stats.tileTokenSplit', formatNum(d.inputTokens || 0), formatNum(d.outputTokens || 0))) +
-      metricTile(t('stats.tileCost'), fwdFmtCost(d.costUsd, isPool), '') +
+      costTile(d.costUsd, isPool, payload) +
       metricTile(t('stats.tileRpm'), fwdFmtRate(d.rpm),
         t('stats.tileTpm', fwdFmtRate(d.tpm))) +
       metricTile(t('stats.tileLatency'), fwdFmtLatency(d.avgLatencyMs || 0),
@@ -7629,7 +7629,7 @@
         '<td class="num' + heatCls(heat, pid, 'requests') + '">' + escapeHtml(formatNum(p.requests || 0)) + '</td>' +
         '<td class="num' + heatCls(heat, pid, 'successRate') + '">' + escapeHtml(fwdFmtPct(p.successRate)) + '</td>' +
         '<td class="num">' + escapeHtml(tokens ? formatNum(tokens) : '—') + '</td>' +
-        '<td class="num">' + escapeHtml(fwdFmtCost(p.costUsd, p.isPool)) + '</td>' +
+        '<td class="num">' + fwdCostHtml(p.costUsd, p.isPool, p.isPool || !p.configured ? null : ((p.priceInPerM || 0) > 0 || (p.priceOutPerM || 0) > 0)) + '</td>' +
         '<td class="num' + heatCls(heat, pid, 'avgLatencyMs') + '">' + escapeHtml(p.requests ? fwdFmtLatency(p.avgLatencyMs) : '—') + '</td>' +
         '<td class="num' + heatCls(heat, pid, 'rpm') + '">' + escapeHtml(fwdFmtRate(p.rpm)) + '</td>' +
         '<td class="num">' + escapeHtml(p.lastUsed ? fwdFmtWhen(p.lastUsed) : '—') + '</td>' +
@@ -8248,74 +8248,179 @@
     row.classList.add('fwd-event-row--open');
   }
 
-  // fwdEventDetailHtml renders the fields the table has no room for. ErrorMsg is
-  // the upstream's own reason: it is deliberately withheld from API clients (it
-  // can leak upstream host/proxy topology) but this page is behind admin auth.
+  // fwdDigest shows a keyed digest short, with the full value on hover; digests
+  // are only ever compared for equality, so eight characters tell two apart.
+  function fwdDigest(d) {
+    return '<span class="font-mono" title="' + escapeAttr(d) + '">' + escapeHtml(String(d).slice(0, 8)) + '</span>';
+  }
+
+  // fwdProviderPriced reports whether a provider has per-1M-token prices
+  // configured: true or false, or null when the provider is not in the loaded
+  // list (deleted, or the list has not loaded). The pool is metered in credits.
+  function fwdProviderPriced(providerId) {
+    const p = (forwardStats.providers || []).find(x => x.providerId === providerId);
+    if (!p || p.isPool || !p.configured) return null;
+    return (p.priceInPerM || 0) > 0 || (p.priceOutPerM || 0) > 0;
+  }
+
+  // fwdCostText turns a recorded cost into display text. A zero cost means two
+  // different things — "free/no tokens" and "no price configured" — and the
+  // provider's own price setting is what tells them apart, so it is passed in:
+  // priced is true, false, or null when unknown.
+  //   returns { text, unpriced }
+  function fwdCostText(v, isPool, priced) {
+    if (isPool) return { text: fwdFmtCost(v, true), unpriced: false };
+    if (v > 0) return { text: fwdFmtCost(v, false), unpriced: false };
+    if (priced === false) return { text: t('forward.costNotPriced'), unpriced: true };
+    if (priced === true) return { text: '$0.00', unpriced: false };
+    return { text: '—', unpriced: false };
+  }
+
+  // fwdCostHtml renders fwdCostText for a table cell or detail row.
+  function fwdCostHtml(v, isPool, priced) {
+    const c = fwdCostText(v, isPool, priced);
+    return c.unpriced
+      ? '<span class="muted-text" title="' + escapeAttr(t('forward.costNotPricedHint')) + '">' + escapeHtml(c.text) + '</span>'
+      : escapeHtml(c.text);
+  }
+
+  // costTile shows the estimated cost, or says plainly that the provider has no
+  // price set. Priced-ness comes from the panel's own provider config; a provider
+  // that is no longer configured reports nothing about it, so its zero stays "—".
+  function costTile(costUsd, isPool, payload) {
+    const configured = isPool || payload.name != null;
+    const priced = !configured ? null : (isPool ? null : ((payload.priceInPerM || 0) > 0 || (payload.priceOutPerM || 0) > 0));
+    const c = fwdCostText(costUsd, isPool, priced);
+    return metricTile(t('stats.tileCost'), c.text, c.unpriced ? t('forward.costNotPricedSub') : '');
+  }
+
+  // fwdDetailSection wraps one group of detail rows. collapsed makes it a
+  // <details> that starts closed, for material that is for debugging rather
+  // than for reading a request at a glance.
+  function fwdDetailSection(title, bodyHtml, collapsed) {
+    if (!bodyHtml) return '';
+    return collapsed
+      ? '<details class="fwd-detail-section"><summary class="fwd-detail-title">' + escapeHtml(title) + '</summary>' + bodyHtml + '</details>'
+      : '<section class="fwd-detail-section"><h4 class="fwd-detail-title">' + escapeHtml(title) + '</h4>' + bodyHtml + '</section>';
+  }
+
+  // fwdTierSplit renders the upstream's 5m/1h split of a cache write, naming only
+  // the tiers it reported (they are independent figures; a missing one is unknown,
+  // not zero). Empty when neither was reported.
+  function fwdTierSplit(w5, w1) {
+    const parts = [];
+    if (w5 != null) parts.push('5m ' + fwdFmtTokens(w5));
+    if (w1 != null) parts.push('1h ' + fwdFmtTokens(w1));
+    return parts.join(' · ');
+  }
+
+  // fwdCacheLegend names the three parts of the input beside a wide bar, with
+  // each part's share, so the split reads without hovering. A write that the
+  // upstream split by TTL tier shows both tiers; one that did not says so.
+  function fwdCacheLegend(e, c) {
+    const u = e.usage || {};
+    const base = Math.max(c.total || 0, c.r + c.w);
+    const pct = n => base > 0 ? ' (' + (n * 100 / base >= 10 ? Math.round(n * 100 / base) : (n * 100 / base).toFixed(1)) + '%)' : '';
+    const item = (cls, label, n, extra) => '<span class="cache-legend-item"><i class="cache-swatch cache-seg--' + cls + '" aria-hidden="true"></i>' +
+      escapeHtml(label + ' ' + fwdFmtTokens(n) + pct(n)) + (extra ? ' <span class="muted-text">' + escapeHtml(extra) + '</span>' : '') + '</span>';
+    const items = [];
+    if (c.read != null) items.push(item('read', t('forward.usageCacheRead'), c.r));
+    if (c.create != null) {
+      let tier = '';
+      if (c.w > 0) tier = fwdTierSplit(u.cacheCreation5mTokens, u.cacheCreation1hTokens) || t('forward.detailCacheTierUnknown');
+      items.push(item('write', t('forward.usageCacheWrite'), c.w, tier));
+    }
+    if (c.rest != null) items.push(item(c.restIsUncached ? 'uncached' : 'other', t(c.restIsUncached ? 'forward.usageUncached' : 'forward.usageOther'), c.rest));
+    return '<div class="cache-legend">' + items.join('') + '</div>';
+  }
+
+  // fwdEventDetailHtml renders the fields the table has no room for, in four
+  // groups: Overview (what happened), Tokens & cache, Timeline, and Diagnostics
+  // (identifiers and the cache fingerprint, collapsed). Every row is conditional,
+  // so events recorded before a field existed simply have fewer rows.
+  // ErrorMsg is the upstream's own reason: it is deliberately withheld from API
+  // clients (it can leak upstream host/proxy topology) but this page is behind
+  // admin auth.
   function fwdEventDetailHtml(e, uid, extra) {
     const isPool = e.providerId === '__kiro_pool__';
-    const rows = [];
-    const add = (label, value) => {
-      if (value === '' || value == null) return;
-      rows.push('<div class="fwd-detail-item"><span class="fwd-detail-label">' + escapeHtml(label) +
-        '</span><span class="fwd-detail-value">' + value + '</span></div>');
+    const group = () => {
+      const rows = [];
+      return {
+        add(label, value) {
+          if (value === '' || value == null) return;
+          rows.push('<div class="fwd-detail-item"><span class="fwd-detail-label">' + escapeHtml(label) +
+            '</span><span class="fwd-detail-value">' + value + '</span></div>');
+        },
+        html() { return rows.length ? '<div class="fwd-detail-grid">' + rows.join('') + '</div>' : ''; },
+        get count() { return rows.length; }
+      };
     };
-    add(t('forward.detailWhen'), escapeHtml(fwdFmtWhen(e.time)));
-    if (e.requestId) add(t('forward.detailRequestId'), '<span class="font-mono">' + escapeHtml(e.requestId) + '</span>');
-    add(t('forward.detailEndpoint'), escapeHtml(e.endpoint || '—'));
-    add(t('forward.detailClientModel'), escapeHtml(e.clientModel || '—'));
-    if (e.targetModel) add(t('forward.detailTargetModel'), escapeHtml(e.targetModel));
-    add(t('forward.detailProvider'), escapeHtml(e.providerName || fwdProviderNames[e.providerId] || e.providerId || '—'));
-    if (e.connectionName) add(t('forward.detailConnection'), escapeHtml(e.connectionName));
-    if (e.accountLabel || e.accountId) add(t('forward.detailAccount'), escapeHtml(e.accountLabel || e.accountId));
-    if (e.apiKeyName || e.apiKeyId) add(t('forward.detailApiKey'), escapeHtml(e.apiKeyName || e.apiKeyId));
-    if (e.routeId) add(t('forward.detailRoute'), '<span class="font-mono">' + escapeHtml(e.routeId) + '</span>');
-    add(t('forward.detailStatus'), String(e.status || '—'));
-    add(t('forward.detailLatency'), escapeHtml(fwdFmtLatency(e.latencyMs)));
-    add(t('forward.detailTtfb'), e.ttfbMs ? escapeHtml(fwdFmtLatency(e.ttfbMs)) : '—');
-    // Token breakdown. The nested usage object, when present, is the upstream's
-    // own reported detail; its absence means "not reported", rendered as "—"
-    // rather than a misleading 0.
+    const overview = group(), tokens = group(), timeline = group(), diagnostics = group();
+    const mono = v => '<span class="font-mono">' + escapeHtml(v) + '</span>';
+
+    // ---- Overview ----
+    overview.add(t('forward.detailWhen'), escapeHtml(fwdFmtWhen(e.time)));
+    overview.add(t('forward.detailStatus'), escapeHtml(String(e.status || '—')));
+    const route = e.targetModel && e.targetModel !== e.clientModel
+      ? escapeHtml(e.clientModel || '—') + ' <span class="muted-text">&rarr;</span> ' + escapeHtml(e.targetModel)
+      : escapeHtml(e.clientModel || '—');
+    overview.add(t('forward.detailModelRoute'), route);
+    overview.add(t('forward.detailProvider'), escapeHtml(e.providerName || fwdProviderNames[e.providerId] || e.providerId || '—'));
+    if (e.connectionName) overview.add(t('forward.detailConnection'), escapeHtml(e.connectionName));
+    if (e.accountLabel || e.accountId) overview.add(t('forward.detailAccount'), escapeHtml(e.accountLabel || e.accountId));
+    if (e.apiKeyName || e.apiKeyId) overview.add(t('forward.detailApiKey'), escapeHtml(e.apiKeyName || e.apiKeyId));
+    overview.add(t('forward.detailEndpoint'), escapeHtml(e.endpoint || '—'));
+    overview.add(t('forward.detailCost'), fwdCostHtml(e.costUsd, isPool, isPool ? null : fwdProviderPriced(e.providerId)));
+
+    // ---- Tokens & cache ----
+    // The nested usage object, when present, is the upstream's own reported
+    // detail; its absence means "not reported", rendered as "—" rather than a
+    // misleading 0.
     const u = e.usage;
-    const readN = u && u.cacheReadInputTokens != null ? u.cacheReadInputTokens : null;
-    const createN = u && u.cacheCreationInputTokens != null ? u.cacheCreationInputTokens : null;
+    const c = fwdCacheParts(e);
     const reasoningN = u && u.reasoningOutputTokens != null ? u.reasoningOutputTokens : null;
     const hasTotals = u || e.inputTokens || e.outputTokens;
+    let tokenVisual = '';
     if (hasTotals) {
       // Both cells go through the tri-state renderer: with a usage object the
       // canonical pointers decide "reported" vs "unknown", so a missing output
       // total reads "—" rather than a misleading 0.
-      add(t('forward.detailTokensIn'), fwdTokenCell(e, 'inputTokens'));
-      add(t('forward.detailTokensOut'), fwdTokenCell(e, 'outputTokens'));
+      tokens.add(t('forward.detailTokensIn'), escapeHtml(fwdTokenCell(e, 'inputTokens')));
+      tokens.add(t('forward.detailTokensOut'), escapeHtml(fwdTokenCell(e, 'outputTokens')));
+      if (reasoningN != null) tokens.add(t('forward.detailReasoning'), escapeHtml(fwdFmtTokens(reasoningN)));
+      if (c.read != null && c.total > 0) tokens.add(t('forward.detailCacheHit'), c.hit + '%');
       // Active input = tokens actually processed this turn = total minus the
       // cache-read hits (cache writes stay inside it). Shown only when a cache
       // breakdown was reported; without one it would just equal the total.
-      if ((readN != null || createN != null) && e.inputTokens > 0) {
-        add(t('forward.usageActiveInput'), fwdFmtTokens(Math.max(0, e.inputTokens - (readN || 0))));
+      if ((c.read != null || c.create != null) && c.active != null) {
+        tokens.add(t('forward.usageActiveInput'), escapeHtml(fwdFmtTokens(c.active)) +
+          ' <span class="muted-text">' + escapeHtml(t('forward.usageActiveHint')) + '</span>');
       }
-      if (readN != null) add(t('forward.detailCacheRead'), fwdFmtTokens(readN));
-      if (createN != null) add(t('forward.detailCacheCreate'), fwdFmtTokens(createN));
-      // Uncached input is derived, never stored: input minus what the cache
-      // served (reads plus writes). Anthropic's input_tokens is billed input
-      // EXCLUDING cache, so subtracting the canonical cache fields yields the
-      // uncached remainder; for subset dialects (OpenAI/DeepSeek/Gemini) the
-      // same subtraction is exact by definition. Skipped when the input total
-      // is unknown — a derivation from nothing would read as a fake 0.
-      if ((readN != null || createN != null) && e.inputTokens > 0) {
-        add(t('forward.detailUncached'), fwdFmtTokens(Math.max(0, e.inputTokens - (readN || 0) - (createN || 0))));
+      if (u && u.source) tokens.add(t('forward.detailUsageSource'), escapeHtml(u.source === 'estimated' ? t('forward.sourceEstimated') : t('forward.sourceUpstream')));
+      if (u && u.protocol) tokens.add(t('forward.detailProtocol'), escapeHtml(fwdProtoLabel(u.protocol)));
+      if (c.read != null || c.create != null) {
+        tokenVisual = '<div class="cache-split">' + fwdCacheBar(c).replace('class="cache-bar"', 'class="cache-bar cache-bar--wide"') + fwdCacheLegend(e, c) + '</div>';
       }
-      if (reasoningN != null) add(t('forward.detailReasoning'), fwdFmtTokens(reasoningN));
-      if (readN != null && e.inputTokens > 0) {
-        add(t('forward.detailCacheHit'), Math.round(readN * 100 / e.inputTokens) + '%');
-      }
-      if (u && u.source) add(t('forward.detailUsageSource'), escapeHtml(u.source === 'estimated' ? t('forward.sourceEstimated') : t('forward.sourceUpstream')));
-      if (u && u.protocol) add(t('forward.detailProtocol'), escapeHtml(fwdProtoLabel(u.protocol)));
     } else {
-      add(t('forward.detailTokensIn'), '—');
-      add(t('forward.detailTokensOut'), '—');
+      tokens.add(t('forward.detailTokensIn'), '—');
+      tokens.add(t('forward.detailTokensOut'), '—');
     }
-    add(t('forward.detailCost'), escapeHtml(fwdFmtCost(e.costUsd, isPool)));
-    add(t('forward.detailStream'), e.stream ? t('forward.detailYes') : t('forward.detailNo'));
-    if (e.canceled) add(t('forward.detailCanceled'), t('forward.detailYes'));
+
+    // ---- Timeline ----
+    timeline.add(t('forward.detailTtfb'), e.ttfbMs ? escapeHtml(fwdFmtLatency(e.ttfbMs)) : '—');
+    // After the first byte is derived, and only meaningful for a stream: it is
+    // the time spent generating, which TTFB alone hides.
+    if (e.stream && e.ttfbMs > 0 && e.latencyMs >= e.ttfbMs) {
+      timeline.add(t('forward.detailAfterFirstByte'), escapeHtml(fwdFmtLatency(e.latencyMs - e.ttfbMs)));
+    }
+    timeline.add(t('forward.detailLatency'), escapeHtml(fwdFmtLatency(e.latencyMs)));
+    timeline.add(t('forward.detailStream'), e.stream ? t('forward.detailYes') : t('forward.detailNo'));
+    if (e.canceled) timeline.add(t('forward.detailCanceled'), t('forward.detailYes'));
+
+    // ---- Diagnostics ----
+    if (e.requestId) diagnostics.add(t('forward.detailRequestId'), mono(e.requestId));
+    if (e.routeId) diagnostics.add(t('forward.detailRoute'), mono(e.routeId));
+    if (e.upstreamModel) diagnostics.add(t('forward.detailUpstreamModel'), escapeHtml(e.upstreamModel));
     // Session identity of the attempt: which carrier it came from, whether it
     // groups a conversation or only this request, and whether the provider's
     // configured header actually carried it. The id itself is never recorded, so
@@ -8324,10 +8429,28 @@
     // Source and scope stay in their wire spelling on purpose: they are the exact
     // tokens the logs and metrics carry, so an operator can grep for what the UI
     // showed. Only the yes/no reading below is localized.
-    if (e.sessionSource) add(t('forward.detailSessionSource'), '<span class="font-mono">' + escapeHtml(e.sessionSource) + '</span>');
-    if (e.sessionScope) add(t('forward.detailSessionScope'), '<span class="font-mono">' + escapeHtml(e.sessionScope) + '</span>');
+    if (e.sessionSource) diagnostics.add(t('forward.detailSessionSource'), mono(e.sessionSource));
+    if (e.sessionScope) diagnostics.add(t('forward.detailSessionScope'), mono(e.sessionScope));
     if (e.sessionSource && e.sessionSource !== 'none') {
-      add(t('forward.detailSessionMapped'), e.sessionMapped ? t('forward.detailYes') : t('forward.detailNo'));
+      diagnostics.add(t('forward.detailSessionMapped'), e.sessionMapped ? t('forward.detailYes') : t('forward.detailNo'));
+    }
+    // Cache fingerprint: keyed digests of what the request asked the upstream to
+    // cache. Present only on Messages-shaped requests with tracing on.
+    const ct = e.cache;
+    if (ct) {
+      if (ct.conv) diagnostics.add(t('forward.detailCacheConv'), fwdDigest(ct.conv));
+      if (ct.tools) diagnostics.add(t('forward.detailCacheTools'), fwdDigest(ct.tools));
+      if (ct.system) diagnostics.add(t('forward.detailCacheSystem'), fwdDigest(ct.system));
+      if (ct.settings) diagnostics.add(t('forward.detailCacheSettings'), fwdDigest(ct.settings));
+      if (ct.msgs) diagnostics.add(t('forward.detailCacheMsgs'), escapeHtml(String(ct.msgs)));
+      if (Array.isArray(ct.marks) && ct.marks.length) {
+        diagnostics.add(t('forward.detailCacheMarks'), ct.marks.map(m => '<span class="fwd-chip">' + escapeHtml(m) + '</span>').join(' '));
+      }
+      if (Array.isArray(ct.prefix) && ct.prefix.length) {
+        diagnostics.add(t('forward.detailCachePrefix'), '<span title="' + escapeAttr(ct.prefix.join('\n')) + '">' +
+          escapeHtml(t('forward.detailCachePrefixCount', String(ct.prefix.length))) + '</span>');
+      }
+      if (ct.policy) diagnostics.add(t('forward.detailCachePolicy'), mono(ct.policy));
     }
 
     let err = '';
@@ -8350,12 +8473,14 @@
         }).join('') + '</ol></div>';
     }
     if (diag) {
-      if (diag.connectionName && !e.connectionName) add(t('forward.detailConnection'), escapeHtml(diag.connectionName));
-      if (diag.upstreamStatus) add(t('forward.detailUpstreamStatus'), String(diag.upstreamStatus));
-      if (diag.upstreamCode) add(t('forward.detailUpstreamCode'), escapeHtml(diag.upstreamCode));
-      if (diag.upstreamRequestId) add(t('forward.detailUpstreamRequestId'), '<span class="font-mono">' + escapeHtml(diag.upstreamRequestId) + '</span>');
-      if (diag.retryAfter) add(t('forward.detailRetryAfter'), escapeHtml(diag.retryAfter));
-      if (diag.publicCode) add(t('forward.detailPublicCode'), escapeHtml(diag.publicCode));
+      // What the upstream answered belongs with what happened; the identifiers
+      // it returned belong with the diagnostics.
+      if (diag.connectionName && !e.connectionName) overview.add(t('forward.detailConnection'), escapeHtml(diag.connectionName));
+      if (diag.upstreamStatus) overview.add(t('forward.detailUpstreamStatus'), escapeHtml(String(diag.upstreamStatus)));
+      if (diag.upstreamCode) overview.add(t('forward.detailUpstreamCode'), escapeHtml(diag.upstreamCode));
+      if (diag.retryAfter) overview.add(t('forward.detailRetryAfter'), escapeHtml(diag.retryAfter));
+      if (diag.upstreamRequestId) diagnostics.add(t('forward.detailUpstreamRequestId'), mono(diag.upstreamRequestId));
+      if (diag.publicCode) diagnostics.add(t('forward.detailPublicCode'), escapeHtml(diag.publicCode));
       const raw = diag.detail || diag.upstreamMessage || '';
       err = '<div class="fwd-detail-error"><div class="fwd-detail-label">' +
         escapeHtml(t('forward.detailError')) +
@@ -8372,7 +8497,10 @@
     }
 
     return '<div class="fwd-detail-panel">' + err + ladder +
-      '<div class="fwd-detail-grid">' + rows.join('') + '</div>' +
+      fwdDetailSection(t('forward.sectionOverview'), overview.html()) +
+      fwdDetailSection(t('forward.sectionTokens'), tokenVisual + tokens.html()) +
+      fwdDetailSection(t('forward.sectionTimeline'), timeline.html()) +
+      fwdDetailSection(t('forward.sectionDiagnostics'), diagnostics.html(), true) +
       '<div class="fwd-detail-actions"><button type="button" class="btn btn-outline btn-sm" ' +
       'data-fwd-copy="' + escapeHtml(uid) + '"><i class="fa-solid fa-copy" aria-hidden="true"></i>' +
       '<span class="btn-text">' + escapeHtml(t('forward.detailCopy')) + '</span></button></div></div>';

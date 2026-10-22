@@ -3222,6 +3222,10 @@ img.brand-icon {
   margin-top: 0.5rem;
 }
 .fwd-events-scroll {
+  /* Lets an open detail row size itself to the visible width (100cqw) instead of
+     the full table width, so on a phone it is not cut off by the table's
+     horizontal scroll. */
+  container-type: inline-size;
   max-height: 55vh;
   overflow-y: auto;
   /* The usage columns keep the table wider than a phone viewport; scroll the
@@ -3243,7 +3247,7 @@ img.brand-icon {
 .fwd-events-table th {
   position: sticky;
   top: 0;
-  background: var(--card-bg, #fff);
+  background: var(--card, #fff);
   font-size: 0.72rem;
   text-transform: uppercase;
   letter-spacing: 0.03em;
@@ -3336,6 +3340,35 @@ img.brand-icon {
 .cache-seg--other {
   background: var(--muted-foreground);
 }
+.cache-bar--wide {
+  display: flex;
+  width: 100%;
+  max-width: 32rem;
+  height: 0.6rem;
+}
+.cache-split {
+  margin-bottom: 0.6rem;
+}
+.cache-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  margin-top: 0.4rem;
+  font-size: 0.78rem;
+}
+.cache-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.cache-swatch {
+  display: inline-block;
+  flex: none;
+  width: 0.6rem;
+  height: 0.6rem;
+  min-width: 0;
+  border-radius: 2px;
+}
 /* API key label: keep long names from stretching the column. */
 .fwd-key {
   display: inline-block;
@@ -3410,6 +3443,14 @@ img.brand-icon {
 .fwd-detail-panel {
   padding: 0.75rem 0.9rem;
 }
+/* Only the Activity detail row sits in the container-query scroller; the same
+   class also frames the probe panels in modals, which must keep their own width. */
+.fwd-detail-row > td > .fwd-detail-panel {
+  position: sticky;
+  left: 0;
+  box-sizing: border-box;
+  width: 100cqw;
+}
 .fwd-detail-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
@@ -3430,6 +3471,51 @@ img.brand-icon {
 .fwd-detail-value {
   font-size: 0.8rem;
   word-break: break-word;
+}
+.fwd-detail-section {
+  margin-top: 0.85rem;
+}
+.fwd-detail-panel > .fwd-detail-section:first-child {
+  margin-top: 0;
+}
+.fwd-detail-title {
+  margin: 0 0 0.4rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted-foreground);
+}
+/* Diagnostics is a <details>: the native control keeps it keyboard-operable. */
+summary.fwd-detail-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  list-style: none;
+}
+summary.fwd-detail-title::-webkit-details-marker {
+  display: none;
+}
+summary.fwd-detail-title::before {
+  content: "\25B8";
+  content: "\25B8" / "";
+}
+details[open] > summary.fwd-detail-title::before {
+  content: "\25BE";
+  content: "\25BE" / "";
+}
+details.fwd-detail-section[open] > summary.fwd-detail-title {
+  margin-bottom: 0.4rem;
+}
+.fwd-chip {
+  display: inline-block;
+  padding: 0 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
 }
 .fwd-detail-error {
   margin-bottom: 0.75rem;
