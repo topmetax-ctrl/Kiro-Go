@@ -74,7 +74,13 @@ type EventUsage struct {
 	OutputTokens             *int64 `json:"outputTokens,omitempty"`
 	CacheReadInputTokens     *int64 `json:"cacheReadInputTokens,omitempty"`
 	CacheCreationInputTokens *int64 `json:"cacheCreationInputTokens,omitempty"`
-	ReasoningOutputTokens    *int64 `json:"reasoningOutputTokens,omitempty"`
+	// CacheCreation5mTokens and CacheCreation1hTokens split the cache-creation
+	// total by the TTL tier the upstream wrote, from usage.cache_creation
+	// (ephemeral_5m_input_tokens / ephemeral_1h_input_tokens). Nil means the
+	// upstream sent no breakdown — the tier is then unknown, never inferred.
+	CacheCreation5mTokens *int64 `json:"cacheCreation5mTokens,omitempty"`
+	CacheCreation1hTokens *int64 `json:"cacheCreation1hTokens,omitempty"`
+	ReasoningOutputTokens *int64 `json:"reasoningOutputTokens,omitempty"`
 	// Source names where the figures came from ("upstream" today).
 	Source string `json:"source,omitempty"`
 	// Protocol names the response dialect the usage was read from
@@ -173,6 +179,51 @@ type Event struct {
 	SessionSource string `json:"sessionSource,omitempty"`
 	SessionScope  string `json:"sessionScope,omitempty"`
 	SessionMapped bool   `json:"sessionMapped,omitempty"`
+
+	// UpstreamModel is the model the upstream's own response named, which can
+	// differ from TargetModel when a gateway in between remaps it.
+	UpstreamModel string `json:"upstreamModel,omitempty"`
+	// Cache is the request-side evidence for explaining this request's cache
+	// outcome. Nil when tracing is off or the body is not a Messages request.
+	Cache *CacheTrace `json:"cache,omitempty"`
+}
+
+// CacheTrace is keyed-digest evidence about what a request asked the upstream
+// to cache, so a cache write can be explained after the fact (expired, prefix
+// changed, concurrent, other) without storing any prompt text.
+//
+// Every digest is a truncated HMAC-SHA256 under a per-install key: two digests
+// compare equal across requests, and say nothing else. Digests ignore
+// cache_control markers, because a marker moving between turns does not change
+// what the upstream hashes — the content up to a breakpoint.
+//
+// It describes the body this gateway sent. A gateway further upstream may still
+// rewrite the body, so a digest that stays equal proves the client side was
+// stable, not that the final upstream request was.
+type CacheTrace struct {
+	// Conv anchors a conversation: the digest of its first message. Requests of
+	// one conversation share it until the client rewrites history (compaction).
+	Conv string `json:"conv,omitempty"`
+	// Tools and System digest the tool definitions and the system prompt.
+	Tools  string `json:"tools,omitempty"`
+	System string `json:"system,omitempty"`
+	// Settings digests the fields that invalidate cached messages when they
+	// change: model, thinking, output_config and tool_choice.
+	Settings string `json:"settings,omitempty"`
+	// Msgs is the number of messages in the request.
+	Msgs int `json:"msgs,omitempty"`
+	// Prefix lists "k:digest" checkpoints, where the digest covers tools, system
+	// and the first k messages. The last few messages are always listed, plus a
+	// sparse stride over the rest, so two requests of a conversation can be
+	// compared down to a window of messages where their histories diverge.
+	Prefix []string `json:"prefix,omitempty"`
+	// Marks lists the cache breakpoints the body carried: "t<i>" for a tool,
+	// "s<i>" for a system block, "m<i>" for a message, each suffixed ":<ttl>"
+	// when the body names one. Only top-level blocks are listed.
+	Marks []string `json:"marks,omitempty"`
+	// Policy labels the Token Optimization settings in force, since they change
+	// what the prompt contains.
+	Policy string `json:"policy,omitempty"`
 }
 
 // eventModelRounds is the number of model rounds an Event represents. Unset (0)

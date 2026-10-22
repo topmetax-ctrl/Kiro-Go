@@ -331,6 +331,10 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 	// reports it; it stays zero (recorded as no session) for the failure paths
 	// that abort before the request is built.
 	var sess clientSession
+	// cacheTrace resolves the request's cache evidence (see cache_trace.go). It
+	// starts hashing now and is read only when the event is recorded, so the
+	// digests cost the upstream call no time.
+	cacheTrace := h.startCacheTrace(payload, isClaudeRoute)
 
 	// recordMetric is called once, at the end of the attempt (after the body/stream
 	// finishes), so LatencyMs reflects the full relay — not just time-to-headers.
@@ -365,6 +369,8 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 			SessionSource:  sess.Source,
 			SessionScope:   sess.Scope.String(),
 			SessionMapped:  sessionMappedUpstream(sess, up),
+			UpstreamModel:  usage.Model,
+			Cache:          cacheTrace(),
 		}
 		if usage.known() || usage.cacheKnown() || usage.ReasoningOutputTokens != nil {
 			ev.Usage = &metrics.EventUsage{
@@ -377,6 +383,8 @@ func (h *Handler) forwardOneConnection(r *http.Request, w http.ResponseWriter, p
 				OutputTokens:             usage.Output,
 				CacheReadInputTokens:     usage.CacheReadInputTokens,
 				CacheCreationInputTokens: usage.CacheCreationInputTokens,
+				CacheCreation5mTokens:    usage.CacheCreation5mTokens,
+				CacheCreation1hTokens:    usage.CacheCreation1hTokens,
 				ReasoningOutputTokens:    usage.ReasoningOutputTokens,
 				Source:                   metrics.UsageSourceUpstream,
 				Protocol:                 usageProtocol(usage, subPath),

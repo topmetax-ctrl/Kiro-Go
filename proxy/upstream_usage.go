@@ -55,7 +55,15 @@ type usageCounts struct {
 	// between "0 · 0%" and "—" on the activity table.
 	CacheReadInputTokens     *int64
 	CacheCreationInputTokens *int64
-	ReasoningOutputTokens    *int64
+	// CacheCreation5mTokens and CacheCreation1hTokens split CacheCreationInputTokens
+	// by the TTL tier written (Anthropic usage.cache_creation). Nil means the
+	// upstream sent no breakdown: the tier is unknown, never derived from the total.
+	CacheCreation5mTokens *int64
+	CacheCreation1hTokens *int64
+	ReasoningOutputTokens *int64
+	// Model is the model the response itself named (message_start.message.model,
+	// or the body's top-level model). Empty when the response did not say.
+	Model string
 	// Protocol names the response dialect the figures were read from. It is
 	// detected from the wire shape, never from the provider's display name, so
 	// any provider speaking a known dialect is covered without per-name hacks.
@@ -109,6 +117,12 @@ type usageEnvelope struct {
 	// input_tokens. Their presence is what marks the Anthropic dialect.
 	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens"`
+	// CacheCreation splits the creation total by TTL tier. Anthropic documents
+	// cache_creation_input_tokens as the sum of its two members.
+	CacheCreation struct {
+		Ephemeral5m *int64 `json:"ephemeral_5m_input_tokens"`
+		Ephemeral1h *int64 `json:"ephemeral_1h_input_tokens"`
+	} `json:"cache_creation"`
 
 	// OpenAI Chat Completions
 	PromptTokens        *int64 `json:"prompt_tokens"`
@@ -197,6 +211,8 @@ func (e usageEnvelope) normalize() usageCounts {
 		c.Input = sumIntPtr(e.InputTokens, e.CacheReadInputTokens, e.CacheCreationInputTokens)
 		c.CacheReadInputTokens = e.CacheReadInputTokens
 		c.CacheCreationInputTokens = e.CacheCreationInputTokens
+		c.CacheCreation5mTokens = e.CacheCreation.Ephemeral5m
+		c.CacheCreation1hTokens = e.CacheCreation.Ephemeral1h
 		c.Output = e.OutputTokens
 		c.Protocol = protocolAnthropic
 
@@ -262,6 +278,19 @@ func derefOr(p *int64, or int64) int64 {
 		return *p
 	}
 	return or
+}
+
+// maxUpstreamModelLen bounds the model name kept from a response. A real model
+// id is a few dozen bytes; the cap stops a hostile upstream from putting an
+// arbitrary string on every recorded event.
+const maxUpstreamModelLen = 128
+
+func capUpstreamModel(m string) string {
+	m = strings.TrimSpace(m)
+	if len(m) > maxUpstreamModelLen {
+		m = m[:maxUpstreamModelLen]
+	}
+	return m
 }
 
 // firstNonNil returns the first non-nil pointer, or nil when every argument is
@@ -346,11 +375,13 @@ func usageFromJSONBody(body []byte) usageCounts {
 	}
 	var envelope struct {
 		Usage usageEnvelope `json:"usage"`
+		Model string        `json:"model"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return usageCounts{}
 	}
 	c := envelope.Usage.normalize()
+	c.Model = capUpstreamModel(envelope.Model)
 	if c.Protocol == "" {
 		// Non-stream Gemini bodies nest usage under "usageMetadata" instead.
 		var gem struct {
@@ -360,6 +391,7 @@ func usageFromJSONBody(body []byte) usageCounts {
 			g := gem.UsageMetadata.normalize()
 			if g.Protocol != "" {
 				g.Protocol = protocolGemini
+				g.Model = c.Model
 				return g
 			}
 		}
@@ -923,11 +955,14 @@ func (s *usageScanner) scanLine(line []byte) {
 	}
 
 	var frame struct {
+		Model   string        `json:"model"`
 		Usage   usageEnvelope `json:"usage"`
 		Message struct {
+			Model string        `json:"model"`
 			Usage usageEnvelope `json:"usage"`
 		} `json:"message"`
 		Response struct {
+			Model string        `json:"model"`
 			Usage usageEnvelope `json:"usage"`
 		} `json:"response"`
 		// Gemini chunks nest the dialect's fields under usageMetadata; the
@@ -951,6 +986,11 @@ func (s *usageScanner) scanLine(line []byte) {
 	mergeUsage(&s.counts, frame.Message.Usage)
 	mergeUsage(&s.counts, frame.Usage)
 	mergeUsage(&s.counts, frame.Response.Usage)
+	for _, m := range []string{frame.Model, frame.Message.Model, frame.Response.Model} {
+		if m = capUpstreamModel(m); m != "" {
+			s.counts.Model = m
+		}
+	}
 	if frame.UsageMetadata != nil {
 		mergeUsage(&s.counts, *frame.UsageMetadata)
 	}
@@ -986,6 +1026,12 @@ func mergeUsage(dst *usageCounts, env usageEnvelope) {
 	}
 	if c.CacheCreationInputTokens != nil {
 		dst.CacheCreationInputTokens = c.CacheCreationInputTokens
+	}
+	if c.CacheCreation5mTokens != nil {
+		dst.CacheCreation5mTokens = c.CacheCreation5mTokens
+	}
+	if c.CacheCreation1hTokens != nil {
+		dst.CacheCreation1hTokens = c.CacheCreation1hTokens
 	}
 	if c.ReasoningOutputTokens != nil {
 		dst.ReasoningOutputTokens = c.ReasoningOutputTokens

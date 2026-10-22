@@ -460,6 +460,9 @@ type Config struct {
 	APIKeyPepper string `json:"apiKeyPepper,omitempty"`
 	// PortalEnabled defaults true when nil. Public /usage is served only when true.
 	PortalEnabled *bool `json:"portalEnabled,omitempty"`
+	// CacheTrace defaults true when nil. Set false to stop recording keyed
+	// prompt-prefix digests on forward events (docs/cache-observability.md).
+	CacheTrace *bool `json:"cacheTrace,omitempty"`
 	// UsageRetentionDays is the raw request_events TTL. 0 means the 30-day default.
 	UsageRetentionDays int `json:"usageRetentionDays,omitempty"`
 	// LegacyPlaintextRetention defaults true: keep apiKeys[].key in this file so
@@ -2071,6 +2074,17 @@ func GetEndpointFallback() bool {
 		return true
 	}
 	return *cfg.EndpointFallback
+}
+
+// CacheTraceEnabled reports whether forward events carry cache-trace digests.
+// Defaults to true.
+func CacheTraceEnabled() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.CacheTrace == nil {
+		return true
+	}
+	return *cfg.CacheTrace
 }
 
 // UpdateEndpointFallback sets the endpoint fallback switch and persists the change.

@@ -11,6 +11,7 @@ import (
 	"io"
 	"kiro-go/apikey"
 	"kiro-go/auth"
+	"kiro-go/cachetrace"
 	"kiro-go/config"
 	"kiro-go/logger"
 	"kiro-go/metrics"
@@ -130,6 +131,11 @@ type Handler struct {
 	// that never enable the feature pay nothing.
 	tokenOptOnce sync.Once
 	tokenOptMgr  *tokenopt.Manager
+
+	// cacheTraceTracer digests forward requests for the event log (see
+	// cache_trace.go); built on first use, nil when no signing secret exists.
+	cacheTraceOnce   sync.Once
+	cacheTraceTracer *cachetrace.Tracer
 }
 
 type microsoftProfileSelection struct {
