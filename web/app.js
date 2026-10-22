@@ -6603,6 +6603,15 @@
     const buckets = o.buckets || [];
     const n = buckets.length;
     const segs = o.segments;
+    // The charts redraw on every live refresh. When nothing they show has changed
+    // (same buckets, labels and coverage) keep the DOM, so a tooltip someone is
+    // reading or a focused plot survives an idle refresh.
+    const sig = JSON.stringify([buckets, segs.map(s => s.label), o.unitLabel, o.summary, o.noDataBefore || 0, !!o.normalize, o.emptyText]);
+    if (host._bcSig === sig && host.firstChild) return;
+    host._bcSig = sig;
+    // Remember where the reader was, to put them back after the redraw.
+    const prev = host._bc ? host._bc.active : -1;
+    const plotFocused = !!(host.contains(document.activeElement) && document.activeElement.classList.contains('bc-plot'));
     const totals = buckets.map(b => segs.reduce((a, s) => a + Math.max(0, Number(s.value(b)) || 0), 0));
     const sum = totals.reduce((a, v) => a + v, 0);
     host._bc = null;
@@ -6649,6 +6658,12 @@
       '</div>';
     host._bc = { o, buckets, n, blind, spanMs, active: -1 };
     fwdBarChartBind(host);
+    // A redraw replaces the plot element: hand focus and the open tooltip back.
+    if (plotFocused) {
+      const plot = host.querySelector('.bc-plot');
+      if (plot) plot.focus({ preventScroll: true });
+    }
+    if (prev >= 0 && prev < n && (plotFocused || host._bcPointerInside)) fwdBarChartShow(host, prev);
   }
 
   // fwdBarChartTip is the tooltip body for one bucket: its time range, then each
@@ -6724,9 +6739,10 @@
     };
     host.addEventListener('pointermove', e => {
       const i = indexAt(e);
+      host._bcPointerInside = i >= 0;
       if (i < 0) fwdBarChartHide(host); else fwdBarChartShow(host, i);
     });
-    host.addEventListener('pointerleave', () => fwdBarChartHide(host));
+    host.addEventListener('pointerleave', () => { host._bcPointerInside = false; fwdBarChartHide(host); });
     host.addEventListener('click', e => select(indexAt(e)));
     host.addEventListener('focusout', e => {
       if (e.target.closest && e.target.closest('.bc-plot')) fwdBarChartHide(host);
