@@ -6542,11 +6542,14 @@
   // what the provider sparkline draws with, minus the chrome.
 
   let fwdChartSeq = 0;
+  // Hosts of charts that have bound their interaction, so a tap elsewhere can
+  // dismiss every open tooltip.
+  const fwdChartHosts = new Set();
 
   // fwdSeg describes one stacked segment. tone is the CSS class that colours both
   // the bar and its legend swatch; value reads the segment off a bucket.
-  function fwdSeg(key, label, tone, value) {
-    return { key, label, tone, cls: 'bc-seg ' + tone, value };
+  function fwdSeg(key, label, tone, value, format) {
+    return { key, label, tone, cls: 'bc-seg ' + tone, value, format };
   }
 
   // fwdStackBars returns the SVG rects of stacked bars: one column per bucket in
@@ -6566,24 +6569,37 @@
       const total = vals.reduce((a, v) => a + v, 0);
       if (!total) return;
       const denom = o.normalize ? total : o.max;
+      const heights = vals.map(v => v ? Math.max(v / denom * h, minSeg) : 0);
+      // Minimum heights can push a nearly full bar past the box. Take the excess
+      // off the tallest segment (and scale if that is not enough) so no segment
+      // is ever drawn on top of another.
+      const over = heights.reduce((a, v) => a + v, 0) - h;
+      if (over > 0) {
+        const tall = heights.indexOf(Math.max(...heights));
+        heights[tall] = Math.max(minSeg, heights[tall] - over);
+        const sum = heights.reduce((a, v) => a + v, 0);
+        if (sum > h) heights.forEach((v, k) => { heights[k] = v * h / sum; });
+      }
       let y = h;
       segs.forEach((s, k) => {
-        if (!vals[k]) return;
-        const sh = Math.max(vals[k] / denom * h, minSeg);
-        y = Math.max(0, y - sh);
+        if (!heights[k]) return;
+        y -= heights[k];
+        // A hairline gap under each segment keeps neighbours of similar
+        // lightness apart without relying on hue alone.
+        const drawn = heights[k] > 1.5 ? heights[k] - 0.3 : heights[k];
         out += '<rect class="' + s.cls + '" x="' + (i * bw).toFixed(2) + '" y="' + y.toFixed(2) +
-          '" width="' + (bw * 0.8).toFixed(2) + '" height="' + sh.toFixed(2) + '"></rect>';
+          '" width="' + (bw * 0.8).toFixed(2) + '" height="' + drawn.toFixed(2) + '"></rect>';
       });
     });
     return out;
   }
 
-  // fwdFmtTick labels a time on the x axis: just the clock for a window of a day
-  // or less, with the date once it spans more.
-  function fwdFmtTick(ms, spanMs) {
+  // fwdFmtTick labels a time on the x axis: just the clock, with the date once
+  // the series crosses a calendar day (showDate).
+  function fwdFmtTick(ms, showDate) {
     const d = new Date(ms);
     const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    if (spanMs < 36 * 3600000) return time;
+    if (!showDate) return time;
     return d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ' ' + time;
   }
 
@@ -6615,7 +6631,10 @@
     const totals = buckets.map(b => segs.reduce((a, s) => a + Math.max(0, Number(s.value(b)) || 0), 0));
     const sum = totals.reduce((a, v) => a + v, 0);
     host._bc = null;
-    if (!n || !sum) {
+    // o.empty lets the caller decide emptiness by what the series counts (requests)
+    // rather than by the plotted metric: failed requests with zero tokens are not
+    // "no activity".
+    if (!n || (o.empty !== undefined ? o.empty : !sum)) {
       host.innerHTML = '<div class="muted-text text-xs" style="padding:1rem 0;">' + escapeHtml(o.emptyText) + '</div>';
       return;
     }
@@ -6623,19 +6642,19 @@
     let blind = 0;
     if (o.noDataBefore) while (blind < n && o.startOf(buckets[blind]) + o.bucketMs <= o.noDataBefore) blind++;
     const max = o.normalize ? 100 : Math.max(...totals);
+    const scale = max || 1;
     const pct = x => (x * 100 / n).toFixed(3) + '%';
-    const spanMs = n * o.bucketMs;
+    const showDate = new Date(o.startOf(buckets[0])).toDateString() !== new Date(o.startOf(buckets[n - 1])).toDateString();
 
-    const ticks = [0, 0.25, 0.5, 0.75, 1].map(f => {
-      const i = Math.min(n - 1, Math.round(f * (n - 1)));
-      return '<span>' + escapeHtml(fwdFmtTick(o.startOf(buckets[i]), spanMs)) + '</span>';
-    }).join('');
+    // One bar has one distinct tick; more bars share five evenly spaced ones.
+    const ticks = Array.from(new Set([0, 0.25, 0.5, 0.75, 1].map(f => Math.min(n - 1, Math.round(f * (n - 1))))))
+      .map(i => '<span>' + escapeHtml(fwdFmtTick(o.startOf(buckets[i]), showDate)) + '</span>').join('');
 
     const used = segs.filter(s => buckets.some((b, i) => i >= blind && (Number(s.value(b)) || 0) > 0));
     const legend = used.map(s => '<span class="bc-legend-item"><i class="bc-swatch ' + s.tone + '" aria-hidden="true"></i>' +
       escapeHtml(s.label) + '</span>').join('') +
       (blind ? '<span class="bc-legend-item"><i class="bc-swatch bc-swatch--nodata" aria-hidden="true"></i>' +
-        escapeHtml(t('chart.noDataBand', fwdFmtTick(o.noDataBefore, spanMs))) + '</span>' : '');
+        escapeHtml(t('chart.noDataBand', fwdFmtTick(o.noDataBefore, showDate))) + '</span>' : '');
 
     host.innerHTML =
       '<div class="bc">' +
@@ -6648,7 +6667,7 @@
           '<div class="bc-base" style="left:' + pct(blind) + '"></div>' +
           '<div class="bc-hover" style="width:' + pct(1) + '" hidden></div>' +
           '<svg class="bc-svg" viewBox="0 0 100 40" preserveAspectRatio="none" aria-hidden="true">' +
-            fwdStackBars(buckets, segs, { w: 100, h: 40, max, normalize: !!o.normalize, minSeg: 0.8, skip: i => i < blind }) +
+            fwdStackBars(buckets, segs, { w: 100, h: 40, max: scale, normalize: !!o.normalize, minSeg: 0.8, skip: i => i < blind }) +
           '</svg>' +
           '<div class="bc-tip" role="tooltip" hidden></div>' +
         '</div>' +
@@ -6656,7 +6675,7 @@
         '<div class="bc-legend">' + legend + '</div>' +
         '<div class="sr-only" aria-live="polite"></div>' +
       '</div>';
-    host._bc = { o, buckets, n, blind, spanMs, active: -1 };
+    host._bc = { o, buckets, n, blind, showDate, active: -1 };
     fwdBarChartBind(host);
     // A redraw replaces the plot element: hand focus and the open tooltip back.
     if (plotFocused) {
@@ -6672,19 +6691,20 @@
     const c = host._bc, o = c.o, b = c.buckets[i];
     const start = o.startOf(b);
     const end = start + o.bucketMs;
-    const head = fwdFmtTick(start, c.spanMs) + ' – ' + new Date(end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const head = fwdFmtTick(start, c.showDate) + ' – ' + new Date(end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     if (i < c.blind) {
-      return { html: '<strong>' + escapeHtml(head) + '</strong><div>' + escapeHtml(t('chart.noDataTip', fwdFmtTick(o.noDataBefore, c.spanMs))) + '</div>', text: head + '. ' + t('chart.noDataTip', fwdFmtTick(o.noDataBefore, c.spanMs)) };
+      return { html: '<strong>' + escapeHtml(head) + '</strong><div>' + escapeHtml(t('chart.noDataTip', fwdFmtTick(o.noDataBefore, c.showDate))) + '</div>', text: head + '. ' + t('chart.noDataTip', fwdFmtTick(o.noDataBefore, c.showDate)) };
     }
     const vals = o.segments.map(s => ({ s, v: Math.max(0, Number(s.value(b)) || 0) }));
     const total = vals.reduce((a, x) => a + x.v, 0);
     const fmt = o.tipFormat || o.yFormat;
+    const show = x => x.s.format ? x.s.format(x.v, b) : fmt(x.v);
     const lines = vals.map(x => '<div class="bc-tip-row"><i class="bc-swatch ' + x.s.tone + '" aria-hidden="true"></i>' +
-      escapeHtml(x.s.label) + ' <b>' + escapeHtml(fmt(x.v)) + '</b>' +
+      escapeHtml(x.s.label) + ' <b>' + escapeHtml(show(x)) + '</b>' +
       (o.normalize && total ? ' <span class="muted-text">(' + Math.round(x.v * 100 / total) + '%)</span>' : '') + '</div>').join('');
     const extra = o.tipExtra ? o.tipExtra(b) : '';
     const hint = o.onSelect ? '<div class="bc-tip-hint">' + escapeHtml(t('chart.clickHint')) + '</div>' : '';
-    const text = head + '. ' + vals.map(x => x.s.label + ' ' + fmt(x.v)).join(', ');
+    const text = head + '. ' + vals.map(x => x.s.label + ' ' + show(x)).join(', ');
     return { html: '<strong>' + escapeHtml(head) + '</strong>' + lines + extra + hint, text };
   }
 
@@ -6696,6 +6716,9 @@
     const tip = host.querySelector('.bc-tip');
     const hover = host.querySelector('.bc-hover');
     if (!plot || !tip || !hover) return;
+    // Pointer moves inside one bar fire constantly; do not rewrite the tooltip or
+    // re-announce it to a screen reader for the same bar.
+    if (c.active === i && !tip.hidden) return;
     c.active = i;
     const body = fwdBarChartTip(host, i);
     tip.innerHTML = body.html;
@@ -6742,14 +6765,43 @@
       host._bcPointerInside = i >= 0;
       if (i < 0) fwdBarChartHide(host); else fwdBarChartShow(host, i);
     });
-    host.addEventListener('pointerleave', () => { host._bcPointerInside = false; fwdBarChartHide(host); });
-    host.addEventListener('click', e => select(indexAt(e)));
+    // A finger lifting is a pointerleave too; a touch tooltip stays until the next
+    // tap elsewhere (below), a mouse tooltip goes when the mouse does.
+    host.addEventListener('pointerleave', e => {
+      if (e.pointerType !== 'mouse') return;
+      host._bcPointerInside = false;
+      fwdBarChartHide(host);
+    });
+    fwdChartHosts.add(host);
+    if (!fwdChartHosts.dismissBound) {
+      fwdChartHosts.dismissBound = true;
+      document.addEventListener('pointerdown', e => {
+        if (e.target.closest && e.target.closest('.bc-plot')) return;
+        fwdChartHosts.forEach(h => { h._bcPointerInside = false; fwdBarChartHide(h); });
+      });
+    }
+    // Touch has no hover: the first tap on a bar shows its tooltip, a second tap
+    // on the same bar opens it. A mouse click opens at once.
+    host.addEventListener('pointerdown', e => {
+      host._bcTouch = e.pointerType !== 'mouse';
+      if (!host._bcTouch) return;
+      const i = indexAt(e);
+      if (i >= 0) { host._bcPointerInside = true; fwdBarChartShow(host, i); }
+    });
+    host.addEventListener('click', e => {
+      const i = indexAt(e);
+      if (host._bcTouch && host._bcTapped !== i) { host._bcTapped = i; return; }
+      host._bcTapped = -1;
+      select(i);
+    });
     host.addEventListener('focusout', e => {
       if (e.target.closest && e.target.closest('.bc-plot')) fwdBarChartHide(host);
     });
     host.addEventListener('keydown', e => {
       const c = host._bc;
       if (!c || !e.target.closest || !e.target.closest('.bc-plot')) return;
+      // Alt/Cmd+Arrow is the browser's history navigation, not ours.
+      if (e.altKey || e.ctrlKey || e.metaKey) return;
       let i = c.active < 0 ? c.n - 1 : c.active;
       if (e.key === 'ArrowLeft') i = Math.max(0, i - 1);
       else if (e.key === 'ArrowRight') i = Math.min(c.n - 1, i + 1);
@@ -6768,13 +6820,17 @@
   }
 
   // Segment sets shared by the request-count charts.
+  function fwdBucketSuccess(b) {
+    return b.success != null ? b.success : Math.max(0, (b.requests || 0) - (b.failed || 0));
+  }
+
   function fwdRequestSegments() {
     return [
-      fwdSeg('ok', t('chart.segOk'), 'bc-ok', b => b.success != null ? b.success : (b.requests || 0) - (b.failed || 0)),
+      fwdSeg('ok', t('chart.segOk'), 'bc-ok', fwdBucketSuccess),
       fwdSeg('failed', t('chart.segFailed'), 'bc-fail', b => b.failed || 0),
       // Canceled requests count in neither success nor failed; named so the
       // columns still add up to the request total.
-      fwdSeg('canceled', t('chart.segCanceled'), 'bc-cancel', b => Math.max(0, (b.requests || 0) - (b.success || 0) - (b.failed || 0)))
+      fwdSeg('canceled', t('chart.segCanceled'), 'bc-cancel', b => Math.max(0, (b.requests || 0) - fwdBucketSuccess(b) - (b.failed || 0)))
     ];
   }
 
@@ -7921,7 +7977,9 @@
     }
     if (statsTrendMetric === 'latency') {
       return {
-        segments: [fwdSeg('lat', t('chart.segLatency'), 'bc-lat', b => (b.requests ? b.avgLatencyMs : 0) || 0)],
+        // An average over zero requests is undefined, not 0 ms.
+        segments: [fwdSeg('lat', t('chart.segLatency'), 'bc-lat', b => (b.requests ? b.avgLatencyMs : 0) || 0,
+          (v, b) => b.requests ? fwdFmtLatency(v) : t('chart.noRequests'))],
         yFormat: fwdFmtLatency,
         unitLabel: t(perUnit ? 'chart.unitLatencyMin' : 'chart.unitLatencyHour')
       };
@@ -7959,6 +8017,12 @@
     const failed = series.reduce((n, b) => n + (b.failed || 0), 0);
     const tokens = series.reduce((n, b) => n + (b.inputTokens || 0) + (b.outputTokens || 0), 0);
     const cfg = statsTrendConfig(unit);
+    const weighted = series.reduce((n, b) => n + (b.avgLatencyMs || 0) * (b.requests || 0), 0);
+    const ariaSummary = statsTrendMetric === 'tokens'
+      ? t('chart.summaryTokens', formatNum(tokens))
+      : statsTrendMetric === 'latency'
+        ? t('chart.summaryLatency', total ? fwdFmtLatency(Math.round(weighted / total)) : '—')
+        : t('chart.summaryRequests', formatNum(total), formatNum(failed));
     fwdBarChart(host, {
       buckets: series,
       startOf: b => b.minute * (isMinute ? 60000 : 3600000),
@@ -7969,8 +8033,9 @@
       tipExtra: cfg.tipExtra,
       // Only the per-minute series is memory-only; hourly rollups are persisted.
       noDataBefore: isMinute ? minuteSinceMs : 0,
+      empty: !total,
       emptyText: t('forward.noData'),
-      summary: t('chart.summaryRequests', formatNum(total), formatNum(failed))
+      summary: ariaSummary
     });
 
     const summary = $('statsTrendSummary');
@@ -8193,7 +8258,7 @@
         byKey.set(key, t);
       }
       t.requests += b.requests || 0;
-      t.success += b.success || 0;
+      t.success += fwdBucketSuccess(b);
       t.failed += b.failed || 0;
       t.inputTokens += b.inputTokens || 0;
       t.outputTokens += b.outputTokens || 0;
@@ -8206,6 +8271,8 @@
       .map(b => Object.assign(b, { avgLatencyMs: b.requests ? Math.round(b.latencySum / b.requests) : 0 }))
       .sort((a, b) => a.minute - b.minute);
   }
+  // statsRangeParams renders the active Stats-tab range as query params: the
+  // custom window's from/to when one is applied, otherwise the preset's hours.
   function statsRangeParams() {
     if (statsCustomRange) {
       return { from: String(statsCustomRange.from), to: String(statsCustomRange.to) };
@@ -8213,6 +8280,10 @@
     return { hours: String(statsHistoryHours) };
   }
 
+  // loadStatsWindow refetches the per-provider figures scoped to the selected
+  // range and re-renders the two surfaces that read them. On failure the window
+  // copy is dropped so the tab falls back to all-time rather than freezing on a
+  // stale range.
   let statsWindowSeq = 0;
 
   async function loadStatsWindow() {
@@ -8465,6 +8536,11 @@
       });
     }
 
+    // A browser can restore radio state on reload; start from what is checked.
+    const checkedMetric = document.querySelector('input[name="statsTrendMetric"]:checked');
+    if (checkedMetric) statsTrendMetric = checkedMetric.value;
+    const checkedView = document.querySelector('input[name="cacheView"]:checked');
+    if (checkedView) cacheView = checkedView.value;
     qsa('input[name="cacheView"]').forEach(r => r.addEventListener('change', () => {
       cacheView = r.value;
       renderCacheAnalytics();

@@ -5215,6 +5215,8 @@ body.modal-open .scroll-nav {
 }
 .bc-plot {
   position: relative;
+  /* Horizontal drags move the tooltip; vertical drags still scroll the page. */
+  touch-action: pan-y;
   height: 6rem;
   border-left: 1px solid var(--border);
 }
