@@ -186,10 +186,11 @@
     // box's language while the badges, tooltips and match count beside it kept the
     // old one. Guarded, so this is a no-op when the editor is closed.
     if (isDialogOpen('modelRouteModal') && routeTargetDraft.length) renderRouteTargets();
-    Object.keys(openProviderDetails).forEach(pid => {
-      if (!providerDetailCache[pid]) return;
-      qsa('[data-provider-detail="' + cssEscape(pid) + '"]').forEach(el => {
-        el.innerHTML = renderProviderDetailHTML(providerDetailCache[pid]);
+    Object.keys(openProviderDetails).forEach(key => {
+      if (!providerDetailCache[key]) return;
+      const k = pdSplitKey(key);
+      pdHosts(k.surface, k.id).forEach(el => {
+        el.innerHTML = renderProviderDetailHTML(providerDetailCache[key]);
       });
     });
   }
@@ -6506,7 +6507,7 @@
       renderForwardChart(d.timeseries || [], d.percentiles || {});
       populateForwardProviderFilter();
       renderProviderInlineStats();
-      refreshOpenProviderDetails();
+      refreshOpenProviderDetails('fwd');
     } catch (e) {
       // Non-fatal: dashboard just shows zeros.
     }
@@ -6584,11 +6585,33 @@
   }
 
   // ===== Per-provider detail panel =====
-  // Shared by the expandable cards on the Forwarding tab and the drill-down on
-  // the Stats tab, so both surfaces always show the same figures.
+  // One panel renderer serves two surfaces with different scopes: the card on
+  // the Forwarding tab (all-time) and the row drill-down on the Stats tab (the
+  // selected range). State is keyed by "surface:providerId", so loading,
+  // caching and re-rendering one surface can never overwrite the other. A single
+  // slot per provider once let a live-event refresh drop all-time figures into
+  // the panel under a "Last hour" row.
 
-  const providerDetailCache = {}; // providerId -> last loaded detail payload
-  const openProviderDetails = {}; // providerId -> true while expanded
+  const PD_ROOT = { fwd: '#upstreamsList', stats: '#statsTableBody' };
+  const providerDetailCache = {}; // "surface:id" -> last loaded detail payload
+  const openProviderDetails = {}; // "surface:id" -> true while expanded
+  const providerDetailSeq = {};   // "surface:id" -> number of the newest request
+
+  function pdKey(surface, id) { return surface + ':' + id; }
+  function pdSplitKey(key) {
+    const i = key.indexOf(':');
+    return { surface: key.slice(0, i), id: key.slice(i + 1) };
+  }
+  function pdSurfaceOfScope(scope) { return scope && scope.id === 'statsTableBody' ? 'stats' : 'fwd'; }
+  function pdHosts(surface, id) {
+    return qsa(PD_ROOT[surface] + ' [data-provider-detail="' + cssEscape(id) + '"]');
+  }
+  function pdOpenIds(surface) {
+    return Object.keys(openProviderDetails).map(pdSplitKey).filter(k => k.surface === surface).map(k => k.id);
+  }
+  // pdWindow is the headline-number scope of a surface: null is all-time.
+  function pdWindow(surface) { return surface === 'stats' ? statsDetailWindowParams() : null; }
+  function pdScopeKey(win) { return win ? JSON.stringify(win) : 'all'; }
 
   function fwdFmtRate(n) {
     if (!n) return '0';
@@ -6925,19 +6948,16 @@
     return html;
   }
 
-  // loadProviderDetail fetches and renders one provider's panel into every host
-  // element currently showing it (a card on Forwarding, a row on Stats).
-  //
-  // hours controls the headline-number scope: pass statsHistoryHours from the
-  // Stats tab so the detail panel shows the same range as its row; pass 0 (or
-  // omit) for the Forwarding tab, where there is no range selector and KPI
-  // cards are intentionally all-time.
-  // loadProviderDetail fetches one provider's drill-down. win scopes the
-  // headline numbers: null for all-time, {hours} for a preset window, or
-  // {from,to} (Unix ms) for the Stats tab's custom range.
-  async function loadProviderDetail(providerId, win) {
-    const hosts = qsa('[data-provider-detail="' + cssEscape(providerId) + '"]');
-    if (!hosts.length) return;
+  // loadProviderDetail fetches one provider's drill-down for one surface and
+  // renders it into that surface's host. The surface decides the scope of the
+  // headline numbers (see pdWindow): all-time for the Forwarding card, the
+  // selected preset or custom range for the Stats row.
+  async function loadProviderDetail(providerId, surface) {
+    if (!pdHosts(surface, providerId).length) return;
+    const key = pdKey(surface, providerId);
+    const seq = (providerDetailSeq[key] || 0) + 1;
+    providerDetailSeq[key] = seq;
+    const win = pdWindow(surface);
     try {
       let url = '/provider-stats?id=' + encodeURIComponent(providerId);
       if (win && win.hours && win.hours > 0) url += '&hours=' + encodeURIComponent(win.hours);
@@ -6945,12 +6965,19 @@
       const res = await api(url);
       if (!res.ok) throw new Error('http ' + res.status);
       const payload = await res.json();
+      // A newer request (range changed, another refresh) owns the panel now; an
+      // older answer arriving late must not put its scope back on screen.
+      if (providerDetailSeq[key] !== seq) return;
       payload.providerId = providerId;
-      providerDetailCache[providerId] = payload;
+      payload.scopeKey = pdScopeKey(win);
+      providerDetailCache[key] = payload;
       const html = renderProviderDetailHTML(payload);
-      hosts.forEach(el => { el.innerHTML = html; });
+      // Hosts are resolved after the await: a table re-render during the fetch
+      // replaces them, and writing to the detached copies would be lost.
+      pdHosts(surface, providerId).forEach(el => { el.innerHTML = html; });
     } catch (e) {
-      hosts.forEach(el => {
+      if (providerDetailSeq[key] !== seq) return;
+      pdHosts(surface, providerId).forEach(el => {
         el.innerHTML = '<div class="muted-text text-xs" style="padding:0.75rem 0;">' +
           escapeHtml(t('stats.loadFailed')) + '</div>';
       });
@@ -6977,49 +7004,48 @@
   // scope matters: the same providerId has a detail host on BOTH the Forwarding
   // tab and the Stats table, so the host must be resolved within the container
   // the click came from. Resolving globally would toggle whichever surface
-  // happens to appear first in the document.
+  // happens to appear first in the document. The container also names the
+  // surface, and with it the scope of the numbers the panel loads.
   function toggleProviderDetail(providerId, btn, scope) {
     const sel = '[data-provider-detail="' + cssEscape(providerId) + '"]';
     const root = scope || document;
     const host = root.querySelector(sel);
     if (!host) return;
+    const surface = pdSurfaceOfScope(scope);
+    const key = pdKey(surface, providerId);
     const open = !host.classList.contains('hidden');
     if (open) {
       host.classList.add('hidden');
-      delete openProviderDetails[providerId];
+      delete openProviderDetails[key];
       if (btn) btn.setAttribute('aria-expanded', 'false');
       return;
     }
     host.classList.remove('hidden');
-    openProviderDetails[providerId] = true;
+    openProviderDetails[key] = true;
     if (btn) btn.setAttribute('aria-expanded', 'true');
     if (!host.innerHTML) {
       host.innerHTML = '<div class="muted-text text-xs" style="padding:0.75rem 0;">' +
         escapeHtml(t('stats.loading')) + '</div>';
     }
-    // Determine the range: panels opened from inside the Stats table carry the
-    // current window; panels on the Forwarding tab have no range selector and
-    // should always show all-time so the KPI cards there stay consistent.
-    const inStats = scope && scope.id === 'statsTableBody';
-    loadProviderDetail(providerId, inStats ? statsDetailWindowParams() : null);
+    loadProviderDetail(providerId, surface);
   }
 
-  // refreshOpenProviderDetails re-fetches every expanded panel, so an open panel
-  // tracks live traffic instead of freezing at its opening snapshot.
-  function refreshOpenProviderDetails() {
-    Object.keys(openProviderDetails).forEach(id => {
-      const host = document.querySelector('[data-provider-detail="' + cssEscape(id) + '"]');
-      if (!host) return;
-      // Re-use the same scope heuristic as toggleProviderDetail: if the host
-      // lives inside statsTableBody the panel respects the range selector.
-      const inStats = !!host.closest('#statsTableBody');
-      loadProviderDetail(id, inStats ? statsDetailWindowParams() : null);
+  // refreshOpenProviderDetails re-fetches the expanded panels of one surface, so
+  // an open panel tracks live traffic instead of freezing at its opening
+  // snapshot. Each surface is refreshed by the loader that owns its scope:
+  // loadForwardStats for the Forwarding cards, loadStatsWindow for the Stats rows.
+  // A hidden host means closed: the Forwarding cards are rebuilt on config
+  // changes without re-opening.
+  function refreshOpenProviderDetails(surface) {
+    pdOpenIds(surface).forEach(id => {
+      if (pdHosts(surface, id).some(h => !h.classList.contains('hidden'))) loadProviderDetail(id, surface);
     });
   }
 
   // resetProviderStats clears one provider's counters after confirmation.
   async function resetProviderStats(providerId) {
-    const label = (providerDetailCache[providerId] && providerDetailCache[providerId].name) || providerId;
+    const cached = providerDetailCache[pdKey('stats', providerId)] || providerDetailCache[pdKey('fwd', providerId)];
+    const label = (cached && cached.name) || providerId;
     if (!confirm(t('stats.confirmResetProvider', label))) return;
     try {
       const res = await api('/forward-stats/reset-provider', {
@@ -7028,11 +7054,10 @@
       });
       if (!res.ok) throw new Error('http ' + res.status);
       toast(t('stats.resetProviderDone'), 'success');
+      // Both loaders refresh the open panels of their own surface, so the fresh
+      // zeros arrive with the scope each panel is meant to show.
       loadForwardStats();
       loadStatsWindow();
-      // After a reset the panel is always re-opened from Stats context, so
-      // pass the current range so the fresh zeros match the windowed row.
-      loadProviderDetail(providerId, statsDetailWindowParams());
     } catch (e) {
       toastError(t('stats.resetProviderFailed'));
     }
@@ -7467,13 +7492,17 @@
       th.setAttribute('aria-sort', active ? (statsSortDesc ? 'descending' : 'ascending') : 'none');
     });
 
-    // Re-expand whatever was open before the re-render.
-    Object.keys(openProviderDetails).forEach(pid => {
+    // Re-expand whatever was open before the re-render. A cached panel from a
+    // different range is not shown under the new rows; it waits for the refresh.
+    const scopeKey = pdScopeKey(pdWindow('stats'));
+    pdOpenIds('stats').forEach(pid => {
       const host = document.querySelector('#statsTableBody [data-provider-detail="' + cssEscape(pid) + '"]');
-      if (host) {
-        host.classList.remove('hidden');
-        if (providerDetailCache[pid]) host.innerHTML = renderProviderDetailHTML(providerDetailCache[pid]);
-      }
+      if (!host) return;
+      host.classList.remove('hidden');
+      const cached = providerDetailCache[pdKey('stats', pid)];
+      host.innerHTML = cached && cached.scopeKey === scopeKey
+        ? renderProviderDetailHTML(cached)
+        : '<div class="muted-text text-xs" style="padding:0.75rem 0;">' + escapeHtml(t('stats.loading')) + '</div>';
     });
   }
 
@@ -7612,6 +7641,7 @@
     }
     renderStatsTable();
     renderStatsCompare();
+    refreshOpenProviderDetails('stats');
   }
 
   // loadTopIps fetches the per-source-IP leaderboard for the selected range and
