@@ -37,6 +37,8 @@ func getJSON(t *testing.T, h *Handler, target string) map[string]interface{} {
 		h.apiGetProviderDetail(rec, r)
 	case strings.HasPrefix(target, "/admin/api/forward-history"):
 		h.apiGetForwardHistory(rec, r)
+	case strings.HasPrefix(target, "/admin/api/forward-cache-series"):
+		h.apiGetForwardCacheSeries(rec, r)
 	case strings.HasPrefix(target, "/admin/api/forward-stats"):
 		h.apiGetForwardStats(rec, r)
 	default:
@@ -606,5 +608,75 @@ func TestForwardHistoryReportsMemorySince(t *testing.T) {
 		if !ok || int64(got) != since {
 			t.Fatalf("%s: memorySinceMs = %v, want %d", target, out["memorySinceMs"], since)
 		}
+	}
+}
+
+func cacheUsageEvent(provider string, at int64, input, read, write int64) metrics.Event {
+	return metrics.Event{
+		TimeMs: at, ProviderID: provider, ProviderName: "p", ClientModel: "m", Ok: true, Status: 200,
+		Usage: &metrics.EventUsage{InputTokens: &input, CacheReadInputTokens: &read, CacheCreationInputTokens: &write, Source: metrics.UsageSourceUpstream},
+	}
+}
+
+func TestForwardCacheSeriesEndpoint(t *testing.T) {
+	metrics.Reset()
+	initStatsConfig(t)
+	now := time.Now().UnixMilli()
+	metrics.Record(cacheUsageEvent("up-1", now-5*60*1000, 306702, 303300, 3400))
+	metrics.Record(cacheUsageEvent("up-1", now-2*60*1000, 150000, 0, 120000))
+	// Pool traffic and an event outside the window must not appear.
+	metrics.Record(cacheUsageEvent(metrics.KiroPoolID, now-60*1000, 1000, 900, 50))
+	metrics.Record(cacheUsageEvent("up-1", now-3*60*60*1000, 1000, 900, 50))
+
+	out := getJSON(t, &Handler{}, "/admin/api/forward-cache-series?hours=1")
+	totals := out["totals"].(map[string]interface{})
+	if out["eligible"].(float64) != 2 || totals["write"].(float64) != 123400 || totals["read"].(float64) != 303300 {
+		t.Fatalf("totals wrong: %+v (eligible %v)", totals, out["eligible"])
+	}
+	if out["excluded"].(map[string]interface{})["pool"].(float64) != 1 {
+		t.Fatalf("pool exclusion not reported: %+v", out["excluded"])
+	}
+	if out["bucketMs"].(float64) != 60000 || out["bigWriteMin"].(float64) != float64(metrics.DefaultBigWriteTokens) {
+		t.Fatalf("bucket/threshold: %v %v", out["bucketMs"], out["bigWriteMin"])
+	}
+	if totals["bigWrites"].(float64) != 1 {
+		t.Fatalf("bigWrites = %v, want 1 (120000 >= 100000)", totals["bigWrites"])
+	}
+	tops := out["topWrites"].([]interface{})
+	if len(tops) != 2 || tops[0].(map[string]interface{})["write"].(float64) != 120000 {
+		t.Fatalf("topWrites: %+v", tops)
+	}
+	ret := out["retention"].(map[string]interface{})
+	if ret["eventLogSinceMs"].(float64) <= 0 || out["coverageFrom"].(float64) != ret["eventLogSinceMs"].(float64) {
+		t.Fatalf("coverage and retention disagree: %v vs %v", out["coverageFrom"], ret["eventLogSinceMs"])
+	}
+
+	// Provider filter and the larger window.
+	if got := getJSON(t, &Handler{}, "/admin/api/forward-cache-series?hours=6&provider=up-1")["eligible"].(float64); got != 3 {
+		t.Fatalf("6h up-1 eligible = %v, want 3", got)
+	}
+	// A custom window uses from/to; a malformed one is a 400, not a silent default.
+	rec := httptest.NewRecorder()
+	(&Handler{}).apiGetForwardCacheSeries(rec, httptest.NewRequest(http.MethodGet, "/admin/api/forward-cache-series?from=abc", nil))
+	if rec.Code != 400 {
+		t.Fatalf("bad from -> %d, want 400", rec.Code)
+	}
+}
+
+func TestForwardEventsMinCacheWriteFilter(t *testing.T) {
+	metrics.Reset()
+	initStatsConfig(t)
+	now := time.Now().UnixMilli()
+	metrics.Record(cacheUsageEvent("up-1", now-3000, 1000, 0, 5000))
+	metrics.Record(cacheUsageEvent("up-1", now-2000, 1000, 0, 50))
+	metrics.Record(metrics.Event{TimeMs: now - 1000, ProviderID: "up-1", Ok: true, Status: 200})
+
+	rec := httptest.NewRecorder()
+	(&Handler{}).apiGetForwardEvents(rec, httptest.NewRequest(http.MethodGet, "/admin/api/forward-events?minCacheWrite=1000", nil))
+	var out struct {
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || out.Total != 1 {
+		t.Fatalf("minCacheWrite=1000: total %d err %v body %s", out.Total, err, rec.Body.String())
 	}
 }

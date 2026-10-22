@@ -1899,8 +1899,12 @@ type EventFilter struct {
 	Model      string
 	SinceMs    int64
 	UntilMs    int64
-	Offset     int
-	Limit      int
+	// MinCacheWrite keeps only events whose upstream reported a cache write of at
+	// least this many tokens (0 = no filter). Events with no usage, or no
+	// reported cache write, never match.
+	MinCacheWrite int64
+	Offset        int
+	Limit         int
 }
 
 func (f EventFilter) matches(e Event, model string) bool {
@@ -1934,6 +1938,12 @@ func (f EventFilter) matches(e Event, model string) bool {
 	}
 	if f.UntilMs != 0 && e.TimeMs > f.UntilMs {
 		return false
+	}
+	if f.MinCacheWrite > 0 {
+		u := e.Usage
+		if u == nil || u.CacheCreationInputTokens == nil || *u.CacheCreationInputTokens < f.MinCacheWrite {
+			return false
+		}
 	}
 	if model != "" &&
 		!strings.Contains(strings.ToLower(e.ClientModel), model) &&
@@ -2078,6 +2088,11 @@ type RetentionStat struct {
 	// collecting (process start or last reset). Minutes before it have no data,
 	// as opposed to zero requests.
 	MemorySinceMs int64 `json:"memorySinceMs"`
+	// EventLogSinceMs is the earliest moment the event log can answer for: the
+	// oldest retained event once the ring has wrapped (older ones were
+	// overwritten), otherwise when collection began — a quiet start is covered,
+	// it just had no events.
+	EventLogSinceMs int64 `json:"eventLogSinceMs"`
 }
 
 // MemorySince is when the memory-only views began collecting. It is the cheap
@@ -2097,19 +2112,17 @@ func Retention() RetentionStat {
 	if s.full {
 		size = EventRingCapacity
 	}
-	var oldest int64
-	for i := 0; i < size; i++ {
-		// Callers may stamp TimeMs themselves, so ring order is not a promise of
-		// time order; scan for the true minimum (bounded by the ring capacity).
-		if t := s.ring[i].TimeMs; oldest == 0 || t < oldest {
-			oldest = t
-		}
+	oldest := ringOldestLocked()
+	logSince := s.sinceMs
+	if s.full {
+		logSince = oldest
 	}
 	return RetentionStat{
 		EventRingCapacity: EventRingCapacity,
 		EventRingSize:     size,
 		EventRingOldestMs: oldest,
 		MemorySinceMs:     s.sinceMs,
+		EventLogSinceMs:   logSince,
 	}
 }
 

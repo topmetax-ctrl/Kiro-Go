@@ -3526,6 +3526,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetProviderDetail(w, r)
 	case path == "/forward-history" && r.Method == "GET":
 		h.apiGetForwardHistory(w, r)
+	case path == "/forward-cache-series" && r.Method == "GET":
+		h.apiGetForwardCacheSeries(w, r)
 	case path == "/forward-events/export" && r.Method == "GET":
 		h.apiExportForwardEvents(w, r)
 	case path == "/forward-stats/reset-provider" && r.Method == "POST":
@@ -6549,6 +6551,38 @@ func (h *Handler) apiGetForwardHistory(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// apiGetForwardCacheSeries returns the cache accounting of forwarded requests
+// over time: read, write by TTL tier and uncached input per bucket, the largest
+// writes, and what the figures leave out (pool, estimated, not reported).
+//
+// A window is `hours` (default 24) or a `from`/`to` pair, like the other stats
+// endpoints. `provider` narrows it to one provider and `bigWrite` sets the size
+// of a "large write" in tokens. The data comes from the in-memory event log, so
+// it only covers retention.coverage: a restart empties it.
+func (h *Handler) apiGetForwardCacheSeries(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	hours := 24
+	if n, err := strconv.Atoi(strings.TrimSpace(q.Get("hours"))); err == nil && n > 0 {
+		hours = n
+	}
+	fromMs, toMs, hasWindow, err := windowQuery(r)
+	if err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if !hasWindow {
+		toMs = time.Now().UnixMilli()
+		fromMs = toMs - int64(hours)*time.Hour.Milliseconds()
+	}
+	bigWrite, _ := strconv.ParseInt(strings.TrimSpace(q.Get("bigWrite")), 10, 64)
+	res := metrics.CacheSeries(fromMs, toMs, strings.TrimSpace(q.Get("provider")), bigWrite)
+	json.NewEncoder(w).Encode(struct {
+		metrics.CacheSeriesResult
+		Retention metrics.RetentionStat `json:"retention"`
+	}{res, metrics.Retention()})
+}
+
 // apiResetProviderStats clears the counters and history for a single provider,
 // leaving every other provider untouched, then persists the new state.
 func (h *Handler) apiResetProviderStats(w http.ResponseWriter, r *http.Request) {
@@ -6653,8 +6687,11 @@ func eventFilterFromQuery(q url.Values, offset, limit int) metrics.EventFilter {
 		Model:      strings.TrimSpace(q.Get("model")),
 		SinceMs:    atoi64(q.Get("since")),
 		UntilMs:    atoi64(q.Get("until")),
-		Offset:     offset,
-		Limit:      limit,
+		// minCacheWrite narrows the log to requests that wrote at least this many
+		// tokens to the upstream cache; the cache analytics drill-down uses it.
+		MinCacheWrite: atoi64(q.Get("minCacheWrite")),
+		Offset:        offset,
+		Limit:         limit,
 	}
 }
 

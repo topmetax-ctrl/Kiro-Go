@@ -1280,6 +1280,11 @@ func TestRetentionReportsRingCoverage(t *testing.T) {
 	if r.EventRingSize != 2 || r.EventRingOldestMs != 2_000 {
 		t.Fatalf("two events: %+v", r)
 	}
+	// Until the ring wraps nothing has been dropped, so the log is complete from
+	// when collection began, not from the first event: a quiet start is covered.
+	if r.EventLogSinceMs != r.MemorySinceMs {
+		t.Fatalf("eventLogSince = %d, want memorySince %d while the ring has room", r.EventLogSinceMs, r.MemorySinceMs)
+	}
 }
 
 func TestRetentionWrappedRingAndReset(t *testing.T) {
@@ -1296,6 +1301,10 @@ func TestRetentionWrappedRingAndReset(t *testing.T) {
 	// The 10 oldest were overwritten, so the oldest survivor is event #10.
 	if r.EventRingOldestMs != 1_010 {
 		t.Fatalf("oldest = %d, want 1010", r.EventRingOldestMs)
+	}
+	// Once wrapped, history before the oldest survivor is gone.
+	if r.EventLogSinceMs != 1_010 {
+		t.Fatalf("eventLogSince = %d, want 1010 after wrap", r.EventLogSinceMs)
 	}
 
 	before := r.MemorySinceMs
