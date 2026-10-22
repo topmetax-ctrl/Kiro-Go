@@ -6572,7 +6572,7 @@ func (h *Handler) apiResetProviderStats(w http.ResponseWriter, r *http.Request) 
 // offline analysis. It accepts the same filters as apiGetForwardEvents but
 // ignores pagination, exporting every match up to exportEventsMax.
 func (h *Handler) apiExportForwardEvents(w http.ResponseWriter, r *http.Request) {
-	const exportEventsMax = 5000
+	exportEventsMax := metrics.EventRingCapacity
 
 	q := r.URL.Query()
 	items, total := metrics.Events(eventFilterFromQuery(q, 0, exportEventsMax))

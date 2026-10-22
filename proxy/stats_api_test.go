@@ -540,3 +540,27 @@ func TestForwardHistoryFromToScopesAndNamesUnit(t *testing.T) {
 		t.Fatalf("24h window buckets = %v requests, want 2", got)
 	}
 }
+
+// An export that stopped short of the ring would silently lose the oldest events
+// of a long measurement window.
+func TestExportForwardEventsCoversTheWholeRing(t *testing.T) {
+	metrics.Reset()
+	defer metrics.Reset()
+	initStatsConfig(t)
+	n := 5200 // more than the ring held before it was enlarged
+	for i := 1; i <= n; i++ {
+		metrics.Record(metrics.Event{TimeMs: int64(i), ProviderID: "up-1", Ok: true, Status: 200})
+	}
+	rec := httptest.NewRecorder()
+	(&Handler{}).apiExportForwardEvents(rec, httptest.NewRequest(http.MethodGet, "/admin/api/forward-events/export?format=json", nil))
+	var out struct {
+		Total    int `json:"total"`
+		Exported int `json:"exported"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Total != n || out.Exported != n {
+		t.Fatalf("total/exported = %d/%d, want %d/%d", out.Total, out.Exported, n, n)
+	}
+}

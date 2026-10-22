@@ -23,12 +23,16 @@ import (
 )
 
 const (
-	eventRingCapacity = 5000 // recent events retained for the log view
-	bucketWindowMins  = 120  // per-minute time-series buckets kept (rolling)
-	hourWindowHours   = 720  // per-provider hourly rollups kept (30 days)
-	subscriberBuffer  = 256  // per-subscriber channel depth before dropping
-	recentErrorsKept  = 10   // most recent error samples retained per provider
-	topStatusCodes    = 12   // distinct status codes retained per provider
+	// EventRingCapacity is how many recent events the log view and its export
+	// retain. At about 1.7 KB an event (a cache trace included) the ring costs
+	// roughly 20 MB when full; the size holds about two days of the traffic this
+	// gateway has seen, so a one-day measurement window is never overwritten.
+	EventRingCapacity = 12000
+	bucketWindowMins  = 120 // per-minute time-series buckets kept (rolling)
+	hourWindowHours   = 720 // per-provider hourly rollups kept (30 days)
+	subscriberBuffer  = 256 // per-subscriber channel depth before dropping
+	recentErrorsKept  = 10  // most recent error samples retained per provider
+	topStatusCodes    = 12  // distinct status codes retained per provider
 
 	// KiroPoolID is the synthetic provider id under which Kiro account-pool
 	// traffic is recorded, so the pool appears alongside forwarding providers.
@@ -213,13 +217,19 @@ type CacheTrace struct {
 	// Msgs is the number of messages in the request.
 	Msgs int `json:"msgs,omitempty"`
 	// Prefix lists "k:digest" checkpoints, where the digest covers tools, system
-	// and the first k messages. The last few messages are always listed, plus a
-	// sparse stride over the rest, so two requests of a conversation can be
-	// compared down to a window of messages where their histories diverge.
+	// and the first k messages and ignores cache markers. The last few messages
+	// are always listed, plus a sparse stride over the rest, so two requests of a
+	// conversation can be compared down to a window of messages where their
+	// histories diverge. The boundary after every message that carries a
+	// breakpoint is always listed too: that digest is the content the breakpoint
+	// asks the upstream to cache.
 	Prefix []string `json:"prefix,omitempty"`
-	// Marks lists the cache breakpoints the body carried: "t<i>" for a tool,
-	// "s<i>" for a system block, "m<i>" for a message, each suffixed ":<ttl>"
-	// when the body names one. Only top-level blocks are listed.
+	// Marks is the breakpoint signature, kept apart from the content digests:
+	// "t<i>" for a tool, "s<i>" for a system block, "m<i>" for a message,
+	// suffixed ":<ttl>" and "@<scope>" when the body names them. Only top-level
+	// blocks are listed. Equal content digests do not mean equal cache entries:
+	// the upstream also keys on where the breakpoint sits, so compare marks as
+	// well. A ttl or scope that is not a short plain token is recorded as "?".
 	Marks []string `json:"marks,omitempty"`
 	// Policy labels the Token Optimization settings in force, since they change
 	// what the prompt contains.
@@ -598,7 +608,7 @@ var s = newStore()
 
 func newStore() *store {
 	return &store{
-		ring:        make([]Event, eventRingCapacity),
+		ring:        make([]Event, EventRingCapacity),
 		byProvider:  make(map[string]*providerAgg),
 		byRoute:     make(map[string]*routeAgg),
 		byIP:        make(map[string]*ipAgg),
@@ -659,7 +669,7 @@ func Record(ev Event) {
 	s.mu.Lock()
 
 	s.ring[s.next] = ev
-	s.next = (s.next + 1) % eventRingCapacity
+	s.next = (s.next + 1) % EventRingCapacity
 	if s.next == 0 {
 		s.full = true
 	}
@@ -1965,7 +1975,7 @@ func (s *store) snapshotEventsLocked() []Event {
 		out = make([]Event, s.next)
 		copy(out, s.ring[:s.next])
 	} else {
-		out = make([]Event, 0, eventRingCapacity)
+		out = make([]Event, 0, EventRingCapacity)
 		out = append(out, s.ring[s.next:]...)
 		out = append(out, s.ring[:s.next]...)
 	}
@@ -2076,7 +2086,7 @@ func Reset() {
 		names[id] = p.name
 	}
 
-	s.ring = make([]Event, eventRingCapacity)
+	s.ring = make([]Event, EventRingCapacity)
 	s.next = 0
 	s.full = false
 	s.overall = counter{}
@@ -2131,7 +2141,7 @@ func ResetProvider(id string) bool {
 	// Rebuild the ring and the per-minute series without this provider's events.
 	// Both are recent-window views, so reconstructing them from the ring is exact.
 	kept := s.snapshotEventsLocked()
-	s.ring = make([]Event, eventRingCapacity)
+	s.ring = make([]Event, EventRingCapacity)
 	s.next = 0
 	s.full = false
 	s.buckets = make(map[int64]*Bucket)
@@ -2141,7 +2151,7 @@ func ResetProvider(id string) bool {
 			continue
 		}
 		s.ring[s.next] = e
-		s.next = (s.next + 1) % eventRingCapacity
+		s.next = (s.next + 1) % EventRingCapacity
 		if s.next == 0 {
 			s.full = true
 		}

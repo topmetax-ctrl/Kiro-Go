@@ -78,3 +78,21 @@ func TestRecordedTraceDoesNotAffectCounters(t *testing.T) {
 		t.Fatalf("traced events = %d, want 1", traced)
 	}
 }
+
+// The cache-miss analysis reads the ring a day after the fact, so it has to keep
+// the newest EventRingCapacity events and drop only older ones.
+func TestRingKeepsTheNewestCapacityEvents(t *testing.T) {
+	Reset()
+	defer Reset()
+	extra := 25
+	for i := 1; i <= EventRingCapacity+extra; i++ {
+		Record(Event{TimeMs: int64(i), ClientModel: "m", ProviderID: "p", Status: 200, Ok: true})
+	}
+	got, total := Events(EventFilter{})
+	if total != EventRingCapacity || len(got) != EventRingCapacity {
+		t.Fatalf("kept %d/%d events, want %d", len(got), total, EventRingCapacity)
+	}
+	if got[0].TimeMs != int64(EventRingCapacity+extra) || got[len(got)-1].TimeMs != int64(extra+1) {
+		t.Fatalf("newest/oldest = %d/%d, want %d/%d", got[0].TimeMs, got[len(got)-1].TimeMs, EventRingCapacity+extra, extra+1)
+	}
+}

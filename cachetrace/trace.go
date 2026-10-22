@@ -27,10 +27,10 @@ import (
 )
 
 const (
-	// digestBytes is the digest length kept: 48 bits. Enough to tell apart the
-	// few thousand requests an event ring holds, too short to confirm a guess
-	// at the content.
-	digestBytes = 6
+	// digestBytes is the digest length kept: 96 bits. A false match between two
+	// requests is out of reach at any ring size, and the key makes a digest
+	// useless for confirming a guess at the content.
+	digestBytes = 12
 
 	// tailCheckpoints is how many of the newest message boundaries are always
 	// listed. The next request of a conversation normally extends this one by
@@ -46,6 +46,9 @@ const (
 
 	// maxMarks bounds the breakpoint list. The API allows four per request.
 	maxMarks = 16
+
+	// maxLabel bounds a ttl or scope value copied from the body into a mark.
+	maxLabel = 16
 )
 
 // domain separates this key from every other use of the secret it derives from.
@@ -110,7 +113,12 @@ func (t *Tracer) Trace(body []byte, policy string) *metrics.CacheTrace {
 	chain := hmac.New(sha256.New, t.key)
 	chain.Write(toolsSum)
 	chain.Write(systemSum)
+	var marked []int
+	tr.Marks, marked = marks(req.Tools, req.System, req.Messages)
 	want := checkpoints(len(req.Messages))
+	for _, k := range marked {
+		want[k] = true
+	}
 	for i, m := range req.Messages {
 		sum := t.sum(stripMarks(m))
 		if i == 0 {
@@ -121,7 +129,6 @@ func (t *Tracer) Trace(body []byte, policy string) *metrics.CacheTrace {
 			tr.Prefix = append(tr.Prefix, strconv.Itoa(i+1)+":"+short(chainSum(chain)))
 		}
 	}
-	tr.Marks = marks(req.Tools, req.System, req.Messages)
 	return tr
 }
 
@@ -255,20 +262,32 @@ func skipSpaceBack(b []byte, i, floor int) int {
 }
 
 // marks lists the cache breakpoints on top-level blocks, in the order the
-// upstream evaluates them: tools, system, messages.
-func marks(tools, system json.RawMessage, messages []json.RawMessage) []string {
-	var out []string
-	add := func(prefix string, i int, raw []byte) {
+// upstream evaluates them: tools, system, messages. It also returns, for each
+// breakpoint on a message, the message count k whose prefix digest covers it, so
+// the caller records that checkpoint: a mark names where the upstream caches,
+// and the digest at that position names what.
+func marks(tools, system json.RawMessage, messages []json.RawMessage) ([]string, []int) {
+	var (
+		out    []string
+		bounds []int
+	)
+	add := func(prefix string, i int, raw []byte) bool {
 		if len(out) >= maxMarks {
-			return
+			return false
 		}
-		if on, ttl := markOf(raw); on {
-			label := prefix + strconv.Itoa(i)
-			if ttl != "" {
-				label += ":" + ttl
-			}
-			out = append(out, label)
+		on, ttl, scope := markOf(raw)
+		if !on {
+			return false
 		}
+		label := prefix + strconv.Itoa(i)
+		if ttl != "" {
+			label += ":" + ttl
+		}
+		if scope != "" {
+			label += "@" + scope
+		}
+		out = append(out, label)
+		return true
 	}
 	for i, raw := range blocks(tools) {
 		add("t", i, raw)
@@ -287,10 +306,12 @@ func marks(tools, system json.RawMessage, messages []json.RawMessage) []string {
 			continue
 		}
 		for _, raw := range blocks(msg.Content) {
-			add("m", i, raw)
+			if add("m", i, raw) && (len(bounds) == 0 || bounds[len(bounds)-1] != i+1) {
+				bounds = append(bounds, i+1)
+			}
 		}
 	}
-	return out
+	return out, bounds
 }
 
 // blocks splits a JSON array into its elements; anything that is not an array
@@ -306,19 +327,43 @@ func blocks(raw json.RawMessage) []json.RawMessage {
 	return out
 }
 
-// markOf reports whether a block carries a breakpoint and the ttl it names, if
-// any. A null marker is no breakpoint.
-func markOf(raw []byte) (bool, string) {
+// markOf reports whether a block carries a breakpoint, with the ttl and scope it
+// names, if any. A null marker is no breakpoint.
+func markOf(raw []byte) (on bool, ttl, scope string) {
 	if !bytes.Contains(raw, cacheControlKey) {
-		return false, ""
+		return false, "", ""
 	}
 	var b struct {
 		CacheControl *struct {
-			TTL string `json:"ttl"`
+			TTL   json.RawMessage `json:"ttl"`
+			Scope json.RawMessage `json:"scope"`
 		} `json:"cache_control"`
 	}
 	if json.Unmarshal(raw, &b) != nil || b.CacheControl == nil {
-		return false, ""
+		return false, "", ""
 	}
-	return true, b.CacheControl.TTL
+	return true, label(b.CacheControl.TTL), label(b.CacheControl.Scope)
+}
+
+// label reads a short enum-like string out of a marker. The body is client
+// input, so anything that is not a short plain token is recorded as "?": the
+// event stays bounded and carries no text the client chose to put there.
+func label(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var v string
+	if json.Unmarshal(raw, &v) != nil || v == "" {
+		return "?"
+	}
+	if len(v) > maxLabel {
+		return "?"
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.') {
+			return "?"
+		}
+	}
+	return v
 }

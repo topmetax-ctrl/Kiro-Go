@@ -100,8 +100,15 @@ func TestMarkersDoNotChangeDigests(t *testing.T) {
 		if got.Conv != plain.Conv || got.Tools != plain.Tools || got.System != plain.System {
 			t.Fatalf("mark on %d changed an anchor digest", mark)
 		}
-		if strings.Join(got.Prefix, ",") != strings.Join(plain.Prefix, ",") {
-			t.Fatalf("mark on %d changed the prefix chain:\n%v\n%v", mark, got.Prefix, plain.Prefix)
+		// A marker adds a checkpoint at its own boundary; every digest the two
+		// requests both list must still agree.
+		for k := 1; k <= 6; k++ {
+			if a, b := prefixAt(got, k), prefixAt(plain, k); a != "" && b != "" && a != b {
+				t.Fatalf("mark on %d changed the prefix digest at %d: %q vs %q", mark, k, a, b)
+			}
+		}
+		if prefixAt(got, mark+1) == "" {
+			t.Fatalf("mark on %d: its boundary %d is not a checkpoint: %v", mark, mark+1, got.Prefix)
 		}
 	}
 	// Markers on tools and system digest the same too.
@@ -341,4 +348,96 @@ func TestTraceSizeIsBounded(t *testing.T) {
 			t.Fatalf("n=%d: trace is %d bytes", n, len(raw))
 		}
 	}
+}
+
+// A breakpoint names where the upstream caches; the digest at that position
+// names what. Both must be recorded, wherever the breakpoint sits in a long
+// history that the sparse checkpoints would otherwise skip.
+func TestEveryMarkedMessageIsACheckpoint(t *testing.T) {
+	msgs := turns(100)
+	tr := testTracer.Trace(body(t, msgs, 37, nil), "")
+	if prefixAt(tr, 38) == "" {
+		t.Fatalf("marked message 37 has no checkpoint at 38: %v", tr.Prefix)
+	}
+	plain := testTracer.Trace(body(t, msgs, -1, nil), "")
+	if prefixAt(tr, 38) == "" || prefixAt(plain, 38) != "" {
+		t.Fatalf("an unmarked body must not list boundary 38: %v", plain.Prefix)
+	}
+	// Two requests that differ only in where the breakpoint sits agree on every
+	// content digest they share.
+	for k := 1; k <= 100; k++ {
+		if a, b := prefixAt(tr, k), prefixAt(plain, k); a != "" && b != "" && a != b {
+			t.Fatalf("digest at %d differs by marker placement", k)
+		}
+	}
+}
+
+func TestMarksCarryTTLAndScope(t *testing.T) {
+	tr := testTracer.Trace(body(t, turns(3), 2, func(r map[string]any) {
+		r["system"].([]any)[0].(map[string]any)["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "1h", "scope": "global"}
+		r["tools"].([]any)[0].(map[string]any)["cache_control"] = map[string]any{"type": "ephemeral", "scope": "org"}
+	}), "")
+	if got := strings.Join(tr.Marks, ","); got != "t0@org,s0:1h@global,m2" {
+		t.Fatalf("marks = %q", got)
+	}
+}
+
+// ttl and scope come from the client body. Whatever text it puts there must not
+// reach the event: only short plain tokens are copied.
+func TestMarkLabelsAreSanitized(t *testing.T) {
+	for in, want := range map[string]string{
+		`"5m"`:                  "m0:5m",
+		`"1h"`:                  "m0:1h",
+		`"global"`:              "m0:global",
+		`""`:                    "m0:?",
+		`"Has Space"`:           "m0:?",
+		`"secret-sk-ant-api03"`: "m0:?",
+		`"0123456789abcdefg"`:   "m0:?",
+		`3600`:                  "m0:?",
+		`null`:                  "m0",
+	} {
+		b := `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"x","cache_control":{"type":"ephemeral","ttl":` + in + `}}]}]}`
+		tr := testTracer.Trace([]byte(b), "")
+		if tr == nil || len(tr.Marks) != 1 || tr.Marks[0] != want {
+			t.Errorf("ttl %s: marks = %v, want [%s]", in, tr, want)
+		}
+	}
+}
+
+// The key derives from a persisted secret, so digests must stay comparable
+// across restarts and releases. These values pin the derivation: a change to the
+// domain label, the framing or the truncation breaks them on purpose, because it
+// would make every digest recorded before it incomparable with the ones after.
+// An independent HMAC-SHA256 implementation reproduces these values from the
+// scheme in docs/cache-observability.md.
+func TestDigestsAreStableAcrossReleases(t *testing.T) {
+	tr := New([]byte("pinned-secret-for-the-stability-test")).Trace([]byte(
+		`{"model":"claude-sonnet-5-5","system":[{"type":"text","text":"sys"}],"tools":[{"name":"t"}],`+
+			`"thinking":{"type":"enabled","budget_tokens":1000},`+
+			`"messages":[{"role":"user","content":[{"type":"text","text":"a"}]},`+
+			`{"role":"assistant","content":[{"type":"text","text":"b","cache_control":{"type":"ephemeral"}}]}]}`), "off")
+	got := strings.Join([]string{tr.Conv, tr.Tools, tr.System, tr.Settings, strings.Join(tr.Prefix, "/")}, " ")
+	const want = "2c8986aaf7cee627bd8979c5 37d68cb8f1d70be24af3f87e c26a4e55645b22657f8baff5 241a3f32bf36f530592bf2ad 1:9b3ea6caff5dd6f345785ff3/2:fd06f1d23d17f57ef15fba7e"
+	if got != want {
+		t.Fatalf("digests changed:\n got %s\nwant %s", got, want)
+	}
+}
+
+// Concurrent requests each hash their own body; this shows how the cost scales
+// with the number in flight.
+func BenchmarkTraceParallel(b *testing.B) {
+	msgs := make([]string, 300)
+	for i := range msgs {
+		msgs[i] = strings.Repeat("x", 6000)
+	}
+	bd := body(b, msgs, 299, nil)
+	b.SetBytes(int64(len(bd)))
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if testTracer.Trace(bd, "") == nil {
+				b.Error("nil trace")
+			}
+		}
+	})
 }
