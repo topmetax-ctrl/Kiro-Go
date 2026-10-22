@@ -176,9 +176,10 @@ func cacheEventParts(ev Event) (b CacheBucket, readReported bool, ok bool) {
 // (see CoverageFromMs).
 //
 // Eligible events are those whose upstream reported a cache figure and an input
-// total, excluding the Kiro pool and estimated usage. bigWriteMin <= 0 uses
+// total, excluding the Kiro pool and estimated usage. providerIDs narrows the
+// window to those providers (empty = all). bigWriteMin <= 0 uses
 // DefaultBigWriteTokens.
-func CacheSeries(fromMs, toMs int64, providerID string, bigWriteMin int64) CacheSeriesResult {
+func CacheSeries(fromMs, toMs int64, providerIDs []string, bigWriteMin int64) CacheSeriesResult {
 	if bigWriteMin <= 0 {
 		bigWriteMin = DefaultBigWriteTokens
 	}
@@ -208,12 +209,19 @@ func CacheSeries(fromMs, toMs int64, providerID string, bigWriteMin int64) Cache
 	}
 	s.mu.Unlock()
 
+	var only map[string]bool
+	if len(providerIDs) > 0 {
+		only = make(map[string]bool, len(providerIDs))
+		for _, id := range providerIDs {
+			only[id] = true
+		}
+	}
 	var writes []CacheWrite
 	for _, ev := range all {
 		if ev.TimeMs < fromMs || ev.TimeMs > toMs {
 			continue
 		}
-		if providerID != "" && ev.ProviderID != providerID {
+		if only != nil && !only[ev.ProviderID] {
 			continue
 		}
 		if ev.ProviderID == KiroPoolID {

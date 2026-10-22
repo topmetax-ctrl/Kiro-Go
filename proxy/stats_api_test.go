@@ -655,6 +655,9 @@ func TestForwardCacheSeriesEndpoint(t *testing.T) {
 	if got := getJSON(t, &Handler{}, "/admin/api/forward-cache-series?hours=6&provider=up-1")["eligible"].(float64); got != 3 {
 		t.Fatalf("6h up-1 eligible = %v, want 3", got)
 	}
+	if got := getJSON(t, &Handler{}, "/admin/api/forward-cache-series?hours=6&provider=up-2,up-3")["eligible"].(float64); got != 0 {
+		t.Fatalf("6h other providers eligible = %v, want 0", got)
+	}
 	// A custom window uses from/to; a malformed one is a 400, not a silent default.
 	rec := httptest.NewRecorder()
 	(&Handler{}).apiGetForwardCacheSeries(rec, httptest.NewRequest(http.MethodGet, "/admin/api/forward-cache-series?from=abc", nil))

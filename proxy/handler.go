@@ -6556,7 +6556,8 @@ func (h *Handler) apiGetForwardHistory(w http.ResponseWriter, r *http.Request) {
 // writes, and what the figures leave out (pool, estimated, not reported).
 //
 // A window is `hours` (default 24) or a `from`/`to` pair, like the other stats
-// endpoints. `provider` narrows it to one provider and `bigWrite` sets the size
+// endpoints. `provider` narrows it to those providers (comma separated) and
+// `bigWrite` sets the size
 // of a "large write" in tokens. The data comes from the in-memory event log, so
 // it only covers retention.coverage: a restart empties it.
 func (h *Handler) apiGetForwardCacheSeries(w http.ResponseWriter, r *http.Request) {
@@ -6576,7 +6577,13 @@ func (h *Handler) apiGetForwardCacheSeries(w http.ResponseWriter, r *http.Reques
 		fromMs = toMs - int64(hours)*time.Hour.Milliseconds()
 	}
 	bigWrite, _ := strconv.ParseInt(strings.TrimSpace(q.Get("bigWrite")), 10, 64)
-	res := metrics.CacheSeries(fromMs, toMs, strings.TrimSpace(q.Get("provider")), bigWrite)
+	var providers []string
+	for _, id := range strings.Split(q.Get("provider"), ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			providers = append(providers, id)
+		}
+	}
+	res := metrics.CacheSeries(fromMs, toMs, providers, bigWrite)
 	json.NewEncoder(w).Encode(struct {
 		metrics.CacheSeriesResult
 		Retention metrics.RetentionStat `json:"retention"`

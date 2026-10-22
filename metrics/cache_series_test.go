@@ -36,7 +36,7 @@ func TestCacheSeriesArithmeticAndTiers(t *testing.T) {
 		Record(e)
 	}
 
-	r := CacheSeries(base, base+30*minute, "", 0)
+	r := CacheSeries(base, base+30*minute, nil, 0)
 	tot := r.Totals
 	if r.Eligible != 4 || tot.Requests != 4 {
 		t.Fatalf("eligible = %d / %d, want 4", r.Eligible, tot.Requests)
@@ -83,7 +83,7 @@ func TestCacheSeriesEligibilityAndExclusions(t *testing.T) {
 	Record(cacheEv("p1", at-1, 1_000, i64(900), nil))           // just before the window
 	Record(cacheEv("p1", at+10*minute+1, 1_000, i64(900), nil)) // just after
 
-	r := CacheSeries(at, at+10*minute, "", 0)
+	r := CacheSeries(at, at+10*minute, nil, 0)
 	if r.Eligible != 2 {
 		t.Fatalf("eligible = %d, want 2", r.Eligible)
 	}
@@ -95,8 +95,11 @@ func TestCacheSeriesEligibilityAndExclusions(t *testing.T) {
 	}
 	// Provider filter keeps the pool out and other providers out.
 	Record(cacheEv("p2", at+20, 2_000, i64(100), nil))
-	if got := CacheSeries(at, at+10*minute, "p2", 0); got.Eligible != 1 || got.Excluded.Pool != 0 {
+	if got := CacheSeries(at, at+10*minute, []string{"p2"}, 0); got.Eligible != 1 || got.Excluded.Pool != 0 {
 		t.Fatalf("p2 filter: %+v", got)
+	}
+	if got := CacheSeries(at, at+10*minute, []string{"p1", "p2"}, 0); got.Eligible != 3 {
+		t.Fatalf("p1+p2 filter: eligible %d, want 3", got.Eligible)
 	}
 }
 
@@ -108,7 +111,7 @@ func TestCacheSeriesBucketsAndBounds(t *testing.T) {
 	Record(cacheEv("p1", from+minute, 100, i64(50), nil))    // first instant of bucket 1
 	Record(cacheEv("p1", from+60*minute, 100, i64(50), nil)) // exactly toMs: included
 
-	r := CacheSeries(from, from+60*minute, "", 0)
+	r := CacheSeries(from, from+60*minute, nil, 0)
 	if r.BucketMs != minute {
 		t.Fatalf("bucket = %d, want one minute for a 1h window", r.BucketMs)
 	}
@@ -131,7 +134,7 @@ func TestCacheSeriesBucketsAndBounds(t *testing.T) {
 		}
 	}
 	// A careless window is clamped instead of allocating millions of buckets.
-	huge := CacheSeries(1, 1+10*365*24*60*minute, "", 0)
+	huge := CacheSeries(1, 1+10*365*24*60*minute, nil, 0)
 	if len(huge.Buckets) > 800 {
 		t.Fatalf("unclamped window produced %d buckets", len(huge.Buckets))
 	}
@@ -148,7 +151,7 @@ func TestCacheSeriesBigWritesAndTopWrites(t *testing.T) {
 	tie := cacheEv("p1", at+99_000, 500_000, i64(0), i64(120_000)) // ties the largest, but is newer
 	tie.RequestID = "tie"
 	Record(tie)
-	r := CacheSeries(at, at+10*minute, "", 0)
+	r := CacheSeries(at, at+10*minute, nil, 0)
 	if len(r.TopWrites) != topWritesKept {
 		t.Fatalf("top writes = %d, want %d", len(r.TopWrites), topWritesKept)
 	}
@@ -164,11 +167,11 @@ func TestCacheSeriesBigWritesAndTopWrites(t *testing.T) {
 	if r.Totals.BigWrites != 4 || r.BigWriteMin != DefaultBigWriteTokens {
 		t.Fatalf("bigWrites = %d (min %d), want 4", r.Totals.BigWrites, r.BigWriteMin)
 	}
-	if got := CacheSeries(at, at+10*minute, "", 50_000).Totals.BigWrites; got != 9 {
+	if got := CacheSeries(at, at+10*minute, nil, 50_000).Totals.BigWrites; got != 9 {
 		t.Fatalf("bigWrites at 50k = %d, want 9", got)
 	}
 	// A window with nothing in it still returns empty lists, not nulls.
-	empty := CacheSeries(at+time.Hour.Milliseconds(), at+2*time.Hour.Milliseconds(), "", 0)
+	empty := CacheSeries(at+time.Hour.Milliseconds(), at+2*time.Hour.Milliseconds(), nil, 0)
 	if empty.TopWrites == nil || empty.Buckets == nil || empty.Eligible != 0 {
 		t.Fatalf("empty window: %+v", empty)
 	}
@@ -177,14 +180,14 @@ func TestCacheSeriesBigWritesAndTopWrites(t *testing.T) {
 func TestCacheSeriesCoverage(t *testing.T) {
 	reset(t)
 	now := nowMs()
-	if got := CacheSeries(now-minute, now, "", 0).CoverageFromMs; got != Retention().MemorySinceMs {
+	if got := CacheSeries(now-minute, now, nil, 0).CoverageFromMs; got != Retention().MemorySinceMs {
 		t.Fatalf("coverage = %d, want memorySince while the ring has room", got)
 	}
 	for i := 0; i < EventRingCapacity+5; i++ {
 		e := cacheEv("p1", 1_000+int64(i), 100, i64(1), nil)
 		Record(e)
 	}
-	if got := CacheSeries(0, 1_000_000, "", 0).CoverageFromMs; got != 1_005 {
+	if got := CacheSeries(0, 1_000_000, nil, 0).CoverageFromMs; got != 1_005 {
 		t.Fatalf("coverage after wrap = %d, want 1005 (oldest survivor)", got)
 	}
 }
