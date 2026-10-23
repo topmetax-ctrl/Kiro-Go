@@ -7134,37 +7134,36 @@
   }
 
   // fwdInCell renders the IN cell. Without cache telemetry it is the plain
-  // tri-state input total. With cache, the total input (the request's real
-  // context size) is the primary figure, followed by a bar and a line saying how
-  // much of it was served from cache, written to cache, or neither. The tooltip
-  // defines each term, including "active input" (total minus cache reads: what
-  // was actually processed this turn), which is also in the detail panel.
+  // tri-state input total. With cache it shows what the cache took off the
+  // request: the total input, struck through once a cache read is involved (like
+  // an old price), the hit rate beside it, and below it the active input in green
+  // (total minus cache reads: what was actually processed this turn, cache writes
+  // included) with a "+Nk write" marker on a request that primes the cache. The
+  // read/write/uncached split is in the tooltip and the detail panel.
   function fwdInCell(e) {
     const prefix = fwdUsageSourcePrefix(e);
     const c = fwdCacheParts(e);
     if (c.read == null && c.create == null) {
       return '<span>' + escapeHtml(prefix + fwdTokenCell(e, 'inputTokens')) + '</span>';
     }
-    const bits = [];
-    if (c.read != null) bits.push(fwdFmtTokens(c.r) + ' ' + t('forward.usageCachedShort'));
-    if (c.create != null && c.w > 0) bits.push(fwdFmtTokens(c.w) + ' ' + t('forward.usageWriteShort'));
-    if (c.rest) bits.push(fwdFmtTokens(c.rest) + ' ' + t(c.restIsUncached ? 'forward.usageUncachedShort' : 'forward.usageOtherShort'));
     let tip = t('forward.usageTotalInput') + ' ' + fwdFmtTokens(c.total);
     if (c.read != null) tip += '\n' + t('forward.usageCacheRead') + ' ' + fwdFmtTokens(c.r);
     if (c.create != null) tip += '\n' + t('forward.usageCacheWrite') + ' ' + fwdFmtTokens(c.w);
     if (c.rest != null) tip += '\n' + t(c.restIsUncached ? 'forward.usageUncached' : 'forward.usageOther') + ' ' + fwdFmtTokens(c.rest);
     if (c.hit != null) tip += '\n' + t('forward.usageCacheHit') + ' ' + c.hit + '%';
     if (c.active != null) tip += '\n\n' + t('forward.usageActiveInput') + ' ' + fwdFmtTokens(c.active) + ' — ' + t('forward.usageActiveHint');
-    // The hit rate sits beside the bar: it is the figure people read first. The
-    // split line below keeps the exact counts and wraps between its parts, so a
-    // narrow table gives the width to the model column instead of scrolling.
+    // The struck figure is not announced as struck, so each figure carries its name for screen readers.
+    const label = key => '<span class="sr-only">' + escapeHtml(t(key)) + ' </span>';
     const hitTag = c.hit != null
-      ? '<span class="fwd-in-hit"><span class="sr-only">' + escapeHtml(t('forward.usageCacheHit')) + ' </span>' + c.hit + '%</span>'
-      : '';
+      ? '<span class="fwd-in-hit">' + label('forward.usageCacheHit') + c.hit + '%</span>' : '';
+    const activeTag = c.active != null
+      ? '<span class="fwd-in-active">' + label('forward.usageActiveInput') + '<i class="fa-solid fa-bolt" aria-hidden="true"></i>' + escapeHtml(fwdFmtTokens(c.active)) + '</span>' : '';
+    const writeTag = c.w > 0
+      ? '<span class="fwd-in-write">+' + escapeHtml(fwdFmtTokens(c.w)) + ' ' + escapeHtml(t('forward.usageWriteShort')) + '</span>' : '';
     return '<span class="fwd-in-merged" title="' + escapeAttr(tip) + '">' +
-      '<span class="fwd-in-head"><span class="fwd-in-total">' + escapeHtml(prefix + fwdFmtTokens(c.total)) + '</span>' +
-        fwdCacheBar(c) + hitTag + '</span>' +
-      (bits.length ? '<span class="fwd-in-split">' + bits.map(b => '<span class="fwd-in-bit">' + escapeHtml(b) + '</span>').join('') + '</span>' : '') +
+      '<span class="fwd-in-head"><span class="fwd-in-total' + (c.r > 0 ? ' fwd-in-total-old' : '') + '">' +
+        label('forward.usageTotalInput') + escapeHtml(prefix + fwdFmtTokens(c.total)) + '</span>' + hitTag + '</span>' +
+      (activeTag || writeTag ? '<span class="fwd-in-sub">' + activeTag + writeTag + '</span>' : '') +
       '</span>';
   }
 

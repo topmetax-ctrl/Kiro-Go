@@ -3301,40 +3301,47 @@ img.brand-icon {
 .scope-line + .fwd-stats-grid {
   margin-top: 0.5rem;
 }
-/* IN cell: total input first, then a bar and a line splitting it into cache
-   read / cache write / uncached. The bar colors are all >= 3:1 on the row
-   background in both themes; the line and the aria-label carry the same
-   numbers, so color is never the only cue. */
+/* IN cell: the total input (struck through once a cache read is involved, like
+   an old price) with the hit rate beside it, and below it the active input in
+   green and a marker for a request that writes the cache. The detail panel
+   carries the stacked bar. Every figure has a screen-reader label; the struck
+   total keeps full contrast, since the strike is the cue and not a dimmed state. */
 .fwd-in-merged {
   display: inline-flex;
   flex-direction: column;
-  gap: 0.15rem;
-  line-height: 1.2;
+  gap: 0.1rem;
+  line-height: 1.15;
 }
-.fwd-in-head {
+.fwd-in-head,
+.fwd-in-sub {
   display: inline-flex;
-  align-items: center;
+  align-items: baseline;
   gap: 0.5rem;
 }
 .fwd-in-total {
-  color: var(--foreground);
-  font-weight: 600;
+  color: var(--muted-foreground);
+  font-size: 0.9em;
+}
+.fwd-in-total-old {
+  text-decoration: line-through;
 }
 .fwd-in-hit {
   color: var(--foreground);
   font-weight: 600;
 }
-.fwd-in-split {
-  color: var(--muted-foreground);
-  font-size: 0.72rem;
-  /* The cell is nowrap; the parts of this line wrap as whole units, so a narrow
-     table gives the width to the model column and the line never splits a figure
-     from its label. */
-  display: flex;
-  flex-wrap: wrap;
-  column-gap: 0.6rem;
+.fwd-in-active {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--success);
+  font-weight: 600;
 }
-.fwd-in-bit {
+.fwd-in-active .fa-bolt {
+  font-size: 0.85em;
+}
+.fwd-in-write {
+  font-size: 0.8em;
+  color: color-mix(in oklab, var(--warning) 55%, var(--foreground));
   white-space: nowrap;
 }
 .cache-bar {
