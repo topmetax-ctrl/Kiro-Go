@@ -3257,7 +3257,17 @@ img.brand-icon {
 }
 .fwd-events-table td:nth-child(2) {
   white-space: normal;
-  word-break: break-all;
+}
+.fwd-model-to {
+  white-space: nowrap;
+}
+.fwd-model-name {
+  display: inline-block;
+  max-width: 20rem;
+  vertical-align: bottom;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 /* Scope tags: every aggregate says which window it covers (selected range,
    all-time counters, or the memory-only views that restart empties). Text is
@@ -3310,9 +3320,21 @@ img.brand-icon {
   color: var(--foreground);
   font-weight: 600;
 }
+.fwd-in-hit {
+  color: var(--foreground);
+  font-weight: 600;
+}
 .fwd-in-split {
   color: var(--muted-foreground);
   font-size: 0.72rem;
+  /* The cell is nowrap; the parts of this line wrap as whole units, so a narrow
+     table gives the width to the model column and the line never splits a figure
+     from its label. */
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 0.6rem;
+}
+.fwd-in-bit {
   white-space: nowrap;
 }
 .cache-bar {
@@ -3427,6 +3449,13 @@ img.brand-icon {
   transform: rotate(180deg);
 }
 .fwd-err-hint {
+  /* A long upstream error must not widen the Status column for every row: the
+     rest is in the tooltip and the detail panel. */
+  display: inline-block;
+  max-width: 11rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
   margin-left: 0.4rem;
   font-size: 0.72rem;
   color: var(--destructive);

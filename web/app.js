@@ -7155,10 +7155,16 @@
     if (c.rest != null) tip += '\n' + t(c.restIsUncached ? 'forward.usageUncached' : 'forward.usageOther') + ' ' + fwdFmtTokens(c.rest);
     if (c.hit != null) tip += '\n' + t('forward.usageCacheHit') + ' ' + c.hit + '%';
     if (c.active != null) tip += '\n\n' + t('forward.usageActiveInput') + ' ' + fwdFmtTokens(c.active) + ' — ' + t('forward.usageActiveHint');
+    // The hit rate sits beside the bar: it is the figure people read first. The
+    // split line below keeps the exact counts and wraps between its parts, so a
+    // narrow table gives the width to the model column instead of scrolling.
+    const hitTag = c.hit != null
+      ? '<span class="fwd-in-hit"><span class="sr-only">' + escapeHtml(t('forward.usageCacheHit')) + ' </span>' + c.hit + '%</span>'
+      : '';
     return '<span class="fwd-in-merged" title="' + escapeAttr(tip) + '">' +
       '<span class="fwd-in-head"><span class="fwd-in-total">' + escapeHtml(prefix + fwdFmtTokens(c.total)) + '</span>' +
-        fwdCacheBar(c) + '</span>' +
-      (bits.length ? '<span class="fwd-in-split">' + escapeHtml(bits.join(' · ')) + '</span>' : '') +
+        fwdCacheBar(c) + hitTag + '</span>' +
+      (bits.length ? '<span class="fwd-in-split">' + bits.map(b => '<span class="fwd-in-bit">' + escapeHtml(b) + '</span>').join('') + '</span>' : '') +
       '</span>';
   }
 
@@ -8740,9 +8746,12 @@
     const uid = 'ev' + (++fwdEventSeq);
     fwdEventStore[uid] = e;
     fwdEventKeys.add(fwdEventKey(e));
+    // Each name stays in one piece (a long one is cut with an ellipsis, the full
+    // text is in the tooltip); the cell breaks only at the arrow.
+    const modelName = m => '<span class="fwd-model-name" title="' + escapeAttr(m) + '">' + escapeHtml(m) + '</span>';
     const model = e.targetModel && e.targetModel !== e.clientModel
-      ? escapeHtml(e.clientModel) + ' <span class="muted-text">&rarr;</span> ' + escapeHtml(e.targetModel)
-      : escapeHtml(e.clientModel || '');
+      ? modelName(e.clientModel) + ' <span class="fwd-model-to"><span class="muted-text">&rarr;</span> ' + modelName(e.targetModel) + '</span>'
+      : modelName(e.clientModel || '');
     const prov = escapeHtml(e.providerName || fwdProviderNames[e.providerId] || e.providerId || '');
     const badge = e.ok
       ? '<span class="fwd-badge fwd-badge--ok">' + (e.status || 200) + '</span>'
